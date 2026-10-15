@@ -396,7 +396,24 @@ def service_fixture():
     # 19. EP7 Cmd 10 (cmd 0x0a, tag 0x7a, len 4) -> reply len 0
     write64(SEP + 0x1010, 7 | (0x0a << 8) | (0x7a << 16) | (4 << 48))
     read(SEP + 0x1038, 7 | (0x0a << 8) | (1 << 15) | (0x7a << 16), True)
-    # 20. Unsupported command on EP7 (cmd 0x15) -> no reply
+    # 20. EP7 Cmd 7 (cmd 0x07, tag 0x7b, len 8) -> reply len 4
+    write64(SEP + 0x1010, 7 | (0x07 << 8) | (0x7b << 16) | (8 << 48))
+    read(SEP + 0x1038, 7 | (0x07 << 8) | (1 << 15) | (0x7b << 16) | (4 << 48), True)
+    read(BASE + 0x500000, 0, False)
+    # 21. EP7 Cmd 8 unwrap (cmd 0x08, tag 0x7c, len 28) -> reply len 16
+    write32(BASE + 0x600000, 0x11223344)
+    write32(BASE + 0x600004, 1)
+    write32(BASE + 0x600008, 0)
+    write32(BASE + 0x60000c, 8)
+    write64(BASE + 0x600010, 0x1122334455667788)
+    write32(BASE + 0x600018, 0)
+    write64(SEP + 0x1010, 7 | (0x08 << 8) | (0x7c << 16) | (28 << 48))
+    read(SEP + 0x1038, 7 | (0x08 << 8) | (1 << 15) | (0x7c << 16) | (16 << 48), True)
+    read(BASE + 0x500000, 8, False)
+    read(BASE + 0x500004, 0x55667788, False)
+    read(BASE + 0x500008, 0x11223344, False)
+    read(BASE + 0x50000c, 0, False)
+    # 22. Unsupported command on EP7 (cmd 0x15) -> no reply
     send(0x15, ep=7)
     empty()
 

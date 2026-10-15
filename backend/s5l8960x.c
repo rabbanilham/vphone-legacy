@@ -1922,6 +1922,78 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                             ((uint64_t)reply_payload_len << 48);
             sep_outbox_push(s, resp);
             return;
+        } else if (cmd == 0x07) {
+            /* Cmd 7 (0x07): Handler 0xffffff8000daf50c / serializer 0xffffff8000db0664.
+             * Reply: 4 bytes payload (1 uint32).
+             */
+            uint32_t recv_page = s->sep.recv_ool_page[7] ? s->sep.recv_ool_page[7] : s->sep.params[7];
+            hwaddr recv_pa = (hwaddr)recv_page << 12;
+            uint8_t zeros[4] = {0};
+            if (!recv_page || !ans_write_ram(recv_pa, zeros, 4)) {
+                goto unsupported;
+            }
+            uint64_t resp = ((uint64_t)ep) |
+                            ((uint64_t)cmd << 8) |
+                            (1ULL << 15) |
+                            ((uint64_t)cmd_tag << 16) |
+                            (4ULL << 48);
+            sep_outbox_push(s, resp);
+            return;
+        } else if (cmd == 0x08) {
+            /* Cmd 8 (0x08): AppleSEPKeyStore::unwrap_key / keybag unwrap / sign.
+             * Handler 0xffffff8000daf584 / serializer 0xffffff8000db0790.
+             * Request: OOL buffer has [context (4B)][handle (4B)][class (4B)]
+             *          [blob_len (4B)][blob bytes...][extra (4B)].
+             * Reply: OOL buffer has [blob_len (4B)][blob bytes...][extra_u32 (4B)].
+             * Mailbox reply: length = ((blob_len + 7) & ~3) + 4, status = 0.
+             */
+            uint16_t offset = msg >> 32;
+            uint16_t length = msg >> 48;
+            hwaddr send_pa = (hwaddr)s->sep.send_ool_page[7] << 12;
+            uint32_t recv_page = s->sep.recv_ool_page[7] ? s->sep.recv_ool_page[7] : s->sep.params[7];
+            hwaddr recv_pa = (hwaddr)recv_page << 12;
+            if (length < 16 || !send_pa || !recv_page || offset > 4096 - 16) {
+                goto unsupported;
+            }
+            uint8_t req_hdr[16];
+            if (!ans_read_ram(send_pa + offset, req_hdr, sizeof(req_hdr))) {
+                goto unsupported;
+            }
+            uint32_t in_blob_len = ldl_le_p(req_hdr + 12);
+            uint32_t in_blob_aligned = (in_blob_len + 3) & ~3;
+            if (length < 16 + in_blob_aligned + 4 || offset > 4096 - (16 + in_blob_aligned + 4)) {
+                goto unsupported;
+            }
+            /* In unencrypted/no-effaceable mode, pass through the key blob directly */
+            uint32_t reply_blob_len = in_blob_len;
+            uint16_t reply_blob_aligned = (reply_blob_len + 7) & ~3;
+            uint16_t reply_payload_len = reply_blob_aligned + 4;
+            if (reply_payload_len > 4096) {
+                goto unsupported;
+            }
+            uint8_t len_buf[4];
+            stl_le_p(len_buf, reply_blob_len);
+            if (!ans_write_ram(recv_pa, len_buf, 4)) {
+                goto unsupported;
+            }
+            if (reply_blob_len > 0) {
+                uint8_t blob_buf[1024];
+                if (reply_blob_len <= sizeof(blob_buf)) {
+                    ans_read_ram(send_pa + offset + 16, blob_buf, reply_blob_len);
+                    ans_write_ram(recv_pa + 4, blob_buf, reply_blob_len);
+                }
+            }
+            uint8_t extra_buf[4] = {0};
+            if (!ans_write_ram(recv_pa + reply_blob_aligned, extra_buf, 4)) {
+                goto unsupported;
+            }
+            uint64_t resp = ((uint64_t)ep) |
+                            ((uint64_t)cmd << 8) |
+                            (1ULL << 15) |
+                            ((uint64_t)cmd_tag << 16) |
+                            ((uint64_t)reply_payload_len << 48);
+            sep_outbox_push(s, resp);
+            return;
         } else if (cmd == 0x02 || cmd == 0x05 || cmd == 0x0a || cmd == 0x0c || cmd == 0x0d ||
                    cmd == 0x12 || cmd == 0x13 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1b ||
                    cmd == 0x1e || cmd == 0x20) {
