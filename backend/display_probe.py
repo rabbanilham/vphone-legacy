@@ -149,6 +149,10 @@ def main():
     p.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
     p.add_argument('--plan', type=Path, help='Alternative boot_plan.json path')
     p.add_argument('--keybagd-loader-hooks', action='store_true', help='Trace native systembag file loading and stop on a proven open error')
+    p.add_argument('--diagnostic-poke', action='append', default=[], choices=('meta_alive','stamps','device_status','drain'),
+                   help='Diagnostic-only guest writes used to map later blockers; never acceptance evidence')
+    p.add_argument('--meta-dump', action='store_true', help='On the first meta_wait, save AGXMetaFirmware state, pointer translations and guest RAM')
+    p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     args = p.parse_args()
     assert 0 < args.seconds <= 180
     assert 1 <= args.step_count <= 64
@@ -196,6 +200,15 @@ def main():
         provenance['auxiliary_images'].append(image)
     save_json(out / 'provenance.json', provenance)
     bps = {int(item.split('=', 1)[1], 0): item.split('=', 1)[0] for item in args.breakpoint}
+    # Every GDB stop costs a host round trip; high-rate hooks such as
+    # swap_advancer turned 75 guest seconds into ~600 wall seconds.
+    poke = set(args.diagnostic_poke)
+    max_hits = {'accel_': 0, 'meta_': 0}
+    max_hits.update({k: int(v, 0) for k, v in (item.split('=', 1) for item in args.max_hits)})
+    def hit_cap(name, pc):
+        for prefix in sorted(max_hits, key=len, reverse=True):
+            if name.startswith(prefix):return max_hits[prefix]
+        return 24 if pc in user_expected else 8
     user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
     user_installed = False
     user_expected = {}
@@ -634,6 +647,85 @@ def main():
                                     if name=='ca_add_context':event['ca_context']=memory(gs,x[1],512).hex()
                                 if name.startswith('surface_') and pc in temporary and 0x100000000<=x[0]<0x200000000:
                                     event['surface_head']=memory(gs,x[0],256).hex()
+                                if name.startswith('accel_') and pc in bps:
+                                    dev = x[0] if x[0] >> 56 == 0xff else 0
+                                    dev_status = memory(gs, dev + 0x490, 1) if dev else b''
+                                    if not dev_status and dev:
+                                        alt_dev = u64(gs, dev + 0x118)
+                                        if alt_dev >> 56 == 0xff:
+                                            dev = alt_dev
+                                            dev_status = memory(gs, dev + 0x490, 1)
+                                    if dev_status:
+                                        event['device_status_before'] = dev_status.hex()
+                                        if 'device_status' in poke and not (dev_status[0] & 2):
+                                            new_byte = dev_status[0] | 2
+                                            rsp(gs, f'M{dev + 0x490:x},1:{new_byte:02x}')
+                                            event['device_status_after'] = hex(new_byte)
+                                if name.startswith('accel_wait_stamp') and pc in bps:
+                                    channel_obj = x[0]
+                                    ring_idx = x[1] & 0x1f
+                                    target_stamp = x[2] & 0xffffffff
+                                    stamps_table = u64(gs, channel_obj + 0x28) if channel_obj >> 56 == 0xff else 0
+                                    stamp_ptr = u64(gs, stamps_table + ring_idx * 8) if stamps_table >> 56 == 0xff else 0
+                                    if stamp_ptr >> 56 == 0xff:
+                                        cur_stamp = int.from_bytes(memory(gs, stamp_ptr, 4), 'little')
+                                        event['stamp_before'] = cur_stamp
+                                        event['target_stamp'] = target_stamp
+                                        event['stamp_ptr'] = hex(stamp_ptr)
+                                        if 'stamps' in poke and cur_stamp < target_stamp:
+                                            rsp(gs, f'M{stamp_ptr:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                            event['stamp_after'] = target_stamp
+                                        if 'stamps' in poke and x[3] >> 56 == 0xff:
+                                            rsp(gs, f'M{x[3]:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                if name.startswith('accel_stamp_') and pc in bps:
+                                    stamp_ptr = x[23] if x[23] >> 56 == 0xff else x[0]
+                                    if stamp_ptr >> 56 == 0xff:
+                                        cur_stamp = int.from_bytes(memory(gs, stamp_ptr, 4), 'little')
+                                        target_stamp = x[21] & 0xffffffff
+                                        event['stamp_before'] = cur_stamp
+                                        event['target_stamp'] = target_stamp
+                                        event['stamp_ptr'] = hex(stamp_ptr)
+                                        if 'stamps' in poke and cur_stamp < target_stamp:
+                                            rsp(gs, f'M{stamp_ptr:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                            event['stamp_after'] = target_stamp
+                                        if 'stamps' in poke and x[22] >> 56 == 0xff:
+                                            rsp(gs, f'M{x[22]:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                if name == 'accel_drain_sleep' and pc in bps and 'drain' in poke:
+                                    event['drain_iteration'] = x[23]
+                                    event['drain_event_obj'] = hex(x[21])
+                                    regs_mod = list(x)
+                                    regs_mod[24] = 1
+                                    rsp(gs, 'G' + struct.pack('<33Q', *regs_mod).hex())
+                                    event['drain_x24_set'] = 1
+                            if name.startswith('meta_') and pc in bps:
+                                meta=x[19] if x[19]>>56==0xff else (x[0] if x[0]>>56==0xff else 0)
+                                if meta:
+                                    event['meta_object']=hex(meta)
+                                    event['meta_state_538']=memory(gs,meta+0x530,16).hex()
+                                    owner=u64(gs,meta+0x58)
+                                    if owner>>56==0xff:
+                                        doorbell=u64(gs,owner+0x518)
+                                        event['meta_owner']=hex(owner);event['meta_doorbell_va']=hex(doorbell)
+                                        if doorbell>>56==0xff:
+                                            event['meta_doorbell_pa']=command(fp,'human-monitor-command',{'command-line':f'gva2gpa {doorbell:#x}'}).strip()
+                                if name=='meta_wait' and args.meta_dump and meta and not (out/'meta-dump.json').exists():
+                                    def gpa(va):
+                                        raw=command(fp,'human-monitor-command',{'command-line':f'gva2gpa {va:#x}'})
+                                        found=re.findall(r'gpa: 0x([0-9a-fA-F]+)',raw);return hex(int(found[0],16)) if found else None
+                                    owner=u64(gs,meta+0x58);dump=dict(meta=hex(meta),owner=hex(owner),meta_bytes=memory(gs,meta,0x600).hex(),pointers={})
+                                    for base,size in ((meta,0x600),(owner,0x3f00)):
+                                        for o in range(0,size,8):
+                                            v=u64(gs,base+o)
+                                            if v>>40==0xffffff and v&7==0:dump['pointers'][f'{base:#x}+{o:#x}']=dict(va=hex(v),pa=gpa(v))
+                                    dump['owner_bytes']=memory(gs,owner,0x3f00).hex()
+                                    dump['sgx1_sequencer']=command(fp,'human-monitor-command',{'command-line':'xp /20xw 0x201e10000'})
+                                    command(fp,'pmemsave',{'val':plan['dram_base'],'size':plan['memory_size'],'filename':str(out/'ram.bin')})
+                                    save_json(out/'meta-dump.json',dump)
+                                if name=='meta_msg':
+                                    event['meta_message']=memory(gs,x[1],64).hex() if x[1]>>56==0xff else None
+                                if name=='meta_wait' and 'meta_alive' in poke and meta and memory(gs,meta+0x539,1)==b'\0':
+                                    assert rsp(gs,f'M{meta+0x538:x},2:0101')=='OK'
+                                    event['diagnostic_poke']='meta_alive'
                             if name=='swap_submit' and pc in bps:
                                 event['swap_payload']=memory(gs,x[1],min(x[2],0x138)).hex()
                             if name in ('swap_begin','program_hardware','irq_filter'):
@@ -698,7 +790,8 @@ def main():
                                 break
                             if pc in bps:
                                 hook_counts[pc]=hook_counts.get(pc,0)+1
-                                if hook_counts[pc]>=(24 if pc in user_expected else 8):
+                                cap=hit_cap(name,pc)
+                                if cap and hook_counts[pc]>=cap:
                                     if pc not in temporary:assert rsp(gs,f'z0,{pc:x},4')=='OK'
                                     del bps[pc]
                             steps = []
@@ -732,7 +825,7 @@ def main():
                     save_json(out/'observations.json',dict(kernel_panic=panicked,guest_running_seconds=clock.elapsed(),wall_seconds=clock.wall(),stop_condition=args.stop_condition))
                     (out / 'registers.txt').write_text(command(fp, 'human-monitor-command', {'command-line':'info registers'}))
                     views = {}
-                    for addr, count in [(0x206200000,4),(0x206300000,4),(0x206201020,24),(0x206204040,16),(0x206400000,32)]:
+                    for addr, count in [(0x206200000,4),(0x206300000,4),(0x206201020,24),(0x206204040,16),(0x206400000,32),(0x201000000,16),(0x201e00000,16)]:
                         views[hex(addr)] = command(fp, 'human-monitor-command', {'command-line': f'xp /{count}xw {addr:#x}'})
                     save_json(out / 'mmio_registers.json', views)
                     command(fp, 'screendump', {'filename': str(out / 'qmp-framebuffer.ppm')})

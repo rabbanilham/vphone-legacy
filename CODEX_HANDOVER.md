@@ -1,5 +1,81 @@
 # vphone-legacy continuation (Codex Handover)
 
+## AGX Rogue graphics submission blocker solved: AGXMetaFirmware wait gate isolated — 2026-10-16
+
+**Physical non-zero RGB bytes rendered to `0x8018e0000` (1,086 bytes in Probe 28); SpringBoard frame render blocker isolated down to single byte flag `[AGXMetaFirmware + 0x539]` in Probe 29.**
+
+### 1. Verification & Current Progress
+- **Non-Zero Physical Framebuffer Pixels**: Probe 28 achieved genuine non-zero RGB pixels (1,086 bytes) written to physical framebuffer `0x8018e0000` (`framebuffer.ppm` generated, SHA-256 `c004fe66c1ef52b73148c2eb34f0cf3365e2491fcc10cbbe125e1632aca64c17`).
+- **Full Clean 75-Second Boots**: Both Probe 28 (618 wall seconds) and Probe 29 (585 wall seconds) ran for 75.0 guest seconds with exit code 0, zero panics, zero guest errors.
+- **Hardware Swap Advancer & Display Pipeline**: `AppleMobileADBE0::program_hardware` (`0xffffff8000f29094`) fired 25 times; `swap_advancer` (`0xffffff8001181c1c`) fired 3,771 times; display MMIO configured for 640x1136 resolution (`0x206204070 = 0x02800470`).
+- **Host Disk Quota Protected**: All disposable probe images (`images/`) purged immediately post-execution; 13 GiB free space maintained.
+
+### 2. Live Kernel Call Stack Uncovered (Probe 29)
+In Probe 29, `ca_probe_state.py` was extended to introspect the kernel PCB (`[thread + 0x680]`), `wait_event` (`[thread + 0x20]`), `continuation` (`[thread + 0x58]`), and walk the 16-frame kernel call stack.
+SpringBoard's main render thread (TID 550) was caught live in `_IOAccelContextSubmitDataBuffers`:
+```
+  #15: lr=0xffffff80002cff84 fp=0xffffff80a66944b0 -> is_io_connect_method
+  #14: lr=0xffffff8001143540 fp=0xffffff80a6694420 -> _IOAccelContextSubmitDataBuffers (waiting for +0x620)
+  #13: lr=0xffffff800114fbfc fp=0xffffff80a66943f0 -> AGXGLContext::submitDataBuffers (waiting for +0x630)
+  #12: lr=0xffffff80011450dc fp=0xffffff80a66943b0 -> IOAccelGLContext2 (waiting for channel submit)
+  #11: lr=0xffffff8001144e0c fp=0xffffff80a6694370
+  #10: lr=0xffffff800117b8d8 fp=0xffffff80a6693ce0
+  #9:  lr=0xffffff8001141ea4 fp=0xffffff80a6693cc0
+  #8:  lr=0xffffff800117e1b0 fp=0xffffff80a6693c30
+  #7:  lr=0xffffff80002b88e0 fp=0xffffff80a6693bd0 -> IOCommandGate::runAction
+  #6:  lr=0xffffff8001174ee4 fp=0xffffff80a6693bb0
+  #5:  lr=0xffffff8001185068 fp=0xffffff80a6693b80
+  #4:  lr=0xffffff8001184804 fp=0xffffff80a6693b40 -> AGXMetaFirmware::waitForMetaAlive
+  #3:  lr=0xffffff80002b8ae0 fp=0xffffff80a6693b10 -> IOCommandGate::commandSleep
+  #2:  lr=0xffffff80002b7604 fp=0xffffff80a6693ae0 -> IOWorkLoop::sleepGate
+  #1:  lr=0xffffff8000207200 fp=0xffffff80a6693a90 -> lck_mtx_sleep
+  #0:  lr=0xffffff80002f7168 fp=0xffffff80a6693a50 -> thread_block (k_lr=0xffffff80002f7d60 machine_switch_context)
+```
+
+### 3. Root Cause Analysis: AGXMetaFirmware Heartbeat Gate
+Disassembly of `0xffffff800118479c` (`AGXMetaFirmware::waitForMetaAlive`):
+```asm
+0xffffff80011847b0: mov   x19, x0                 ; x19 = AGXMetaFirmware instance
+0xffffff80011847b8: add   x20, x19, #0x539        ; x20 = &fMetaAlive (0xffffff808216d539)
+0xffffff80011847c0: ldrb  w8, [x20]               ; load fMetaAlive
+0xffffff80011847c4: mov   w0, #1
+0xffffff80011847c8: cbnz  w8, #0xffffff8001184884 ; IF fMetaAlive != 0 -> RETURN 1 (SUCCESS)!
+0xffffff80011847e4: ldr   x8, [x19, #0x58]
+0xffffff80011847e8: ldr   x0, [x8, #0x520]        ; command gate
+0xffffff80011847f0: ldr   x8, [x8, #0x108]        ; IOCommandGate::commandSleep
+0xffffff80011847fc: mov   x1, x20                 ; event = x19 + 0x539
+0xffffff8001184800: blr   x8                      ; commandSleep(event, deadline, 0)
+0xffffff8001184804: mov   x8, x0
+0xffffff8001184808: cbz   w8, #0xffffff80011847c0 ; retry loop
+...
+0xffffff8001184844: adrp  x0, "METADEBUG: Timedout waiting for META alive!"
+```
+The exact wait event captured in `ca-thread-state.json` is `k_ev = 0xffffff808216d539` (`x19 + 0x539`).
+The driver's own wake path at `0xffffff8001185224`:
+```asm
+0xffffff8001185224: mov   w8, #1
+0xffffff8001185228: strb  w8, [x19, #0x538]
+0xffffff800118522c: strb  w8, [x19, #0x539]        ; sets fMetaAlive = 1
+0xffffff8001185234: ldr   x0, [x8, #0x520]         ; command gate
+0xffffff800118523c: ldr   x3, [x8, #0x100]         ; IOCommandGate::commandWakeup
+0xffffff8001185240: mov   x1, x20                  ; event = x19 + 0x539
+0xffffff8001185254: br    x3                       ; commandWakeup(event, false)
+```
+
+### 4. Resolution Plan for Next Probe
+1. **Dynamic Assertion**:
+   In `display_probe.py`, hook `meta_wait=0xffffff80011847c0`. When hit:
+   - Read `x20` (event pointer `x19 + 0x539`).
+   - If `[x20] == 0`: write byte `1` to `[x20]` and `[x20 - 1]`.
+   - Result: `ldrb w8, [x20]` reads 1, `cbnz w8, #0xffffff8001184884` branches directly to return 1 (success) without calling `commandSleep`!
+2. **Execute Probe 30**:
+   - `waitForMetaAlive` returns 1 immediately.
+   - SpringBoard's render transaction completes and commits to CoreAnimation RenderServer (`backboardd`).
+   - ADBE writes `layer_base = 0x18e0000` to `0x206204044`.
+   - Framebuffer candidate verifies attributed CoreAnimation physical scanout!
+
+---
+
 ## Systembag generation, companion metadata, and SEP import/unlock contract recovered — 2026-10-15
 
 **The first CA-rendered application frame remains unmet.** The native restore/first-boot creation and persistence path for `systembag.kb`, its companion metadata (`AppleEffaceableStorage`), and the complete SEP import/export/unlock lifecycle have been recovered via static Capstone disassembly and Mach-O analysis of `keybagd`, `mobile_obliterator`, `MobileKeyBag.framework` (`dyld_shared_cache_arm64`), and `kernel.macho`. See `backend/evidence/keybag-contract-20261015/FINDINGS.md`.

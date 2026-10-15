@@ -167,6 +167,9 @@ struct A7State {
     uint32_t ipi, ipi_mask;
     bool timer_level[2];
     QEMUTimer *vblank_timer;
+    QEMUTimer *agx_meta_timer;
+    uint64_t agx_cat_base;
+    uint32_t agx_meta_alive_count;
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -379,9 +382,21 @@ static void aic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     A7State *s = opaque;
     if (off >= 0x3000 && off < 0x4000) { s->targets[(off - 0x3000) / 4] = val; }
     else if (off >= 0x4000 && off < 0x4080) { s->soft[(off - 0x4000) / 4] |= val; }
-    else if (off >= 0x4080 && off < 0x4100) { s->soft[(off - 0x4080) / 4] &= ~val; }
+    else if (off >= 0x4080 && off < 0x4100) {
+        unsigned word = (off - 0x4080) / 4;
+        if (word == 2 && (val & ((1U << 20) | 2U))) {
+            fprintf(stderr, "[AIC] Soft clear word 2 val=0x%" PRIx64 "\n", val);
+        }
+        s->soft[word] &= ~val;
+    }
     else if (off >= 0x4100 && off < 0x4180) { s->mask[(off - 0x4100) / 4] |= val; }
-    else if (off >= 0x4180 && off < 0x4200) { s->mask[(off - 0x4180) / 4] &= ~val; }
+    else if (off >= 0x4180 && off < 0x4200) {
+        unsigned word = (off - 0x4180) / 4;
+        if (word == 2 && (val & ((1U << 20) | 2U))) {
+            fprintf(stderr, "[AIC] Mask clear (unmask) word 2 val=0x%" PRIx64 "\n", val);
+        }
+        s->mask[word] &= ~val;
+    }
     else if (off == 0x2008 || off == 0x5008) { s->ipi |= val & 0x80000001; }
     else if (off == 0x200c || off == 0x500c) { s->ipi &= ~val; }
     else if (off == 0x2024 || off == 0x5024) { s->ipi_mask |= val; }
@@ -2086,9 +2101,19 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
             if (off == 8) { return p->i2c_rx_valid ? 0x100 : 0; }
             if (off == 0x0c) { return 0; }
         }
-        if (p->base == UINT64_C(0x201000000) && off == 0x20) {
-            /* Apple S5L8960X Rogue G6430 GPU core ID */
-            return 0x46000000;
+        if (p->base == UINT64_C(0x201000000)) {
+            if (off == 0x20) {
+                return 0x00014600; /* PowerVR G6430 Silicon Core ID */
+            }
+            if (off == 0x18) {
+                return 0x00000000; /* Core Revision */
+            }
+        }
+        if (p->base == UINT64_C(0x206400000) && size == 4) {
+            if (off == 0x0000) {
+                /* DSI status: bit 0 = Tx FIFO empty / command complete */
+                return (*(uint32_t *)(p->regs + off)) | 1U;
+            }
         }
         if (p->base == UINT64_C(0x206200000) && size == 4) {
             if (off == 0x0004) {
@@ -2241,14 +2266,6 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
             }
             default:
                 break;
-            }
-        }
-        if (p->base == UINT64_C(0x201000000)) {
-            if (off == 0x20) {
-                return 0x00014600; /* PowerVR G6430 Silicon Core ID */
-            }
-            if (off == 0x18) {
-                return 0x00000000; /* Core Revision */
             }
         }
         if (size == 4) {
@@ -2564,7 +2581,9 @@ static void display_mmio_trace(A7Peripheral *p, const char *op,
         (p->base != UINT64_C(0x206200000) &&
          p->base != UINT64_C(0x206300000) &&
          p->base != UINT64_C(0x206400000) &&
-         p->base != UINT64_C(0x20a110000))) {
+         p->base != UINT64_C(0x20a110000) &&
+         p->base != UINT64_C(0x201000000) &&
+         p->base != UINT64_C(0x201e00000))) {
         return;
     }
     CPUState *cpu = current_cpu;
@@ -2578,6 +2597,138 @@ static void display_mmio_trace(A7Peripheral *p, const char *op,
                   off, size, val, pc);
 }
 
+/*
+ * AGX META firmware host interface, high-level model. Only the boot
+ * handshake is modeled; no GPU command stream is executed.
+ *
+ * Native AGXMetaFirmware start (0xffffff800118472c) writes a boot program
+ * to the sgx1 sequencer at +0x10000 as {reg | mask << 16, value} pairs
+ * ending in 0xffff0000, then runs it through sgx1+0x1000 bit 0. The program
+ * sets RGX_CR_SOFT_RESET (0x100), RGX_CR_META_BOOT (0xbf8) and
+ * RGX_CR_BIF_CAT_BASE0 (0x1200/0x1204), the GPU page catalogue.
+ *
+ * The firmware boot page at GPU VA 0xe1c0000000 (META 0x40000000) holds the
+ * PIO list at +0x200, a (0, 0) terminator, and then the META address of
+ * argv. META addresses map to GPU VA 0xe1c0000000 + (addr & 0x3fffffff)
+ * (0xffffff800118588c). argv[1] is the shared control page. Firmware->host
+ * ring 0 has its control block at shared+0x40 (read index +0, write index
+ * +0x10, 256 entries) and its 0x28-byte entries at shared+0xc0
+ * (0xffffff8001181c1c). Type 0 is "META alive" (0xffffff80011851a8).
+ * The firmware raises AIC software IRQ 84, which the driver acknowledges
+ * through AIC+0x4088 (0xffffff80011852c0).
+ */
+#define AGX_FW_HEAP_GVA       UINT64_C(0xe1c0000000)
+#define AGX_HOST_IRQ          84
+#define AGX_SEQ_BASE          0x10000
+#define AGX_SEQ_END           0x20000
+#define AGX_FW_RING0_CTRL     0x40
+#define AGX_FW_RING0_ENTRIES  0xc0
+#define AGX_FW_RING_STRIDE    0x28
+
+static bool agx_gpu_translate(A7State *s, uint64_t gva, hwaddr *pa)
+{
+    MemTxResult r;
+    uint32_t pce = address_space_ldl_le(&address_space_memory,
+                                        s->agx_cat_base + ((gva >> 30) & 0x3ff) * 4,
+                                        MEMTXATTRS_UNSPECIFIED, &r);
+    if (r != MEMTX_OK || !(pce & 1)) {
+        return false;
+    }
+    uint64_t pde = address_space_ldq_le(&address_space_memory,
+                                        ((uint64_t)(pce >> 4) << 12) + ((gva >> 21) & 0x1ff) * 8,
+                                        MEMTXATTRS_UNSPECIFIED, &r);
+    if (r != MEMTX_OK || !(pde & 1)) {
+        return false;
+    }
+    uint64_t pte = address_space_ldq_le(&address_space_memory,
+                                        (pde & UINT64_C(0xfffffff000)) + ((gva >> 12) & 0x1ff) * 8,
+                                        MEMTXATTRS_UNSPECIFIED, &r);
+    if (r != MEMTX_OK || !(pte & 1)) {
+        return false;
+    }
+    *pa = (pte & UINT64_C(0xfffffff000)) | (gva & 0xfff);
+    return true;
+}
+
+static bool agx_gpu_access(A7State *s, uint64_t gva, void *buf, size_t length, bool write)
+{
+    uint8_t *bytes = buf;
+    while (length) {
+        size_t chunk = MIN(length, 0x1000 - (gva & 0xfff));
+        hwaddr pa;
+        if (!agx_gpu_translate(s, gva, &pa) ||
+            (write ? address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                         bytes, chunk)
+                   : address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                        bytes, chunk)) != MEMTX_OK) {
+            return false;
+        }
+        gva += chunk; bytes += chunk; length -= chunk;
+    }
+    return true;
+}
+
+static void agx_meta_alive_cb(void *opaque)
+{
+    A7State *s = opaque;
+    uint32_t pio[(0x1000 - 0x200) / 4];
+    if (!agx_gpu_access(s, AGX_FW_HEAP_GVA + 0x200, pio, sizeof(pio), false)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: boot page unmapped (cat base 0x%" PRIx64 ")\n",
+                      s->agx_cat_base);
+        return;
+    }
+    unsigned i = 0;
+    while (i + 2 < ARRAY_SIZE(pio) && (pio[i] || pio[i + 1])) {
+        i += 2;
+    }
+    uint32_t argv[2];
+    if (i + 2 >= ARRAY_SIZE(pio) ||
+        !agx_gpu_access(s, AGX_FW_HEAP_GVA + (pio[i + 2] & 0x3fffffff), argv, sizeof(argv), false)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: argv not found after %u PIO entries\n", i / 2);
+        return;
+    }
+    uint64_t shared = AGX_FW_HEAP_GVA + (argv[1] & 0x3fffffff);
+    uint32_t write_index;
+    uint8_t entry[AGX_FW_RING_STRIDE] = { 0 }; /* type 0: META alive */
+    if (!agx_gpu_access(s, shared + AGX_FW_RING0_CTRL + 0x10, &write_index, 4, false) ||
+        !agx_gpu_access(s, shared + AGX_FW_RING0_ENTRIES + (write_index & 0xff) * AGX_FW_RING_STRIDE,
+                        entry, sizeof(entry), true)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: ring 0 unmapped at shared GVA 0x%" PRIx64 "\n", shared);
+        return;
+    }
+    smp_wmb();
+    write_index = (write_index + 1) & 0xff;
+    agx_gpu_access(s, shared + AGX_FW_RING0_CTRL + 0x10, &write_index, 4, true);
+    s->agx_meta_alive_count++;
+    qemu_log_mask(LOG_UNIMP, "AGX META: alive posted (PIO %u, shared GVA 0x%" PRIx64
+                  ", ring0 write %u)\n", i / 2, shared, write_index);
+    s->soft[AGX_HOST_IRQ / 32] |= 1U << (AGX_HOST_IRQ % 32);
+    aic_update(s);
+}
+
+static void agx_sequencer_run(A7Peripheral *p)
+{
+    A7State *s = p->owner;
+    uint64_t cat_base = 0;
+    bool meta_boot = false;
+    for (uint32_t off = AGX_SEQ_BASE; off + 8 <= AGX_SEQ_END; off += 8) {
+        uint32_t command = ldl_le_p(p->regs + off);
+        uint32_t value = ldl_le_p(p->regs + off + 4);
+        if (command == 0xffff0000) {
+            break;
+        }
+        switch (command & 0xffff) {
+        case 0xbf8: meta_boot = value & 1; break;
+        case 0x1200: cat_base = deposit64(cat_base, 0, 32, value); break;
+        case 0x1204: cat_base = deposit64(cat_base, 32, 32, value); break;
+        }
+    }
+    if (meta_boot && cat_base) {
+        s->agx_cat_base = cat_base;
+        timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+    }
+}
+
 static uint64_t peripheral_read(void *opaque, hwaddr off, unsigned size)
 {
     uint64_t val = peripheral_read_impl(opaque, off, size);
@@ -2587,8 +2738,12 @@ static uint64_t peripheral_read(void *opaque, hwaddr off, unsigned size)
 
 static void peripheral_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
+    A7Peripheral *p = opaque;
     display_mmio_trace(opaque, "write", off, size, val);
     peripheral_write_impl(opaque, off, val, size);
+    if (p->base == UINT64_C(0x201e00000) && off == 0x1000 && (val & 1)) {
+        agx_sequencer_run(p);
+    }
 }
 
 static const MemoryRegionOps peripheral_ops = {
@@ -2650,6 +2805,10 @@ static void vblank_timer_cb(void *opaque)
                 s->device_irq[64 / 32] |= (1U << (64 % 32));
                 aic_update(s);
             }
+            if (!(s->mask[2] & 2U) && !(s->soft[2] & 2U)) {
+                s->soft[2] |= 2U;
+                aic_update(s);
+            }
             break;
         }
     }
@@ -2699,6 +2858,11 @@ static void a7_reset(void *opaque)
         timer_del(s->vblank_timer);
         timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
     }
+    if (s->agx_meta_timer) {
+        timer_del(s->agx_meta_timer);
+    }
+    s->agx_cat_base = 0;
+    s->agx_meta_alive_count = 0;
     s->ans_clock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ans_calendar_seconds = s->utility_epoch;
     s->ans_elapsed_seconds = 0;
@@ -2745,6 +2909,10 @@ static void a7_reset(void *opaque)
             uint8_t *regs = s->peripherals[i].regs;
             *(uint32_t *)(regs + 0x20) = 0x00014600; /* PowerVR G6430 Silicon Core ID */
             *(uint32_t *)(regs + 0x18) = 0x00000000;
+        }
+        if (s->peripherals[i].base == UINT64_C(0x206400000)) {
+            uint8_t *regs = s->peripherals[i].regs;
+            *(uint32_t *)(regs + 0x0000) = 1U; /* DSI status: Tx FIFO empty */
         }
     }
     s->ipi = 0; s->ipi_mask = UINT32_MAX; s->rx_count = 0;
@@ -2966,6 +3134,9 @@ static void a7_init(MachineState *ms)
             *(uint32_t *)(s->peripherals[i].regs + 0x20) = 0x00014600;
             *(uint32_t *)(s->peripherals[i].regs + 0x18) = 0x00000000;
         }
+        if (peripheral_defs[i].base == UINT64_C(0x206400000)) {
+            *(uint32_t *)(s->peripherals[i].regs + 0x0000) = 1U; /* DSI status: Tx FIFO empty */
+        }
         memory_region_init_io(&s->peripherals[i].mr, OBJECT(s), &peripheral_ops,
                               &s->peripherals[i], peripheral_defs[i].name,
                               peripheral_defs[i].size);
@@ -2983,6 +3154,7 @@ static void a7_init(MachineState *ms)
     s->sep.os_active_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          sep_os_active_timer_cb, s);
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
+    s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);

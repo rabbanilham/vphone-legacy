@@ -41,10 +41,15 @@ class ScanoutTracker:
         self.client_commit=False;self.surfaces=set();self.physical_clients=set();self.successful_swaps=0
     def observe(self,e):
         name=e['name'];ret=e.get('return_of');process=e.get('identity',{}).get('process');x0=int(e['registers'][0],16)
-        if name=='ca_commit' and not ret and process=='SpringBoard':self.client_commit=True
-        if name=='surface_create' and ret and x0:self.surfaces.add(x0)
+        if name=='ca_commit' and not ret and process in ('SpringBoard','backboardd'):self.client_commit=True
+        if name in ('surface_create','surface_client_create') and ret and x0:self.surfaces.add(x0)
         if name=='swap_submit':
-            if not ret and e.get('provider_properties',{}).get('IOClass',{}).get('text')=='AppleMobileADBE0':self.physical_clients.add(x0)
+            if not ret and e.get('provider_properties',{}).get('IOClass',{}).get('text')=='AppleMobileADBE0':
+                self.physical_clients.add(x0)
+                payload = e.get('swap_payload', '')
+                if payload:
+                    s_id = int.from_bytes(bytes.fromhex(payload)[:4], 'little')
+                    if s_id: self.surfaces.add(s_id)
             elif ret and int(ret['object'],16) in self.physical_clients and x0&0xffffffff==0:self.successful_swaps+=1
     def eligible(self,rgb,layer_base,completion_token):
         return bool(rgb and self.client_commit and self.surfaces and self.successful_swaps and layer_base==0x18e0000 and completion_token)

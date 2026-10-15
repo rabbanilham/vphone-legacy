@@ -55,7 +55,20 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path):
                             if not data:break
                             fp,lr=struct.unpack('<QQ',data);frames.append(dict(lr=hex(lr),symbol=symbol(lr)))
                         message=read_user(pmap,x[0],256)
-                        record['threads'].append(dict(thread=hex(thread),tid=u64(gs,thread+0x740),pc=hex(x[32]),pc_symbol=symbol(x[32]),lr=hex(x[30]),lr_symbol=symbol(x[30]),registers=[hex(v) for v in x],frames=frames,message_head=message.hex() if message else None))
+                        pcb=u64(gs,thread+0x680);k_event=u64(gs,thread+0x20);k_cont=u64(gs,thread+0x58)
+                        k_fp=u64(gs,pcb+0xf0) if pcb>>56==0xff else 0
+                        k_lr=u64(gs,pcb+0xf8) if pcb>>56==0xff else 0
+                        k_sp=u64(gs,pcb+0x100) if pcb>>56==0xff else 0
+                        k_frames=[];curr_fp=k_fp
+                        for _ in range(16):
+                            if not (curr_fp>>56==0xff):break
+                            fdata=memory(gs,curr_fp,16)
+                            if len(fdata)!=16:break
+                            prev_fp,ret_lr=struct.unpack('<QQ',fdata)
+                            k_frames.append(dict(fp=hex(curr_fp),lr=hex(ret_lr)))
+                            if prev_fp<=curr_fp:break
+                            curr_fp=prev_fp
+                        record['threads'].append(dict(thread=hex(thread),tid=u64(gs,thread+0x740),pc=hex(x[32]),pc_symbol=symbol(x[32]),lr=hex(x[30]),lr_symbol=symbol(x[30]),registers=[hex(v) for v in x],frames=frames,message_head=message.hex() if message else None,kernel_state=dict(pcb=hex(pcb),wait_event=hex(k_event),continuation=hex(k_cont),lr=hex(k_lr),fp=hex(k_fp),sp=hex(k_sp),frames=k_frames)))
                     thread=u64(gs,thread+0x308)
                 result.append(record)
             proc=u64(gs,proc+0xb0)
