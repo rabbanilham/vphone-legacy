@@ -382,10 +382,13 @@ def service_fixture():
     read(BASE + 0x500004, 0x89abcdef, False)
     read(BASE + 0x500008, 0x01234567, False)
     read(BASE + 0x50000c, 0x76543210, False)
-    read(BASE + 0x500010, 0xfedcba98, False)
+    # Also verify handle 0 (system keybag) succeeds
+    write32(BASE + 0x600004, 0)
+    write64(SEP + 0x1010, 7 | (0x06 << 8) | (0x79 << 16) | (8 << 48))
+    read(SEP + 0x1038, 7 | (0x06 << 8) | (1 << 15) | (0x79 << 16) | (20 << 48), True)
     # Wrong handle (handle 2) -> unsupported, no reply
     write32(BASE + 0x600004, 2)
-    write64(SEP + 0x1010, 7 | (0x06 << 8) | (0x79 << 16) | (8 << 48))
+    write64(SEP + 0x1010, 7 | (0x06 << 8) | (0x80 << 16) | (8 << 48))
     empty()
     # 17. EP7 keybag free (cmd 0x05, tag 0x76, len 8) -> reply len 0
     write64(SEP + 0x1010, 7 | (0x05 << 8) | (0x76 << 16) | (8 << 48))

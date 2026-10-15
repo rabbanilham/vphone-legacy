@@ -1897,7 +1897,7 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                 goto unsupported;
             }
             uint32_t handle = ldl_le_p(req + 4);
-            if (handle != 1) {
+            if (handle > 1) {
                 goto unsupported;
             }
             uint32_t reply_blob_len = s->sep.keybag_blob_len;
