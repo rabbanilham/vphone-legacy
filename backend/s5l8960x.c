@@ -140,6 +140,8 @@ typedef struct SepMailbox {
     uint32_t params[256];
     uint32_t send_ool_page[256];
     uint32_t recv_ool_page[256];
+    uint8_t keybag_blob[1024];
+    uint32_t keybag_blob_len;
 } SepMailbox;
 
 struct A7State {
@@ -1859,6 +1861,10 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
             if (length < 8 + blob_len || offset > 4096 - (8 + blob_len)) {
                 goto unsupported;
             }
+            if (blob_len <= sizeof(s->sep.keybag_blob)) {
+                ans_read_ram(send_pa + offset + 8, s->sep.keybag_blob, blob_len);
+                s->sep.keybag_blob_len = blob_len;
+            }
             uint8_t handle_buf[4];
             stl_le_p(handle_buf, 1);
             if (!ans_write_ram(recv_pa, handle_buf, sizeof(handle_buf))) {
@@ -1869,6 +1875,51 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                             (1ULL << 15) |
                             ((uint64_t)cmd_tag << 16) |
                             (4ULL << 48);
+            sep_outbox_push(s, resp);
+            return;
+        } else if (cmd == 0x06) {
+            /* Cmd 6 (0x06): AppleKeyStoreKeyBagCopyData / get keybag blob by handle.
+             * Handler 0xffffff8000daf494 / serializer 0xffffff8000db0594.
+             * Request: OOL buffer has [context (4B)][handle (4B)]. Total 8 bytes.
+             * Reply: OOL buffer has [blob_len (4B)][blob bytes...].
+             * Mailbox reply: length = (blob_len + 7) & ~3, status = 0.
+             */
+            uint16_t offset = msg >> 32;
+            uint16_t length = msg >> 48;
+            hwaddr send_pa = (hwaddr)s->sep.send_ool_page[7] << 12;
+            uint32_t recv_page = s->sep.recv_ool_page[7] ? s->sep.recv_ool_page[7] : s->sep.params[7];
+            hwaddr recv_pa = (hwaddr)recv_page << 12;
+            if (length != 8 || !send_pa || !recv_page || offset > 4096 - 8) {
+                goto unsupported;
+            }
+            uint8_t req[8];
+            if (!ans_read_ram(send_pa + offset, req, sizeof(req))) {
+                goto unsupported;
+            }
+            uint32_t handle = ldl_le_p(req + 4);
+            if (handle != 1) {
+                goto unsupported;
+            }
+            uint32_t reply_blob_len = s->sep.keybag_blob_len;
+            uint16_t reply_payload_len = (reply_blob_len + 7) & ~3;
+            if (reply_payload_len > 4096) {
+                goto unsupported;
+            }
+            uint8_t len_buf[4];
+            stl_le_p(len_buf, reply_blob_len);
+            if (!ans_write_ram(recv_pa, len_buf, 4)) {
+                goto unsupported;
+            }
+            if (reply_blob_len > 0) {
+                if (!ans_write_ram(recv_pa + 4, s->sep.keybag_blob, reply_blob_len)) {
+                    goto unsupported;
+                }
+            }
+            uint64_t resp = ((uint64_t)ep) |
+                            ((uint64_t)cmd << 8) |
+                            (1ULL << 15) |
+                            ((uint64_t)cmd_tag << 16) |
+                            ((uint64_t)reply_payload_len << 48);
             sep_outbox_push(s, resp);
             return;
         } else if (cmd == 0x02 || cmd == 0x05 || cmd == 0x0d || cmd == 0x12 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1e) {
