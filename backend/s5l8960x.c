@@ -168,8 +168,13 @@ struct A7State {
     bool timer_level[2];
     QEMUTimer *vblank_timer;
     QEMUTimer *agx_meta_timer;
+    QEMUTimer *agx_kick_timer;
     uint64_t agx_cat_base;
+    uint64_t agx_shared_gva;
     uint32_t agx_meta_alive_count;
+    uint32_t agx_queues[32];
+    unsigned agx_queue_count;
+    uint32_t agx_pending_doorbells;
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -2616,6 +2621,17 @@ static void display_mmio_trace(A7Peripheral *p, const char *op,
  * (0xffffff8001181c1c). Type 0 is "META alive" (0xffffff80011851a8).
  * The firmware raises AIC software IRQ 84, which the driver acknowledges
  * through AIC+0x4088 (0xffffff80011852c0).
+ *
+ * Host->firmware: the driver enqueues on host ring N (control at
+ * shared+0x98c0+N*0x20, 0x18-byte entries at shared+0x9940+N*0x1800, argument
+ * at +8) and writes sgx0+0xb00 = 0x10|N (0xffffff8001184fd8, 0x118504c,
+ * 0x1185134). Ring 1 carries the META address of a channel queue block
+ * (0xffffff8001186ab8): +4 control (read +0, write +0x20, size +0x30) and +8
+ * a u32 array of command META addresses (0xffffff8001186cb4). Command type 4
+ * is {4, stamp META address, stamp value, channel} (0xffffff800117e0ec); the
+ * model stores the stamp and reports completion with a type-1 firmware event
+ * (0xffffff800117505c). Render (type 1) and mapping (type 3) commands are
+ * consumed without executing any GPU work.
  */
 #define AGX_FW_HEAP_GVA       UINT64_C(0xe1c0000000)
 #define AGX_HOST_IRQ          84
@@ -2624,6 +2640,11 @@ static void display_mmio_trace(A7Peripheral *p, const char *op,
 #define AGX_FW_RING0_CTRL     0x40
 #define AGX_FW_RING0_ENTRIES  0xc0
 #define AGX_FW_RING_STRIDE    0x28
+#define AGX_HOST_RING_CTRL    0x98c0
+#define AGX_HOST_RING_ENTRIES 0x9940
+#define AGX_HOST_RING_STRIDE  0x18
+#define AGX_HOST_RING_SPAN    0x1800
+#define AGX_DOORBELL          0xb00
 
 static bool agx_gpu_translate(A7State *s, uint64_t gva, hwaddr *pa)
 {
@@ -2668,6 +2689,37 @@ static bool agx_gpu_access(A7State *s, uint64_t gva, void *buf, size_t length, b
     return true;
 }
 
+static uint64_t agx_meta_gva(uint32_t addr)
+{
+    return AGX_FW_HEAP_GVA + (addr & 0x3fffffff);
+}
+
+static bool agx_post_fw_message(A7State *s, uint32_t type)
+{
+    uint64_t control = s->agx_shared_gva + AGX_FW_RING0_CTRL;
+    uint32_t read_index, write_index;
+    uint8_t entry[AGX_FW_RING_STRIDE] = { 0 };
+    stl_le_p(entry, type);
+    if (!agx_gpu_access(s, control, &read_index, 4, false) ||
+        !agx_gpu_access(s, control + 0x10, &write_index, 4, false)) {
+        return false;
+    }
+    if (((write_index + 1) & 0xff) == (read_index & 0xff)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: firmware ring 0 full\n");
+        return false;
+    }
+    if (!agx_gpu_access(s, s->agx_shared_gva + AGX_FW_RING0_ENTRIES +
+                        (write_index & 0xff) * AGX_FW_RING_STRIDE, entry, sizeof(entry), true)) {
+        return false;
+    }
+    smp_wmb();
+    write_index = (write_index + 1) & 0xff;
+    agx_gpu_access(s, control + 0x10, &write_index, 4, true);
+    s->soft[AGX_HOST_IRQ / 32] |= 1U << (AGX_HOST_IRQ % 32);
+    aic_update(s);
+    return true;
+}
+
 static void agx_meta_alive_cb(void *opaque)
 {
     A7State *s = opaque;
@@ -2687,23 +2739,104 @@ static void agx_meta_alive_cb(void *opaque)
         qemu_log_mask(LOG_GUEST_ERROR, "AGX META: argv not found after %u PIO entries\n", i / 2);
         return;
     }
-    uint64_t shared = AGX_FW_HEAP_GVA + (argv[1] & 0x3fffffff);
-    uint32_t write_index;
-    uint8_t entry[AGX_FW_RING_STRIDE] = { 0 }; /* type 0: META alive */
-    if (!agx_gpu_access(s, shared + AGX_FW_RING0_CTRL + 0x10, &write_index, 4, false) ||
-        !agx_gpu_access(s, shared + AGX_FW_RING0_ENTRIES + (write_index & 0xff) * AGX_FW_RING_STRIDE,
-                        entry, sizeof(entry), true)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: ring 0 unmapped at shared GVA 0x%" PRIx64 "\n", shared);
+    s->agx_shared_gva = agx_meta_gva(argv[1]);
+    s->agx_queue_count = 0;
+    if (!agx_post_fw_message(s, 0)) { /* type 0: META alive */
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX META: ring 0 unmapped at shared GVA 0x%" PRIx64 "\n",
+                      s->agx_shared_gva);
         return;
     }
-    smp_wmb();
-    write_index = (write_index + 1) & 0xff;
-    agx_gpu_access(s, shared + AGX_FW_RING0_CTRL + 0x10, &write_index, 4, true);
     s->agx_meta_alive_count++;
-    qemu_log_mask(LOG_UNIMP, "AGX META: alive posted (PIO %u, shared GVA 0x%" PRIx64
-                  ", ring0 write %u)\n", i / 2, shared, write_index);
-    s->soft[AGX_HOST_IRQ / 32] |= 1U << (AGX_HOST_IRQ % 32);
-    aic_update(s);
+    qemu_log_mask(LOG_UNIMP, "AGX META: alive posted (PIO %u, shared GVA 0x%" PRIx64 ")\n",
+                  i / 2, s->agx_shared_gva);
+}
+
+static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
+{
+    uint32_t pointers[2], read_index, write_index, size;
+    if (!agx_gpu_access(s, agx_meta_gva(block) + 4, pointers, sizeof(pointers), false)) {
+        return 0;
+    }
+    uint64_t control = agx_meta_gva(pointers[0]), entries = agx_meta_gva(pointers[1]);
+    if (!agx_gpu_access(s, control, &read_index, 4, false) ||
+        !agx_gpu_access(s, control + 0x20, &write_index, 4, false) ||
+        !agx_gpu_access(s, control + 0x30, &size, 4, false) ||
+        !size || size > 0x10000 || read_index >= size || write_index >= size) {
+        return 0;
+    }
+    unsigned done = 0;
+    while (read_index != write_index) {
+        uint32_t address, command[4];
+        if (!agx_gpu_access(s, entries + read_index * 4, &address, 4, false) ||
+            !agx_gpu_access(s, agx_meta_gva(address), command, sizeof(command), false)) {
+            break;
+        }
+        if (command[0] == 4 && agx_gpu_access(s, agx_meta_gva(command[1]), &command[2], 4, true)) {
+            (*stamps)++;
+            qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
+                          block, command[1], command[2], command[3]);
+        }
+        read_index = (read_index + 1) % size;
+        done++;
+    }
+    smp_wmb();
+    agx_gpu_access(s, control, &read_index, 4, true);
+    return done;
+}
+
+static void agx_kick_cb(void *opaque)
+{
+    A7State *s = opaque;
+    uint32_t rings = s->agx_pending_doorbells;
+    s->agx_pending_doorbells = 0;
+    for (unsigned ring = 0; ring < 4; ring++) {
+        if (!(rings & (1U << ring))) {
+            continue;
+        }
+        uint64_t control = s->agx_shared_gva + AGX_HOST_RING_CTRL + ring * 0x20;
+        uint32_t read_index, write_index;
+        if (!agx_gpu_access(s, control, &read_index, 4, false) ||
+            !agx_gpu_access(s, control + 0x10, &write_index, 4, false)) {
+            continue;
+        }
+        while ((read_index & 0xff) != (write_index & 0xff)) {
+            uint32_t entry[AGX_HOST_RING_STRIDE / 4];
+            if (!agx_gpu_access(s, s->agx_shared_gva + AGX_HOST_RING_ENTRIES + ring * AGX_HOST_RING_SPAN +
+                                (read_index & 0xff) * AGX_HOST_RING_STRIDE, entry, sizeof(entry), false)) {
+                break;
+            }
+            qemu_log_mask(LOG_UNIMP, "AGX META: host ring %u type %u arg 0x%x\n", ring, entry[0], entry[2]);
+            if (ring == 1) {
+                bool known = false;
+                for (unsigned q = 0; q < s->agx_queue_count; q++) {
+                    known |= s->agx_queues[q] == entry[2];
+                }
+                if (!known && s->agx_queue_count < ARRAY_SIZE(s->agx_queues)) {
+                    s->agx_queues[s->agx_queue_count++] = entry[2];
+                }
+            }
+            read_index = (read_index + 1) & 0xff;
+        }
+        smp_wmb();
+        agx_gpu_access(s, control, &read_index, 4, true);
+    }
+    unsigned commands = 0, stamps = 0;
+    for (unsigned q = 0; q < s->agx_queue_count; q++) {
+        commands += agx_drain_queue(s, s->agx_queues[q], &stamps);
+    }
+    if (commands) {
+        qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n", commands, stamps);
+        agx_post_fw_message(s, 1); /* type 1: work completed */
+    }
+}
+
+static void agx_doorbell(A7State *s, uint64_t value)
+{
+    if (!s->agx_shared_gva || (value & ~UINT64_C(3)) != 0x10) {
+        return;
+    }
+    s->agx_pending_doorbells |= 1U << (value & 3);
+    timer_mod(s->agx_kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
 }
 
 static void agx_sequencer_run(A7Peripheral *p)
@@ -2725,6 +2858,7 @@ static void agx_sequencer_run(A7Peripheral *p)
     }
     if (meta_boot && cat_base) {
         s->agx_cat_base = cat_base;
+        s->agx_shared_gva = 0;
         timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
     }
 }
@@ -2743,6 +2877,9 @@ static void peripheral_write(void *opaque, hwaddr off, uint64_t val, unsigned si
     peripheral_write_impl(opaque, off, val, size);
     if (p->base == UINT64_C(0x201e00000) && off == 0x1000 && (val & 1)) {
         agx_sequencer_run(p);
+    }
+    if (p->base == UINT64_C(0x201000000) && off == AGX_DOORBELL) {
+        agx_doorbell(p->owner, val);
     }
 }
 
@@ -2861,7 +2998,13 @@ static void a7_reset(void *opaque)
     if (s->agx_meta_timer) {
         timer_del(s->agx_meta_timer);
     }
+    if (s->agx_kick_timer) {
+        timer_del(s->agx_kick_timer);
+    }
     s->agx_cat_base = 0;
+    s->agx_shared_gva = 0;
+    s->agx_queue_count = 0;
+    s->agx_pending_doorbells = 0;
     s->agx_meta_alive_count = 0;
     s->ans_clock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ans_calendar_seconds = s->utility_epoch;
@@ -3155,6 +3298,7 @@ static void a7_init(MachineState *ms)
                                          sep_os_active_timer_cb, s);
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
     s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);
+    s->agx_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_kick_cb, s);
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);

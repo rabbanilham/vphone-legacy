@@ -152,6 +152,7 @@ def main():
     p.add_argument('--diagnostic-poke', action='append', default=[], choices=('meta_alive','stamps','device_status','drain'),
                    help='Diagnostic-only guest writes used to map later blockers; never acceptance evidence')
     p.add_argument('--meta-dump', action='store_true', help='On the first meta_wait, save AGXMetaFirmware state, pointer translations and guest RAM')
+    p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     args = p.parse_args()
     assert 0 < args.seconds <= 180
@@ -270,6 +271,7 @@ def main():
                     started = time.monotonic(); next_sample = started + 1
                     temporary = ReturnRegistry()
                     hook_counts={}
+                    snapshot_at=sorted(args.snapshot_at)
                     serial_offset=0; serial_tail=b''; panicked=False
                     def freeze():
                         if gs and clock.resumed is not None:
@@ -310,6 +312,11 @@ def main():
                                 if capture(fp,out,clock.elapsed()):
                                     freeze();capture(fp,out,clock.elapsed())
                                     if pixel_stop():break
+                                    cont()
+                                if snapshot_at and clock.elapsed()>=snapshot_at[0] and user_hooks and (out/'user-hook-mapping.json').exists():
+                                    at=snapshot_at.pop(0);freeze()
+                                    from ca_probe_state import snapshot
+                                    snapshot(gs,memory,u64,out,out/'user-hook-mapping.json',Path(user_hooks['index_path']),f'ca-thread-state-{int(at):03d}s.json')
                                     cont()
                                 next_sample=time.monotonic()+1
                             if not select.select([gs], [], [], max(0, min(.1, args.seconds - clock.elapsed())))[0]:
