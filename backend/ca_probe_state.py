@@ -4,7 +4,7 @@ import json
 import struct
 from pathlib import Path
 
-def snapshot(gs, memory, u64, out, mapping_path, index_path, name='ca-thread-state.json'):
+def snapshot(gs, memory, u64, out, mapping_path, index_path, output_name='ca-thread-state.json'):
     phys=u64(gs,0xffffff8000694020);virt=u64(gs,0xffffff8000694018)
     def direct(pa): return pa-phys+virt
     def read_user(pmap,va,size):
@@ -72,4 +72,4 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path, name='ca-thread-sta
                     thread=u64(gs,thread+0x308)
                 result.append(record)
             proc=u64(gs,proc+0xb0)
-    (out/name).write_text(json.dumps(dict(cache_slide=hex(slide),tasks=result,process_inventory=inventory),indent=2)+'\n')
+    (out/output_name).write_text(json.dumps(dict(cache_slide=hex(slide),tasks=result,process_inventory=inventory),indent=2)+'\n')

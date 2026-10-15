@@ -215,3 +215,18 @@ df -h .
 
 ### Next bounded task
 - Find which AppleKeyStore/SEP request SpringBoard sends before `sks request timeout`: hook `aks_*` around `0xffffff8000dabc28` and the SEP inbox log in `qemu-trace.log`. Then model the missing reply in the SEP mailbox.
+
+---
+
+## 10. AppleKeyStore cmd 24 reply; backboardd reaches the CA render path (Claude, 2026-10-16)
+
+### Fix
+- The `"sks request timeout"` panic (probe 37) was SEP EP7 **cmd 24 (0x18)**. The model logged `SEP unsupported request ... tag=0x18` and sent no reply. The command table at `0xffffff8000db4310` gives `{cmd 0x18, struct 0x38, serializer 0xdb1814}`: the request packs 3×u32 + u64 + an empty blob (24 bytes), and the reply unpacks 2×u64. Caller `0xdaa3ac` → `0xdaa028`: u64[0] is an action mask (bits 0–3) with a timeout in bits 8+, u64[1] a companion value. A zero mask returns immediately (`0xdaa248`) and maps to kIOReturnSuccess (`db2fd0[8]`). The model replies with 16 zero bytes (no lock-state action). `sep_contract_test.py` 11b covers it.
+
+### Verified result: `probe-39-sks` r1/r2 (180 s each, no pokes, no panic)
+- SpringBoard GPU submit completes (as in §9), then backboardd reaches **`ca_eagl_render_update` → `ca_renderer` → `ca_render_display` → `surface_create`** (~82–85 s). That render path had not been reached before. backboardd's first GPU submit (82.6 s) returns without a doorbell, like SpringBoard's first submit.
+- A one-off CommCenter kernel data abort (`pc 0xf100f8`, `far 0x88`, baseband) at 23 s in `probe-38-sks` did not reproduce in r1/r2. It happened before SpringBoard and is unrelated to cmd 24.
+- `display_probe.py` snapshot bug fixed: `ca_probe_state.snapshot` used a parameter `name` that the process-name loop shadowed, so snapshots were written to a file named after the last process (e.g. `misd`). Probes 36–39 had no `ca-thread-state.json` for this reason (r1's file was recovered).
+
+### Next wall
+- backboardd thread 797 blocks in `IOSurfaceRoot` (`0xc4fdf8`, waiting for `[root+0x138] == [root+0x13c]`), via user-client open `0xc48c58` → `0xc48e54`. `IOSurfaceRoot::installMemoryRegions()` (`0xc4f3c8`) waits for the `/vram` region (`vram` → `PurpleGfxMem`); `/arm-io/edram` is absent so EDRAM is skipped. Our device tree has **`/vram reg = 0`** (base 0, size 0); on hardware iBoot fills it with the framebuffer carveout. Candidate fix: set `/vram reg = (framebuffer_pa, FRAMEBUFFER_SIZE)` in `scripts/qemu/boot_image.py` (next to `DiagnosticFramebuffer`, line ~355), regenerate the boot plan, and confirm `[root+0x13c]` advances. The publisher/consumer path (`x22->vtbl 0xb8` with `"vram"`, and the display pipe `0xf27238` looking up `PurpleGfxMem` via provider vtbl `0x578`) is not yet confirmed.

@@ -1800,8 +1800,14 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
          */
         uint8_t cmd = (msg >> 8) & 0x7f;
         uint8_t cmd_tag = (msg >> 16) & 0xff;
-        if (cmd == 0x11 || cmd == 0x19) {
+        if (cmd == 0x11 || cmd == 0x18 || cmd == 0x19) {
             /* Cmd 17 (0x11): get_lock_state.
+             * Cmd 24 (0x18): table entry 0xffffff8000db4310 (struct 0x38,
+             * serializer db1814) packs three u32, one u64 and an empty blob
+             * (24 bytes) and unpacks two u64. Caller 0xffffff8000daa3ac passes
+             * them to daa028: u64[0] is an action mask (bits 0-3) with a
+             * timeout in bits 8+, u64[1] a companion value. A zero mask
+             * returns at daa248 and maps to kIOReturnSuccess (db2fd0[8]).
              * Cmd 25 (0x19): get_lock_state (user client / system keybag query).
              * AppleSEPKeyStore::send_command checks:
              * - reply bit 15 == 1 (in _msgAction, to wake waiter)
@@ -1813,7 +1819,7 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
              */
             uint32_t recv_page = s->sep.recv_ool_page[7] ? s->sep.recv_ool_page[7] : s->sep.params[7];
             hwaddr recv_pa = (hwaddr)recv_page << 12;
-            size_t reply_length = cmd == 0x19 ? 8 : 16;
+            size_t reply_length = cmd == 0x19 ? 8 : 16; /* Cmd 24: two u64 */
             uint8_t zeros[16] = {0};
             if (!recv_page || !ans_write_ram(recv_pa, zeros, reply_length)) {
                 goto unsupported;
