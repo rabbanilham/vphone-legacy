@@ -247,3 +247,20 @@ df -h .
 ### CA_ENABLE_OGL (software compositing) — blocked
 - QuartzCore `0x18434d5a4` reads `getenv("CA_ENABLE_OGL")` into a static flag, and `0x18434d92c` uses the OGL renderer only when the flag is set. Otherwise it falls back to the base render `0x18435845c`, whose context (vtable `0x18eb3a6c0`) uses IOSurfaceLock/GetBaseAddress, i.e. a CPU renderer. This mirrors iPhone OS 1.0's `LK_ENABLE_OGL=0` used by `~/Documents/Projects/iphone-1-emulator`.
 - Adding `EnvironmentVariables = {CA_ENABLE_OGL: "0"}` to `com.apple.backboardd.plist` (copy `build/diagnostic/system-diagnostic-sep-ogl0.raw`, same inode, root:wheel kept) has **no effect**: a hook at `0x18434d5f8` shows `getenv` returns NULL. `launchctl` loads jobs from `/System/Library/Caches/com.apple.xpcd/xpcd_cache.dylib`, which is **inside the dyld shared cache**, and falls back to plists only if that dlopen fails. Getting the variable to backboardd would mean editing the shared cache, which needs a separate decision.
+
+---
+
+## 12. Software compositing experiments: both dead ends (Claude, 2026-10-16)
+
+### A. Editing the xpcd job cache in the dyld shared cache — breaks userland
+- `xpcd_cache.dylib` lives in the shared cache at `0x180098000` (file offset `0x98000`); the `__TEXT,__xpcd_cache` section is `0x1800989ac`, size `0x2760c`, a binary plist with 200 LaunchDaemons (15 already have `EnvironmentVariables`).
+- On a disk copy, the section was rewritten to the same size: plistlib re-encode (83,834 bytes) with `CA_ENABLE_OGL=0` added for backboardd, padded inside the object area. All other content was verified identical, and the inode and size were kept.
+- Result (`probe-42-xpcd-sw`): root mounts, but **launchd never starts** (no `launchd[1] has started up`, no user hooks). The shared cache is code-signed and its `__TEXT` pages are validated, so any byte change stops userland. The copy was deleted; the original disk is unchanged (`dfbc4938…`). Do not repeat without a separate decision on code signing.
+
+### B. No GPU in the DeviceTree — SpringBoard requires OpenGL ES
+- QuartzCore falls back to the CPU renderer when GL context creation fails (`0x18434cde4` → `0x184281200` returns NULL → `0x18434d92c` takes base render `0x18435845c`).
+- Experiment plan `boot-plan-vram-nogpu` (evidence only): `/arm-io/sgx` compatible renamed `sgx,…` → `off,…` (3 bytes), so AGX does not load.
+- Result (`probe-43-nogpu`, no panic): SpringBoard checks in at 22.4 s, then **re-checks in every ~5 s from 53.4 s**. That is a crash/relaunch loop at the point where GPU runs create their accelerator context. The CA render loop never starts. iOS 7 SpringBoard needs a working GL context, so CPU-only compositing is not reachable without modifying guest code.
+
+### Conclusion
+- Real CoreAnimation pixels need the GPU path: the META HLE must **execute** at least the render work that backboardd's compositor submits (type-1 render commands, PowerVR Rogue TA/3D), not just complete stamps. This is the remaining large piece. Everything else up to `ca_render_display` + swap now runs without pokes (§8–§11).
