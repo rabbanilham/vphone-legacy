@@ -22,7 +22,7 @@ from probe_state import RunClock, ReturnRegistry, ScanoutTracker, pixel_present,
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = Path('/Users/bagas/.gemini/antigravity/brain/4f2c8eb8-288b-4247-84a2-e745314f5c38/scratch')
-PLAN = ROOT / 'build/ios712-validated/logs/20261013-122816-2da89b24/boot/boot_plan.json'
+PLAN = ROOT / 'build/ios712-validated/boot/boot_plan.json'
 FB = 0x8018e0000
 FB_SIZE = 2560 * 1136
 
@@ -159,7 +159,7 @@ def main():
     plan_path = args.plan.resolve() if args.plan else PLAN
     storage = plan_path.parent.parent / 'storage-before'
     if not storage.exists():
-        storage = ROOT / 'build/ios712-validated/logs/20261013-122816-2da89b24/storage-before'
+        storage = ROOT / 'build/ios712-validated'
     system_src = args.diagnostic_system.resolve() if args.diagnostic_system else storage / 'system.raw'
     data_src = args.diagnostic_data.resolve() if args.diagnostic_data else SCRATCH / 'data-seeded-clean.raw'
     sources = dict(system=system_src, data=data_src,
