@@ -1836,8 +1836,44 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                             (UINT64_C(0xfd) << 24);
             sep_outbox_push(s, resp);
             return;
-        } else if (cmd == 0x02 || cmd == 0x0d || cmd == 0x12 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1e) {
+        } else if (cmd == 0x03) {
+            /* Cmd 3 (0x03): AppleKeyStoreKeyBagCreateWithData / import keybag from data.
+             * Handler 0xffffff8000daf388 / serializer 0xffffff8000db02fc.
+             * Request: OOL buffer has [context (4B)][blob_len (4B)][blob_bytes...].
+             * Reply: 4 bytes payload containing assigned uint32_t handle.
+             * Reply mailbox: bit 15 set, tag echoed, status 0, length 4 (4ULL << 48).
+             */
+            uint16_t offset = msg >> 32;
+            uint16_t length = msg >> 48;
+            hwaddr send_pa = (hwaddr)s->sep.send_ool_page[7] << 12;
+            uint32_t recv_page = s->sep.recv_ool_page[7] ? s->sep.recv_ool_page[7] : s->sep.params[7];
+            hwaddr recv_pa = (hwaddr)recv_page << 12;
+            if (length < 8 || !send_pa || !recv_page || offset > 4096 - 8) {
+                goto unsupported;
+            }
+            uint8_t req_hdr[8];
+            if (!ans_read_ram(send_pa + offset, req_hdr, sizeof(req_hdr))) {
+                goto unsupported;
+            }
+            uint32_t blob_len = ldl_le_p(req_hdr + 4);
+            if (length < 8 + blob_len || offset > 4096 - (8 + blob_len)) {
+                goto unsupported;
+            }
+            uint8_t handle_buf[4];
+            stl_le_p(handle_buf, 1);
+            if (!ans_write_ram(recv_pa, handle_buf, sizeof(handle_buf))) {
+                goto unsupported;
+            }
+            uint64_t resp = ((uint64_t)ep) |
+                            ((uint64_t)cmd << 8) |
+                            (1ULL << 15) |
+                            ((uint64_t)cmd_tag << 16) |
+                            (4ULL << 48);
+            sep_outbox_push(s, resp);
+            return;
+        } else if (cmd == 0x02 || cmd == 0x05 || cmd == 0x0d || cmd == 0x12 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1e) {
             /* Cmd 2  (0x02): keybag init / create. Handler 0xffffff8000db022c.
+             * Cmd 5  (0x05): keybag free. Handler 0xffffff8000db04e4.
              * Cmd 13 (0x0d): keybag session / system set. Handler 0xffffff8000db0c20.
              * Cmd 18 (0x12): register_client / session init. Handler 0xffffff8000db129c.
              * Cmd 22 (0x16): keybag operation / session state. Handler 0xffffff8000db1700.

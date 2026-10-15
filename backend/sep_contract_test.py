@@ -363,7 +363,23 @@ def service_fixture():
     # Until an import contract is implemented, query stays absent even after them.
     write64(SEP + 0x1010, 7 | (4 << 8) | (0x74 << 16) | (16 << 48))
     read(SEP + 0x1038, 7 | (4 << 8) | (1 << 15) | (0x74 << 16) | (0xfd << 24), True)
-    # 15. Unsupported command on EP7 (cmd 0x15) -> no reply
+    # 15. EP7 keybag create with data (cmd 0x03, tag 0x75, len 24) -> handle 1, reply len 4
+    write32(BASE + 0x600000, 0x11223344)
+    write32(BASE + 0x600004, 16)
+    write64(BASE + 0x600008, 0x0123456789abcdef)
+    write64(BASE + 0x600010, 0xfedcba9876543210)
+    write64(BASE + 0x500000, 0xdeadbeefcafebabe)
+    write64(SEP + 0x1010, 7 | (0x03 << 8) | (0x75 << 16) | (24 << 48))
+    read(SEP + 0x1038, 7 | (0x03 << 8) | (1 << 15) | (0x75 << 16) | (4 << 48), True)
+    read(BASE + 0x500000, 1, False)
+    read(BASE + 0x500004, 0xdeadbeef, False)
+    # 16. EP7 keybag free (cmd 0x05, tag 0x76, len 8) -> reply len 0
+    write64(SEP + 0x1010, 7 | (0x05 << 8) | (0x76 << 16) | (8 << 48))
+    read(SEP + 0x1038, 7 | (0x05 << 8) | (1 << 15) | (0x76 << 16), True)
+    # 17. Malformed Cmd 3 (length < 8) -> no reply
+    write64(SEP + 0x1010, 7 | (0x03 << 8) | (0x77 << 16) | (4 << 48))
+    empty()
+    # 18. Unsupported command on EP7 (cmd 0x15) -> no reply
     send(0x15, ep=7)
     empty()
 
