@@ -1897,9 +1897,8 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                 goto unsupported;
             }
             uint32_t handle = ldl_le_p(req + 4);
-            if (handle > 1) {
-                goto unsupported;
-            }
+            qemu_log_mask(LOG_UNIMP, "SEP Cmd6 handle=0x%x keybag_len=%u\n",
+                          handle, s->sep.keybag_blob_len);
             uint32_t reply_blob_len = s->sep.keybag_blob_len;
             uint16_t reply_payload_len = (reply_blob_len + 7) & ~3;
             if (reply_payload_len > 4096) {
