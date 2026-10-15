@@ -393,7 +393,10 @@ def service_fixture():
     # 18. Malformed Cmd 3 (length < 8) -> no reply
     write64(SEP + 0x1010, 7 | (0x03 << 8) | (0x77 << 16) | (4 << 48))
     empty()
-    # 18. Unsupported command on EP7 (cmd 0x15) -> no reply
+    # 19. EP7 Cmd 10 (cmd 0x0a, tag 0x7a, len 4) -> reply len 0
+    write64(SEP + 0x1010, 7 | (0x0a << 8) | (0x7a << 16) | (4 << 48))
+    read(SEP + 0x1038, 7 | (0x0a << 8) | (1 << 15) | (0x7a << 16), True)
+    # 20. Unsupported command on EP7 (cmd 0x15) -> no reply
     send(0x15, ep=7)
     empty()
 

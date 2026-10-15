@@ -1922,14 +1922,21 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                             ((uint64_t)reply_payload_len << 48);
             sep_outbox_push(s, resp);
             return;
-        } else if (cmd == 0x02 || cmd == 0x05 || cmd == 0x0d || cmd == 0x12 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1e) {
+        } else if (cmd == 0x02 || cmd == 0x05 || cmd == 0x0a || cmd == 0x0c || cmd == 0x0d ||
+                   cmd == 0x12 || cmd == 0x13 || cmd == 0x16 || cmd == 0x1a || cmd == 0x1b ||
+                   cmd == 0x1e || cmd == 0x20) {
             /* Cmd 2  (0x02): keybag init / create. Handler 0xffffff8000db022c.
              * Cmd 5  (0x05): keybag free. Handler 0xffffff8000db04e4.
+             * Cmd 10 (0x0a): keybag operation / status. Handler 0xffffff8000db0a58.
+             * Cmd 12 (0x0c): keybag operation. Handler 0xffffff8000db0b6c.
              * Cmd 13 (0x0d): keybag session / system set. Handler 0xffffff8000db0c20.
              * Cmd 18 (0x12): register_client / session init. Handler 0xffffff8000db129c.
+             * Cmd 19 (0x13): session operation. Handler 0xffffff8000db1404.
              * Cmd 22 (0x16): keybag operation / session state. Handler 0xffffff8000db1700.
              * Cmd 26 (0x1a): key locker / keybag operation. Handler 0xffffff8000db1a74.
+             * Cmd 27 (0x1b): key locker operation. Handler 0xffffff8000db1b28.
              * Cmd 30 (0x1e): system keybag unlock. Handler 0xffffff8000db1dc0.
+             * Cmd 32 (0x20): keybag operation. Handler 0xffffff8000db1ff0.
              * Handlers expect 0 bytes unpacked on reply (w8 == w19 == 0).
              * Reply with bit 15 set, tag echoed, status 0, length 0.
              */
