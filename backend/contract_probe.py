@@ -194,25 +194,30 @@ def summarize(output, phases_path=None):
     return report
 
 
-def command(output, seconds=90, extra_hooks=()):
+def command(output, seconds=90, extra_hooks=(), diagnostic_data=None, plan=None):
     invocation = read(PROBE11 / 'probe-invocation.json')
     if not invocation:
         raise FileNotFoundError('Probe 11 invocation is required for the persisted-ART preset')
     user_hooks = ROOT / 'backend/evidence/keybag-contract-20261015/user-hooks.json'
     def argument(name):
         return invocation[invocation.index(name) + 1]
-    return [sys.executable, str(ROOT / 'backend/display_probe.py'), '--output', str(output),
-            '--plan', argument('--plan'), '--diagnostic-system', argument('--diagnostic-system'),
-            '--user-hooks', str(user_hooks) if user_hooks.exists() else argument('--user-hooks'), '--returns', '--seconds', str(seconds),
-            '--stop-condition', 'ca-scanout',
-            '--breakpoint', 'sep_start=0xffffff8000d4748c',
-            '--breakpoint', 'userclient_start=0xffffff8000c5cf18',
-            '--breakpoint', 'swap_submit=0xffffff8000c5d810',
-            '--breakpoint', 'aks_external_method=0xffffff8000daee48',
-            '--breakpoint', 'aks_system_unlock=0xffffff8000dab8d0',
-            '--breakpoint', 'aks_ready_before=0xffffff8000dab964',
-            '--breakpoint', 'aks_wakeup_before=0xffffff8000dae450',
-            *[v for hook in extra_hooks for v in ('--breakpoint', hook)]]
+    plan_arg = str(plan) if plan else argument('--plan')
+    cmd = [sys.executable, str(ROOT / 'backend/display_probe.py'), '--output', str(output),
+           '--plan', plan_arg, '--diagnostic-system', argument('--diagnostic-system')]
+    if diagnostic_data:
+        cmd += ['--diagnostic-data', str(diagnostic_data)]
+    cmd += [
+           '--user-hooks', str(user_hooks) if user_hooks.exists() else argument('--user-hooks'), '--returns', '--seconds', str(seconds),
+           '--stop-condition', 'ca-scanout',
+           '--breakpoint', 'sep_start=0xffffff8000d4748c',
+           '--breakpoint', 'userclient_start=0xffffff8000c5cf18',
+           '--breakpoint', 'swap_submit=0xffffff8000c5d810',
+           '--breakpoint', 'aks_external_method=0xffffff8000daee48',
+           '--breakpoint', 'aks_system_unlock=0xffffff8000dab8d0',
+           '--breakpoint', 'aks_ready_before=0xffffff8000dab964',
+           '--breakpoint', 'aks_wakeup_before=0xffffff8000dae450',
+           *[v for hook in extra_hooks for v in ('--breakpoint', hook)]]
+    return cmd
 
 
 def main():
@@ -224,6 +229,8 @@ def main():
     parser.add_argument('--phases', type=Path, help='JSON object of measured phase seconds; missing phases stay null')
     parser.add_argument('--breakpoint', action='append', default=[])
     parser.add_argument('--keybagd-loader-hooks', action='store_true')
+    parser.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
+    parser.add_argument('--plan', type=Path, help='Alternative boot_plan.json path')
     args = parser.parse_args()
     if args.summarize:
         print(json.dumps(summarize(args.summarize, args.phases), indent=2))
@@ -233,7 +240,7 @@ def main():
     output = args.output.resolve()
     if output.exists():
         parser.error('--output must not already exist')
-    invocation = command(output, args.seconds, args.breakpoint)
+    invocation = command(output, args.seconds, args.breakpoint, diagnostic_data=args.diagnostic_data, plan=args.plan)
     if args.keybagd_loader_hooks:
         invocation.append('--keybagd-loader-hooks')
     started = time.monotonic()

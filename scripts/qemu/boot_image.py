@@ -201,6 +201,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     defaults = root.find_node("defaults")
     if defaults is None or defaults.get_prop("monitor-size") != struct.pack("<I", MONITOR_SIZE) or defaults.get_prop("sep-size") != struct.pack("<I", SEP_SIZE):
         raise ValueError("DeviceTree must declare native SEP/monitor reservations")
+    defaults.set_prop("no-effaceable-storage", b"")
     segments = [s for s in info["segments"] if s["vmsize"]]
     for seg in segments:
         relative = seg["vmaddr"] - virt_base

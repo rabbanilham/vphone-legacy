@@ -146,6 +146,7 @@ def main():
     p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout'), default='first-pixel')
     p.add_argument('--step-count', type=int, default=1, help='Bounded instruction steps after each hook')
     p.add_argument('--diagnostic-system', type=Path, help='Alternative diagnostic system image')
+    p.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
     p.add_argument('--plan', type=Path, help='Alternative boot_plan.json path')
     p.add_argument('--keybagd-loader-hooks', action='store_true', help='Trace native systembag file loading and stop on a proven open error')
     args = p.parse_args()
@@ -160,12 +161,26 @@ def main():
     if not storage.exists():
         storage = ROOT / 'build/ios712-validated/logs/20261013-122816-2da89b24/storage-before'
     system_src = args.diagnostic_system.resolve() if args.diagnostic_system else storage / 'system.raw'
-    sources = dict(system=system_src, data=SCRATCH / 'data-seeded-clean.raw',
+    data_src = args.diagnostic_data.resolve() if args.diagnostic_data else SCRATCH / 'data-seeded-clean.raw'
+    sources = dict(system=system_src, data=data_src,
                    utility=storage / 'utility.raw')
     provenance = dict(plan=str(plan_path), plan_sha256=digest(plan_path), inputs={})
+    def clone_or_copy(src, dst):
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None)
+            if hasattr(libc, 'clonefile'):
+                libc.clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+                libc.clonefile.restype = ctypes.c_int
+                if libc.clonefile(str(src).encode(), str(dst).encode(), 0) == 0:
+                    return
+        except Exception:
+            pass
+        shutil.copyfile(src, dst)
+
     for kind, source in sources.items():
         target = images / (kind + '.raw')
-        shutil.copyfile(source, target)
+        clone_or_copy(source, target)
         sha = digest(source)
         assert digest(target) == sha
         provenance['inputs'][kind] = dict(source=str(source), copy=str(target), sha256=sha)
@@ -416,6 +431,8 @@ def main():
                                         verified.append(dict(name=uname,static=hex(static),runtime=hex(static+slide),bytes=actual.hex(),expected=expected.hex(),mapped_at_install=bool(actual)))
                                     save_json(out/'user-hook-mapping.json',dict(slide=hex(slide),hooks=verified))
                                     user_installed=True;break
+                            if name.startswith('keybagd_') and caller_identity.get('process') != 'keybagd':
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if pc in user_expected:
                                 actual=memory(gs,pc,16)
                                 try:mapped=instruction_mapped(actual,user_expected[pc])
@@ -486,7 +503,12 @@ def main():
                             if name == 'aks_wakeup_before':
                                 provider=u64(gs,x[21]+0xd8);ready=memory_state(gs,provider+0x119,1)
                                 event['contract_observation']=dict(provider=hex(provider),ready_flag=int(ready['value'],16) if ready['readable'] else None)
-                                if provider in ready_providers and ready['readable'] and ready['value']=='0x1':wake_providers.add(provider)
+                                if provider in ready_providers and ready['readable'] and ready['value']=='0x1':
+                                    wake_providers.add(provider)
+                                    for k_pc in [k for k, v in list(bps.items()) if v.startswith('keybagd_')]:
+                                        if k_pc not in temporary: rsp(gs, f'z0,{k_pc:x},4')
+                                        bps.pop(k_pc, None)
+                                        user_expected.pop(k_pc, None)
                             if (pending and wake_providers and
                                     (name in ('ls_lookup','ls_plugin_store','bks_checkin') or
                                      name=='aks_external_method' and int(pending['argument1'],16)==17 and x[0]&0xffffffff==0)):
