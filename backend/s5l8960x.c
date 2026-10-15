@@ -2243,6 +2243,14 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
                 break;
             }
         }
+        if (p->base == UINT64_C(0x201000000)) {
+            if (off == 0x20) {
+                return 0x00014600; /* PowerVR G6430 Silicon Core ID */
+            }
+            if (off == 0x18) {
+                return 0x00000000; /* Core Revision */
+            }
+        }
         if (size == 4) {
             return *(uint32_t *)(p->regs + off);
         }
@@ -2733,6 +2741,11 @@ static void a7_reset(void *opaque)
             uint8_t *regs = s->peripherals[i].regs;
             *(uint32_t *)(regs + 0x0004) = 0; /* ADBE0Driver Region 1: timings not yet started */
         }
+        if (s->peripherals[i].base == UINT64_C(0x201000000)) {
+            uint8_t *regs = s->peripherals[i].regs;
+            *(uint32_t *)(regs + 0x20) = 0x00014600; /* PowerVR G6430 Silicon Core ID */
+            *(uint32_t *)(regs + 0x18) = 0x00000000;
+        }
     }
     s->ipi = 0; s->ipi_mask = UINT32_MAX; s->rx_count = 0;
     s->timer_level[0] = s->timer_level[1] = false;
@@ -2949,6 +2962,10 @@ static void a7_init(MachineState *ms)
         s->peripherals[i].size = peripheral_defs[i].size;
         s->peripherals[i].name = peripheral_defs[i].name;
         s->peripherals[i].regs = g_malloc0(peripheral_defs[i].size);
+        if (peripheral_defs[i].base == UINT64_C(0x201000000)) {
+            *(uint32_t *)(s->peripherals[i].regs + 0x20) = 0x00014600;
+            *(uint32_t *)(s->peripherals[i].regs + 0x18) = 0x00000000;
+        }
         memory_region_init_io(&s->peripherals[i].mr, OBJECT(s), &peripheral_ops,
                               &s->peripherals[i], peripheral_defs[i].name,
                               peripheral_defs[i].size);
