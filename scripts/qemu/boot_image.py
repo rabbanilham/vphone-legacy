@@ -353,6 +353,13 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     framebuffer_offset = align(dt_offset + len(raw_tree))
     framebuffer = DRAM_BASE + framebuffer_offset
     memory_map.set_prop("DiagnosticFramebuffer", struct.pack("<QQ", framebuffer, FRAMEBUFFER_SIZE))
+    # iBoot fills the /vram placeholder with the display carveout.
+    # IOSurfaceRoot::installMemoryRegions waits for this region (vram ->
+    # PurpleGfxMem) before any IOSurfaceRoot client can open; a zero reg
+    # blocks backboardd's render server. Same 16-byte size: offsets stay put.
+    vram = root.find_node("vram")
+    if vram is not None:
+        vram.set_prop("reg", struct.pack("<QQ", framebuffer, FRAMEBUFFER_SIZE))
     raw_tree = serialize_node(root)
     top = DRAM_BASE + align(framebuffer_offset + FRAMEBUFFER_SIZE)
     total = top - DRAM_BASE + 0x10000

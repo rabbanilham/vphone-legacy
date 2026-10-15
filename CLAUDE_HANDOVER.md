@@ -230,3 +230,20 @@ df -h .
 
 ### Next wall
 - backboardd thread 797 blocks in `IOSurfaceRoot` (`0xc4fdf8`, waiting for `[root+0x138] == [root+0x13c]`), via user-client open `0xc48c58` → `0xc48e54`. `IOSurfaceRoot::installMemoryRegions()` (`0xc4f3c8`) waits for the `/vram` region (`vram` → `PurpleGfxMem`); `/arm-io/edram` is absent so EDRAM is skipped. Our device tree has **`/vram reg = 0`** (base 0, size 0); on hardware iBoot fills it with the framebuffer carveout. Candidate fix: set `/vram reg = (framebuffer_pa, FRAMEBUFFER_SIZE)` in `scripts/qemu/boot_image.py` (next to `DiagnosticFramebuffer`, line ~355), regenerate the boot plan, and confirm `[root+0x13c]` advances. The publisher/consumer path (`x22->vtbl 0xb8` with `"vram"`, and the display pipe `0xf27238` looking up `PurpleGfxMem` via provider vtbl `0x578`) is not yet confirmed.
+
+---
+
+## 11. /vram carveout, Samsung DSIM status, and the CA_ENABLE_OGL finding (Claude, 2026-10-16)
+
+### Changes
+- `scripts/qemu/boot_image.py`: set `/vram reg = (framebuffer_pa, FRAMEBUFFER_SIZE)` the way iBoot does. The property keeps the same 16-byte size, so no offsets move.
+- `backend/evidence/keybag-contract-20261015/boot-plan-vram/` (evidence, gitignored): a copy of `boot-plan-noeffaceable` with only 5 DeviceTree bytes changed (`/vram reg` = `0x8018e0000, 0x2c6000`), both in `DeviceTree.runtime` and inside `KernelMemory.bin` at `devicetree_pa`. The old plan could not be rebuilt byte-for-byte: its DT boot-args lack `csi_disable_watchdog=1`, which its boot_args struct has, so it was hand-assembled.
+- `backend/s5l8960x.c`: Samsung DSIM STATUS (`0x206400000+0`) is now computed from SWRST/CLKCTRL/ESCMODE/PLLCTRL (stop state, ULPS, TxReadyHsClk, SW reset released, PLL stable), replacing the constant `regs|1`. Recovered from `AppleSamsungMIPIDSIController::_waitStatus` (`0xe91d20`) and its 11 call sites. New `backend/dsim_contract_test.py`. `display_trace_contract_test` now **passes** (the constant DSI status made it fail before).
+
+### Verified result: `probe-41-dsim` (180 s ×2, no pokes, no panic)
+- The `/vram` fix lets `IOSurfaceRoot` clients open, and the CA render loop runs repeatedly (`ca_eagl_render_update`/`ca_renderer`/`ca_render_display` hit their caps, 12 GPU submits, `swap_submit`/`program_hardware` repeat). Probe 40 without the DSIM fix panicked with `_waitStatus timeout (status & 0x00100000) != 0` at ~133 s; probe 41 has no panic.
+- The framebuffer still has no CA pixels (render commands are not executed). The ~1.1 KB of non-zero bytes is the old console-style capture.
+
+### CA_ENABLE_OGL (software compositing) — blocked
+- QuartzCore `0x18434d5a4` reads `getenv("CA_ENABLE_OGL")` into a static flag, and `0x18434d92c` uses the OGL renderer only when the flag is set. Otherwise it falls back to the base render `0x18435845c`, whose context (vtable `0x18eb3a6c0`) uses IOSurfaceLock/GetBaseAddress, i.e. a CPU renderer. This mirrors iPhone OS 1.0's `LK_ENABLE_OGL=0` used by `~/Documents/Projects/iphone-1-emulator`.
+- Adding `EnvironmentVariables = {CA_ENABLE_OGL: "0"}` to `com.apple.backboardd.plist` (copy `build/diagnostic/system-diagnostic-sep-ogl0.raw`, same inode, root:wheel kept) has **no effect**: a hook at `0x18434d5f8` shows `getenv` returns NULL. `launchctl` loads jobs from `/System/Library/Caches/com.apple.xpcd/xpcd_cache.dylib`, which is **inside the dyld shared cache**, and falls back to plists only if that dlopen fails. Getting the variable to backboardd would mean editing the shared cache, which needs a separate decision.

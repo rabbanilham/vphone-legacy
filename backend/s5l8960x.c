@@ -2122,8 +2122,30 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
         }
         if (p->base == UINT64_C(0x206400000) && size == 4) {
             if (off == 0x0000) {
-                /* DSI status: bit 0 = Tx FIFO empty / command complete */
-                return (*(uint32_t *)(p->regs + off)) | 1U;
+                /* Samsung DSIM STATUS, derived from the control registers
+                 * that AppleSamsungMIPIDSIController::_waitStatus
+                 * (0xffffff8000e91d20) polls after writing them:
+                 * [3:0]/8 data/clock stop state, [7:4]/9 data/clock ULPS
+                 * (ESCMODE 0x14: bit3/bit1 request, bit2/bit0 exit), 10
+                 * TxReadyHsClk (CLKCTRL 0x08 bit31), 20 software reset
+                 * released (SWRST 0x04 completes immediately), 31 PLL stable
+                 * (PLLCTRL 0x4c bit23 PLL_EN). The PHY has no latency here.
+                 */
+                uint32_t clkctrl = ldl_le_p(p->regs + 0x08);
+                uint32_t escmode = ldl_le_p(p->regs + 0x14);
+                uint32_t pllctrl = ldl_le_p(p->regs + 0x4c);
+                bool ulps_data = (escmode & 0x8) && !(escmode & 0x4);
+                bool ulps_clock = (escmode & 0x2) && !(escmode & 0x1);
+                uint32_t status = 1U << 20;
+                status |= ulps_data ? 0xf0 : 0x0f;
+                status |= ulps_clock ? 0x200 : 0x100;
+                if (clkctrl & 0x80000000U) {
+                    status |= 1U << 10;
+                }
+                if (pllctrl & (1U << 23)) {
+                    status |= 1U << 31;
+                }
+                return status;
             }
         }
         if (p->base == UINT64_C(0x206200000) && size == 4) {
@@ -3059,10 +3081,6 @@ static void a7_reset(void *opaque)
             *(uint32_t *)(regs + 0x20) = 0x00014600; /* PowerVR G6430 Silicon Core ID */
             *(uint32_t *)(regs + 0x18) = 0x00000000;
         }
-        if (s->peripherals[i].base == UINT64_C(0x206400000)) {
-            uint8_t *regs = s->peripherals[i].regs;
-            *(uint32_t *)(regs + 0x0000) = 1U; /* DSI status: Tx FIFO empty */
-        }
     }
     s->ipi = 0; s->ipi_mask = UINT32_MAX; s->rx_count = 0;
     s->timer_level[0] = s->timer_level[1] = false;
@@ -3282,9 +3300,6 @@ static void a7_init(MachineState *ms)
         if (peripheral_defs[i].base == UINT64_C(0x201000000)) {
             *(uint32_t *)(s->peripherals[i].regs + 0x20) = 0x00014600;
             *(uint32_t *)(s->peripherals[i].regs + 0x18) = 0x00000000;
-        }
-        if (peripheral_defs[i].base == UINT64_C(0x206400000)) {
-            *(uint32_t *)(s->peripherals[i].regs + 0x0000) = 1U; /* DSI status: Tx FIFO empty */
         }
         memory_region_init_io(&s->peripherals[i].mr, OBJECT(s), &peripheral_ops,
                               &s->peripherals[i], peripheral_defs[i].name,
