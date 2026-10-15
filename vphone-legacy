@@ -1,0 +1,12 @@
+#!/bin/zsh
+# vphone-legacy — CLI wrapper running with the project virtualenv
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_PY="${SCRIPT_DIR}/.venv/bin/python"
+
+if [[ ! -f "${VENV_PY}" ]]; then
+    echo "Initializing virtual environment first..."
+    "${SCRIPT_DIR}/scripts/setup_venv.sh"
+fi
+
+exec "${VENV_PY}" "${SCRIPT_DIR}/sources/vphone-legacy-cli/main.py" "$@"

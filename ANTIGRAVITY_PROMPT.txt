@@ -1,0 +1,57 @@
+Continue the vphone-legacy bring-up in /Users/bagas/Documents/Projects/vphone/vphone-legacy. The immediate goal is the first real CoreAnimation application frame from original iOS 7.1.2 (n53ap / 11D257). This goal remains unmet.
+
+READ FIRST
+1. Latest section of ANTIGRAVITY_HANDOVER.md and CODEX_HANDOVER.md. Historical sections are superseded where they conflict.
+2. backend/evidence/keybag-contract-20261015/FINDINGS.md
+3. backend/evidence/keybag-contract-20261015/native-art-persisted-probe-14/contract-report.json
+4. backend/evidence/keybag-contract-20261015/native-contract.json and verification-summary.json
+
+CURRENT VERIFIED STATE
+- SEP manager reaches state 5. Native userspace and daemons execute.
+- EP7 command 4 now decodes the actual 16-byte systembag query: context, bag=0, operation=-1, empty blob. It returns signed status -3 / wire 0xfd, with no payload write. Unsupported other operations are not given query success.
+- Command 25 replies with exactly 8 bytes and preserves following memory; command 17 remains 16 bytes. Real backend fixtures cover negative cases and machine reset.
+- Keybagd selector 14 returns 0xe00002f0 (NotFound), then executes its verified systembag-loading branch at 0x100003488 + executable slide.
+- Native open("/private/var//keybags/systembag.kb", 0) returns -1; a matching same-thread errno read is 2 (ENOENT). The normalized path is /private/var/keybags/systembag.kb. Native normal boot has no in-band generation fallback on this missing-input path.
+- The genuine native generation, persistence, companion metadata, and SEP import/unlock lifecycle are now fully recovered from disassembled binaries:
+  * Generation: `mobile_obliterator` (`0x100006654`) / `restored_external` calls `_MKBKeyBagCreateSystem(0, "/private/var")` (`0x187c51a2c`).
+  * Creation: `AppleKeyStoreKeyBagCreate` (Selector 0, `0xffffff8000dad1dc`) sends SEP EP7 Cmd 2 (`0x02` - keybag create); `AppleKeyStoreKeyBagCopyData` (Selector 13, `0xffffff8000dad8dc`) sends SEP EP7 Cmd 4 op 1 / Cmd 17 (`0x11`) to retrieve `KeyBagKeys`.
+  * Companion metadata: `AppleEffaceableStorage` stores wipe ID `'BAG1'` (`0x42414731`), IV (16B), AES key (32B) via Selector 6 (`storeBlastableBytes`); outer plist stores `_MKBWIPEID`, `_MKBIV`, `_MKBPAYLOAD` (AES-256-CBC ciphertext); or unencrypted when DeviceTree `/defaults` has `no-effaceable-storage`.
+  * Import contract: `keybagd` loads `/private/var/keybags/systembag.kb`, decrypts via effaceable storage, calls `AppleKeyStoreKeyBagCreateWithData` (Selector 6, `0xffffff8000dad5a4`), which sends SEP EP7 Cmd 3 (`0x03` - import keybag from data).
+  * Unlock contract: `keybagd` calls `AppleKeyStoreKeyBagSetSystemAndUnlock` (Selector 5, `0xffffff8000dad538`), which sends SEP EP7 Cmd 30 (`0x1e` - system keybag unlock). Status 0 sets `[AppleKeyStore + 0x119] = 1`, broadcasting `commandGate->commandWakeup`.
+- Cryptographic prerequisite barrier: Opaque SEP keybag structures bound to device-unique hardware AES/GID keys; genuine SEP execution/ROM unavailable; no guest binary patching / fabricated placeholder bags permitted.
+- Final validation passed: 84 unit tests (no skips), all nine smoke/contract suites, make backend, and 18 vm-doctor integrity/backend checks. All owned QEMU processes were reaped; source hashes verified.
+
+NEXT BOUNDED WORK
+Authorize and model the coherent SEP EP7 keybag lifecycle state engine (Command 2 create -> Command 13/17 export -> Command 3 import -> Command 30 unlock) with matching `AppleEffaceableStorage` backing (or DeviceTree `no-effaceable-storage`) to provision a valid native `systembag.kb` on a fresh diagnostic Data volume. Once valid native bag input and import contract are established, resume: selector 5 -> ready byte +0x119 and matching wake -> installd -> lsd -> backboardd -> SpringBoard check-in -> attributed CA physical scanout.
+
+RETAIN THE QUICKER TECHNIQUE: CONTRACT-DRIVEN PROBE LADDER
+Use this as the working loop, not an optional suggestion:
+1. State one falsifiable hypothesis, the native requirement with instruction/file/hash evidence, the expected transition, and what would disprove it.
+2. Read/summarize retained evidence before booting. Validate a proposed device change with the smallest executable fixture against the real backend; include relevant failure, payload-boundary and reset cases. Do not substitute tests that only assemble their own expected messages.
+3. Run one focused native probe for the unresolved transition. Validate instruction bytes and runtime slides, use thread/SP-qualified returns, and retain provider identity for ready/wake claims.
+4. Stop at decisive failure evidence or a conservative CA candidate. Report the first unobserved milestone separately from a directly proven failure. Absence of a hook is not proof of failed execution.
+5. Repeat only after a changed hypothesis, code, required input, instrumentation, or an explicit exact-build verification need. Do not reopen solved SEP publication, ART lookup, display startup, VBI or FIFO diagnosis without contradictory evidence.
+6. Record preparation, build, fixture, guest-running, paused-inspection and cleanup durations. Keep build/native hashes distinct. The ~10-second loader observation is not a proven end-to-end speedup over Probe 11's 90-second run; the experiments and timing coverage differ.
+
+TOOLS AND REPRODUCTION
+Run from /Users/bagas/Documents/Projects/vphone/vphone-legacy.
+Read current results without another boot:
+  .venv/bin/python backend/contract_probe.py --summarize backend/evidence/keybag-contract-20261015/native-art-persisted-probe-14
+
+Only after a changed hypothesis/input/implementation, use a NEW output directory:
+  .venv/bin/python backend/contract_probe.py --output backend/evidence/keybag-contract-20261015/NEW-RUN --seconds 15 --keybagd-loader-hooks --phases backend/evidence/keybag-contract-20261015/phases.json
+The 15-second loader preset stops immediately on a verified open error. Default probes allow 90 guest-running seconds; choose a longer window only for a specific unresolved transition. Keep measured guest time separate from paused inspection. The preset reuses retained persisted-ART inputs and creates independent disk copies.
+
+After backend changes:
+  .venv/bin/python backend/evidence/keybag-contract-20261015/verify.py
+This builds/mirrors the overlay, regenerates manifest hashes, runs the discovered unit suite, all nine guest suites, and vm doctor. Report actual current counts. Probe after the final build when exact artifact correspondence matters; rebuilding can change the binary hash without changing the overlay source.
+
+BOUNDARIES
+- Emulator changes belong in backend/s5l8960x.c (mirrored by the builder) and scripts/qemu/boot_image.py. Focused diagnostics, tests, evidence and documentation updates are authorized.
+- Preserve original/reference media and guest binaries. No guest kernel/userspace patching, placeholder/fabricated bags, unrelated device-bound bag data, forced loaded/unlocked/readiness flags, or injected pixels.
+- Do not start a snapshot/qcow2/universal-tracer/indexing project as a prerequisite to this blocker. The current machine lacks supported migration state and its raw file I/O does not directly accept qcow2 overlays.
+- Keep exact source hashes, fresh independent copies, process ownership, reaping and cleanup evidence. Leave no owned background jobs running at handoff.
+- Require CA surface/commit attribution, a completed physical swap, nonzero RGB and visual verification before accepting a frame. A console spinner is insufficient.
+- Generic error decoding uses signed status+8, with -3 mapping to NotFound. Selector 14 additionally has its own NotFound fallback for nonzero/out-of-range errors: the historical claim that wire 0x01 necessarily prevents this branch is incorrect.
+
+Update both handovers and this prompt with actual results, failures, acceptance limits and the next bounded task before stopping.

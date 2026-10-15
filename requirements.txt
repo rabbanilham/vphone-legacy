@@ -1,0 +1,7 @@
+typer
+capstone
+keystone-engine
+pyimg4
+pycryptodome
+requests
+tqdm
