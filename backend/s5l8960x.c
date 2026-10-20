@@ -2545,6 +2545,15 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                             }
                         }
                         for (unsigned i = 0; i < count; i += 2) {
+                            /* FIFO writes bypass the MMIO callback trace. */
+                            uint32_t addr = s->disp_fifo[i] & 0xffff;
+                            if (s->display_trace && (addr == 0x4044 || addr == 0x4070)) {
+                                qemu_log_mask(LOG_UNIMP,
+                                              "DISPLAY_MMIO origin=guest region=%s op=write "
+                                              "pa=0x%" HWADDR_PRIx " off=0x%x size=4 value=0x%x via=fifo\n",
+                                              p->name, p->base + addr, addr,
+                                              s->disp_fifo[i + 1]);
+                            }
                             peripheral_write_impl(p, s->disp_fifo[i] & 0xffff,
                                                   s->disp_fifo[i + 1], 4);
                         }

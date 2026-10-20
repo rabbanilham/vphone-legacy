@@ -3,6 +3,9 @@
 
 Exit code comes from process-exit.json (QEMU); parallel_probe additionally records
 its display_probe subprocess exit code as probe_exit_code. Missing data is null.
+MMIO counts and distinct values describe recorded writes (in first-seen order),
+not all guest writes when old traces lack FIFO instrumentation. Monitor snapshots
+are reported separately and never treated as writes.
 """
 import argparse
 from collections import Counter
@@ -52,6 +55,9 @@ def summarize(root, probe_exit_code=None):
     panics = []
     hangs = 0
     mmio = dict.fromkeys(('0x206204044', '0x206204070'))
+    writes = {pa: [] for pa in mmio}
+    legacy = {pa: [] for pa in mmio}
+    snapshots = dict(mmio)
     bp = root / 'breakpoints.json'
     if bp.exists():
         hits.update(event['name'] for event in json.loads(bp.read_text()))
@@ -79,10 +85,42 @@ def summarize(root, probe_exit_code=None):
                 if 'DISPLAY_MMIO' in line:
                     fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
                     if fields.get('op') == 'write' and fields.get('pa') in mmio:
-                        mmio[fields['pa']] = hex(int(fields['value'], 0))
+                        writes[fields['pa']].append(hex(int(fields['value'], 0)))
+    # Older FIFO writes only appeared on stderr; prefer structured tracing per
+    # register so a write present in both logs is not counted twice.
+    for name in ('qemu-trace.log', 'stderr.log'):
+        path = root / name
+        if path.exists():
+            with path.open(errors='replace') as stream:
+                for line in stream:
+                    match = re.search(r'\[DISP0\] layer0 base off=0x4044 val=(0x[\da-fA-F]+)', line)
+                    if match:
+                        legacy['0x206204044'].append(hex(int(match[1], 16)))
+    counts, distinct = {}, {}
+    for pa in mmio:
+        values = writes[pa] or legacy[pa]
+        mmio[pa] = values[-1] if values else None
+        counts[pa] = len(values)
+        distinct[pa] = list(dict.fromkeys(values))
+    dump = root / 'mmio_registers.json'
+    if dump.exists():
+        # QMP xp /Nxw dumps: each line starts with a physical address,
+        # followed by consecutive 32-bit words. These are reads, not writes.
+        for view in json.loads(dump.read_text()).values():
+            for line in view.splitlines():
+                match = re.match(r'\s*(?:0x)?([\da-fA-F]+):\s*(.*)', line)
+                if match:
+                    base = int(match[1], 16)
+                    for i, value in enumerate(re.findall(r'0x[\da-fA-F]+', match[2])):
+                        pa = hex(base + 4 * i)
+                        if pa in snapshots:
+                            snapshots[pa] = hex(int(value, 16))
     exited = root / 'process-exit.json'
     result = dict(breakpoint_hits=dict(sorted(hits.items())), panic_lines=panics,
                   gpu_hang_count=hangs, display_mmio_last_writes=mmio,
+                  display_mmio_write_counts=counts,
+                  display_mmio_distinct_write_values=distinct,
+                  display_mmio_snapshots=snapshots,
                   agx_meta_counts=dict(sorted(kinds.items())),
                   framebuffer_nonzero_bytes=ppm_nonzero(root / 'framebuffer.ppm')
                   if (root / 'framebuffer.ppm').exists() else None,
@@ -96,7 +134,12 @@ def format_table(result):
     rows = [('QEMU exit', result['exit_code']), ('Probe exit', result.get('probe_exit_code')),
             ('Panic lines', len(result['panic_lines'])), ('GPU hangs', result['gpu_hang_count']),
             ('Framebuffer nonzero bytes', result['framebuffer_nonzero_bytes'])]
-    rows += list(result['display_mmio_last_writes'].items())
+    for pa, last in result['display_mmio_last_writes'].items():
+        snapshot = result['display_mmio_snapshots'][pa]
+        rows += [(pa, last if last is not None else
+                  f'{snapshot} (snapshot)' if snapshot is not None else None),
+                 (pa + ' writes', result['display_mmio_write_counts'][pa]),
+                 (pa + ' distinct writes', result['display_mmio_distinct_write_values'][pa])]
     rows += [('Hook ' + k, v) for k, v in result['breakpoint_hits'].items()]
     rows += [('AGX META ' + k, v) for k, v in result['agx_meta_counts'].items()]
     return '\n'.join(f'{key:<32} {value if value is not None else "unknown"}' for key, value in rows) + '\n'
