@@ -360,3 +360,13 @@ df -h .
 - backboardd's display surfaces are triple-buffered. In context 1's GPU address space they sit at GVA `0x400000000`, `0x400470000` and `0x4008e0000` (0x470000 = 4096 × 1136 each). One of them has page 0 = `/vram` `0x8018e0000`.
 - **Type-1 `+0x68` (`0x60a00000`) is not the render target.** It is identical in all 200 distinct type-1 commands although the target rotates across three surfaces, and it is unmapped in every catalogue. The real colour target address must be in the fragment / PBE state referenced by the command (`+0x40` `0x101ac000`, `+0x50` `0x101b0000`, `+0x1b0/+0x1bc` `0x80004000` …), which is mapped in the context catalogue (e.g. `0x101c4000` = PC[0]/PD[128]).
 - Next: search those context-mapped buffers for the three surface GVAs (several shift encodings) to locate the PBE address word, then fill/resolve into that surface.
+
+### Update (probes 51–56): colour target located, fill reaches the screen
+- The render-target address is **not** in the type-1 command. Path, verified at runtime:
+  1. The end-of-tile PDS data lives at `0x6_0000_0000 | cmd[+0x1bc]` (= `0x680004000`, size `cmd[+0x1c0]`, PC index 26). The PDS heap base is `0x6_0000_0000`. Beware: `ldl_le_p` sign-extends, so cast to `uint32_t`.
+  2. EOT data word 2 (`0x101a4000`) points at the PBE state words.
+  3. The surface GVA is `A = ((W1 & 0x3f) << 34) | (W0 << 2)` (`PBEEncoderG3::encodeStateWords` `0x1802b217c`, agy report C4).
+- Probe 56: the decoded targets rotate over the three display surfaces (`0x400000000` / `0x400470000` / `0x4008e0000`, about 611 commands each). `agx_trace_rt` now uses that target, with +0x68 kept as fallback; +0x68 is PBE register word 0 (swizzle/format).
+- `VPHONE_AGX_RT_FILL=ff2080e0` (diagnostic only) paints the **top 10 rows of the scanned-out plane blue**. The command → PBE → surface → DPU MMU → screen chain is closed. The fill stopped at `0x40000a000` because only 10 surface pages were GPU-mapped at that moment.
+- Open question: five sparse grey glyph clusters appear around y ≈ 355 in the rtfill screendump (colours 9d9d9d/636363), which were not written by the fill. They may be CPU-written content in a tiled/twiddled layout. Not yet explained.
+- Remaining for genuine CA pixels: execute what the fragment pass does. That means at least the clear (load action) and the textured blits/composites CA issues, i.e. a USC/PDS interpreter subset or a high-level "CA composite" replay from the TA/3D streams. This is the large remaining piece; scope it before starting.

@@ -2973,7 +2973,96 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                   "AGX RT catalogue queue 0x%x cmd 0x%x context %u catalogue 0x%llx (%s)\n",
                   block, address, context_id, (unsigned long long)cat_base,
                   context_cat ? "context slot" : "CAT_BASE0 fallback");
-    uint64_t rt0 = ldl_le_p(raw + 0x68);
+    uint64_t pbe_target = 0;
+    {
+        /* End-of-tile PDS data (heap base 0x6_0000_0000 | cmd +0x1bc, size
+         * +0x1c0) carries the PBE state words: W0 = A >> 2, W1[5:0] = A >> 34. */
+        static unsigned eot_logged;
+        uint64_t eot = UINT64_C(0x600000000) | (uint32_t)ldl_le_p(raw + 0x1bc);
+        uint32_t eot_size = MIN(ldl_le_p(raw + 0x1c0), 0x4000u);
+        uint32_t words[0x1000];
+        unsigned n = 0;
+        while (n * 4 < eot_size) {
+            hwaddr page;
+            uint64_t gva = eot + n * 4;
+            uint32_t chunk = MIN(eot_size - n * 4, 0x1000 - (uint32_t)(gva & 0xfff));
+            if (!agx_gpu_translate_ctx(s, cat_base, gva, &page)) {
+                break;
+            }
+            address_space_read(&address_space_memory, page, MEMTXATTRS_UNSPECIFIED,
+                               words + n, chunk);
+            n += chunk / 4;
+        }
+        static unsigned eot_dumped;
+        if (eot_dumped < 6 && ldl_le_p(raw + 4) == 1) {
+            char line[0x200 * 9 + 1] = "";
+            for (unsigned i = 0; i < MIN(n, 0x200u); i++) {
+                snprintf(line + i * 9, 10, " %08x", words[i]);
+            }
+            eot_dumped++;
+            qemu_log_mask(LOG_UNIMP, "AGX EOT dump cmd 0x%x eot 0x%llx size 0x%x read %u words%s\n",
+                          address, (unsigned long long)eot, eot_size, n, line);
+        }
+        /* EOT data word 2 points at the PBE state words of colour target 0. */
+        if (n > 2) {
+            uint32_t pbe[2];
+            hwaddr page, surface_pa;
+            if (agx_gpu_translate_ctx(s, cat_base, words[2], &page)) {
+                address_space_read(&address_space_memory, page, MEMTXATTRS_UNSPECIFIED,
+                                   pbe, sizeof(pbe));
+                uint64_t a = ((uint64_t)(pbe[1] & 0x3f) << 34) | ((uint64_t)pbe[0] << 2);
+                if (agx_gpu_translate_ctx(s, cat_base, a, &surface_pa)) {
+                    pbe_target = a;
+                    qemu_log_mask(LOG_UNIMP,
+                                  "AGX RT pbe target cmd 0x%x surface 0x%llx pa 0x%llx\n",
+                                  address, (unsigned long long)a,
+                                  (unsigned long long)surface_pa);
+                }
+            }
+        }
+        /* Follow pointers in the EOT data (e.g. 0x101a40xx) one level. */
+        for (unsigned i = 0; i < MIN(n, 0x40u) && eot_logged < 400; i++) {
+            uint64_t ptr = words[i];
+            uint32_t sub[0x40];
+            hwaddr page;
+            if (!ptr || (ptr & 3) || !agx_gpu_translate_ctx(s, cat_base, ptr, &page)) {
+                continue;
+            }
+            address_space_read(&address_space_memory, page, MEMTXATTRS_UNSPECIFIED, sub,
+                               MIN(sizeof(sub), 0x1000 - (ptr & 0xfff)));
+            for (unsigned j = 0; j + 1 < ARRAY_SIZE(sub) && j * 4 + 8 <= 0x1000 - (ptr & 0xfff); j++) {
+                uint64_t a = ((uint64_t)(sub[j + 1] & 0x3f) << 34) | ((uint64_t)sub[j] << 2);
+                hwaddr surface_pa;
+                if (sub[j + 1] && a >= UINT64_C(0x400000000) && a < UINT64_C(0x440000000) &&
+                    !(a & 0xfff) && agx_gpu_translate_ctx(s, cat_base, a, &surface_pa)) {
+                    eot_logged++;
+                    qemu_log_mask(LOG_UNIMP,
+                                  "AGX EOT pbe-ptr cmd 0x%x eot word %u ptr 0x%llx word %u "
+                                  "w0 0x%x w1 0x%x surface 0x%llx pa 0x%llx scanout 0x%llx\n",
+                                  address, i, (unsigned long long)ptr, j, sub[j], sub[j + 1],
+                                  (unsigned long long)a, (unsigned long long)surface_pa,
+                                  (unsigned long long)s->framebuffer);
+                }
+            }
+        }
+        for (unsigned i = 0; i + 1 < n && eot_logged < 400; i++) {
+            uint64_t a = ((uint64_t)(words[i + 1] & 0x3f) << 34) | ((uint64_t)words[i] << 2);
+            hwaddr surface_pa;
+            if (a >= UINT64_C(0x400000000) && a < UINT64_C(0x440000000) && !(a & 0xfff) &&
+                agx_gpu_translate_ctx(s, cat_base, a, &surface_pa)) {
+                eot_logged++;
+                qemu_log_mask(LOG_UNIMP,
+                              "AGX EOT pbe cmd 0x%x eot 0x%llx word %u w0 0x%x w1 0x%x "
+                              "surface 0x%llx pa 0x%llx scanout 0x%llx\n",
+                              address, (unsigned long long)eot, i, words[i], words[i + 1],
+                              (unsigned long long)a, (unsigned long long)surface_pa,
+                              (unsigned long long)s->framebuffer);
+            }
+        }
+    }
+    /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
+     * colour target comes from the end-of-tile PBE state when available. */
+    uint64_t rt0 = pbe_target ? pbe_target : (uint32_t)ldl_le_p(raw + 0x68);
     uint32_t fmt = ldl_le_p(raw + 0x6c);
     uint32_t w = ldl_le_p(raw + 0x74) + 1;
     uint32_t h = ldl_le_p(raw + 0x70) + 1;
@@ -3082,7 +3171,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
             value > UINT32_MAX || !w || !h || pitch < row_bytes ||
             pitch > 64 * MiB || h > 64 * MiB / pitch ||
             pitch * (h - 1) + row_bytes > 64 * MiB ||
-            rt0 + pitch * (h - 1) + row_bytes > (UINT64_C(1) << 32)) {
+            rt0 + pitch * (h - 1) + row_bytes > (UINT64_C(1) << 40)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "AGX RT fill skipped: invalid hex word or dimensions/pitch (64 MiB limit)\n");
             return;
