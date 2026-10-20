@@ -2825,6 +2825,127 @@ static void agx_meta_alive_cb(void *opaque)
                   i / 2, s->agx_shared_gva);
 }
 
+/* Opt-in, read-only PBE discovery. Use exact encodings to avoid incidental
+ * matches from masked low-byte comparisons in shader/state buffers.
+ * Prefer a u64 hit over a u32 hit at the same offset; width is in bits.
+ */
+static void agx_pbe_scan(const uint8_t *raw, size_t length,
+                         unsigned field, uint64_t gva)
+{
+    static const uint64_t surfaces[] = {
+        UINT64_C(0x400000000), UINT64_C(0x400470000),
+        UINT64_C(0x4008e0000),
+    };
+    static const unsigned shifts[] = { 0, 2, 4, 6, 8, 12 };
+
+    for (unsigned off = 0; off + 4 <= length; off += 4) {
+        uint64_t v32 = ldl_le_p(raw + off);
+        bool have64 = off + 8 <= length;
+        uint64_t v64 = have64 ? ldq_le_p(raw + off) : 0;
+        uint64_t value = 0, surface = 0;
+        unsigned width = 0, shift = 0;
+
+        for (unsigned w = 0; w < 2 && !width; w++) {
+            uint64_t v = w == 0 ? v64 : v32;
+            if (!v || (w == 0 && !have64)) {
+                continue;
+            }
+            for (unsigned i = 0; i < ARRAY_SIZE(surfaces) && !width; i++) {
+                for (unsigned j = 0; j < ARRAY_SIZE(shifts); j++) {
+                    if (v == (surfaces[i] >> shifts[j]) ||
+                        (w == 0 && shifts[j] == 0 &&
+                         (v & UINT64_C(0xffffffffff)) == surfaces[i])) {
+                        value = v;
+                        surface = surfaces[i];
+                        shift = shifts[j];
+                        width = w == 0 ? 64 : 32;
+                        break;
+                    }
+                }
+            }
+        }
+        if (width) {
+            qemu_log_mask(LOG_UNIMP,
+                          "AGX PBE hit cmd-field +0x%x buf gva 0x%llx off 0x%x width %u value 0x%llx surface 0x%llx shift %u\n",
+                          field, (unsigned long long)gva, off, width,
+                          (unsigned long long)value,
+                          (unsigned long long)surface, shift);
+        }
+    }
+}
+
+static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
+{
+    static unsigned commands;
+    uint64_t seen_gva[16], seen_cat[16];
+    unsigned buffers = 0;
+    uint32_t ctx = ldl_le_p(raw + 4);
+    uint64_t ctx_cat = ctx < ARRAY_SIZE(s->agx_ctx_cat) - 3 ?
+                       s->agx_ctx_cat[ctx + 3] : 0;
+    uint8_t bytes[0x10000];
+
+    if (!getenv("VPHONE_AGX_PBE_SEARCH") || commands >= 200) {
+        return;
+    }
+    commands++;
+    /* The command itself uses cmd-field +0x0 and its firmware GVA. */
+    agx_pbe_scan(raw, 0x280, 0, agx_meta_gva(address));
+    for (unsigned field = 0; field + 4 <= 0x280 && buffers < 16; field += 4) {
+        for (unsigned width = 4; width <= 8 && buffers < 16; width += 4) {
+            if (field + width > 0x280) {
+                continue;
+            }
+            uint64_t gva = width == 4 ? ldl_le_p(raw + field) :
+                                       ldq_le_p(raw + field);
+            hwaddr pa;
+            uint64_t cat = ctx_cat;
+            if (!gva || gva >= (UINT64_C(1) << 40)) {
+                continue;
+            }
+            if (!agx_gpu_translate_ctx(s, cat, gva, &pa)) {
+                /* META pointers have 01 or 11 in their top two bits. */
+                if (gva > UINT32_MAX || !(gva & 0x40000000)) {
+                    continue;
+                }
+                gva = agx_meta_gva(gva);
+                cat = s->agx_cat_base;
+                if (!agx_gpu_translate_ctx(s, cat, gva, &pa)) {
+                    continue;
+                }
+            }
+            bool duplicate = false;
+            for (unsigned i = 0; i < buffers; i++) {
+                if (seen_gva[i] == gva && seen_cat[i] == cat) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            seen_gva[buffers] = gva;
+            seen_cat[buffers++] = cat;
+            size_t length = 0;
+            while (length < sizeof(bytes)) {
+                size_t chunk = MIN(sizeof(bytes) - length,
+                                   0x1000 - ((gva + length) & 0xfff));
+                if (!agx_gpu_translate_ctx(s, cat, gva + length, &pa) ||
+                    address_space_read(&address_space_memory, pa,
+                                       MEMTXATTRS_UNSPECIFIED, bytes + length,
+                                       chunk) != MEMTX_OK) {
+                    break;
+                }
+                length += chunk;
+            }
+            agx_pbe_scan(bytes, length, field, gva);
+        }
+    }
+    if (commands == 200) {
+        qemu_log_mask(LOG_UNIMP,
+                      "AGX PBE search disabled after 200 commands\n");
+    }
+}
+
 /* Diagnostic only: RT0 is a GPU VA, not a META pointer (B1 sections 2/5). */
 static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
 {
@@ -2839,6 +2960,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                       "AGX RT unreadable queue 0x%x cmd 0x%x\n", block, address);
         return;
     }
+    agx_pbe_search(s, raw, address);
     uint32_t context_id = ldl_le_p(raw + 4);
     uint64_t cat_base = s->agx_cat_base;
     /* Check before adding 3 so a malformed context ID cannot wrap. */

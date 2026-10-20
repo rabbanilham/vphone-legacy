@@ -11,7 +11,8 @@ store its stamp and produce a type-1 completion event with a second IRQ 84.
 A synthetic type-1 render logs RT0 translation and the first discontinuity.
 Context and CAT_BASE0 fallback runs (fill unset and 11223344) check
 no-doorbell ring-3 binds, opt-in little-endian pixel writes,
-noncontiguous pages, and untouched padding. Requires a rebuilt QEMU binary.
+noncontiguous pages, and untouched padding. The context/no-fill case also
+checks one exact PBE hit in a referenced buffer. Requires a rebuilt QEMU binary.
 """
 import json
 import os
@@ -43,7 +44,7 @@ SGX1, AIC = 0x201e00000, 0x20e100000
 HEAP = 0xe1c0000000
 
 
-def data_blob(context=True):
+def data_blob(context=True, pbe=False):
     blob = bytearray(SHARED_E + 0x1000 - DATA)
     def put(pa, fmt, *values): struct.pack_into(fmt, blob, pa - DATA, *values)
     def pte(pa): return pa | 1
@@ -85,6 +86,11 @@ def data_blob(context=True):
     # Three active pixels, two rows, encoded 4096-byte pitch.
     put(QUEUE + 0x368, '<4I', RT_GVA, 0x020007fc, 1, 2)
     put(QUEUE + 0x4d0, '<I', 2)
+    if pbe:
+        # A mapped context buffer, referenced twice: scan it only once.
+        put(QUEUE + 0x340, '<I', RT_GVA)
+        put(QUEUE + 0x350, '<I', RT_GVA)
+        put(RT_PA + 0x100, '<Q', 0x400470000 >> 4)
     # Boot page: one PIO pair, (0, 0) terminator, then META address of argv.
     put(BOOT + 0x200, '<5I', 0x4850000, 0x10000f02, 0, 0, 0xc0024000)
     put(ARGV, '<2I', 0x40438000, 0xc0448000)
@@ -127,7 +133,8 @@ def run_case(fill, context=True):
     with tempfile.TemporaryDirectory(prefix='a7agx-', dir='/tmp') as directory:
         root = Path(directory)
         (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None))
-        (root / 'data.bin').write_bytes(data_blob(context))
+        pbe = context and fill is None
+        (root / 'data.bin').write_bytes(data_blob(context, pbe))
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
                '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
                '-device', f'loader,file={root}/data.bin,addr={DATA:#x},force-raw=on',
@@ -135,6 +142,9 @@ def run_case(fill, context=True):
                '-d', 'unimp,guest_errors', '-D', str(root / 'trace.log')]
         env = os.environ.copy()
         env.pop('VPHONE_AGX_RT_FILL', None)
+        env.pop('VPHONE_AGX_PBE_SEARCH', None)
+        if pbe:
+            env['VPHONE_AGX_PBE_SEARCH'] = '1'
         if fill is not None:
             env['VPHONE_AGX_RT_FILL'] = fill
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -174,6 +184,13 @@ def run_case(fill, context=True):
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
             trace = (root / 'trace.log').read_text()
+            hits = [line for line in trace.splitlines() if 'AGX PBE hit ' in line]
+            if pbe:
+                assert len(hits) == 1, hits
+                assert (f'AGX PBE hit cmd-field +0x40 buf gva 0x{RT_GVA:x} '
+                        'off 0x100 width 64 value 0x40047000 surface 0x400470000 shift 4') in hits[0], hits
+            else:
+                assert not hits, hits
             expected_line = (f'AGX RT queue 0x{QUEUE_META:x} cmd 0x{QUEUE_META + 0x300:x} '
                              f'ch {CONTEXT_ID} rt0 gva 0x{RT_GVA:x} pa 0x{RT_PA:x} '
                              'fmt 0x20007fc w 3 h 2 load 0x2')
