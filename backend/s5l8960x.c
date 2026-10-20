@@ -155,6 +155,8 @@ struct A7State {
     CharFrontend chr;
     QemuConsole *con;
     uint64_t boot_entry, boot_args, framebuffer, boot_el, iop_diagnostic, system_writable, display_trace;
+    uint64_t disp_mmu_table;          /* DPU0MMUPGADDR0 << 4, 0 = linear scanout */
+    uint32_t disp_stride, disp_offset;
     bool iop_started;
     unsigned iop_unknown_count;
     uint64_t apple_c15[8][16][8]; /* Storage only: hardware effects are NOT emulated. */
@@ -2592,11 +2594,22 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                  * first page, programmed by AppleMobileADBE0::program_hardware
                  * (0xf28a98) from the IOSurface memory descriptor; 0x4044
                  * (DPU0SRCBASE) is only the plane offset within it. */
-                fprintf(stderr, "[DISP0] layer0 page0 off=0x4098 val=0x%" PRIx64 "\n", val);
+                A7State *s = p->owner;
                 *(uint32_t *)(p->regs + off) = (uint32_t)val;
+                /* The register holds the display MMU page table: one u32
+                 * (page PA >> 4) | 1 per 4 KiB page of the plane. */
+                s->disp_mmu_table = (uint64_t)(uint32_t)val << 4;
+                s->disp_stride = *(uint32_t *)(p->regs + 0x4040);
+                s->disp_offset = *(uint32_t *)(p->regs + 0x4044);
                 if (val != 0) {
-                    p->owner->framebuffer = ((uint64_t)(uint32_t)val << 4) +
-                                            *(uint32_t *)(p->regs + 0x4044);
+                    MemTxResult r;
+                    uint32_t page0 = address_space_ldl_le(&address_space_memory, s->disp_mmu_table,
+                                                          MEMTXATTRS_UNSPECIFIED, &r);
+                    if (r == MEMTX_OK && (page0 & 1)) {
+                        s->framebuffer = (uint64_t)(page0 & ~0xfU) << 4;
+                    }
+                    fprintf(stderr, "[DISP0] layer0 mmu table 0x%" PRIx64 " page0 0x%" PRIx64
+                            " stride 0x%x\n", s->disp_mmu_table, s->framebuffer, s->disp_stride);
                 }
                 return;
             }
@@ -2844,6 +2857,55 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
     uint32_t h = ldl_le_p(raw + 0x70) + 1;
     mapped = agx_gpu_translate_ctx(s, cat_base, rt0, &pa);
     last_mapped = agx_gpu_translate_ctx(s, cat_base, rt0 + 0x2c5000, &last_pa);
+    if (!mapped && cat_base) {
+        /* Show where the walk stops and the populated catalogue entries. */
+        uint32_t pc[0x400];
+        address_space_read(&address_space_memory, cat_base, MEMTXATTRS_UNSPECIFIED,
+                           pc, sizeof(pc));
+        for (unsigned i = 0; i < ARRAY_SIZE(pc); i++) {
+            if (pc[i]) {
+                uint64_t pd = (uint64_t)(pc[i] >> 4) << 12, pde[0x200];
+                unsigned used = 0, first_pde = 0x200;
+                address_space_read(&address_space_memory, pd, MEMTXATTRS_UNSPECIFIED,
+                                   pde, sizeof(pde));
+                for (unsigned j = 0; j < ARRAY_SIZE(pde); j++) {
+                    if (pde[j]) {
+                        used++;
+                        first_pde = MIN(first_pde, j);
+                    }
+                }
+                qemu_log_mask(LOG_UNIMP,
+                              "AGX RT walk catalogue 0x%llx pce[%u]=0x%x pd 0x%llx used %u "
+                              "first pde[%u]=0x%llx want pde[%u]=0x%llx\n",
+                              (unsigned long long)cat_base, i, pc[i],
+                              (unsigned long long)pd, used, first_pde,
+                              (unsigned long long)(first_pde < 0x200 ? pde[first_pde] : 0),
+                              (unsigned)((rt0 >> 21) & 0x1ff),
+                              (unsigned long long)pde[(rt0 >> 21) & 0x1ff]);
+                /* Reverse lookup: which GVAs map the scanout surface page? */
+                for (unsigned j = 0; j < ARRAY_SIZE(pde); j++) {
+                    uint64_t pte[0x200];
+                    if (!(pde[j] & 1)) {
+                        continue;
+                    }
+                    address_space_read(&address_space_memory, pde[j] & UINT64_C(0xfffffff000),
+                                       MEMTXATTRS_UNSPECIFIED, pte, sizeof(pte));
+                    for (unsigned k = 0; k < ARRAY_SIZE(pte); k++) {
+                        if ((pte[k] & 1) && s->framebuffer &&
+                            (pte[k] & UINT64_C(0xfffffff000)) == (s->framebuffer & ~UINT64_C(0xfff))) {
+                            qemu_log_mask(LOG_UNIMP,
+                                          "AGX RT walk scanout page 0x%llx at gva 0x%llx pte 0x%llx\n",
+                                          (unsigned long long)s->framebuffer,
+                                          (unsigned long long)(((uint64_t)i << 30) |
+                                                               ((uint64_t)j << 21) |
+                                                               ((uint64_t)k << 12)),
+                                          (unsigned long long)pte[k]);
+                        }
+                    }
+                }
+            }
+        }
+    }
     qemu_log_mask(LOG_UNIMP,
                   "AGX RT queue 0x%x cmd 0x%x ch %u rt0 gva 0x%llx pa 0x%llx fmt 0x%x w %u h %u load 0x%x\n",
                   block, address, ldl_le_p(raw + 4),
@@ -3242,6 +3304,7 @@ static void a7_reset(void *opaque)
         timer_del(s->agx_kick_timer);
     }
     s->agx_cat_base = 0;
+    s->disp_mmu_table = 0;
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     s->agx_shared_gva = 0;
     s->agx_queue_count = 0;
@@ -3305,8 +3368,31 @@ static bool display_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
     uint8_t *src = ram + s->framebuffer - RAM_BASE;
-    for (unsigned y = 0; y < 1136; y++) {
-        memcpy(surface_data(surface) + y * surface_stride(surface), src + y * 2560, 2560);
+    if (s->disp_mmu_table) {
+        /* Gather the plane through the display MMU page table. */
+        uint32_t stride = s->disp_stride ? s->disp_stride : 2560;
+        for (unsigned y = 0; y < 1136; y++) {
+            uint8_t *dst = surface_data(surface) + y * surface_stride(surface);
+            uint64_t o = s->disp_offset + (uint64_t)y * stride;
+            for (unsigned x = 0; x < 2560;) {
+                unsigned chunk = MIN(2560 - x, 0x1000 - ((o + x) & 0xfff));
+                MemTxResult r;
+                uint32_t e = address_space_ldl_le(&address_space_memory,
+                                                  s->disp_mmu_table + ((o + x) >> 12) * 4,
+                                                  MEMTXATTRS_UNSPECIFIED, &r);
+                uint64_t pa = ((uint64_t)(e & ~0xfU) << 4) + ((o + x) & 0xfff);
+                if (r == MEMTX_OK && (e & 1) && pa >= RAM_BASE && pa + chunk <= RAM_BASE + GiB) {
+                    memcpy(dst + x, ram + pa - RAM_BASE, chunk);
+                } else {
+                    memset(dst + x, 0, chunk);
+                }
+                x += chunk;
+            }
+        }
+    } else {
+        for (unsigned y = 0; y < 1136; y++) {
+            memcpy(surface_data(surface) + y * surface_stride(surface), src + y * 2560, 2560);
+        }
     }
     qemu_console_update(s->con, 0, 0, 640, 1136);
     return true;

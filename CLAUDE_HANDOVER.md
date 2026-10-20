@@ -353,3 +353,10 @@ df -h .
 1. Find where the AGX driver keeps each GPU context's page catalogue PA and how a channel/command references it (the context ID at type-1 `+0x04`, the parameter buffers at `+0x0c/+0x10`, or the FW memory-context structure). Teach `agx_gpu_translate` to walk that catalogue.
 2. Re-run with `VPHONE_AGX_RT_FILL` to confirm that rt0 maps to the surface at `0x4098` (same PA).
 3. Then decide how much of the fragment pipeline to emulate (CA composites textured quads, so the minimum useful step is a textured blit from the source IOSurface into rt0).
+
+### Update (probes 47–50, 2026-10-21)
+- Host→FW ring 3 binds are now consumed: context 1 (backboardd) → slot 4, context 2 (SpringBoard) → slot 5, each with its page-catalogue PA (the format is the same 3-level PC/PD/PT as the firmware). Type-3 entries with slot 0/1 and catalogue 0 also appear (probably unbinds).
+- **`0x4098` is the display MMU page table, not a pixel page.** Each u32 is `(page PA >> 4) | 1`, one per 4 KiB page of the plane. `0x4040` is the stride (0x1000 = 4096 B), `0x4044` the plane offset. `display_update` now gathers through that table. Probe 50 scanout is clean black (727,040 zero bytes) instead of noise: the plane is genuinely unrendered.
+- backboardd's display surfaces are triple-buffered. In context 1's GPU address space they sit at GVA `0x400000000`, `0x400470000` and `0x4008e0000` (0x470000 = 4096 × 1136 each). One of them has page 0 = `/vram` `0x8018e0000`.
+- **Type-1 `+0x68` (`0x60a00000`) is not the render target.** It is identical in all 200 distinct type-1 commands although the target rotates across three surfaces, and it is unmapped in every catalogue. The real colour target address must be in the fragment / PBE state referenced by the command (`+0x40` `0x101ac000`, `+0x50` `0x101b0000`, `+0x1b0/+0x1bc` `0x80004000` …), which is mapped in the context catalogue (e.g. `0x101c4000` = PC[0]/PD[128]).
+- Next: search those context-mapped buffers for the three surface GVAs (several shift encodings) to locate the PBE address word, then fill/resolve into that surface.
