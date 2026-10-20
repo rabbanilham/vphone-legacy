@@ -2547,7 +2547,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                         for (unsigned i = 0; i < count; i += 2) {
                             /* FIFO writes bypass the MMIO callback trace. */
                             uint32_t addr = s->disp_fifo[i] & 0xffff;
-                            if (s->display_trace && (addr == 0x4044 || addr == 0x4070)) {
+                            if (s->display_trace && (addr == 0x4044 || addr == 0x4070 || addr == 0x4098)) {
                                 qemu_log_mask(LOG_UNIMP,
                                               "DISPLAY_FIFO ns=%" PRId64 " origin=guest region=%s op=write "
                                               "pa=0x%" HWADDR_PRIx " off=0x%x size=4 value=0x%x via=fifo\n",
@@ -2583,6 +2583,19 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 *(uint32_t *)(p->regs + off) = (uint32_t)val;
                 if (val != 0) {
                     p->owner->framebuffer = RAM_BASE | (uint32_t)val;
+                }
+                return;
+            }
+            if (off == 0x4098) {
+                /* DPU0MMUPGADDR0: physical address >> 4 of the layer-0 plane's
+                 * first page, programmed by AppleMobileADBE0::program_hardware
+                 * (0xf28a98) from the IOSurface memory descriptor; 0x4044
+                 * (DPU0SRCBASE) is only the plane offset within it. */
+                fprintf(stderr, "[DISP0] layer0 page0 off=0x4098 val=0x%" PRIx64 "\n", val);
+                *(uint32_t *)(p->regs + off) = (uint32_t)val;
+                if (val != 0) {
+                    p->owner->framebuffer = ((uint64_t)(uint32_t)val << 4) +
+                                            *(uint32_t *)(p->regs + 0x4044);
                 }
                 return;
             }
@@ -2883,7 +2896,8 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                     return;
                 }
                 /* x can be unaligned when the GPU VA crosses a page. */
-                cpu_physical_memory_write(dst, pixels + (x & 3), chunk);
+                address_space_write(&address_space_memory, dst, MEMTXATTRS_UNSPECIFIED,
+                                    pixels + (x & 3), chunk);
                 x += chunk;
             }
         }
