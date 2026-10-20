@@ -170,6 +170,7 @@ struct A7State {
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
     uint64_t agx_cat_base;
+    uint64_t agx_ctx_cat[16]; /* Hardware slots: context_id + 3. */
     uint64_t agx_shared_gva;
     uint32_t agx_meta_alive_count;
     uint32_t agx_queues[32];
@@ -2697,11 +2698,15 @@ static void display_mmio_trace(A7Peripheral *p, const char *op,
 #define AGX_HOST_RING_SPAN    0x1800
 #define AGX_DOORBELL          0xb00
 
-static bool agx_gpu_translate(A7State *s, uint64_t gva, hwaddr *pa)
+static bool agx_gpu_translate_ctx(A7State *s, uint64_t cat_base,
+                                  uint64_t gva, hwaddr *pa)
 {
     MemTxResult r;
+    if (!cat_base) {
+        return false;
+    }
     uint32_t pce = address_space_ldl_le(&address_space_memory,
-                                        s->agx_cat_base + ((gva >> 30) & 0x3ff) * 4,
+                                        cat_base + ((gva >> 30) & 0x3ff) * 4,
                                         MEMTXATTRS_UNSPECIFIED, &r);
     if (r != MEMTX_OK || !(pce & 1)) {
         return false;
@@ -2720,6 +2725,11 @@ static bool agx_gpu_translate(A7State *s, uint64_t gva, hwaddr *pa)
     }
     *pa = (pte & UINT64_C(0xfffffff000)) | (gva & 0xfff);
     return true;
+}
+
+static bool agx_gpu_translate(A7State *s, uint64_t gva, hwaddr *pa)
+{
+    return agx_gpu_translate_ctx(s, s->agx_cat_base, gva, pa);
 }
 
 static bool agx_gpu_access(A7State *s, uint64_t gva, void *buf, size_t length, bool write)
@@ -2816,12 +2826,24 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                       "AGX RT unreadable queue 0x%x cmd 0x%x\n", block, address);
         return;
     }
+    uint32_t context_id = ldl_le_p(raw + 4);
+    uint64_t cat_base = s->agx_cat_base;
+    /* Check before adding 3 so a malformed context ID cannot wrap. */
+    bool context_cat = context_id < ARRAY_SIZE(s->agx_ctx_cat) - 3 &&
+                       s->agx_ctx_cat[context_id + 3];
+    if (context_cat) {
+        cat_base = s->agx_ctx_cat[context_id + 3];
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "AGX RT catalogue queue 0x%x cmd 0x%x context %u catalogue 0x%llx (%s)\n",
+                  block, address, context_id, (unsigned long long)cat_base,
+                  context_cat ? "context slot" : "CAT_BASE0 fallback");
     uint64_t rt0 = ldl_le_p(raw + 0x68);
     uint32_t fmt = ldl_le_p(raw + 0x6c);
     uint32_t w = ldl_le_p(raw + 0x74) + 1;
     uint32_t h = ldl_le_p(raw + 0x70) + 1;
-    mapped = agx_gpu_translate(s, rt0, &pa);
-    last_mapped = agx_gpu_translate(s, rt0 + 0x2c5000, &last_pa);
+    mapped = agx_gpu_translate_ctx(s, cat_base, rt0, &pa);
+    last_mapped = agx_gpu_translate_ctx(s, cat_base, rt0 + 0x2c5000, &last_pa);
     qemu_log_mask(LOG_UNIMP,
                   "AGX RT queue 0x%x cmd 0x%x ch %u rt0 gva 0x%llx pa 0x%llx fmt 0x%x w %u h %u load 0x%x\n",
                   block, address, ldl_le_p(raw + 4),
@@ -2837,7 +2859,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
     for (uint64_t off = 0x1000 - (rt0 & 0xfff);
          off < 0x2c6000; off += 0x1000) {
         hwaddr page_pa = 0;
-        bool page_mapped = agx_gpu_translate(s, rt0 + off, &page_pa);
+        bool page_mapped = agx_gpu_translate_ctx(s, cat_base, rt0 + off, &page_pa);
         if ((!page_mapped || !mapped || page_pa != pa + off) &&
             first == UINT64_MAX) {
             first = off;
@@ -2889,7 +2911,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                 uint64_t gva = rt0 + y * pitch + x;
                 size_t chunk = MIN(row_bytes - x, 0x1000 - (gva & 0xfff));
                 hwaddr dst;
-                if (!agx_gpu_translate(s, gva, &dst)) {
+                if (!agx_gpu_translate_ctx(s, cat_base, gva, &dst)) {
                     qemu_log_mask(LOG_GUEST_ERROR,
                                   "AGX RT fill stopped at unmapped gva 0x%llx\n",
                                   (unsigned long long)gva);
@@ -2964,12 +2986,49 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
     return done;
 }
 
+/* Ring 3 has no doorbell: poll it before queue work and at each vblank. */
+static void agx_drain_context_ring(A7State *s)
+{
+    uint64_t control = s->agx_shared_gva + AGX_HOST_RING_CTRL + 3 * 0x20;
+    uint32_t read_index, write_index;
+
+    if (!s->agx_shared_gva ||
+        !agx_gpu_access(s, control, &read_index, 4, false) ||
+        !agx_gpu_access(s, control + 0x10, &write_index, 4, false)) {
+        return;
+    }
+    while ((read_index & 0xff) != (write_index & 0xff)) {
+        uint8_t entry[AGX_HOST_RING_STRIDE];
+        if (!agx_gpu_access(s, s->agx_shared_gva + AGX_HOST_RING_ENTRIES +
+                            3 * AGX_HOST_RING_SPAN +
+                            (read_index & 0xff) * AGX_HOST_RING_STRIDE,
+                            entry, sizeof(entry), false)) {
+            break;
+        }
+        uint32_t type = ldl_le_p(entry);
+        uint32_t slot = ldl_le_p(entry + 8);
+        if (type == 3 && slot < ARRAY_SIZE(s->agx_ctx_cat)) {
+            uint64_t cat_base = ldq_le_p(entry + 0x10);
+            s->agx_ctx_cat[slot] = cat_base;
+            qemu_log_mask(LOG_UNIMP, "AGX META: bind slot %u catalogue 0x%llx\n",
+                          slot, (unsigned long long)cat_base);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "AGX META: host ring 3 skipped type %u slot %u\n",
+                          type, slot);
+        }
+        read_index = (read_index + 1) & 0xff;
+    }
+    smp_wmb();
+    agx_gpu_access(s, control, &read_index, 4, true);
+}
+
 static void agx_kick_cb(void *opaque)
 {
     A7State *s = opaque;
     uint32_t rings = s->agx_pending_doorbells;
     s->agx_pending_doorbells = 0;
-    for (unsigned ring = 0; ring < 4; ring++) {
+    agx_drain_context_ring(s);
+    for (unsigned ring = 0; ring < 3; ring++) {
         if (!(rings & (1U << ring))) {
             continue;
         }
@@ -3093,6 +3152,7 @@ static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t v
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
+    agx_drain_context_ring(s);
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
             A7Peripheral *p = &s->peripherals[i];
@@ -3182,6 +3242,7 @@ static void a7_reset(void *opaque)
         timer_del(s->agx_kick_timer);
     }
     s->agx_cat_base = 0;
+    memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     s->agx_shared_gva = 0;
     s->agx_queue_count = 0;
     s->agx_pending_doorbells = 0;
