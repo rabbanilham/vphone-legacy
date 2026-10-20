@@ -1,5 +1,51 @@
 # vphone-legacy continuation (Codex Handover)
 
+## GPU Hang Eliminated via TA Queue Draining (Probe 44); Full CoreAnimation Display Rendering Pipeline & DataMigration Gate Isolated — 2026-10-20
+
+**GPU hang bug in AppleH6GPU eliminated via all-ring queue draining in AGX META HLE; backboardd renders continuous CoreAnimation frames (`ca_render_display`, `ca_finish_update`, `swap_submit` with active layer mask 3); SpringBoard check-in blocked at `DataMigration.framework` semaphore wait.**
+
+### 1. Verification & Current Progress
+- **Reproducible Diagnostic Disks Built**: `scripts/prepare_diagnostic_disks.py` generates permanent, hash-verified disk images:
+  * `build/diagnostic/system-diagnostic-sep.raw` (SHA256: `8918b9b0c4fcbfee47f52b26f9a0de2103b8a1b6e6feefb662ec8687241bdae1`): 22MB reclaimed from unused update ramdisk, `/usr/standalone/firmware/sep-firmware.img4` populated with `research/firmware-artifacts/sep-firmware.n53.RELEASE.im4p`.
+  * `build/diagnostic/data-diagnostic-systembag.raw` (SHA256: `a8df5e090c8a172bdaeb79b11c56c1c71794a295aa6561b727cac306cfa7d1d3`): `/private/var` template from `system.raw` populated with `/var/db/` and unencrypted binary plist `/keybags/systembag.kb` for `no-effaceable-storage`.
+  * Stale absolute paths to `/Users/bagas/Documents/Projects/vphone/vphone-legacy` migrated to `/Users/bagas/Downloads/vphone-legacy` in all boot plans.
+- **Root Cause & Fix for Probe 41 GPU Hang**:
+  * Guest previously logged: `GPU hang: Trying restart GPU ... LastSubmittedStamp[4]=8 stampsPtr[4]=4`. Channel 4 is Tile Acceleration (TA) queue `0xc0488000`, kicked on Host Ring 0 (doorbell `0x10`).
+  * `backend/s5l8960x.c` line 2840 updated from `if (ring == 1)` to `if (entry[2])` to register and drain queues across all host rings (Ring 0 TA channel queue `0xc0488000`, Ring 1 3D channel queue `0xc0474000`, Ring 2 compute queue).
+- **Clean 180s Execution (Probe 44)**:
+  * Zero GPU hangs, zero GPU restarts in `serial.log`.
+  * Host Ring 0 and Host Ring 1 queues both drained commands and updated stamps (`consumed 3 commands, 1 stamps` on both rings).
+  * Disposable probe images in `images/` immediately purged with `backend/probe_cleanup.py`.
+
+### 2. CoreAnimation Display Pipeline & Swap Submissions (Probe 44)
+- **Breakpoint Execution Ladder**:
+  * `ca_renderer`: 7 hits
+  * `ca_render_display`: 6 hits (`0x1843a504c`)
+  * `ca_eagl_render_update`: 7 hits (`0x1843a592c`)
+  * `ca_finish_update`: 16 hits (`0x1843a9d7c`)
+  * `swap_submit`: 16 hits (`0xffffff8000c5d810`)
+  * `program_hardware`: 16 hits (`0xffffff8000f29094`)
+- **Application Frame Swap Payloads Captured**:
+  * Hits 683, 699, 715 in `swap_submit` passed 312-byte swap payloads with active layer mask `0x03` (both layer 0 and layer 1 active!), dimensions `0x280` x `0x470` (640 x 1136 Retina display for iPhone 5s), advancing swap tokens `0xb`, `0xc`, `0xd`.
+
+### 3. Disassembly of Display MMIO Hardware Programming (`AppleMobileADBE0::program_hardware`)
+- Disassembly of `0xffffff8000f29094`:
+  * At lines `0xffffff8000f29608` - `0xffffff8000f29734`: Checks active layer bit `x24` in `[x12, #0x1c8]`.
+  * If layer 0 is inactive: branches to `0xffffff8000f29728` which writes `0` to MMIO `0x206204044` (`layer0 base`). This explains why `layer0 base off=0x4044 val=0x0` was written during early boot frames.
+  * When layer 0 IS active: calls `[surface, vtable + 0xd8]` to retrieve the physical buffer base address and writes it to `0x206204044` at `0xffffff8000f29e9c`!
+
+### 4. Live Multi-Process Thread State (`ca-thread-state-150s.json`) & Current Blocker
+- All primary daemons running: `installd` (PID 32), `lsd` (PID 26), `backboardd` (PID 98), `SpringBoard` (PID 31).
+- `backboardd` has `CA::Render::Server::server_thread` (TID 860) listening for mach messages.
+- `SpringBoard` (TID 507) is waiting on `_BKSSystemAppCheckIn+0xb8` (waiting for backboardd system app check-in acknowledgment).
+- `backboardd` worker thread (TID 869) is trapped in `DataMigration.framework` (`0x1869110c8` in `-[DMConnection ...]`, `dispatch_semaphore_wait`), waiting for migration status check before completing system app check-in.
+
+### 5. Next Steps
+1. Trace `DataMigration.framework` in `backboardd` / `data_migrator` daemon to unblock system app checkin completion.
+2. Hook the render target surface to scanout at `0x8018e0000`.
+
+---
+
 ## AGX Rogue graphics submission blocker solved: AGXMetaFirmware wait gate isolated — 2026-10-16
 
 **Physical non-zero RGB bytes rendered to `0x8018e0000` (1,086 bytes in Probe 28); SpringBoard frame render blocker isolated down to single byte flag `[AGXMetaFirmware + 0x539]` in Probe 29.**

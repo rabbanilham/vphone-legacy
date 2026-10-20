@@ -2803,6 +2803,9 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
             (*stamps)++;
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
                           block, command[1], command[2], command[3]);
+        } else if (command[0] != 4) {
+            qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x cmd 0x%x type %u [1]=0x%x [2]=0x%x [3]=0x%x\n",
+                          block, address, command[0], command[1], command[2], command[3]);
         }
         read_index = (read_index + 1) % size;
         done++;
@@ -2834,7 +2837,7 @@ static void agx_kick_cb(void *opaque)
                 break;
             }
             qemu_log_mask(LOG_UNIMP, "AGX META: host ring %u type %u arg 0x%x\n", ring, entry[0], entry[2]);
-            if (ring == 1) {
+            if (entry[2]) {
                 bool known = false;
                 for (unsigned q = 0; q < s->agx_queue_count; q++) {
                     known |= s->agx_queues[q] == entry[2];

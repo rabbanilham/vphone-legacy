@@ -1,6 +1,6 @@
 # vphone-legacy Handover (Claude Handover)
 
-## Date: 2026-10-16
+## Date: 2026-10-20
 
 ---
 
@@ -264,3 +264,48 @@ df -h .
 
 ### Conclusion
 - Real CoreAnimation pixels need the GPU path: the META HLE must **execute** at least the render work that backboardd's compositor submits (type-1 render commands, PowerVR Rogue TA/3D), not just complete stamps. This is the remaining large piece. Everything else up to `ca_render_display` + swap now runs without pokes (§8–§11).
+
+---
+
+## 13. GPU Hang Eliminated via TA Queue Draining (Probe 44); Display Hardware Programming & DataMigration Analysis (Claude, 2026-10-20)
+
+### Diagnostic Disks Automated & Permanent
+- Stale scratch paths from expired chat sessions were replaced with reproducible permanent builder `scripts/prepare_diagnostic_disks.py` creating permanent copies in `build/diagnostic/`:
+  1. `build/diagnostic/system-diagnostic-sep.raw` (SHA256: `8918b9b0c4fcbfee47f52b26f9a0de2103b8a1b6e6feefb662ec8687241bdae1`):
+     - Freed 22MB by removing unused `/usr/standalone/update/ramdisk/H6SURamDisk.dmg`.
+     - Placed `research/firmware-artifacts/sep-firmware.n53.RELEASE.im4p` at `/usr/standalone/firmware/sep-firmware.img4`.
+  2. `build/diagnostic/data-diagnostic-systembag.raw` (SHA256: `a8df5e090c8a172bdaeb79b11c56c1c71794a295aa6561b727cac306cfa7d1d3`):
+     - Populated with `/private/var` template from `system.raw` (ensuring `/var/db/` exists so `cc_fips_test` passes without halting).
+     - Created `/keybags/systembag.kb` containing unencrypted binary plist `{"KeyBagKeys": b"\x00" * 32}` for `no-effaceable-storage` keybag loading.
+- Replaced stale absolute paths pointing to `/Users/bagas/Documents/Projects/vphone/vphone-legacy` with the active workspace `/Users/bagas/Downloads/vphone-legacy` across all boot plans (`boot_plan.json`).
+
+### GPU Hang Bug Root Cause & Backend HLE Fix
+- **Root Cause**: In Probe 41, the guest logged `GPU hang: Trying restart GPU ... LastSubmittedStamp[4]=8 stampsPtr[4]=4`. Channel 4 is the Tile Acceleration (TA) queue `0xc0488000`, kicked on Host Ring 0 (doorbell `0x10`). `backend/s5l8960x.c` line 2840 previously only registered queues when `ring == 1`, ignoring Ring 0 TA queue kicks, which caused channel 4 to stall at stamp 4 while 3D (channel 5) advanced to stamp 8.
+- **Fix**: In `backend/s5l8960x.c`, updated line 2840 from `if (ring == 1)` to `if (entry[2])` to register and drain queues across all host rings (Ring 0 TA channel queue `0xc0488000`, Ring 1 3D channel queue `0xc0474000`, Ring 2 compute queue). Added logging for non-stamp commands (Type 1 render commands).
+
+### Verified Results: `probe-44-ta` (180s guest duration, zero panics, exit code 0)
+- **GPU Hang Completely Gone**: Zero `GPU hang: Trying restart GPU ...` occurrences in `serial.log`!
+- **Both Host Rings Draining**: Host Ring 0 and Host Ring 1 both successfully drained commands and updated stamps (`consumed 3 commands, 1 stamps` on both rings).
+- **CoreAnimation Active**: CoreAnimation rendered continuously in `backboardd`: `ca_renderer` (7 hits), `ca_render_display` (6 hits), `ca_eagl_render_update` (7 hits), `ca_finish_update` (16 hits), and `swap_submit` (16 hits).
+- **Disk Hygiene**: `probe_cleanup.py` executed successfully, verified source hashes and purged disposable cloned disks in `images/`.
+
+### Genuine Application Swap Payloads Recovered
+- In `breakpoints.json`:
+  * Hits 683, 699, 715 in `swap_submit` passed 312-byte swap payloads with active layer mask `0x03` (both layer 0 and layer 1 active!), dimensions `0x280` x `0x470` (640 x 1136 Retina display for iPhone 5s), advancing swap tokens `0xb`, `0xc`, `0xd`.
+
+### Display Hardware Programming Disassembly (`AppleMobileADBE0::program_hardware` `0xffffff8000f29094`)
+- Disassembly revealed the exact mechanism for framebuffer base register `0x206204044`:
+  * Lines `0xffffff8000f29608` - `0xffffff8000f29734`: Checks active layer bit `x24` in `[x12, #0x1c8]`.
+  * If layer 0 is inactive: branches to `0xffffff8000f29728` which writes `0` to MMIO `0x206204044` (`layer0 base`). This explains why `layer0 base off=0x4044 val=0x0` was logged during early boot swaps.
+  * When layer 0 IS active: calls `[surface, vtable + 0xd8]` to retrieve the physical buffer base address and writes it to `0x206204044` at `0xffffff8000f29e9c`!
+
+### Live Thread State Analysis (`ca-thread-state-150s.json`) & Current Blocker
+- `installd` (PID 32), `lsd` (PID 26), `backboardd` (PID 98), and `SpringBoard` (PID 31) are alive and active.
+- `backboardd` has `CA::Render::Server::server_thread` (TID 860) running and waiting on mach messages.
+- `SpringBoard` (TID 507) is waiting on `_BKSSystemAppCheckIn+0xb8` (waiting for backboardd system app check-in acknowledgment).
+- `backboardd` worker thread (TID 869) is waiting on a semaphore in `DataMigration.framework` (`0x1869110c8` in `-[DMConnection ...]`, `dispatch_semaphore_wait`), waiting for migration status check before completing system app check-in.
+
+### Next Bounded Steps
+1. Trace `DataMigration.framework` in `backboardd` / `data_migrator` daemon to unblock system app checkin completion.
+2. Hook the render target surface to scanout at `0x8018e0000`.
+

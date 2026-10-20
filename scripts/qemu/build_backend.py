@@ -53,7 +53,7 @@ def main():
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
         '--disable-user', '--disable-tools', '--disable-werror', '--disable-slirp',
         '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--disable-vnc',
-        '--disable-hvf', '--enable-tcg', '--disable-plugins']
+        '--disable-hvf', '--enable-tcg', '--disable-plugins', '--disable-pvg']
     sdk = args.sdk or (BACKEND / 'macos-sdk' if (BACKEND / 'macos-sdk').exists() else None)
     if sdk:
         if not sdk.is_dir():
