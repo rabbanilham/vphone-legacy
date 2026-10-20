@@ -2781,7 +2781,12 @@ static void agx_meta_alive_cb(void *opaque)
 
 static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
 {
+    static int dump_enabled = -1;
     uint32_t pointers[2], read_index, write_index, size;
+
+    if (dump_enabled < 0) {
+        dump_enabled = getenv("VPHONE_AGX_DUMP") != NULL;
+    }
     if (!agx_gpu_access(s, agx_meta_gva(block) + 4, pointers, sizeof(pointers), false)) {
         return 0;
     }
@@ -2804,6 +2809,22 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
                           block, command[1], command[2], command[3]);
         } else if (command[0] != 4) {
+            if (dump_enabled) {
+                uint8_t raw[0x280];
+                char hex[sizeof(raw) * 2 + 1];
+                static const char digits[] = "0123456789abcdef";
+                size_t length = command[0] == 3 ? 0x40 : sizeof(raw);
+
+                if (agx_gpu_access(s, agx_meta_gva(address), raw, length, false)) {
+                    for (size_t i = 0; i < length; i++) {
+                        hex[i * 2] = digits[raw[i] >> 4];
+                        hex[i * 2 + 1] = digits[raw[i] & 0xf];
+                    }
+                    hex[length * 2] = '\0';
+                    qemu_log_mask(LOG_UNIMP, "AGX DUMP queue 0x%x cmd 0x%x len 0x%zx hex=%s\n",
+                                  block, address, length, hex);
+                }
+            }
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x cmd 0x%x type %u [1]=0x%x [2]=0x%x [3]=0x%x\n",
                           block, address, command[0], command[1], command[2], command[3]);
         }
