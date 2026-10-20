@@ -71,9 +71,9 @@ AGX META: consumed 3 commands, 2 stamps
             # Structured records supersede legacy output for that register.
             with (root / 'qemu-trace.log').open('a') as trace:
                 trace.write(
-                    'DISPLAY_MMIO origin=guest region=a7.disp0 op=write '
+                    'DISPLAY_FIFO ns=1 origin=guest region=a7.disp0 op=write '
                     'pa=0x206204044 off=0x4044 size=4 value=0x0 via=fifo\n'
-                    'DISPLAY_MMIO origin=guest region=a7.disp0 op=write '
+                    'DISPLAY_FIFO ns=1 origin=guest region=a7.disp0 op=write '
                     'pa=0x206204070 off=0x4070 size=4 value=0x2800470 via=fifo\n'
                     'DISPLAY_MMIO ns=123 origin=guest region=a7.disp0 op=write '
                     'pa=0x206204044 off=0x4044 size=4 value=0x18e0000 pc=0xffffff8000f29e9c\n')

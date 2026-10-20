@@ -2549,8 +2549,9 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                             uint32_t addr = s->disp_fifo[i] & 0xffff;
                             if (s->display_trace && (addr == 0x4044 || addr == 0x4070)) {
                                 qemu_log_mask(LOG_UNIMP,
-                                              "DISPLAY_MMIO origin=guest region=%s op=write "
+                                              "DISPLAY_FIFO ns=%" PRId64 " origin=guest region=%s op=write "
                                               "pa=0x%" HWADDR_PRIx " off=0x%x size=4 value=0x%x via=fifo\n",
+                                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                                               p->name, p->base + addr, addr,
                                               s->disp_fifo[i + 1]);
                             }

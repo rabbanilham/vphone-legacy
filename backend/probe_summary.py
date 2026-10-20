@@ -82,7 +82,7 @@ def summarize(root, probe_exit_code=None):
                             'consumed' if message.startswith('consumed ') else
                             re.split(r'\s+(?:0x[\da-fA-F]+|\d+|\()', message, maxsplit=1)[0].strip())
                     kinds[kind] += 1
-                if 'DISPLAY_MMIO' in line:
+                if 'DISPLAY_MMIO' in line or 'DISPLAY_FIFO' in line:
                     fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
                     if fields.get('op') == 'write' and fields.get('pa') in mmio:
                         writes[fields['pa']].append(hex(int(fields['value'], 0)))
