@@ -309,3 +309,28 @@ df -h .
 1. Trace `DataMigration.framework` in `backboardd` / `data_migrator` daemon to unblock system app checkin completion.
 2. Hook the render target surface to scanout at `0x8018e0000`.
 
+
+---
+
+## 14. DataMigration wall cleared; parallel worker workflow (Claude, 2026-10-21)
+
+### Workflow
+- Claude orchestrates; Codex CLI (`codex exec --dangerously-bypass-approvals-and-sandbox -C <worktree>`, stdin from `/dev/null`) implements in git worktrees (`../vphone-wt-<task>`, branch `wt/<task>`); agy (`agy --dangerously-skip-permissions --model … -p="<brief>"`, prompt attached to `-p=`) does read-only RE. Only Claude runs QEMU probes and commits to `agx-meta-hle`.
+- `backend/parallel_probe.py` now waits for host load (`--max-load`, default 6) and runs at most `--max-parallel` (2) variants. Each finished variant gets `summary.json`/`summary.txt` from `backend/probe_summary.py`.
+- **Always cap noisy hooks.** Uncapped `accel_*` hooks now produce ~7,400 GDB stops (~10 min wall for 60 s guest). Pass `--max-hits <hook>=12` for every `accel_*`/`meta_*` breakpoint; with caps, 180 s guest takes ~4 min wall.
+- `VPHONE_AGX_DUMP=1` logs raw type-1 (0x280 B) and type-3 (0x40 B) commands as `AGX DUMP …` lines; decode them with `backend/agx_cmd_decode.py <qemu-trace.log> [--type N] [--json out]`.
+
+### DataMigration root cause (correcting §13)
+- §13's addresses were runtime addresses: thread-state frames are slid (`cache_slide`, 0x58000 in probe 44, random per boot). The blocked frame is `DMPerformMigration` (`0x186910f68`, DataMigration.framework / AppSupport `DMMessaging.m`), not `-[DMConnection …]`. It sends `migrateWithCompletion:` to XPC service `com.apple.datamigrator` (launched through xpcproxy; it is not a LaunchDaemon) and then calls `dispatch_semaphore_wait(FOREVER)` at `0x1869110cc`.
+- The caller `DMPerformMigrationIfNeeded` compares `CFPreferencesCopyAppValue("LastSystemVersion", "com.apple.migration")` with the running build (`0x186910dd4`/`0x186910dec`); the skip path is `0x186910ebc`. The data disk had no such preference, so migration ran on every boot.
+- Probe 45 (`probe-45-dm/`, 180 s, no pokes, both variants exit 0, no panic or GPU hang):
+  - `base`: the migrator replies only at ~141 s (`dm_wait_done`), and the second `bks_checkin` follows at 147 s.
+  - `seeded` (`com.apple.migration.plist` with `LastSystemVersion=11D257` in `mobile` and `root` Library/Preferences): `dm_skip` fires at 57.4 s, `bks_checkin` completes at 58.4 s, and no backboardd/SpringBoard thread is blocked at 170 s.
+- `scripts/prepare_diagnostic_disks.py` now writes that plist. `build/diagnostic/data-diagnostic-systembag.raw` was replaced by the seeded disk (SHA-256 `39a30ccc…c8777`). The previous disk is kept as `data-diagnostic-systembag-pre-dm.raw`.
+
+### First type-1 render command (probe 45 seeded, queue `0xc0474000`, cmd META `0x40404000`)
+- `+0x0c/+0x10` = META `0xc0460000`/`0xc04600a0`; `+0x18`, `+0x40`, `+0x50` = `0x101c4000`/`0x101ac000`/`0x101b0000`; `+0x68` = META `0x60a00000`; `+0x6c` = `0x020007fc`; `+0x70/+0x74` = `0x46f`/`0x27f` (1136−1 × 640−1, a full-screen render target).
+- Queues seen: `0xc0474000` (types 3, 1), `0xc048c000` (types 3, 1), `0xc0470000`/`0xc0488000` (types 7, 0).
+
+### Next
+- Blocker B (pixels): work out which type-1 field points to the colour attachment (agy B1 report pending at the time of writing), translate it through the GPU MMU (`agx_gpu_translate`), and implement a minimal clear/resolve into the IOSurface backing so `program_hardware` scans out non-zero CA pixels.

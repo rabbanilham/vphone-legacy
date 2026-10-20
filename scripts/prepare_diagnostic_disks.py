@@ -7,7 +7,8 @@
 
 2. build/diagnostic/data-diagnostic-systembag.raw:
    Clone of build/ios712-validated/data.raw seeded with the /private/var
-   template from system.raw, plus /keybags/systembag.kb for unencrypted keybag loading.
+   template from system.raw, plus /keybags/systembag.kb for unencrypted keybag loading
+   and com.apple.migration.plist so DataMigration does not rerun on every boot.
 """
 import hashlib
 import os
@@ -104,6 +105,18 @@ def prepare_data():
             systembag_path.write_bytes(payload)
             systembag_path.chmod(0o644)
             print(f"[*] Wrote systembag.kb to {systembag_path}")
+
+            # DMPerformMigrationIfNeeded (DataMigration.framework) compares the
+            # com.apple.migration LastSystemVersion preference with the running
+            # build and, on a mismatch, blocks backboardd on com.apple.datamigrator
+            # for ~80 s before SpringBoard's system app check-in can finish.
+            # Record the state a device has after its first post-restore boot.
+            migration = plistlib.dumps({"LastSystemVersion": "11D257"}, fmt=plistlib.FMT_BINARY)
+            for home in ("mobile", "root"):
+                prefs = data_mount / home / "Library/Preferences"
+                prefs.mkdir(parents=True, exist_ok=True)
+                (prefs / "com.apple.migration.plist").write_bytes(migration)
+            print("[*] Wrote com.apple.migration.plist (LastSystemVersion=11D257)")
         finally:
             detach(data_dev)
     finally:
