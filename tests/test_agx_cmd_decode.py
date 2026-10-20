@@ -48,6 +48,28 @@ class DecodeTests(unittest.TestCase):
             with self.subTest(line=line), self.assertRaisesRegex(ValueError, 'line 1:'):
                 decoder.parse_lines([line])
 
+    def test_rt_table_and_json(self):
+        line = ('prefix AGX RT queue 0xc0474000 cmd 0x40404000 ch 1 '
+                'rt0 gva 0x60a00000 pa 0x8018e0000 fmt 0x20007fc '
+                'w 640 h 1136 load 0x2\n')
+        rt = decoder.parse_rt_lines([line, 'AGX RT span queue ignored'])[0]
+        self.assertEqual(rt, dict(line=1, queue=0xc0474000, address=0x40404000,
+                                  channel=1, gva=0x60a00000, pa=0x8018e0000,
+                                  fmt=0x20007fc, w=640, h=1136, load=2))
+        self.assertIn('640 x 1136', decoder.format_rt_report([rt]))
+        with self.assertRaisesRegex(ValueError, 'line 1: malformed AGX RT'):
+            decoder.parse_rt_lines(['AGX RT queue broken'])
+        with tempfile.TemporaryDirectory() as directory:
+            trace, result = Path(directory) / 'trace', Path(directory) / 'out.json'
+            trace.write_text(line)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(decoder.main([str(trace), '--json', str(result)]), 0)
+            self.assertIn('0x8018e0000', output.getvalue())
+            self.assertEqual(json.loads(result.read_text())[0]['render_targets'], [rt])
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(decoder.main([str(trace), '--type', '3']), 0)
+            self.assertNotIn('render targets', output.getvalue())
+
     def test_full_lengths_cli_json(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / 'qemu-trace.log'

@@ -2789,6 +2789,107 @@ static void agx_meta_alive_cb(void *opaque)
                   i / 2, s->agx_shared_gva);
 }
 
+/* Diagnostic only: RT0 is a GPU VA, not a META pointer (B1 sections 2/5). */
+static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
+{
+    uint8_t raw[0x280];
+    hwaddr pa = 0, last_pa = 0;
+    bool mapped, last_mapped, contiguous;
+    uint64_t first = UINT64_MAX, actual = 0;
+    const char *fill = getenv("VPHONE_AGX_RT_FILL");
+
+    if (!agx_gpu_access(s, agx_meta_gva(address), raw, sizeof(raw), false)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "AGX RT unreadable queue 0x%x cmd 0x%x\n", block, address);
+        return;
+    }
+    uint64_t rt0 = ldl_le_p(raw + 0x68);
+    uint32_t fmt = ldl_le_p(raw + 0x6c);
+    uint32_t w = ldl_le_p(raw + 0x74) + 1;
+    uint32_t h = ldl_le_p(raw + 0x70) + 1;
+    mapped = agx_gpu_translate(s, rt0, &pa);
+    last_mapped = agx_gpu_translate(s, rt0 + 0x2c5000, &last_pa);
+    qemu_log_mask(LOG_UNIMP,
+                  "AGX RT queue 0x%x cmd 0x%x ch %u rt0 gva 0x%llx pa 0x%llx fmt 0x%x w %u h %u load 0x%x\n",
+                  block, address, ldl_le_p(raw + 4),
+                  (unsigned long long)rt0, (unsigned long long)pa,
+                  fmt, w, h, ldl_le_p(raw + 0x1d0));
+
+    /* Fixed 0x2c6000-byte probe, independent of dimensions/encoded pitch.
+     * Check each page boundary, including an unaligned first/last page. */
+    contiguous = mapped;
+    if (!mapped) {
+        first = 0;
+    }
+    for (uint64_t off = 0x1000 - (rt0 & 0xfff);
+         off < 0x2c6000; off += 0x1000) {
+        hwaddr page_pa = 0;
+        bool page_mapped = agx_gpu_translate(s, rt0 + off, &page_pa);
+        if ((!page_mapped || !mapped || page_pa != pa + off) &&
+            first == UINT64_MAX) {
+            first = off;
+            actual = page_pa;
+            contiguous = false;
+        }
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "AGX RT span queue 0x%x cmd 0x%x bytes 0x2c6000 last gva 0x%llx pa 0x%llx mapped %u contiguous %u\n",
+                  block, address, (unsigned long long)(rt0 + 0x2c5000),
+                  (unsigned long long)last_pa, (unsigned)last_mapped,
+                  (unsigned)contiguous);
+    if (!contiguous) {
+        qemu_log_mask(LOG_UNIMP,
+                      "AGX RT discontinuity queue 0x%x cmd 0x%x offset 0x%llx gva 0x%llx expected 0x%llx pa 0x%llx\n",
+                      block, address, (unsigned long long)first,
+                      (unsigned long long)(rt0 + first),
+                      (unsigned long long)(mapped ? pa + first : 0),
+                      (unsigned long long)actual);
+    }
+    if (fill) {
+        const char *end;
+        uint64_t value, row_bytes = (uint64_t)w * 4;
+        uint64_t pitch = row_bytes;
+        uint8_t pixels[0x1004];
+
+        /* B1: format 0x0200 has pitch_pixels = (bits[13:2] + 1)*2.
+         * Other formats use w*4 as a diagnostic fallback. This is a linear
+         * row fill, not a twiddle/format converter. Preserve row padding.
+         * Write the numeric hex word in little endian, with no RGBA swizzle. */
+        if ((fmt >> 16) == 0x0200) {
+            pitch = (((fmt & 0x3ffc) >> 2) + 1) * 8;
+        }
+        if (!*fill || (*fill == '-' || *fill == '+') ||
+            qemu_strtou64(fill, &end, 16, &value) || *end ||
+            value > UINT32_MAX || !w || !h || pitch < row_bytes ||
+            pitch > 64 * MiB || h > 64 * MiB / pitch ||
+            pitch * (h - 1) + row_bytes > 64 * MiB ||
+            rt0 + pitch * (h - 1) + row_bytes > (UINT64_C(1) << 32)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "AGX RT fill skipped: invalid hex word or dimensions/pitch (64 MiB limit)\n");
+            return;
+        }
+        for (size_t i = 0; i < sizeof(pixels); i += 4) {
+            stl_le_p(pixels + i, value);
+        }
+        for (uint32_t y = 0; y < h; y++) {
+            for (uint64_t x = 0; x < row_bytes;) {
+                uint64_t gva = rt0 + y * pitch + x;
+                size_t chunk = MIN(row_bytes - x, 0x1000 - (gva & 0xfff));
+                hwaddr dst;
+                if (!agx_gpu_translate(s, gva, &dst)) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "AGX RT fill stopped at unmapped gva 0x%llx\n",
+                                  (unsigned long long)gva);
+                    return;
+                }
+                /* x can be unaligned when the GPU VA crosses a page. */
+                cpu_physical_memory_write(dst, pixels + (x & 3), chunk);
+                x += chunk;
+            }
+        }
+    }
+}
+
 static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
 {
     static int dump_enabled = -1;
@@ -2819,6 +2920,9 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
                           block, command[1], command[2], command[3]);
         } else if (command[0] != 4) {
+            if (command[0] == 1) {
+                agx_trace_rt(s, block, address);
+            }
             if (dump_enabled) {
                 uint8_t raw[0x280];
                 char hex[sizeof(raw) * 2 + 1];

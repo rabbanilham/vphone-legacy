@@ -8,8 +8,12 @@ the modeled firmware posts one type-0 "alive" entry to firmware->host ring 0
 and raises AIC IRQ 84. An empty sequencer program must post nothing. A
 doorbell on host ring 1 registers a channel queue whose type-4 command must
 store its stamp and produce a type-1 completion event with a second IRQ 84.
+A synthetic type-1 render logs RT0 translation and the first discontinuity.
+Two runs (fill unset and 11223344) check opt-in little-endian pixel writes,
+noncontiguous pages, and untouched padding. Requires a rebuilt QEMU binary.
 """
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -25,6 +29,9 @@ DATA = RAM + 0x10000
 PC, PD, PT0, PT2 = DATA, DATA + 0x1000, DATA + 0x2000, DATA + 0x3000
 BOOT, ARGV, SHARED = DATA + 0x10000, DATA + 0x11000, DATA + 0x12000
 QUEUE, SHARED_9, SHARED_B = DATA + 0x13000, DATA + 0x14000, DATA + 0x15000
+RT_PD, RT_PT0, RT_PT1 = DATA + 0x4000, DATA + 0x5000, DATA + 0x6000
+RT_GVA = 0x60a00000
+RT_PA, RT_SECOND, RT_LAST = DATA + 0x16000, DATA + 0x18000, DATA + 0x19000
 QUEUE_META = 0x40030000
 SGX0 = 0x201000000
 RESULT = RAM + 0x2000
@@ -33,7 +40,7 @@ HEAP = 0xe1c0000000
 
 
 def data_blob():
-    blob = bytearray(SHARED_B + 0x1000 - DATA)
+    blob = bytearray(RT_LAST + 0x1000 - DATA)
     def put(pa, fmt, *values): struct.pack_into(fmt, blob, pa - DATA, *values)
     def pte(pa): return pa | 1
     put(PC + ((HEAP >> 30) & 0x3ff) * 4, '<I', ((PD >> 12) << 4) | 1)
@@ -45,14 +52,26 @@ def data_blob():
     put(PT2 + (((HEAP + 0x448000 + 0x9000) >> 12) & 0x1ff) * 8, '<Q', pte(SHARED_9))
     put(PT2 + (((HEAP + 0x448000 + 0xb000) >> 12) & 0x1ff) * 8, '<Q', pte(SHARED_B))
     put(PT0 + 0x30 * 8, '<Q', pte(QUEUE))
+    # RT0 has a noncontiguous second page and a separately mapped probe end.
+    put(PC + ((RT_GVA >> 30) & 0x3ff) * 4, '<I', ((RT_PD >> 12) << 4) | 1)
+    put(RT_PD + ((RT_GVA >> 21) & 0x1ff) * 8, '<Q', pte(RT_PT0))
+    put(RT_PD + (((RT_GVA + 0x2c5000) >> 21) & 0x1ff) * 8, '<Q', pte(RT_PT1))
+    put(RT_PT0, '<2Q', pte(RT_PA), pte(RT_SECOND))
+    put(RT_PT1 + (((RT_GVA + 0x2c5000) >> 12) & 0x1ff) * 8, '<Q', pte(RT_LAST))
+    for page in (RT_PA, RT_SECOND, RT_LAST):
+        blob[page - DATA:page - DATA + 0x1000] = b'\xa5' * 0x1000
     # Host ring 1 (control shared+0x98e0, entries shared+0xb140): one queue registration.
     put(SHARED_9 + 0x8e0, '<5I', 0, 0, 0, 0, 1)
     put(SHARED_B + 0x140, '<3I', 1, 0, QUEUE_META)
-    # Channel queue block: control/entries pointers, one type-4 stamp command.
+    # Channel queue block: control/entries pointers, a type-1 render then a type-4 stamp.
     put(QUEUE, '<3I', 0, QUEUE_META + 0x30, QUEUE_META + 0x70)
-    put(QUEUE + 0x30, '<13I', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4)
-    put(QUEUE + 0x70, '<I', QUEUE_META + 0x100)
+    put(QUEUE + 0x30, '<13I', 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4)
+    put(QUEUE + 0x70, '<2I', QUEUE_META + 0x300, QUEUE_META + 0x100)
     put(QUEUE + 0x100, '<4I', 4, QUEUE_META + 0x200, 0x1234, 7)
+    put(QUEUE + 0x300, '<2I', 1, 7)
+    # Three active pixels, two rows, encoded 4096-byte pitch.
+    put(QUEUE + 0x368, '<4I', RT_GVA, 0x020007fc, 1, 2)
+    put(QUEUE + 0x4d0, '<I', 2)
     # Boot page: one PIO pair, (0, 0) terminator, then META address of argv.
     put(BOOT + 0x200, '<5I', 0x4850000, 0x10000f02, 0, 0, 0xc0024000)
     put(ARGV, '<2I', 0x40438000, 0xc0448000)
@@ -86,7 +105,7 @@ def fixture():
     return struct.pack('<' + 'I' * len(code), *code)
 
 
-def main():
+def run_case(fill):
     with tempfile.TemporaryDirectory(prefix='a7agx-', dir='/tmp') as directory:
         root = Path(directory)
         (root / 'fixture.bin').write_bytes(fixture())
@@ -94,8 +113,13 @@ def main():
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
                '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
                '-device', f'loader,file={root}/data.bin,addr={DATA:#x},force-raw=on',
-               '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off']
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+               '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off',
+               '-d', 'unimp,guest_errors', '-D', str(root / 'trace.log')]
+        env = os.environ.copy()
+        env.pop('VPHONE_AGX_RT_FILL', None)
+        if fill is not None:
+            env['VPHONE_AGX_RT_FILL'] = fill
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 5
             while not (root / 'qmp.sock').exists():
@@ -117,14 +141,32 @@ def main():
                 assert words(SHARED + 0xc0, 10) == [0] * 10, 'alive entry is not type 0'
                 assert words(RESULT + 8, 1) == [0x10000 | 84], 'no completion interrupt'
                 assert words(QUEUE + 0x200, 1) == [0x1234], 'stamp not stored'
-                assert words(QUEUE + 0x30, 1) == [1], 'queue read index not advanced'
+                assert words(QUEUE + 0x30, 1) == [2], 'queue read index not advanced'
                 assert words(SHARED_9 + 0x8e0, 1) == [1], 'host ring 1 read index not advanced'
                 assert words(SHARED + 0x50, 1) == [2], 'no completion event posted'
                 assert words(SHARED + 0xc0 + 0x28, 1) == [1], 'completion event is not type 1'
+                expected = 0xa5a5a5a5 if fill is None else int(fill, 16)
+                for page in (RT_PA, RT_SECOND):
+                    assert words(page, 4) == [expected] * 3 + [0xa5a5a5a5], 'RT pixels/padding'
+                assert words(RT_PA + 0x1000, 1) == [0], 'physical hole overwritten'
+                assert words(RT_LAST, 1) == [0xa5a5a5a5], 'probe-only end page overwritten'
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
+            trace = (root / 'trace.log').read_text()
+            expected_line = (f'AGX RT queue 0x{QUEUE_META:x} cmd 0x{QUEUE_META + 0x300:x} '
+                             f'ch 7 rt0 gva 0x{RT_GVA:x} pa 0x{RT_PA:x} '
+                             'fmt 0x20007fc w 3 h 2 load 0x2')
+            assert expected_line in trace, trace
+            assert f'last gva 0x{RT_GVA + 0x2c5000:x} pa 0x{RT_LAST:x} mapped 1 contiguous 0' in trace
+            assert f'offset 0x1000 gva 0x{RT_GVA + 0x1000:x} expected 0x{RT_PA + 0x1000:x} pa 0x{RT_SECOND:x}' in trace
         finally:
             if proc.poll() is None: proc.kill(); proc.wait(timeout=5)
+
+
+def main():
+    run_case(None)
+    run_case('11223344')
+    print('PASS: AGX RT trace; opt-in fill follows noncontiguous GPU mappings and preserves padding')
     print('PASS: AGX META boot program -> one type-0 alive entry on firmware ring 0 and AIC IRQ 84; empty program posts nothing')
     print('PASS: AGX doorbell 0x11 -> channel queue registered, type-4 stamp stored, type-1 completion event and IRQ 84')
     print('Synthetic AGX host-interface contract only; no GPU command execution or iOS rendering inferred.')

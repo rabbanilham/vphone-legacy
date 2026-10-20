@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode VPHONE_AGX_DUMP lines; all command words are little endian.
+"""Decode VPHONE_AGX_DUMP and AGX RT lines; all command words are little endian.
 
 Address labels are heuristics, not recovered field definitions. META candidates
 map to GPU VA 0xe1c0000000 + (address & 0x3fffffff), per CLAUDE_HANDOVER.md.
@@ -18,6 +18,40 @@ DUMP_RE = re.compile(
     r"AGX DUMP queue (0x[0-9a-fA-F]+) cmd (0x[0-9a-fA-F]+) "
     r"len (0x[0-9a-fA-F]+) hex=([0-9a-fA-F]+)(?=\s|$)"
 )
+
+RT_RE = re.compile(
+    r"AGX RT queue (0x[0-9a-fA-F]+) cmd (0x[0-9a-fA-F]+) "
+    r"ch ([0-9]+) rt0 gva (0x[0-9a-fA-F]+) pa (0x[0-9a-fA-F]+) "
+    r"fmt (0x[0-9a-fA-F]+) w ([0-9]+) h ([0-9]+) load (0x[0-9a-fA-F]+)(?=\s|$)"
+)
+
+
+def parse_rt_lines(lines):
+    targets = []
+    keys = ('queue', 'address', 'channel', 'gva', 'pa', 'fmt', 'w', 'h', 'load')
+    for line_number, line in enumerate(lines, 1):
+        # Auxiliary span/discontinuity/fill diagnostics are separate records.
+        if 'AGX RT queue' not in line:
+            continue
+        match = RT_RE.search(line)
+        if not match:
+            raise ValueError(f"line {line_number}: malformed AGX RT")
+        targets.append(dict(line=line_number, **{
+            key: int(value, 16 if value.startswith('0x') else 10)
+            for key, value in zip(keys, match.groups())}))
+    return targets
+
+
+def format_rt_report(targets):
+    if not targets:
+        return ''
+    output = ['AGX RT render targets:',
+              'queue       cmd         ch  rt0 gva     pa           fmt        w x h     load']
+    for rt in targets:
+        output.append(f"0x{rt['queue']:08x}  0x{rt['address']:08x}  {rt['channel']:2d}  "
+                      f"0x{rt['gva']:08x}  0x{rt['pa']:09x}  0x{rt['fmt']:08x}  "
+                      f"{rt['w']} x {rt['h']}  0x{rt['load']:x}")
+    return '\n'.join(output)
 
 
 def address_hint(value):
@@ -104,7 +138,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         with args.trace.open(encoding="utf-8", errors="replace") as trace:
-            commands = parse_lines(trace, args.command_type)
+            lines = trace.readlines()
+        commands = parse_lines(lines, args.command_type)
+        targets = parse_rt_lines(lines) if args.command_type in (None, 1) else []
         if args.json_path:
             groups = []
             for (queue, kind), group in group_commands(commands).items():
@@ -115,8 +151,16 @@ def main(argv=None):
                                         word_diff(previous, command["u32"])))
                     previous = command["u32"]
                 groups.append(dict(queue=queue, type=kind, commands=records))
+            for target in targets:
+                group = next((group for group in groups
+                              if group['queue'] == target['queue'] and group['type'] == 1), None)
+                if group is None:
+                    group = dict(queue=target['queue'], type=1, commands=[])
+                    groups.append(group)
+                group.setdefault('render_targets', []).append(target)
             args.json_path.write_text(json.dumps(groups, indent=2) + "\n", encoding="utf-8")
-        print(format_report(commands))
+        print('\n'.join(part for part in (format_report(commands),
+                                          format_rt_report(targets)) if part))
     except (OSError, ValueError) as exc:
         print(f"{parser.prog}: {exc}", file=sys.stderr)
         return 1
