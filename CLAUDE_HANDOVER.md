@@ -334,3 +334,22 @@ df -h .
 
 ### Next
 - Blocker B (pixels): work out which type-1 field points to the colour attachment (agy B1 report pending at the time of writing), translate it through the GPU MMU (`agx_gpu_translate`), and implement a minimal clear/resolve into the IOSurface backing so `program_hardware` scans out non-zero CA pixels.
+
+---
+
+## 15. Scanout follows the CA surface; render target is in a per-context GPU address space (Claude, 2026-10-21)
+
+### Display register model (corrects §1/§13 acceptance wording)
+- `0x206204044` is `DPU0SRCBASE`, the plane offset inside the surface. It is always 0 for single-plane IOSurfaces, so `0x4044 == 0x18e0000` can never hold. The surface's physical page is written through the DPFIFO to **`0x4098` `DPU0MMUPGADDR0` (PA >> 4)**, with `0x4090 DPU0MMUCNTL = 1` (`AppleMobileADBE0` helper `0xf2896c`, write at `0xf28a98`, PA from the IOSurface memory descriptor).
+- Layer 0 is enabled by backboardd from ~64 s (swap tokens 11–13, surface ID 3, 640×1136, `payload[0x10c]` mask 1). Earlier swaps are bootstrap swaps without a surface.
+- Backend: `0x4098` now sets `framebuffer = (val << 4) + [0x4044]`, and FIFO writes to `0x4044/0x4070/0x4098` are traced as `DISPLAY_FIFO` lines.
+- **Acceptance should read:** `0x4098` holds CA's surface page and that surface contains non-zero pixels rendered by the HLE.
+
+### Probe 46 (`probe-46-scanout/plain`, `probe-46-scanout-fill/rtfill`; 180 s each, no panic or GPU hang)
+- `0x4098` = `0x803cbd00` (plain) / `0x803ce000` (rtfill), so scanout PA is `0x803cbd000` / `0x803ce0000`. The QMP screendump now has 790 k non-zero bytes, but the content is noise and `deadbeef` patterns: the CA surface was never rendered. The surface may also be scatter-gather (only page 0 is known).
+- `AGX RT` lines: rt0 GVA `0x60a00000` (backboardd, 640×1136, fmt `0x20007fc`, load Clear) and `0x68800000` (SpringBoard wallpaper 744×1392) are **unmapped in BIF_CAT_BASE0** (the firmware page catalogue). User render targets live in a per-context GPU page catalogue, so `VPHONE_AGX_RT_FILL` stopped at the first page.
+
+### Next
+1. Find where the AGX driver keeps each GPU context's page catalogue PA and how a channel/command references it (the context ID at type-1 `+0x04`, the parameter buffers at `+0x0c/+0x10`, or the FW memory-context structure). Teach `agx_gpu_translate` to walk that catalogue.
+2. Re-run with `VPHONE_AGX_RT_FILL` to confirm that rt0 maps to the surface at `0x4098` (same PA).
+3. Then decide how much of the fragment pipeline to emulate (CA composites textured quads, so the minimum useful step is a textured blit from the source IOSurface into rt0).
