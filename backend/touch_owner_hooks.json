@@ -1,0 +1,359 @@
+{
+  "cache_path": "backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "mt_ui_locked": "0x187ccc828",
+    "mt_get_report": "0x187cccfcc",
+    "mt_set_report": "0x187cccfec",
+    "mt_detection_mode": "0x187cd39b8",
+    "mt_report_dispatch": "0x187ccde24",
+    "mt_unpack_contacts": "0x187ccf8e0",
+    "mt_process_contacts": "0x187cd4150",
+    "mt_forward_binary": "0x187cd1f80",
+    "mt_contact_filled": "0x187cd20ac",
+    "mt_contact_callback": "0x187cd214c",
+    "hid_digitizer_collection": "0x1825b47cc",
+    "hid_digitizer_finger": "0x1825b4adc",
+    "hid_append_event": "0x1825b4440",
+    "hid_system_dispatch": "0x1825ba9f8",
+    "hid_connection_dispatch": "0x1825e1c90",
+    "hid_queue_enqueue": "0x1825c486c",
+    "bks_register_callback": "0x185cdd7e8",
+    "bks_digitizer_info": "0x185cddee8",
+    "ui_send_event": "0x184664a50",
+    "ui_add_touch": "0x1846929c4",
+    "ui_gesture_state": "0x1846943c8",
+    "mt_input_detection_state": "0x187cd36c0",
+    "hid_client_queue_callback": "0x1825bc654",
+    "hid_client_dequeued": "0x1825bc68c",
+    "hid_client_callback_call": "0x1825bc72c",
+    "ui_hid_callback": "0x184660ac0",
+    "ui_hid_enqueue": "0x184660af4",
+    "ui_hid_signal": "0x184660b08",
+    "ui_install_event_source": "0x1846d0d18",
+    "ui_queue_consume": "0x184660b0c",
+    "ui_queue_count": "0x184660b80",
+    "ui_queue_event": "0x184660fc4",
+    "ui_touches_event_result": "0x184661068",
+    "ui_interaction_ignored": "0x184661170",
+    "ui_lifecycle_ignored": "0x184661190",
+    "ui_digitizer_children": "0x1846612a0",
+    "ui_digitizer_status": "0x1846616a4",
+    "ui_window_context_result": "0x184661fcc",
+    "ui_window_context_compare": "0x184662058",
+    "ui_window_fallback": "0x1846620fc",
+    "ui_window_selected": "0x184662134",
+    "ui_touch_add_gate": "0x1846928a8",
+    "ui_dispatch_gate": "0x184662bf8",
+    "ui_send_from_queue": "0x184662c3c",
+    "ui_unknown_hid": "0x184661330",
+    "ui_handle_gs": "0x1846d0d8c",
+    "ui_handle_event_new": "0x184664bc0",
+    "ui_event_timestamp": "0x1846637b0",
+    "bks_event_info_result": "0x185cddd8c",
+    "ca_hit_test": "0x1843895dc",
+    "ca_hit_context_result": "0x18438961c",
+    "ca_context_client": "0x18438968c",
+    "ca_context_client_result": "0x1843896cc",
+    "ca_context_task": "0x1843896dc",
+    "ca_context_task_result": "0x184389738",
+    "hid_connection_enqueue_result": "0x1825e1ccc",
+    "ui_window_hit_test": "0x18469d290",
+    "ui_window_context": "0x18469d26c",
+    "ca_server_create_context": "0x1842ff72c",
+    "ca_server_context_created": "0x1842ff7c4",
+    "ca_server_local_context": "0x1842f7760",
+    "pui_create_context": "0x1895c27cc",
+    "pui_set_visible": "0x1895c2ccc",
+    "pui_dealloc": "0x1895c2734"
+  },
+  "known_return_sites": {
+    "backboardd": {
+      "bks_digitizer_info": "0x100016ef0",
+      "ca_context_task_result": "0x100016790",
+      "ca_hit_test": "0x10001765c"
+    }
+  },
+  "exe_headers": {
+    "backboardd": "cffaedfe0c0000010000000002000000"
+  },
+  "exe_hooks": {
+    "backboardd": {
+      "bb_dispatch_queue": {
+        "address": "0x100016000",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_dispatchEventsFromQueue: entry"
+      },
+      "bb_route_event_block": {
+        "address": "0x10001616c",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "-[BKDigitizerRouter routeEventWithBlock:terminalEvent:] entry"
+      },
+      "bb_display_link_gate": {
+        "address": "0x1000161b8",
+        "expected": "800200342803009008a585b9806a68f8",
+        "description": "Checks display link active flag; drops if inactive"
+      },
+      "bb_handle_collection": {
+        "address": "0x1000163b0",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_queue_BKDigitizerHandlePathCollectionEventOnDisplay entry"
+      },
+      "bb_display_integrated_gate": {
+        "address": "0x100016408",
+        "expected": "c00300b4d9f2ff9780000034e00315aa",
+        "description": "Checks kIOHIDEventFieldDigitizerDisplayIntegrated (0xb0019)"
+      },
+      "bb_pocket_touches_gate": {
+        "address": "0x100016410",
+        "expected": "80000034e00315aa60deff97603c0037",
+        "description": "Checks _pocketTouchesExpected on main display"
+      },
+      "bb_cancel_gate": {
+        "address": "0x10001646c",
+        "expected": "20053836e1030032e00315aadd050094",
+        "description": "Checks cancel bit (bit 7) of event flags 0xb0007"
+      },
+      "bb_external_display_gate": {
+        "address": "0x100016480",
+        "expected": "37030090f7c22d91e82a40f91f0114eb",
+        "description": "Checks non-integrated display == main display"
+      },
+      "bb_children_gate": {
+        "address": "0x100016518",
+        "expected": "803400b4ffd10094f40300aa343400b4",
+        "description": "Checks IOHIDEventGetChildren non-NULL and count > 0"
+      },
+      "bb_destinations_gate": {
+        "address": "0x1000168f0",
+        "expected": "68060034e8020090007145f9c80200d0",
+        "description": "Checks resolved destinations count > 0; drops to exit if 0"
+      },
+      "bb_context_select": {
+        "address": "0x100016d28",
+        "expected": "1b796cb84a0f40f94843403909008012",
+        "description": "Per-destination loop: loads destination task port w27"
+      },
+      "bb_digitizer_info_return": {
+        "address": "0x100016ef0",
+        "expected": "9f030031e8179f1ae9079f1a6aba40b9",
+        "description": "Return from _BKSHIDEventSetDigitizerInfo (rebuilt event tagged)"
+      },
+      "bb_system_gesture_stealing_gate": {
+        "address": "0x100016f64",
+        "expected": "c80d0035f40200f094421891e00314aa",
+        "description": "Checks systemGestureIsStealingEvents (+0x31); drops event if non-zero"
+      },
+      "bb_create_task_block": {
+        "address": "0x100017014",
+        "expected": "480200b0087941f9686600f9e8070232",
+        "description": "Allocates dispatch block capturing rebuilt event and taskPort"
+      },
+      "bb_thread_dispatch_gate": {
+        "address": "0x100017064",
+        "expected": "68050034e00315aa4bdbff9700050034",
+        "description": "Checks router thread dispatch flag [x26, #1]; calls synchronously if 0"
+      },
+      "bb_task_block_invoke": {
+        "address": "0x1000176c4",
+        "expected": "fd7bbfa9fd030091f44fbfa9f30300aa",
+        "description": "Block invoke: calls _forwardEventToClientWithTaskPort and releases event"
+      },
+      "bb_focus_forward": {
+        "address": "0x100017788",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "Focus forwarding: tags context info and calls _forwardEventToClientWithBundleID"
+      },
+      "bb_forward_task": {
+        "address": "0x100013540",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_forwardEventToClientWithTaskPort entry: x0=event, x1=taskPort"
+      },
+      "bb_forward_task_filter_gate": {
+        "address": "0x10001357c",
+        "expected": "e0020034a00240f9e80200d008610c91",
+        "description": "Checks _hidEventFilter return; drops if 0"
+      },
+      "bb_forward_task_lookup": {
+        "address": "0x100013580",
+        "expected": "a00240f9e80200d008610c91010140f9",
+        "description": "Calls [BKHIDClientConnectionManager clientForTaskPort:taskPort]"
+      },
+      "bb_forward_task_conn_gate": {
+        "address": "0x10001359c",
+        "expected": "f40100b4680200d008012e91000140f9",
+        "description": "Checks client connection x20; drops to exit if NULL"
+      },
+      "bb_forward_task_dispatch": {
+        "address": "0x1000135d4",
+        "expected": "fbda0014bf8300d1f657c1a8f44fc1a8",
+        "description": "Tail call to _IOHIDEventSystemConnectionDispatchEvent"
+      },
+      "bb_forward_task_drop": {
+        "address": "0x1000135d8",
+        "expected": "bf8300d1f657c1a8f44fc1a8fd7bc1a8",
+        "description": "Silent drop exit of _forwardEventToClientWithTaskPort"
+      },
+      "bb_forward_bundle": {
+        "address": "0x100013494",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_forwardEventToClientWithBundleID entry: x0=event, x1=bundleID"
+      },
+      "bb_forward_bundle_filter_gate": {
+        "address": "0x1000134d0",
+        "expected": "e0020034a00240f9e80200d008810c91",
+        "description": "Checks _hidEventFilter return; drops if 0"
+      },
+      "bb_forward_bundle_conn_gate": {
+        "address": "0x1000134f0",
+        "expected": "f40100b4680200d008012e91000140f9",
+        "description": "Checks client connection x20; drops to exit if NULL"
+      },
+      "bb_forward_bundle_dispatch": {
+        "address": "0x100013528",
+        "expected": "26db0014bf8300d1f657c1a8f44fc1a8",
+        "description": "Tail call to _IOHIDEventSystemConnectionDispatchEvent"
+      },
+      "bb_forward_bundle_drop": {
+        "address": "0x10001352c",
+        "expected": "bf8300d1f657c1a8f44fc1a8fd7bc1a8",
+        "description": "Silent drop exit of _forwardEventToClientWithBundleID"
+      },
+      "bb_client_for_task": {
+        "address": "0x100046ad4",
+        "expected": "fd7bbfa9fd030091f44fbfa9ff8301d1",
+        "description": "-[BKHIDClientConnectionManager clientForTaskPort:] entry"
+      },
+      "bb_client_for_task_cfport": {
+        "address": "0x100046bac",
+        "expected": "940100b4681240f9a9010090294989b9",
+        "description": "Checks CFMachPortCreateWithPort result; returns NULL if 0"
+      },
+      "bb_client_for_task_dict": {
+        "address": "0x100046bc4",
+        "expected": "8e100094681640f9080540f9000d00f9",
+        "description": "CFDictionaryGetValue on _taskPortToConnectionMap"
+      },
+      "bb_client_for_bundle": {
+        "address": "0x100046c58",
+        "expected": "fd7bbfa9fd030091f44fbfa9ff8301d1",
+        "description": "-[BKHIDClientConnectionManager clientForBundleID:] entry"
+      },
+      "bb_client_for_bundle_dict": {
+        "address": "0x100046d2c",
+        "expected": "34100094681a40f9080540f9000d00f9",
+        "description": "CFDictionaryGetValue on _bundleIDToConnectionMap"
+      },
+      "bb_client_conn_added": {
+        "address": "0x100046dd0",
+        "expected": "fd7bbfa9fd030091f44fbfa9ffc300d1",
+        "description": "-[BKHIDClientConnectionManager clientConnectionAdded:] entry"
+      },
+      "bb_client_conn_added_worker": {
+        "address": "0x100046e48",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "clientConnectionAdded worker: extracts task and bundleID"
+      },
+      "bb_client_conn_added_cfport": {
+        "address": "0x100046ebc",
+        "expected": "360200b4b40100b4a8010090084989b9",
+        "description": "Checks CFMachPortCreateWithPort result when adding connection"
+      },
+      "bb_client_conn_removed": {
+        "address": "0x100046f48",
+        "expected": "fd7bbfa9fd030091f44fbfa9ffc300d1",
+        "description": "-[BKHIDClientConnectionManager clientConnectionRemoved:] entry"
+      },
+      "bb_overlay_create": {
+        "address": "0x10000e6e0",
+        "expected": "fd7bbfa9fd030091f44fbfa973030090",
+        "description": "Entry of -[PUIProgressWindow initWithProgressBarVisibility:0 level:2999.0]"
+      },
+      "bb_overlay_created": {
+        "address": "0x10000e754",
+        "expected": "50f10094602200f9080300f008c10591",
+        "description": "PUIProgressWindow allocated and stored in _progressWindow (x0 = window)"
+      },
+      "bb_overlay_dismiss_delay_trigger": {
+        "address": "0x10000e784",
+        "expected": "fd7bbfa9fd0300916803009008412991",
+        "description": "Schedules 10-second delay dismissal of progress overlay"
+      },
+      "bb_overlay_dismiss_worker": {
+        "address": "0x10000e7dc",
+        "expected": "fd7bbfa9fd030091f44fbfa973030090",
+        "description": "10s timer fired: invokes progress overlay dismiss worker"
+      },
+      "bb_overlay_set_hidden": {
+        "address": "0x10000e814",
+        "expected": "20f10094602240f9080300d008613491",
+        "description": "Calls -[progressWindow setVisible:0] (sets [layer setHidden:1])"
+      },
+      "bb_overlay_release": {
+        "address": "0x10000e828",
+        "expected": "1bf100947f2200f98bf10094020080d2",
+        "description": "Calls -[progressWindow release] and clears _progressWindow = NULL"
+      },
+      "bb_sentinel_dismiss_call": {
+        "address": "0x10003a0ec",
+        "expected": "a651ff97bf020071a41a413a00010054",
+        "description": "lock_bootstrap finds running system app and triggers overlay dismiss"
+      },
+      "bb_sentinel_checkin_dismiss_call": {
+        "address": "0x10003a1c4",
+        "expected": "7051ff1716020090c87a88b9686a68f8",
+        "description": "systemAppCheckIn receives checkin from system app and triggers overlay dismiss"
+      }
+    }
+  },
+  "suggested_hook_dumps": {
+    "bb_forward_task": [
+      "x0:184",
+      "x1:8"
+    ],
+    "bb_forward_task_conn_gate": [
+      "x20:184"
+    ],
+    "bb_client_for_task": [
+      "x2:8"
+    ],
+    "bb_client_for_task_cfport": [
+      "x20:64"
+    ],
+    "bb_client_conn_added_worker": [
+      "x21:8",
+      "x20:64"
+    ],
+    "bb_system_gesture_stealing_gate": [
+      "x8:8"
+    ],
+    "hid_connection_dispatch": [
+      "x0:184",
+      "x1:256"
+    ],
+    "ca_context_task_result": [
+      "x1:256"
+    ],
+    "ca_server_context_created": [
+      "x21:184"
+    ],
+    "ca_server_local_context": [
+      "x20:184"
+    ],
+    "bb_overlay_created": [
+      "x0:64"
+    ],
+    "bb_overlay_dismiss_worker": [
+      "x19:64"
+    ]
+  },
+  "notes": {
+    "architecture": "Covers full backboardd touch forwarding pipeline from path collection through IOHIDEventSystemConnectionDispatchEvent.",
+    "drop_condition_stealing": "bb_system_gesture_stealing_gate checks [x8, #0x31] (systemGestureIsStealingEvents). If non-zero, event is released without dispatch.",
+    "drop_condition_no_connection": "bb_forward_task_conn_gate checks x20 (connection from clientForTaskPort). If NULL, event drops to bb_forward_task_drop (0x1000135d8).",
+    "drop_condition_cfmachport": "bb_client_for_task_cfport checks CFMachPortCreateWithPort. If port is dead or invalid in backboardd, returns NULL.",
+    "drop_condition_destinations": "bb_destinations_gate checks unique client count w24. If 0 (CA hit test / taskPortOfContextId yielded no ports), drops to 0x1000169bc -> exit.",
+    "caps": "Use --max-hits bb_=0 --max-hits ui_=0 --max-hits hid_client_=0 --max-hits ca_=0 for unlimited coverage of touch routing events.",
+    "touch_owner_architecture": "Hooks CA server context creation (0x1842ff72c / 0x1842ff7c4) and local context creation (0x1842f7760) to log all context IDs, client task ports, and client PIDs. Dumps CA::Render::Context (x1:256) at ca_context_task_result (0x184389738) to reveal context_id (+0xc), client PID (+0x90), task port (+0x98), client port (+0x9c), and root layer pointer (+0xb0). Tracks backboardd boot progress overlay (PUIProgressWindow at level 2999.0) creation and dismissal."
+  }
+}
