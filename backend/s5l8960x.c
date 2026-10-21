@@ -5517,14 +5517,14 @@ static void timer_irq(void *opaque, int n, int level)
 static uint64_t apple_c15_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     A7State *s = A7(qdev_get_machine());
-    unsigned c = arm_env_get_cpu(env)->mp_affinity & 1;
+    unsigned c = env_archcpu(env)->mp_affinity & 1;
     return s->apple_c15[c][ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7];
 }
 
 static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val)
 {
     A7State *s = A7(qdev_get_machine());
-    unsigned c = arm_env_get_cpu(env)->mp_affinity & 1;
+    unsigned c = env_archcpu(env)->mp_affinity & 1;
     s->apple_c15[c][ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7] = val;
     qemu_log_mask(LOG_UNIMP, "A7 c15 reg opc1=%d crm=%d opc2=%d stored 0x%" PRIx64 "; hardware effects unimplemented\n",
                   ri->opc1, ri->crm, ri->opc2, val);
