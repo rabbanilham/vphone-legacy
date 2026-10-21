@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
 from probe_state import RunClock,ReturnRegistry,ScanoutTracker,pixel_present,instruction_mapped
-from display_probe import memory_state, parse_hook_dumps, capture_hook_dumps
+from display_probe import memory_state, parse_hook_dumps, capture_hook_dumps, derive_exe_slide, install_exe_hooks
 
 class ProbeStateTests(unittest.TestCase):
     def test_opt_in_hook_dumps_bound_reads_and_preserve_failures(self):
@@ -75,5 +75,57 @@ class ProbeStateTests(unittest.TestCase):
         self.assertFalse(tracker.eligible(1101,0x18e0000,9))
         tracker.observe(dict(name='swap_submit',return_of=dict(object='0x88'),registers=['0x0']))
         self.assertFalse(tracker.eligible(1101,0,None));self.assertFalse(tracker.eligible(0,0x18e0000,9));self.assertTrue(tracker.eligible(1101,0x18e0000,9))
+
+    def test_derive_exe_slide_from_known_return_site(self):
+        hdr = bytes.fromhex('cffaedfe0c0000010000000002000000')
+        known = {'bks_digitizer_info': '0x100016ef0'}
+        lr = 0x1000feef0  # slide 0xe8000
+        def mock_mem(gs, addr, size):
+            return hdr if addr == 0x1000e8000 else b''
+        slide = derive_exe_slide(None, mock_mem, 'backboardd', hdr, known_sites=known, lr=lr, hook_name='bks_digitizer_info')
+        self.assertEqual(slide, 0xe8000)
+
+    def test_derive_exe_slide_from_page_scan(self):
+        hdr = bytes.fromhex('cffaedfe0c0000010000000002000000')
+        def mock_mem(gs, addr, size):
+            return hdr if addr == 0x100064000 else b''
+        slide = derive_exe_slide(None, mock_mem, 'backboardd', hdr, max_scan_bytes=0x100000)
+        self.assertEqual(slide, 0x64000)
+
+    def test_derive_exe_slide_not_found(self):
+        hdr = bytes.fromhex('cffaedfe0c0000010000000002000000')
+        slide = derive_exe_slide(None, lambda gs, a, s: b'', 'backboardd', hdr, max_scan_bytes=0x10000)
+        self.assertIsNone(slide)
+
+    def test_install_exe_hooks_verifies_and_registers(self):
+        hooks = {
+            'bb_route': '0x10001616c',
+            'bb_forward': {'address': '0x100013540', 'expected': '0102030405060708090a0b0c0d0e0f10'}
+        }
+        expected = {'bb_route': 'aabbccddeeff00112233445566778899'}
+        bps = {}; user_expected = {}
+        slide = 0xe8000
+        mem_map = {
+            0x10001616c + slide: bytes.fromhex(expected['bb_route']),
+            0x100013540 + slide: bytes.fromhex(hooks['bb_forward']['expected'])
+        }
+        rsp_log = []
+        def mock_rsp(gs, cmd):
+            rsp_log.append(cmd)
+            return 'OK'
+        verified = install_exe_hooks(None, lambda gs, a, s: mem_map.get(a, b''), mock_rsp, 'backboardd', slide, hooks, expected, bps, user_expected)
+        self.assertEqual(len(verified), 2)
+        self.assertIn(0x10001616c + slide, bps)
+        self.assertEqual(bps[0x10001616c + slide], 'bb_route')
+        self.assertEqual(user_expected[0x10001616c + slide], bytes.fromhex(expected['bb_route']))
+        self.assertEqual(len(rsp_log), 2)
+        self.assertTrue(all(v['exe'] for v in verified))
+
+    def test_install_exe_hooks_rejects_instruction_mismatch(self):
+        hooks = {'bb_route': '0x10001616c'}
+        expected = {'bb_route': 'aabbccddeeff00112233445566778899'}
+        bps = {}; user_expected = {}
+        with self.assertRaises(AssertionError):
+            install_exe_hooks(None, lambda gs, a, s: bytes(16), lambda gs, c: 'OK', 'backboardd', 0xe8000, hooks, expected, bps, user_expected)
 
 if __name__=='__main__':unittest.main()

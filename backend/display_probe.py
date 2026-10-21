@@ -87,6 +87,53 @@ def memory_state(gs,addr,size=8):
     return dict(readable=len(data)==size, value=hex(int.from_bytes(data,'little')) if len(data)==size else None, bytes=data.hex())
 
 
+def derive_exe_slide(gs, mem_fn, proc, expected_header, known_sites=None, lr=None, hook_name=None, max_scan_bytes=0x400000, preferred_base=0x100000000):
+    """Derive executable ASLR slide from verified LR at a known return site or by scanning text pages."""
+    if known_sites and hook_name and hook_name in known_sites and lr:
+        preferred = int(known_sites[hook_name], 0)
+        cand = lr - preferred
+        if cand >= 0 and (cand & 0xfff) == 0:
+            hdr = mem_fn(gs, preferred_base + cand, len(expected_header))
+            if len(hdr) == len(expected_header) and hdr == expected_header:
+                return cand
+    for step in (0x4000, 0x1000):
+        for s in range(0, max_scan_bytes, step):
+            hdr = mem_fn(gs, preferred_base + s, len(expected_header))
+            if len(hdr) == len(expected_header) and hdr == expected_header:
+                return s
+    return None
+
+
+def install_exe_hooks(gs, mem_fn, rsp_fn, proc, slide, hooks_dict, expected_dict, bps, user_expected, exe_path=None, preferred_base=0x100000000):
+    """Verify instruction bytes against expected and install Z0 breakpoints for executable hooks."""
+    disk_data = Path(exe_path).read_bytes() if exe_path and Path(exe_path).exists() else None
+    verified = []
+    for uname, spec in hooks_dict.items():
+        if isinstance(spec, dict):
+            static = int(spec.get('address') or spec.get('static'), 0)
+            exp_hex = spec.get('expected')
+        else:
+            static = int(spec, 0)
+            exp_hex = expected_dict.get(uname)
+        if exp_hex:
+            expected = bytes.fromhex(exp_hex)
+        elif disk_data:
+            off = static - preferred_base
+            expected = disk_data[off:off+16] if 0 <= off <= len(disk_data) - 16 else b''
+        else:
+            expected = b''
+        runtime = static + slide
+        actual = mem_fn(gs, runtime, len(expected)) if expected else b''
+        assert expected and (not actual or actual == expected), (uname, actual.hex(), expected.hex())
+        assert rsp_fn(gs, f'Z0,{runtime:x},4') == 'OK'
+        bps[runtime] = uname
+        user_expected[runtime] = expected
+        verified.append(dict(name=uname, static=hex(static), runtime=hex(runtime),
+                             bytes=actual.hex(), expected=expected.hex(),
+                             mapped_at_install=bool(actual), exe=True, process=proc))
+    return verified
+
+
 def sysreg_numbers(gs):
     # XML negotiation also enables access to registers outside the core packet.
     rsp(gs, 'qSupported:qXfer:features:read+')
@@ -252,6 +299,8 @@ def main():
     user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
     user_installed = False
     user_expected = {}
+    exe_installed = {}
+    exe_slides = {}
     keybagd_installed = False
     ready_providers = set()
     wake_providers = set()
@@ -478,7 +527,7 @@ def main():
                                     if slide<0 or slide&0xfff: continue
                                     if memory(gs,0x180000000+slide,16)!=cache[:16]: continue
                                     verified=[]
-                                    for uname, static in user_hooks['symbols'].items():
+                                    for uname, static in user_hooks.get('symbols', {}).items():
                                         static=int(static,0); expected=b''
                                         for va,size,off,*_ in index['mappings']:
                                             if va<=static<va+size:
@@ -494,8 +543,47 @@ def main():
                                         assert rsp(gs,f'Z0,{va:x},4')=='OK'
                                         bps[va]=uname
                                         verified.append(dict(name=uname,runtime=hex(va),absolute=True))
-                                    save_json(out/'user-hook-mapping.json',dict(slide=hex(slide),hooks=verified))
+                                    mapping_dict = dict(slide=hex(slide),hooks=verified)
+                                    if 'exe_hooks' in user_hooks and 'backboardd' in user_hooks['exe_hooks']:
+                                        proc = 'backboardd'
+                                        hdr_hex = user_hooks.get('exe_headers', {}).get(proc, 'cffaedfe0c0000010000000002000000')
+                                        hdr = bytes.fromhex(hdr_hex)
+                                        known = user_hooks.get('known_return_sites', {}).get(proc, {})
+                                        exe_slide = derive_exe_slide(gs, memory, proc, hdr, known)
+                                        if exe_slide is not None:
+                                            exe_exp = user_hooks.get('exe_expected', {}).get(proc, {})
+                                            exe_path = user_hooks.get('exe_paths', {}).get(proc)
+                                            exe_v = install_exe_hooks(gs, memory, rsp, proc, exe_slide, user_hooks['exe_hooks'][proc], exe_exp, bps, user_expected, exe_path=exe_path)
+                                            verified.extend(exe_v)
+                                            exe_slides[proc] = exe_slide
+                                            exe_installed[proc] = True
+                                            mapping_dict['exe_slide'] = hex(exe_slide)
+                                            mapping_dict['exe_slides'] = {proc: hex(exe_slide)}
+                                    save_json(out/'user-hook-mapping.json',mapping_dict)
                                     user_installed=True;break
+                            if user_hooks and 'exe_hooks' in user_hooks:
+                                cur_proc = caller_identity.get('process')
+                                if cur_proc in user_hooks['exe_hooks'] and cur_proc not in exe_installed:
+                                    hdr_hex = user_hooks.get('exe_headers', {}).get(cur_proc, 'cffaedfe0c0000010000000002000000')
+                                    hdr = bytes.fromhex(hdr_hex)
+                                    known = user_hooks.get('known_return_sites', {}).get(cur_proc, {})
+                                    lr_val = x[30] if len(x) > 30 else None
+                                    exe_slide = derive_exe_slide(gs, memory, cur_proc, hdr, known, lr=lr_val, hook_name=name)
+                                    if exe_slide is not None:
+                                        exe_exp = user_hooks.get('exe_expected', {}).get(cur_proc, {})
+                                        exe_path = user_hooks.get('exe_paths', {}).get(cur_proc)
+                                        exe_v = install_exe_hooks(gs, memory, rsp, cur_proc, exe_slide, user_hooks['exe_hooks'][cur_proc], exe_exp, bps, user_expected, exe_path=exe_path)
+                                        exe_slides[cur_proc] = exe_slide
+                                        exe_installed[cur_proc] = True
+                                        mapping_path = out / 'user-hook-mapping.json'
+                                        if mapping_path.exists():
+                                            m_dict = json.loads(mapping_path.read_text())
+                                            m_dict['exe_slide'] = hex(exe_slide)
+                                            m_dict.setdefault('exe_slides', {})[cur_proc] = hex(exe_slide)
+                                            m_dict.setdefault('hooks', []).extend(exe_v)
+                                            save_json(mapping_path, m_dict)
+                            if name.startswith('bb_') and caller_identity.get('process') != 'backboardd':
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if name.startswith('keybagd_') and caller_identity.get('process') != 'keybagd':
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if pc in user_expected:
