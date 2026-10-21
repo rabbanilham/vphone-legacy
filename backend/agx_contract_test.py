@@ -110,7 +110,12 @@ REPLAY_TEXELS = (0xff010203, 0xff102030, 0xff405060, 0xff708090,
 REPLAY_MASK_CODE = bytes.fromhex(
     '4520b002c44010c0400002806aff4620f44c806080048880a00002806aff280a9400'
     '11f01b8222221000a0a30020398a80940011f01b8222221000a1a30021ff')
-REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'vibrancy-dark', 'vibrancy-light')
+
+# Exact CA narrow blur program: its first 64 bytes identify AGX_USC_BLUR_1.
+REPLAY_BLUR_CODE = bytes.fromhex(
+    '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
+    '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
+REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'gauss-blur', 'vibrancy-dark', 'vibrancy-light')
 
 
 def blend_vibrancy(dst, src):
@@ -279,6 +284,30 @@ def replay_blob(case=True):
                     a = alphas[y * 4 + x - 2]
                     return sum(((destination >> c) & 255) * a // 255 << c for c in range(0, 32, 8))
                 expect_rect((2, 0, 6, 2), masked)
+            elif case == 'gauss-blur':
+                put(state + 15 * 4, '<I', 8 << 8)
+                put(state + 0x110 + 7 * 4, '<I', 0x1200)
+                put(pds + 0x200, '<I', 0x1000)
+                usc = map_page(0x700001000)
+                assert len(REPLAY_BLUR_CODE) == 64
+                fingerprint = 0xcbf29ce484222325
+                for byte in REPLAY_BLUR_CODE:
+                    fingerprint = ((fingerprint ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+                assert fingerprint == 0x115ac3fe908dec8a
+                put(usc, '<64s', REPLAY_BLUR_CODE)
+                blur_texel = 0xff304050
+                for y in range(2):
+                    put(state + 0x500 + y * 64, '<4I', *([blur_texel] * 4))
+                def blurred_over(x, y):
+                    a = (blur_texel >> 24) & 0xff
+                    out = 0
+                    for c in range(0, 32, 8):
+                        sc = (blur_texel >> c) & 0xff
+                        dc = (destination >> c) & 0xff
+                        v = min(255, sc + dc * (255 - a) // 255)
+                        out |= v << c
+                    return out
+                expect_rect((2, 0, 6, 2), blurred_over)
             else:
                 # Luma constants, four sampler words, then the TSW at +28.
                 q = (texture_gva >> 2) << 16
