@@ -87,6 +87,37 @@ def memory_state(gs,addr,size=8):
     return dict(readable=len(data)==size, value=hex(int.from_bytes(data,'little')) if len(data)==size else None, bytes=data.hex())
 
 
+def dispatch_release_evidence(gs, registers):
+    """Read the caller's surviving block/continuation; do not infer their types.
+
+    At call_block_and_release's BLR, x19 saves the block. A tail-called
+    dispatch_release preserves that register, but other callers need not.
+    """
+    result = {}
+    for label, reg in (('object', 0), ('block_candidate', 19),
+                       ('continuation_candidate', 27), ('stack', 31)):
+        addr = registers[reg]
+        data = memory(gs, addr, 128) if 0 < addr < (1 << 64) - 128 else b''
+        result[label] = dict(address=hex(addr), bytes=data.hex(), readable=len(data) == 128)
+        if label == 'block_candidate' and len(data) >= 32:
+            invoke, descriptor = struct.unpack_from('<QQ', data, 16)
+            result[label].update(invoke=hex(invoke), descriptor=hex(descriptor))
+            for key, ptr in (('invoke_bytes', invoke), ('descriptor_bytes', descriptor)):
+                result[label][key] = memory(gs, ptr, 64).hex() if 0 < ptr < (1 << 64) - 64 else ''
+    # The observed drain keeps the pthread/TLS base in x24. Its current
+    # queue slot is +0xa0; verify the captured header before interpreting it.
+    tls = registers[24]
+    slot = memory(gs, tls + 0xa0, 8) if 0 < tls < (1 << 64) - 0xa8 else b''
+    if len(slot) == 8:
+        queue = int.from_bytes(slot, 'little')
+        head = memory(gs, queue, 128) if 0 < queue < (1 << 64) - 128 else b''
+        result['queue_candidate'] = dict(address=hex(queue), bytes=head.hex(), readable=len(head) == 128)
+        if len(head) >= 0x68:
+            label = int.from_bytes(head[0x60:0x68], 'little')
+            result['queue_candidate']['label_bytes'] = memory(gs, label, 128).hex() if 0 < label < (1 << 64) - 128 else ''
+    return result
+
+
 def derive_exe_slide(gs, mem_fn, proc, expected_header, known_sites=None, lr=None, hook_name=None, max_scan_bytes=0x400000, preferred_base=0x100000000):
     """Derive executable ASLR slide from verified LR at a known return site or by scanning text pages."""
     if known_sites and hook_name and hook_name in known_sites and lr:
@@ -600,6 +631,11 @@ def main():
                                     # Let the fault execute, retaining the hook;
                                     # this is not evidence of function execution.
                                     assert rsp(gs,'s').startswith('T');cont();continue
+                            if name == 'sb_dispatch_release_unaligned' and not (x[0] & 7):
+                                # This diagnostic targets the T13 failure (x0 ends
+                                # in 0x78c). Keep the hook until a suspicious call;
+                                # ordinary aligned releases must not consume its cap.
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if name.startswith(('io_','surface_','accel_','ca_')) and caller_identity.get('process') not in ('backboardd','SpringBoard'):
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if name == 'display_irq_register':
@@ -638,6 +674,8 @@ def main():
                             if name in hook_dumps:
                                 event['memory_dumps'] = capture_hook_dumps(gs, x, hook_dumps[name])
                             event['identity'] = caller_identity
+                            if name == 'sb_dispatch_release_unaligned':
+                                event['dispatch_release'] = dispatch_release_evidence(gs, x)
                             if caller_identity.get('exec_fname'):
                                 event['exec_fname'] = caller_identity['exec_fname']
                             if caller_identity.get('vnode_path'):
