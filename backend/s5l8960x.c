@@ -3111,8 +3111,9 @@ static bool agx_replay_enabled(void)
 {
     static int enabled = -1;
     if (enabled < 0) {
+        /* On by default; VPHONE_AGX_REPLAY=0 turns it off for comparisons. */
         const char *v = getenv("VPHONE_AGX_REPLAY");
-        enabled = v && *v && strcmp(v, "0");
+        enabled = !v || strcmp(v, "0");
     }
     return enabled;
 }

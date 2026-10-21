@@ -391,7 +391,11 @@ df -h .
 - `backend/s5l8960x.c`: `agx_replay_frame` / `agx_replay_texture` / `agx_surface_gva` (axis-aligned quads, nearest sampling, premultiplied src-over). It is called from `agx_trace_rt` for context-slot commands with a PBE target. TA commands are retained per context when replay or frame dump is enabled.
 - `backend/agx_replay_offline.py` renders a frame dump to PNG; `backend/agx_vdm_walk.py` prints the VDM stream.
 
+### Replay is the default (2026-10-21)
+- `agx_replay_enabled()` is on unless `VPHONE_AGX_REPLAY=0`. `backend/agx_contract_test.py` covers it: a VDM stream with one solid and one textured quad must produce exact pixels, and `VPHONE_AGX_REPLAY=0` must leave the target untouched.
+- Probe 61 (no env vars, 2 runs, no panic): d2 replays 2,052 frames (logo + progress bar). d1 replays only 1 because **the guest stalls**: backboardd stops submitting after 3 kicks. In d1 at 170 s there is no `CA::Render::Server` thread, `IOMFBServer::set_next_update` is blocked in `kern_EnableVSyncNotifications` (IOMobileFramebuffer user client), and `CA::Context::commit_transaction` is blocked sending to the render server. The same run-to-run variance (1 to ~2,000 type-1 commands) existed before replay, so this is a separate vsync/IOMFB problem.
+
 ### Next
-1. Make replay the default (drop the env gate) once its scope limits are documented, and add a synthetic contract test (VDM + vertex + TSW fixture → expected pixels).
+1. Investigate the intermittent render stall (IOMFB vsync enable path, display vblank IRQ timing; compare d1 and d2 of probe 61).
 2. Generalise beyond axis-aligned quads: transforms, texcoord sub-rects, A8 glyph textures, per-draw opacity, twiddled textures. Use frame dumps from later in boot (SpringBoard UI) to find what is missing.
 3. Fix the intermittent CommCenter baseband data abort (`0xf100f8`).
