@@ -444,3 +444,7 @@ df -h .
 - `backend/crash_batch.py`: N identical probes; counts backboardd respawns.
 - `display_probe.py`: `--qemu-arg` (e.g. `-icount`), `--user-va-hook name=0xVA` (absolute user breakpoints), `hidf_*` IOHIDServiceFilter capture; steps record x16/x19–x21/lr.
 - `VPHONE_AGX_HLE=0` switch in `s5l8960x.c`.
+
+### 180 s after the fix (`probe-66-fixed`)
+- Run a: no panic; 6,947 replayed frames with up to 56 draws each. The screen leaves the boot logo and shows a SpringBoard UI: a white background, a blue ⓘ button at the bottom right, black blocks at the top, and the text drawn as streaks (`a/screen.png`). It looks like the iOS 7 setup / "slide to set up" UI. Text and some elements are wrong because the replay does not yet handle A8 glyph textures, transforms or texcoord sub-rects (next step 2).
+- Run b: kernel panic `"SEP/OS failed to boot"` (caller `0xffffff8000d47a30`), not seen before. It is probably SEP-model boot timing and needs its own investigation.
