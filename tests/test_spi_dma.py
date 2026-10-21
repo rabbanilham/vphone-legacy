@@ -93,7 +93,7 @@ typedef struct A7Peripheral {
         harness += r'''
 struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
-    uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
+    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
     int64_t touch_start_ns, touch_duration_ns;
     bool touch_force;
     unsigned touch_step, touch_steps;
@@ -119,7 +119,7 @@ static int address_space_write(void *as, hwaddr a, int attrs, const void *b, siz
 }
 '''
         harness += extract('static void touch_gpio_update(', 'static const MemoryRegionOps gpio_ops')
-        harness += extract('static int spi_index(', 'static int i2c_index(')
+        harness += extract('static int spi_index(', '/* Recovered ABI: 10513ec')
         harness += extract('static bool ans_ram_range(', 'static bool ans_file_io(')
         harness += extract('static uint64_t sio_pack_msg(', 'static void sio_update_irq(')
         harness += r'''
