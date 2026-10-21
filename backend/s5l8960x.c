@@ -103,6 +103,15 @@ typedef struct A7SPI {
     A7Touch touch;
 } A7SPI;
 
+/* Dialog D2045: native 16-bit register space, not a silicon simulation. */
+typedef struct A7D2045 {
+    uint8_t regs[65536];
+    uint32_t rtc_base;
+    int64_t rtc_start_ns;
+    QEMUTimer *adc_timer;
+    bool irq_low;
+} A7D2045;
+
 typedef struct A7Peripheral {
     A7State *owner;
     const char *name;
@@ -112,6 +121,10 @@ typedef struct A7Peripheral {
     MemoryRegion mr;
     A7SPI spi;
     bool i2c_active, i2c_read;
+    uint16_t pmu_pointer;
+    unsigned pmu_prefix_count, pmu_rx_head, pmu_rx_count;
+    bool pmu_pointer_valid;
+    uint8_t pmu_rx[255];
     uint8_t i2c_address;
     uint8_t chestnut_pointer, i2c_rx_byte;
     bool chestnut_prefix, chestnut_pointer_valid, i2c_rx_valid;
@@ -262,6 +275,7 @@ struct A7State {
     /* Native Chestnut ABI subset: register 0x05 power control. Virtual board
      * starts with rails disabled; this is not a claim about silicon reset ROM. */
     uint8_t chestnut_control;
+    A7D2045 pmu;
     AnsMailbox ans;
     SioMailbox sio;
     SepMailbox sep;
@@ -628,6 +642,14 @@ static void touch_gpio_update(A7State *s)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 22));
     }
+    config = ldl_le_p(s->gpio_regs + 15 * 4);
+    group = (config >> 16) & 0xff;
+    type = config & 0xe;
+    if (group < 7 && ((type == 6 && s->pmu.irq_low) ||
+                      (type == 4 && !s->pmu.irq_low))) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 15));
+    }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
         for (unsigned w = 0; w < 7; w++) {
@@ -661,6 +683,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
         uint64_t val = 0;
         for (unsigned i = 0; i < size; i++) {
             uint8_t byte = s->gpio_regs[off + i];
+            if (off + i == 15 * 4) {
+                byte = (byte & ~1) | !s->pmu.irq_low;
+            }
             if (off + i == 22 * 4) {
                 byte = (byte & ~1) | !s->touch_irq_low;
             }
@@ -1335,6 +1360,120 @@ static void spi_write(A7Peripheral *p, hwaddr off, uint32_t value)
     spi_run(p);
 }
 
+/* Recovered ABI: 10513ec/105164c BE register prefix; 10532b0 reads
+ * 5c6..5cb, discarding two fractional bytes and decoding LE seconds.
+ * PMURTC 105cd38 adds the persistent LE offset at 4004..4007.
+ * Unspecified registers are writable storage, with zero reset values.
+ * Calibration and ADC samples below are explicit emulation choices. */
+static void d2045_update_irq(A7State *s)
+{
+    bool low = false;
+    for (unsigned i = 0; i < 12; i++) {
+        low |= (s->pmu.regs[0x50 + i] & ~s->pmu.regs[0x70 + i]) != 0;
+    }
+    uint32_t config = ldl_le_p(s->gpio_regs + 15 * 4);
+    unsigned group = (config >> 16) & 0xff, type = config & 0xe;
+    if (group < 7 && s->pmu.irq_low != low &&
+        (type == 0xc || (type == 0xa && low) || (type == 8 && !low))) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 15));
+    }
+    s->pmu.irq_low = low;
+    touch_gpio_update(s);
+}
+
+static uint32_t d2045_seconds(A7D2045 *d)
+{
+    return d->rtc_base +
+           (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - d->rtc_start_ns) / 1000000000;
+}
+
+static unsigned d2045_adc_sample(unsigned channel)
+{
+    /* 12-bit raw samples: nominal battery, NTC divider, die temperature.
+     * Exact analog scaling/calibration needs validation on the next boot. */
+    switch (channel) {
+    case 8: return 1061; /* die temperature, native fallback trim 0x425 */
+    case 0: case 4: return 2130; /* VCC_MAIN / VBAT: about 3.8 V */
+    case 2: case 7: return 2048; /* thermistor / divider: about 1.25 V */
+    case 11: case 12: case 13: case 14: return 432; /* tdev: about 25 C */
+    default: return 2048;
+    }
+}
+
+static void d2045_adc_done(void *opaque)
+{
+    A7State *s = opaque;
+    A7D2045 *d = &s->pmu;
+    unsigned sample = d2045_adc_sample(d->regs[0x500] & 0x1f);
+    d->regs[0x502] = sample & 0xf;
+    d->regs[0x503] = sample >> 4;
+    d->regs[0x500] &= ~0x80;
+    /* 105152c: event 91 is consumed internally and wakes ADC state 1 -> 2. */
+    d->regs[0x5b] |= 2;
+    d2045_update_irq(s);
+}
+
+static void d2045_reset(A7State *s)
+{
+    A7D2045 *d = &s->pmu;
+    const char *epoch = getenv("VPHONE_RTC_EPOCH");
+    char *end = NULL;
+    uint64_t seconds = time(NULL);
+    if (epoch) {
+        errno = 0;
+        unsigned long long parsed = strtoull(epoch, &end, 10);
+        if (!errno && epoch[0] >= '0' && epoch[0] <= '9' &&
+            end != epoch && !*end && parsed <= UINT32_MAX) {
+            seconds = parsed;
+        } else {
+            error_report("Invalid VPHONE_RTC_EPOCH '%s'; using host Unix time", epoch);
+        }
+    }
+    timer_del(d->adc_timer);
+    memset(d->regs, 0, sizeof(d->regs));
+    memset(d->regs + 0x70, 0xff, 12); /* all events masked */
+    /* Nondegenerate synthetic calibration endpoints, not hardware OTP IDs. */
+    d->regs[0x4a9] = 0x42;
+    d->regs[0x4aa] = 5;
+    d->regs[0x519] = 0x00; d->regs[0x51a] = 0x04;
+    d->regs[0x51b] = 0x0c; d->regs[0x51c] = 0x00;
+    d->regs[0x51d] = 0x00; d->regs[0x51e] = 0x04;
+    d->regs[0x51f] = 0x00; d->regs[0x520] = 0x0c;
+    d->rtc_base = seconds;
+    d->rtc_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    d->irq_low = false;
+}
+
+static void d2045_store(A7State *s, uint16_t reg, uint8_t value)
+{
+    A7D2045 *d = &s->pmu;
+    if (reg >= 0x5c8 && reg <= 0x5cb) {
+        uint32_t seconds = d2045_seconds(d);
+        unsigned shift = (reg - 0x5c8) * 8;
+        d->rtc_base = (seconds & ~(0xffu << shift)) | (uint32_t)value << shift;
+        d->rtc_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    if (reg >= 0x50 && reg < 0x5c) {
+        d->regs[reg] &= ~value; /* defensive W1C; normal driver uses read-clear */
+    } else {
+        d->regs[reg] = value;
+    }
+    if (reg == 0x500) {
+        if (value & 0x80) {
+            timer_mod(d->adc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+        } else {
+            timer_del(d->adc_timer);
+        }
+    } else if (reg == 0x541 && (value & 0x80)) {
+        unsigned sample = d2045_adc_sample(value & 0x3f);
+        d->regs[0x541] &= ~0x80;
+        d->regs[0x542] = sample & 0xf;
+        d->regs[0x543] = sample >> 4;
+    }
+    d2045_update_irq(s);
+}
+
 static int i2c_index(A7Peripheral *p)
 {
     if (p->base == UINT64_C(0x20a110000)) { return 0; }
@@ -1363,6 +1502,7 @@ static void i2c_nack(A7Peripheral *p)
 {
     p->i2c_active = false;
     p->i2c_rx_valid = false;
+    p->pmu_rx_head = p->pmu_rx_count = 0;
     stl_le_p(p->regs + 0x14, ldl_le_p(p->regs + 0x14) | 0x08200000);
 }
 
@@ -1422,6 +1562,73 @@ static void chestnut_command(A7Peripheral *p, uint32_t value)
     }
 }
 
+static bool i2c_is_d2045(A7Peripheral *p)
+{
+    return i2c_index(p) == 0 && p->i2c_address == 0x74;
+}
+
+static void d2045_command(A7Peripheral *p, uint32_t value)
+{
+    A7D2045 *d = &p->owner->pmu;
+    if (value & 0x100) {
+        p->pmu_rx_head = p->pmu_rx_count = 0;
+        if (!p->i2c_read) {
+            p->pmu_prefix_count = 0;
+            p->pmu_pointer_valid = false;
+            p->pmu_pointer = 0;
+        }
+    } else if (!p->i2c_active) {
+        return;
+    } else if (value & 0x400) {
+        unsigned count = value & 0xff;
+        if (!p->i2c_read || !p->pmu_pointer_valid || !count || p->pmu_rx_count) {
+            i2c_nack(p);
+            return;
+        }
+        /* Snapshot the counter once per burst, including across second rollover. */
+        uint32_t seconds = d2045_seconds(d);
+        uint16_t fraction = ((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                             d->rtc_start_ns) % 1000000000) * 65536 / 1000000000;
+        for (unsigned i = 0; i < count; i++) {
+            uint16_t reg = p->pmu_pointer++;
+            uint8_t byte = d->regs[reg];
+            if (reg >= 0x5c8 && reg <= 0x5cb) {
+                byte = seconds >> ((reg - 0x5c8) * 8);
+            } else if (reg == 0x5c6 || reg == 0x5c7) {
+                byte = fraction >> ((reg - 0x5c6) * 8);
+            }
+            p->pmu_rx[i] = byte;
+            if (reg >= 0x50 && reg < 0x5c) {
+                d->regs[reg] = 0; /* native handler has no explicit acknowledge */
+            }
+        }
+        p->pmu_rx_head = 0;
+        p->pmu_rx_count = count;
+        d2045_update_irq(p->owner);
+        stl_le_p(p->regs + 0x14, ldl_le_p(p->regs + 0x14) | (1u << 20));
+    } else if (!p->i2c_read) {
+        if (p->pmu_prefix_count < 2) {
+            p->pmu_pointer = (p->pmu_pointer << 8) | (value & 0xff);
+            p->pmu_pointer_valid = ++p->pmu_prefix_count == 2;
+        } else {
+            d2045_store(p->owner, p->pmu_pointer++, value);
+        }
+    } else {
+        i2c_nack(p);
+        return;
+    }
+    if (value & 0x200) {
+        p->i2c_active = false;
+        if (!p->i2c_read) {
+            if (!p->pmu_pointer_valid) {
+                i2c_nack(p);
+                return;
+            }
+            stl_le_p(p->regs + 0x14, ldl_le_p(p->regs + 0x14) | (1u << 27));
+        }
+    }
+}
+
 static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
 {
     switch (off) {
@@ -1430,7 +1637,9 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
             p->i2c_address = (value & 0xff) >> 1;
             p->i2c_read = value & 1;
             p->i2c_active = true;
-            if (!i2c_is_chestnut(p)) {
+            p->i2c_rx_valid = false;
+            p->pmu_rx_head = p->pmu_rx_count = 0;
+            if (!i2c_is_chestnut(p) && !i2c_is_d2045(p)) {
                 /* Other slave addresses retain the native NACK boundary. */
                 i2c_nack(p);
                 qemu_log_mask(LOG_UNIMP,
@@ -1440,6 +1649,8 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
         }
         if (i2c_is_chestnut(p)) {
             chestnut_command(p, value);
+        } else if (i2c_is_d2045(p)) {
+            d2045_command(p, value);
         } else if (value & 0x200) {
             p->i2c_active = false;
         }
@@ -1449,6 +1660,8 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
             p->i2c_active = false;
             p->i2c_rx_valid = false;
             p->chestnut_prefix = false;
+            p->pmu_rx_head = p->pmu_rx_count = p->pmu_prefix_count = 0;
+            p->pmu_pointer_valid = false;
             stl_le_p(p->regs + 0x14, 0);
             stl_le_p(p->regs + 0x18, 0);
             value &= ~0x80000000U;
@@ -1462,6 +1675,27 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
         stl_le_p(p->regs + off, value);
     }
     i2c_update(p);
+}
+
+static uint32_t i2c_read(A7Peripheral *p, hwaddr off)
+{
+    if (off == 4) {
+        if (p->pmu_rx_count) {
+            p->pmu_rx_count--;
+            return p->pmu_rx[p->pmu_rx_head++];
+        }
+        if (p->i2c_rx_valid) {
+            uint8_t byte = p->i2c_rx_byte;
+            p->i2c_rx_valid = false;
+            return byte;
+        }
+        return 0x100; /* Native RX FIFO empty flag. */
+    }
+    if (off == 8) {
+        return (p->pmu_rx_count + (p->i2c_rx_valid ? 1 : 0)) << 8;
+    }
+    if (off == 0x0c) { return 0; }
+    return ldl_le_p(p->regs + off);
 }
 
 static void ans_update_irq(A7State *s)
@@ -2992,16 +3226,7 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
             return spi_read(p, off);
         }
         if (i2c_index(p) >= 0 && size == 4) {
-            if (off == 4) {
-                if (p->i2c_rx_valid) {
-                    uint8_t byte = p->i2c_rx_byte;
-                    p->i2c_rx_valid = false;
-                    return byte;
-                }
-                return 0x100; /* Native RX FIFO empty flag. */
-            }
-            if (off == 8) { return p->i2c_rx_valid ? 0x100 : 0; }
-            if (off == 0x0c) { return 0; }
+            return i2c_read(p, off);
         }
         if (p->base == UINT64_C(0x201000000)) {
             if (off == 0x20) {
@@ -5144,6 +5369,9 @@ static void a7_reset(void *opaque)
     }
     for (int i = 0; i < NUM_PERIPHERALS; i++) {
         s->peripherals[i].i2c_active = false;
+        s->peripherals[i].pmu_rx_head = s->peripherals[i].pmu_rx_count = 0;
+        s->peripherals[i].pmu_prefix_count = 0;
+        s->peripherals[i].pmu_pointer_valid = false;
         memset(&s->peripherals[i].spi, 0, sizeof(s->peripherals[i].spi));
         s->peripherals[i].spi.touch.owner = s;
         s->peripherals[i].i2c_rx_valid = false;
@@ -5155,6 +5383,7 @@ static void a7_reset(void *opaque)
     }
     touch_script_reset(s);
     s->chestnut_control = 0;
+    d2045_reset(s);
     s->disp_token = 0;
     s->disp_pending_token = 0;
     s->disp_fifo_count = s->disp_fifo_expected = s->disp_fifo_token = 0;
@@ -5441,6 +5670,7 @@ static void a7_init(MachineState *ms)
     s->sep.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sep_irq_timer_cb, s);
     s->sep.os_active_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          sep_os_active_timer_cb, s);
+    s->pmu.adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d2045_adc_done, s);
     s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
     s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);

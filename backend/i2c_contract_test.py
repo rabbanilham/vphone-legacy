@@ -31,7 +31,7 @@ def fixture():
     # Preserve an unrelated software interrupt across peripheral updates/reset.
     write(aic + 0x4014, 1)
     write(aic + 0x4114, 1)  # Mask IRQ160 for deterministic event selection.
-    write(bus, 0x1e8)  # Native PMU write address: unmodeled, never ACK.
+    write(bus, 0x1ea)  # Unmatched 7-bit slave 0x75: never ACK.
     read(bus + 0x14, 0x08200000)
     read(aic + 0x4210, 0)  # Controller IRQ disabled.
     write(bus + 0x18, 0x08800040)
@@ -52,7 +52,7 @@ def fixture():
     write(bus + 0x14, 0x00200000)
     read(bus + 0x14, 0)
     read(aic + 0x4210, 0)
-    write(bus, 0x1e9)
+    write(bus, 0x1eb)
     write(bus, 0x601)  # Read command consumes request but produces no fake RX.
     read(bus + 4, 0x100)
     read(bus + 8, 0)
