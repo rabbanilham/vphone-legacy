@@ -273,23 +273,30 @@ int main(void) {
     unsetenv("VPHONE_TOUCH_SCRIPT"); touch_script_reset(&state);
     uint8_t start[16]={0xe4,0x70,1,2};
     stw_le_p(start+14,touch_sum(start,14));
-    pio(p,start,16,reply);
+    /* Disabled (0xe): the falling edge is not latched, and enabling a
+     * falling-edge pin while the line is already low latches nothing. */
+    stl_le_p(gpio+88,0x20e);pio(p,start,16,reply);
     assert(state.touch_irq_low && p->spi.touch.frame_count==1);
-    assert(!(state.device_irq[3] & (1u<<12))); /* disabled */
+    assert(!(state.device_irq[3] & (1u<<12)));
     stl_le_p(gpio+88,0x20a);touch_gpio_update(&state);
+    assert(!(state.device_irq[3] & (1u<<12)));
+    touch_gpio_level(&state,false);touch_gpio_level(&state,true);
     assert(state.device_irq[3] & (1u<<12));
     uint8_t query[16]={0xeb,1};
     pio(p,query,16,reply); assert(lduw_le_p(reply+1)==4);
     assert(lduw_le_p(reply+14)==touch_sum(reply,14));
     query[1]=2;pio(p,query,16,reply);assert(lduw_le_p(reply+1)==4);
     gpio_write(&state,0x800,1u<<22,4);
-    assert(gpio_read(&state,0x800,4)==(1u<<22)); /* active level re-latches */
+    /* Edge latch: W1C clears even while the line stays low (the GPIOIC
+     * rescan at ec9afc would otherwise never terminate). */
+    assert(gpio_read(&state,0x800,4)==0 && state.touch_irq_low);
+    assert(!(state.device_irq[3] & (1u<<12)));
     uint8_t fetch[64]={0xeb,2,1};
     stw_le_p(fetch+7,touch_sum(fetch,3));
     pio(p,fetch,9,reply);assert(!memcmp(reply+5,"\x60\x02",2));
     assert(!(touch_sum(reply,5)&255));
     assert(lduw_le_p(reply+7)==0x62 && !state.touch_irq_low);
-    /* Level must re-latch W1C until SPI consumption releases the line. */
+    /* After consumption the line is released; nothing re-latches. */
     gpio_write(&state,0x800,1u<<22,4);
     assert(gpio_read(&state,88,4)==0x20b);
     assert(!(state.device_irq[3] & (1u<<12)));
@@ -373,10 +380,14 @@ int main(void) {
     stl_le_p(gpio+0x800,0);stl_le_p(gpio+0x800+24,1);
     touch_gpio_update(&state);assert(state.device_irq[3]&(1u<<12));
     stl_le_p(gpio+0x800+24,0);touch_gpio_update(&state);
+    touch_gpio_level(&state,false);
     stl_le_p(gpio+88,0x20e);touch_gpio_level(&state,true);
     assert(!(state.device_irq[3]&(1u<<12)));
-    stl_le_p(gpio+88,0x20a);touch_gpio_update(&state);
-    assert(state.device_irq[3]&(1u<<12));
+    stl_le_p(gpio+88,0x20a);touch_gpio_level(&state,false);
+    touch_gpio_level(&state,true);assert(state.device_irq[3]&(1u<<12));
+    /* Level-low type 6 (flags bit0) latches whenever the line is low. */
+    stl_le_p(gpio+0x800,0);stl_le_p(gpio+88,0x206);touch_gpio_update(&state);
+    assert(gpio_read(&state,0x800,4)==(1u<<22));
     return 0;
 }
 '''

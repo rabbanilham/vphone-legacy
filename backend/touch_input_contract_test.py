@@ -63,10 +63,12 @@ def fixture(force=False):
     stop = bytearray([0xe4, 0x70, 1, 2]) + bytearray(12)
     struct.pack_into('<H', stop, 14, sum(stop[:14]))
     r = bytearray(16); r[0] = 0xe4; r[14] = 0xe4
-    transfer(stop, r)  # deferred unlock must preserve boot notification
-    record(GPIO + 88, 0)  # active low sample, no config yet
-    record(AIC + 0x2004, 0)  # no interrupt while disabled
+    # iOS enables falling-edge type 0xa long before the line asserts; the
+    # edge is latched once, so W1C clears it while the line stays low.
     write(GPIO + 88, 0x20a)
+    record(GPIO + 0x800, 0)
+    transfer(stop, r)  # 70=2 announces reset-complete
+    record(GPIO + 88, 0x20a)  # active low sample
     record(GPIO + 0x800, 1 << 22)
     record(AIC + 0x2004, 0x1006c)
     # Native event source disables type before workloop SPI reads.

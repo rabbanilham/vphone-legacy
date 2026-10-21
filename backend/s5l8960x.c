@@ -612,14 +612,19 @@ static void mmio_trace(const char *name, const char *op, hwaddr off, unsigned si
 /* GPIOIC ec99ec/ec9a0c: seven IRQ groups, each with seven 32-pin
  * status words. Group is config[23:16], NOT pin / 32 (DT #gpio-gcbs=7).
  * ec9c58 disables with type 0xe; ec9d60 enables with type 0xa for n53.
- * Bit zero is the sampled line, not an interrupt enable bit. */
+ * Bit zero is the sampled line, not an interrupt enable bit.
+ * ec9cd0..cec maps IOKit flags to types: bit0 (kIOInterruptTypeLevel)
+ * gives 6/4 (level low/high), else 0xa/8 (falling/rising edge); bit2
+ * gives 0xc (both edges). n53 touch has flags 0 => falling edge 0xa.
+ * Its handler never masks the pin, and ec9a28..b04 acks then rescans
+ * until pending clears, so a level latch here livelocks (probe 89). */
 static void touch_gpio_update(A7State *s)
 {
     uint32_t config = ldl_le_p(s->gpio_regs + 22 * 4);
     unsigned group = (config >> 16) & 0xff;
     unsigned type = config & 0xe;
-    if (group < 7 && ((type == 0xa && s->touch_irq_low) ||
-                      (type == 8 && !s->touch_irq_low))) {
+    if (group < 7 && ((type == 6 && s->touch_irq_low) ||
+                      (type == 4 && !s->touch_irq_low))) {
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 22));
     }
@@ -640,7 +645,7 @@ static void touch_gpio_level(A7State *s, bool low)
     uint32_t config = ldl_le_p(s->gpio_regs + 22 * 4);
     unsigned group = (config >> 16) & 0xff, type = config & 0xe;
     bool edge = s->touch_irq_low != low &&
-                (type == 0xc || (type == 6 && low) || (type == 4 && !low));
+                (type == 0xc || (type == 0xa && low) || (type == 8 && !low));
     if (group < 7 && edge) {
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 22));
@@ -1014,7 +1019,10 @@ static void touch_finish(A7Touch *t, unsigned len)
             lduw_le_p(b + len - 2) == touch_sum(b, 3)) {
             t->frame_head = (t->frame_head + 1) % ARRAY_SIZE(t->frames);
             t->frame_count--;
-            touch_gpio_level(t->owner, t->frame_count != 0);
+            /* Release after each read and re-assert for the next frame
+             * so every pending frame produces a fresh falling edge. */
+            touch_gpio_level(t->owner, false);
+            if (t->frame_count) { touch_gpio_level(t->owner, true); }
         }
         return;
     }
