@@ -453,3 +453,30 @@ df -h .
 - Cause: the SEP model sends OS-active (`ep0 op 0x0d`) 2 ms of virtual time after the AP pops the boot-finish reply. Virtual time follows host time, so when the kernel thread is delayed the message arrives before `AppleSEPManager` enters its booting state. The kernel logs `received OS Active message in unexpected state 2`, drops it, and later panics `"SEP/OS failed to boot"` (caller `0xffffff8000d47a30`; `probe-66-fixed/b`).
 - Fix (`sep_os_active_timer_cb`): after sending OS-active, the model resends it every 250 ms of virtual time, up to 8 times, until the AP sends any non-boot endpoint traffic (`ep != 0xff/0xfe`). That traffic only starts once the kernel has accepted OS-active.
 - Verified by forcing the race with `VPHONE_SEP_OSACTIVE_DELAY_NS=0` (test-only knob; `probe-67-sep-race` a/b): both runs hit "unexpected state 2", resent once, then logged `SEP booting` and `SEP/OS is alive`, with no panic. `sep_contract_test.py` still passes.
+
+
+---
+
+## 18. Replay extended for SpringBoard UI (Claude, 2026-10-21)
+
+### Recovered rules (verified on frame dumps `probe-68-ui-frames`, `probe-71-late-frames`, `probe-72-full-frames`)
+- **VDM_STATE size**: bit 28 → +1 word (cut index), bit 27 → +1 word (vertex PDS data), bit 26 → +3 words (vertex PDS code + 2 state words). `0x48002f84` carries data only. The old rule (2 + 2) desynchronised the stream and lost most draws.
+- **Fragment data**: PPP words `0x8xxxxxxx` → PDS heap (`0x6_0000_0000|w`) → up to four u64 pointers. Each points to blocks made of a sampler header (`00000fff 0000240x 0 0`), TSWs (`w0 >> 28 == 6`) and shader constants. Draws whose constants start with the Rec.709 luma weights (`0x3d93a000 0x3e59a000 0x3f372000`) are CA vibrancy/desaturation passes; the replay skips them, since painting them as solid quads produced the black blocks.
+- **TSW**: `w1 = (h-1)<<16 | (w-1)<<2`; `addr = ((q>>16) & 0x3ffffffff)<<2` with `q = w2 | w3<<32`.
+  - Linear textures (`w0 & 7 != 1`): **pitch (pixels − 1) is in `w2 & 0xffff`** (logo 129 px → 144; labels align8). This matches 50/51 textures by a row-continuity score.
+  - `w0 & 7 == 1`: a GPU-rendered IOSurface, with rows 64-pixel aligned in 16-row / 64 KiB strips like the display (`base + (y>>4)*0x10000 + (y&15)*pitch + x*4`).
+- **Vertices**: stride 20 = position + BGRA colour; 24 = position + normalised u,v; 28 = position + BGRA tint + u,v in texels (rectangle textures). The replay now uses vertex u,v (sub-rects) and tints.
+- **Pass dims**: type-1 `+0x70/+0x74` carry flags above the max y/x in bits [15:0] (e.g. `0x6000003f` / `0xa000025f` = 608×64).
+
+### Code
+- `backend/s5l8960x.c`: `agx_replay_texture` (multi-block TSW search, vibrancy skip), `agx_replay_decode_tsw`, `agx_texel_gva`, u,v/tint sampling, the VDM_STATE size fix, masked pass dims. **Only 640×1136 passes are replayed**: offscreen passes such as the 608×64 blur backdrops position screen-space geometry through vertex-shader uniforms that are not modelled yet.
+- `VPHONE_AGX_FRAME_DUMP_SKIP`, `_EVERY` and `_MIN_DRAWS` select which frames are dumped; `agx_vdm_draw_count` counts draws for `MIN_DRAWS`.
+- `backend/agx_replay_offline.py` mirrors the C rules.
+
+### Results
+- Offline replay of `probe-72-full-frames/frame-6` (an offscreen full-size pass SpringBoard renders) reproduces the **complete iOS 7 home screen**: icons, labels, dock, wallpaper, "9:41 AM" (`probe-72-full-frames/homescreen-offline.png`).
+- Live (`probe-73-ui`, 180 s × 2, no panic): the scanout shows the setup screen with a correct status bar ("Searching…", battery) and the ⓘ button, and no black blocks or streaks (`a/screen.png`). The setup greeting and the bottom "slide to set up" are still missing, because they go through vibrancy/blur shaders and 608×64 offscreen passes.
+
+### Next
+1. Recover the vertex-shader transform (uniforms reachable from the vertex PDS data) so offscreen passes can be replayed into their own coordinate space.
+2. Approximate the vibrancy passes (luma-weighted tint of the backdrop) instead of skipping them, so text drawn through them appears.

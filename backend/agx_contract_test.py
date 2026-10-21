@@ -162,7 +162,8 @@ def replay_blob():
     put(fragment, '<Q', state_gva + 0x400)
     texture_gva = state_gva + 0x500
     q = (texture_gva >> 2) << 16
-    put(state + 0x400, '<4I', 0, (2 - 1) << 16 | (4 - 1) << 2,
+    # w0 0x60008864: linear BGRA layout, as on the boot logo's real TSW.
+    put(state + 0x400, '<4I', 0x60008864, (2 - 1) << 16 | (4 - 1) << 2,
         q & 0xffffffff, q >> 32)
     for y in range(2):
         put(state + 0x500 + y * 64, '<4I', *REPLAY_TEXELS[y * 4:y * 4 + 4])
@@ -170,7 +171,8 @@ def replay_blob():
     put(QUEUE + 0x300 + 0x1bc, '<2I', 0x1080, 12)
     put(pds + 0x80, '<3I', 0, 0, state_gva + 0x600)
     put(state + 0x600, '<2I', (REPLAY_TARGET >> 2) & 0xffffffff, REPLAY_TARGET >> 34)
-    put(QUEUE + 0x370, '<2I', 4 - 1, 8 - 1)
+    # Full-screen pass (max y/x with flag bits above [15:0]); offscreen passes are not replayed.
+    put(QUEUE + 0x370, '<2I', 0x60000000 | (1136 - 1), 0xa0000000 | (640 - 1))
     return bytes(blob), target_pages
 
 
@@ -299,7 +301,7 @@ def run_case(fill, context=True, replay=None):
                         f'surface 0x{REPLAY_TARGET:x} pa 0x{target_pages[0]:x}') in trace, trace
             rt_gva = REPLAY_TARGET if replay is not None else RT_GVA
             rt_pa = target_pages[0] if replay is not None else RT_PA
-            dimensions = 'w 8 h 4' if replay is not None else 'w 3 h 2'
+            dimensions = 'w 640 h 1136' if replay is not None else 'w 3 h 2'
             expected_line = (f'AGX RT queue 0x{QUEUE_META:x} cmd 0x{QUEUE_META + 0x300:x} '
                              f'ch {CONTEXT_ID} rt0 gva 0x{rt_gva:x} pa 0x{rt_pa:x} '
                              f'fmt 0x20007fc {dimensions} load 0x2')

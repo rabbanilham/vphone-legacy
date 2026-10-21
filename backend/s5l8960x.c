@@ -179,6 +179,7 @@ struct A7State {
     uint32_t agx_last_ta_queue[16];
     bool agx_last_ta_valid[16];
     unsigned agx_frame_dump_count;
+    uint64_t agx_frame_dump_seen;     /* qualifying frames seen, for SKIP/EVERY */
     uint64_t agx_shared_gva;
     uint32_t agx_meta_alive_count;
     uint32_t agx_queues[32];
@@ -2975,6 +2976,32 @@ static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
  * commands, then {u64 GVA, u64 PA, u8 page[4096]} records. No filtering:
  * aliases and every valid PC/PD/PT mapping are retained, up to 96 MiB total.
  */
+static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n);
+
+/* Count index-list (draw) blocks in a TA command's VDM stream. */
+static unsigned agx_vdm_draw_count(A7State *s, uint64_t cat, const uint8_t *ta)
+{
+    uint64_t pc = ldq_le_p(ta + 0x68);
+    unsigned draws = 0;
+    for (unsigned guard = 0; guard < 4096; guard++) {
+        uint32_t w[2];
+        if (!agx_ctx_read(s, cat, pc, w, 8)) {
+            break;
+        }
+        switch (w[0] >> 29) {
+        case 6: return draws;
+        case 4: pc = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u); break;
+        case 2: pc += 4 * (1 + !!(w[0] & (1u << 28)) + !!(w[0] & (1u << 27)) +
+                           3 * !!(w[0] & (1u << 26))); break;
+        case 1: pc += 12; break;
+        case 0: pc += 8; break;
+        case 3: draws++; pc += 12; break;
+        default: return draws;
+        }
+    }
+    return draws;
+}
+
 static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
                            uint64_t target, uint32_t queue, const uint8_t *raw)
 {
@@ -3005,6 +3032,17 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
     }
     if (s->agx_frame_dump_count >= limit) {
         return;
+    }
+    {
+        /* SKIP leaves early boot frames out; EVERY spreads dumps over time. */
+        const char *skip_env = getenv("VPHONE_AGX_FRAME_DUMP_SKIP");
+        const char *every_env = getenv("VPHONE_AGX_FRAME_DUMP_EVERY");
+        uint64_t skip = skip_env ? strtoull(skip_env, NULL, 0) : 0;
+        uint64_t every = every_env ? MAX(strtoull(every_env, NULL, 0), 1) : 1;
+        uint64_t seen = ++s->agx_frame_dump_seen;
+        if (seen <= skip || (seen - skip - 1) % every) {
+            return;
+        }
     }
     number = ++s->agx_frame_dump_count;
     path = g_strdup_printf("%s/frame-%u.bin", dir, number);
@@ -3169,32 +3207,83 @@ static uint64_t agx_surface_gva(uint64_t base, unsigned x, unsigned y)
 typedef struct AGXTexture {
     uint64_t addr;
     uint32_t w, h, stride;
+    bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
 } AGXTexture;
 
-/* PPP words that point into the PDS heap reference fragment PDS data whose
- * first u64 points at the texture state words (TSW). */
-static bool agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
-                               unsigned n, AGXTexture *tex)
+enum { AGX_TEX_NONE, AGX_TEX_FOUND, AGX_TEX_SKIP };
+
+static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
+                                  AGXTexture *tex)
 {
-    for (unsigned i = 0; i < n; i++) {
-        uint64_t ptr;
-        uint32_t tsw[4];
-        if ((ppp[i] & 0xc0000000) != 0x80000000 ||
-            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], &ptr, 8) ||
-            !agx_ctx_read(s, cat, ptr, tsw, sizeof(tsw))) {
-            continue;
-        }
-        uint64_t q = tsw[2] | ((uint64_t)tsw[3] << 32);
-        hwaddr pa;
-        tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
-        tex->h = (tsw[1] >> 16) + 1;
-        tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
-        tex->stride = ((tex->w + 15) & ~15u) * 4;
-        if (tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa)) {
-            return true;
+    uint64_t q = tsw[2] | ((uint64_t)tsw[3] << 32);
+    hwaddr pa;
+
+    if (tsw[0] >> 28 != 6) {
+        return false;
+    }
+    tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
+    tex->h = (tsw[1] >> 16) + 1;
+    tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
+    /* Layout 1 marks GPU-rendered IOSurfaces (row pitch 64-pixel aligned,
+     * strip-mapped like the display); otherwise uploaded linear textures. */
+    tex->strip = (tsw[0] & 7) == 1;
+    if (tex->strip) {
+        tex->stride = ((tex->w + 63) & ~63u) * 4;
+    } else {
+        /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
+        tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
+        if (tex->stride < tex->w * 4) {
+            tex->stride = ((tex->w + 15) & ~15u) * 4;
         }
     }
-    return false;
+    return tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa);
+}
+
+/* PPP words that point into the PDS heap reference fragment PDS data: u64
+ * pointers to blocks holding sampler state, texture state words (TSW) and
+ * shader constants. Draws whose constants are the Rec.709 luma weights are
+ * CA vibrancy/desaturation passes, which the replay cannot express; skip
+ * them rather than painting an opaque quad. */
+static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
+                              unsigned n, AGXTexture *tex)
+{
+    static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
+    uint32_t blocks[4][12];
+    unsigned count = 0;
+
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t data[8];
+        if ((ppp[i] & 0xc0000000) != 0x80000000 ||
+            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], data, sizeof(data))) {
+            continue;
+        }
+        for (unsigned k = 0; k < 8 && count < ARRAY_SIZE(blocks); k += 2) {
+            uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
+            if (ptr >= 0x1000 && ptr < (UINT64_C(1) << 40) &&
+                agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
+                if (!memcmp(blocks[count], luma, sizeof(luma))) {
+                    return AGX_TEX_SKIP;
+                }
+                count++;
+            }
+        }
+    }
+    for (unsigned b = 0; b < count; b++) {
+        for (unsigned k = 0; k + 4 <= 12; k++) {
+            if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
+                return AGX_TEX_FOUND;
+            }
+        }
+    }
+    return AGX_TEX_NONE;
+}
+
+static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
+{
+    if (tex->strip) {
+        return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * 4;
+    }
+    return tex->addr + (uint64_t)y * tex->stride + x * 4;
 }
 
 static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
@@ -3233,8 +3322,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             pc = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u);
         } else if (kind == 2) {
-            unsigned extra = !!(w[0] & (1u << 28)) + 2 * !!(w[0] & (1u << 27)) +
-                             2 * !!(w[0] & (1u << 26));
+            /* bit 28: cut index; bit 27: vertex PDS data; bit 26: vertex PDS
+             * code plus two state words. */
+            unsigned extra = !!(w[0] & (1u << 28)) + !!(w[0] & (1u << 27)) +
+                             3 * !!(w[0] & (1u << 26));
             if ((w[0] & (1u << 27)) &&
                 agx_ctx_read(s, cat, pc + 4 + ((w[0] & (1u << 28)) ? 4 : 0), w + 1, 4)) {
                 vs_data = AGX_PDS_HEAP | w[1];
@@ -3277,16 +3368,42 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
                 miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
             }
+            /* Vertex layouts seen from CA: stride 20 = position + BGRA colour;
+             * 24 = position + normalised u,v; 28 = position + BGRA tint +
+             * u,v in texels. */
+            float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
+            uint32_t tint = 0xffffffff;
             if (stride == 20) {
                 agx_ctx_read(s, cat, buf + 16, &colour, 4);
+            } else if (stride == 24 || stride == 28) {
+                unsigned uv = stride == 28 ? 20 : 16;
+                u0 = v0 = 1e9; u1 = v1 = -1e9;
+                if (stride == 28) {
+                    agx_ctx_read(s, cat, buf + 16, &tint, 4);
+                }
+                for (unsigned i = 0; i < count; i++) {
+                    float t[2];
+                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride + uv, t, 8)) {
+                        break;
+                    }
+                    u0 = MIN(u0, t[0]); u1 = MAX(u1, t[0]);
+                    v0 = MIN(v0, t[1]); v1 = MAX(v1, t[1]);
+                }
             }
             int x0 = MAX(0, (int)minx), y0 = MAX(0, (int)miny);
             int x1 = MIN((int)width, (int)maxx), y1 = MIN((int)height, (int)maxy);
-            if (x0 >= x1 || y0 >= y1) {
+            if (x0 >= x1 || y0 >= y1 || !(u1 >= u0) || !(v1 >= v0)) {
                 continue;
             }
-            bool textured = agx_replay_texture(s, cat, ppp, ppp_count, &tex) &&
-                            tex.stride <= sizeof(texrow);
+            int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
+            if (found == AGX_TEX_SKIP || (found == AGX_TEX_NONE && stride != 20) ||
+                (found == AGX_TEX_FOUND && tex.w * 4 > sizeof(texrow))) {
+                continue;
+            }
+            bool textured = found == AGX_TEX_FOUND;
+            /* Texel-unit coordinates (rectangle textures) exceed 1. */
+            float su = textured && MAX(u1, v1) <= 1.0001f ? tex.w : 1;
+            float sv = textured && MAX(u1, v1) <= 1.0001f ? tex.h : 1;
             draws++;
             for (int y = y0; y < y1; y++) {
                 if (!textured) {
@@ -3295,16 +3412,25 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     continue;
                 }
-                uint32_t ty = MIN(tex.h - 1, (uint32_t)((y - y0) * tex.h / (y1 - y0)));
-                if (!agx_ctx_read(s, cat, tex.addr + (uint64_t)ty * tex.stride, texrow,
-                                  tex.w * 4) ||
+                float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
+                uint32_t ty = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty), texrow, tex.w * 4) ||
                     !agx_ctx_read(s, cat, agx_surface_gva(target, x0, y), row,
                                   (x1 - x0) * 4)) {
                     continue;
                 }
                 for (int x = x0; x < x1; x++) {
-                    uint32_t tx = MIN(tex.w - 1, (uint32_t)((x - x0) * tex.w / (x1 - x0)));
-                    uint32_t src = texrow[tx], dst = row[x - x0], a = src >> 24, out = 0;
+                    float fu = u0 + (u1 - u0) * (x - x0 + 0.5f) / (x1 - x0);
+                    uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                    uint32_t src = texrow[tx], dst = row[x - x0], out = 0;
+                    if (tint != 0xffffffff) {
+                        uint32_t m = 0;
+                        for (unsigned c = 0; c < 32; c += 8) {
+                            m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
+                        }
+                        src = m;
+                    }
+                    uint32_t a = src >> 24;
                     for (unsigned c = 0; c < 24; c += 8) {
                         uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
                         out |= MIN(v, 255u) << c;
@@ -3440,7 +3566,13 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
         }
     }
     if (context_id == 1 && context_cat && pbe_target && s->disp_mmu_table) {
-        agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
+        /* Optional: only dump frames with at least MIN_DRAWS draws (CA
+         * redraws only dirty regions, so most frames are small). */
+        const char *min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
+        if (!min_env || agx_vdm_draw_count(s, cat_base, s->agx_last_ta[context_id]) >=
+                        strtoul(min_env, NULL, 0)) {
+            agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
+        }
     }
     if (pbe_target) {
         static bool raw_logged;
@@ -3465,17 +3597,24 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                           (unsigned long long)pbe_target, pce, (unsigned long long)pde, line);
         }
     }
+    /* +0x70/+0x74 carry flags above the max x/y in bits [15:0]. */
+    uint32_t pass_w = (ldl_le_p(raw + 0x74) & 0xffff) + 1;
+    uint32_t pass_h = (ldl_le_p(raw + 0x70) & 0xffff) + 1;
+    /* Offscreen passes (e.g. 608x64 blur backdrops) position their screen-
+     * space geometry through vertex-shader uniforms the replay does not
+     * model yet; replaying them untransformed paints status-bar quads into
+     * the backdrop. Only full-screen passes are replayed for now. */
     if (pbe_target && context_cat && agx_replay_enabled() &&
+        pass_w == 640 && pass_h == 1136 &&
         context_id < ARRAY_SIZE(s->agx_last_ta) && s->agx_last_ta_queue[context_id]) {
-        agx_replay_frame(s, cat_base, s->agx_last_ta[context_id], pbe_target,
-                         (uint32_t)ldl_le_p(raw + 0x74) + 1, (uint32_t)ldl_le_p(raw + 0x70) + 1);
+        agx_replay_frame(s, cat_base, s->agx_last_ta[context_id], pbe_target, pass_w, pass_h);
     }
     /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
      * colour target comes from the end-of-tile PBE state when available. */
     uint64_t rt0 = pbe_target ? pbe_target : (uint32_t)ldl_le_p(raw + 0x68);
     uint32_t fmt = ldl_le_p(raw + 0x6c);
-    uint32_t w = ldl_le_p(raw + 0x74) + 1;
-    uint32_t h = ldl_le_p(raw + 0x70) + 1;
+    uint32_t w = (ldl_le_p(raw + 0x74) & 0xffff) + 1;
+    uint32_t h = (ldl_le_p(raw + 0x70) & 0xffff) + 1;
     mapped = agx_gpu_translate_ctx(s, cat_base, rt0, &pa);
     last_mapped = agx_gpu_translate_ctx(s, cat_base, rt0 + 0x2c5000, &last_pa);
     if (!mapped && cat_base) {
@@ -3946,6 +4085,7 @@ static void a7_reset(void *opaque)
     memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
     memset(s->agx_last_ta_valid, 0, sizeof(s->agx_last_ta_valid));
     s->agx_frame_dump_count = 0;
+    s->agx_frame_dump_seen = 0;
     s->agx_shared_gva = 0;
     s->agx_queue_count = 0;
     s->agx_pending_doorbells = 0;

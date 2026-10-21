@@ -37,7 +37,7 @@ while n < limit:
         n += 1
         continue
     if top == 2:
-        extra = (1 if w0 & (1 << 28) else 0) + (2 if w0 & (1 << 27) else 0) + (2 if w0 & (1 << 26) else 0)
+        extra = (1 if w0 & (1 << 28) else 0) + (1 if w0 & (1 << 27) else 0) + (3 if w0 & (1 << 26) else 0)
         words = [f.u32(pc + 4 * i) for i in range(1 + extra)]
         print(f'{pc:#x}: VDM_STATE ' + ' '.join(f'{x:#x}' for x in words))
         pc += 4 * (1 + extra)
