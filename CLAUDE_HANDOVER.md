@@ -409,6 +409,11 @@ df -h .
   - Plugin instances look sane right up to the last Release (refcount 2 → 0, valid vtable and factoryID).
   - Clean runs create 288 filters for 21 services by about 54 s. h1's pid 17 died at about 39 s after 75 creates, in the middle of enumeration.
 - Symbolised crash A: `objc_msgSend` ← `_CFNumberGetValue+0x134` ← CompassPlugIn ← `Release` ← `CFRelease` ← `_IOHIDServiceFilterCreate+0x2b4` ← `__IOHIDServiceCreate(Virtual)` ← `_IOHIDEventSystemCreate`. CompassPlugIn only calls `CFNumberGetValue` in `setPropertyForClient` (`+0x3b84`), and crash B is in `setMagnetometerUpdateInterval`, so plugin methods run on a just-released or corrupted object. The bad isa values (`0x1_5f67_bea8`, `0x1_37cb_bea8`, `0x1_fd65_bea8`) keep the low 16 bits and corrupt bits 16–31, which looks like partial heap corruption.
+- **Statistical bisect (2026-10-21, `bisect/`, `backend/crash_batch.py`, 6 runs × 75 s per configuration):**
+  - baseline: 2/6 crash. `VPHONE_AGX_HLE=0` (new switch: META stays silent, no AGX guest-RAM writes): 2/6, one of them a 5× crash loop. **The AGX HLE is not the cause.**
+  - Shared-cache slide against crash across ~80 historical runs: no correlation. Crashes go back to native-keybag probe 15, so the failure rate is about 50 % and long-standing.
+  - Hooks on `__IOHIDEventSystemAddService` (`0x1825ba758`), `__IOHIDEventSystemRemoveService` (`0x1825ba944`) and `_IOHIDSessionRemoveService` (`0x1825c345c`): never hit in 6 runs (1 crash, r4, after 51 filter creates). There is no evidence of HID service removal during enumeration.
+- Remaining hypotheses: (1) a race between backboardd threads that the emulator's much slower HID enumeration (≈20 s versus milliseconds on hardware) makes likely; (2) guest-RAM writes by the SEP mailbox / SIO AES models; (3) a CPU/MMU emulation bug. A deterministic `-icount` run that reproduces the crash would allow watchpoints on the corrupted object.
 - Next: (a) hook the remaining IOKit filter call sites (`_IOHIDServiceFilterOpen` `0x1825e05cc`, `_IOHIDServiceFilterSetPropertyForClient`, `_IOHIDServiceFilterMatch` `0x1825e0270`) to catch the exact call that enters the plugin on the bad object; (b) bisect emulator writes to guest RAM statistically (AGX stamp/ring/replay writes, SEP mailbox, ANS DMA) with batches of 6+ runs per configuration, since the failure rate is about 30–50 %.
 
 ### Next

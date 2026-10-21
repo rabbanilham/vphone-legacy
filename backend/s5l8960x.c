@@ -3768,9 +3768,14 @@ static void agx_sequencer_run(A7Peripheral *p)
         }
     }
     if (meta_boot && cat_base) {
+        /* VPHONE_AGX_HLE=0 leaves META silent (no alive, no queue service,
+         * no guest RAM writes), for A/B comparisons against the HLE. */
+        const char *hle = getenv("VPHONE_AGX_HLE");
         s->agx_cat_base = cat_base;
         s->agx_shared_gva = 0;
-        timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        if (!hle || strcmp(hle, "0")) {
+            timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        }
     }
 }
 
