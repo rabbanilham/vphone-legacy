@@ -44,7 +44,10 @@ def fixture():
     def segments(handle, entries):
         write(TABLE + handle * 12 + 20, len(entries))
         for i, (address, length) in enumerate(entries):
-            write(TABLE + (handle + 2 + i) * 12, address, True)
+            # 12-byte stride: odd entries are only 4-aligned, and an
+            # unaligned 64-bit store faults with the MMU off.
+            write(TABLE + (handle + 2 + i) * 12, address & 0xffffffff)
+            write(TABLE + (handle + 2 + i) * 12 + 4, address >> 32)
             write(TABLE + (handle + 2 + i) * 12 + 8, length)
 
     send(0, 1, 3, 1, TABLE >> 12)
