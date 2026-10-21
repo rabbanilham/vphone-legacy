@@ -517,6 +517,34 @@ static const MemoryRegionOps pmgr_ext_ops = {
     .valid.min_access_size = 1, .valid.max_access_size = 8,
 };
 
+/* VPHONE_TRACE_MMIO=a7.spi1,a7.gpio,... logs every access to the named
+ * regions (bring-up aid for unmodelled devices). */
+static bool mmio_trace_wanted(const char *name)
+{
+    static char *list;
+    static bool parsed;
+    if (!parsed) {
+        const char *env = getenv("VPHONE_TRACE_MMIO");
+        list = env ? g_strdup_printf(",%s,", env) : NULL;
+        parsed = true;
+    }
+    if (!list) {
+        return false;
+    }
+    g_autofree char *needle = g_strdup_printf(",%s,", name);
+    return strstr(list, needle) != NULL;
+}
+
+static void mmio_trace(const char *name, const char *op, hwaddr off, unsigned size, uint64_t val)
+{
+    if (mmio_trace_wanted(name)) {
+        CPUState *cpu = current_cpu;
+        qemu_log_mask(LOG_UNIMP, "MMIO %s %s off=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64
+                      " pc=0x%" PRIx64 " ns=%" PRId64 "\n", name, op, off, size, val,
+                      cpu ? cpu->cc->get_pc(cpu) : 0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+}
+
 static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
 {
     A7State *s = opaque;
@@ -548,6 +576,7 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
             }
             val |= (uint64_t)byte << (i * 8);
         }
+        mmio_trace("a7.gpio", "read", off, size, val);
         return val;
     }
     qemu_log_mask(LOG_UNIMP, "A7 GPIO out-of-bounds read 0x%" HWADDR_PRIx "\n", off);
@@ -557,6 +586,7 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
 static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     A7State *s = opaque;
+    mmio_trace("a7.gpio", "write", off, size, val);
     if (off + size <= GPIO_SIZE) {
         for (unsigned i = 0; i < size; i++) {
             s->gpio_regs[off + i] = (val >> (i * 8)) & 0xff;
@@ -4115,8 +4145,10 @@ static void agx_sequencer_run(A7Peripheral *p)
 
 static uint64_t peripheral_read(void *opaque, hwaddr off, unsigned size)
 {
+    A7Peripheral *p = opaque;
     uint64_t val = peripheral_read_impl(opaque, off, size);
     display_mmio_trace(opaque, "read", off, size, val);
+    mmio_trace(p->name, "read", off, size, val);
     return val;
 }
 
@@ -4124,6 +4156,7 @@ static void peripheral_write(void *opaque, hwaddr off, uint64_t val, unsigned si
 {
     A7Peripheral *p = opaque;
     display_mmio_trace(opaque, "write", off, size, val);
+    mmio_trace(p->name, "write", off, size, val);
     peripheral_write_impl(opaque, off, val, size);
     if (p->base == UINT64_C(0x201e00000) && off == 0x1000 && (val & 1)) {
         agx_sequencer_run(p);
