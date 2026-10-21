@@ -130,11 +130,16 @@ def decode_tsw(f, tsw):
     addr = ((q >> 16) & 0x3ffffffff) << 2
     if not addr or (addr & ~0xfff) not in f.pages:
         return None
-    strip = (tsw[0] & 7) == 1
-    # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0];
-    # GPU-rendered surfaces use 64-pixel aligned rows in 16-row strips.
-    pitch = ((tsw[2] & 0xffff) + 1) * 4
-    stride = ((w + 63) & ~63) * 4 if strip else (pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4)
+    # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
+    # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
+    # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
+    strip = False
+    if (tsw[0] & 7) == 1:
+        strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
+        stride = 2560 if strip else ((w + 15) & ~15) * 4
+    else:
+        pitch = ((tsw[2] & 0xffff) + 1) * 4
+        stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
     return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, tsw=tsw)
 
 

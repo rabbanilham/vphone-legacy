@@ -3221,11 +3221,32 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
     return true;
 }
 
-/* Display surfaces are linear 2560-byte rows in physical memory; the GPU
- * maps each 16-row strip (40 KiB) at a 64 KiB-aligned GVA. */
-static uint64_t agx_surface_gva(uint64_t base, unsigned x, unsigned y)
+/* GPU-rendered surface layout. Display surfaces are linear 2560-byte rows in
+ * physical memory, mapped as 16-row strips (40 KiB) at 64 KiB-aligned GVAs,
+ * which leaves an unmapped hole at base + 0xa000. Other render targets
+ * (offscreen layers) are mapped densely with a 16-pixel aligned pitch. */
+typedef struct AGXSurface {
+    uint64_t base;
+    uint32_t pitch;
+    bool strip;
+} AGXSurface;
+
+static void agx_surface_layout(A7State *s, uint64_t cat, uint64_t base, uint32_t w,
+                               AGXSurface *out)
 {
-    return base + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * 2560 + x * 4;
+    hwaddr pa;
+    out->base = base;
+    out->strip = agx_gpu_translate_ctx(s, cat, base + 0x9000, &pa) &&
+                 !agx_gpu_translate_ctx(s, cat, base + 0xa000, &pa);
+    out->pitch = out->strip ? 2560 : ((w + 15) & ~15u) * 4;
+}
+
+static uint64_t agx_surface_gva(const AGXSurface *sf, unsigned x, unsigned y)
+{
+    if (sf->strip) {
+        return sf->base + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * sf->pitch + x * 4;
+    }
+    return sf->base + (uint64_t)y * sf->pitch + x * 4;
 }
 
 typedef struct AGXTexture {
@@ -3248,11 +3269,14 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
-    /* Layout 1 marks GPU-rendered IOSurfaces (row pitch 64-pixel aligned,
-     * strip-mapped like the display); otherwise uploaded linear textures. */
-    tex->strip = (tsw[0] & 7) == 1;
-    if (tex->strip) {
-        tex->stride = ((tex->w + 63) & ~63u) * 4;
+    /* Layout 1 marks GPU-rendered surfaces (agx_surface_layout); otherwise
+     * uploaded linear textures. */
+    tex->strip = false;
+    if ((tsw[0] & 7) == 1) {
+        AGXSurface sf;
+        agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
+        tex->strip = sf.strip;
+        tex->stride = sf.pitch;
     } else {
         /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
         tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
@@ -3362,7 +3386,7 @@ static uint64_t agx_replay_program(A7State *s, uint64_t cat, const uint32_t *ppp
     return h;
 }
 
-static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
+static void agx_replay_put(A7State *s, uint64_t cat, const AGXSurface *target,
                            unsigned x, unsigned y, uint32_t bgra)
 {
     hwaddr pa;
@@ -3429,6 +3453,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
     width = MIN(width, 640u);
     height = MIN(height, 1136u);
+    AGXSurface sf;
+    agx_surface_layout(s, cat, target, width, &sf);
     /* Default viewport covers the pass; PPP state updates it. */
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
     for (unsigned guard = 0; guard < 4096; guard++) {
@@ -3541,12 +3567,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             draws++;
             for (int y = y0; y < y1; y++) {
                 if (!textured) {
-                    if (!agx_ctx_read(s, cat, agx_surface_gva(target, x0, y), row,
+                    if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
                                       (x1 - x0) * 4)) {
                         continue;
                     }
                     for (int x = x0; x < x1; x++) {
-                        agx_replay_put(s, cat, target, x, y,
+                        agx_replay_put(s, cat, &sf, x, y,
                                        agx_blend_over(row[x - x0], colour));
                     }
                     continue;
@@ -3554,7 +3580,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
                 uint32_t ty = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
                 if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty), texrow, tex.w * 4) ||
-                    !agx_ctx_read(s, cat, agx_surface_gva(target, x0, y), row,
+                    !agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
                                   (x1 - x0) * 4)) {
                     continue;
                 }
@@ -3582,7 +3608,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                 }
                 for (int x = x0; x < x1; x++) {
-                    agx_replay_put(s, cat, target, x, y, row[x - x0]);
+                    agx_replay_put(s, cat, &sf, x, y, row[x - x0]);
                 }
             }
         } else {
