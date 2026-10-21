@@ -244,4 +244,55 @@ class ProbeStateTests(unittest.TestCase):
         self.assertEqual(len(rsp_log), 2)
         self.assertTrue(all(v['exe'] and v['process'] == 'SpringBoard' for v in verified))
 
+    def test_touch_runloop_hooks_schema_and_contents(self):
+        path = Path(__file__).resolve().parent.parent / 'backend' / 'touch_runloop_hooks.json'
+        self.assertTrue(path.exists(), 'backend/touch_runloop_hooks.json must exist')
+        data = json.loads(path.read_text())
+        self.assertIn('symbols', data)
+        self.assertIn('exe_hooks', data)
+        self.assertIn('backboardd', data['exe_hooks'])
+        self.assertIn('suggested_hook_dumps', data)
+        self.assertIn('notes', data)
+
+        # Check safe run loop investigation symbols
+        safe_syms = {
+            'cf_runloop_run_specific': '0x181599c0c',
+            'cf_runloop_run': '0x1816587b0',
+            'cf_runloop_add_source': '0x1815da808',
+            'cf_mach_port_create_source': '0x1815da548',
+            'hid_client_schedule_runloop': '0x1825bbafc',
+            'hid_client_unschedule_runloop': '0x1825bc490',
+            'bks_register_callback_schedule': '0x185cdd824',
+            'bks_register_callback_post_schedule': '0x185cdd82c',
+            'hid_data_queue_enqueue_tail': '0x18259df50',
+            'hid_data_queue_notify': '0x18259e0c4',
+            'hid_data_queue_notify_ret': '0x18259e118',
+        }
+        for name, addr in safe_syms.items():
+            self.assertIn(name, data['symbols'])
+            self.assertEqual(data['symbols'][name], addr)
+
+        # Ensure unsafe hooks that stalled probe 105/106 are EXCLUDED
+        for unsafe_sym in (
+            'cf_mach_port_perform',
+            'hid_server_create_queue',
+            'hid_server_start_queue',
+            'hid_server_stop_queue',
+            'hid_queue_set_notify_port',
+            'hid_data_queue_set_port',
+        ):
+            self.assertNotIn(unsafe_sym, data['symbols'])
+
+        # Check suggested hook dumps
+        dumps = data['suggested_hook_dumps']
+        self.assertIn('cf_runloop_run_specific', dumps)
+        self.assertIn('x1:32', dumps['cf_runloop_run_specific'])
+        self.assertIn('cf_runloop_add_source', dumps)
+        self.assertIn('x1:176', dumps['cf_runloop_add_source'])
+        self.assertIn('x2:32', dumps['cf_runloop_add_source'])
+        self.assertIn('hid_client_schedule_runloop', dumps)
+        self.assertIn('x0:256', dumps['hid_client_schedule_runloop'])
+        self.assertIn('bks_register_callback_post_schedule', dumps)
+        self.assertIn('x20:256', dumps['bks_register_callback_post_schedule'])
+
 if __name__=='__main__':unittest.main()
