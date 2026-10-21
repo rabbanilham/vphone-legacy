@@ -72,10 +72,11 @@ typedef struct A7Bridge {
  * +04 bit7, TX-ready bit8, RX-count-done bit21 / status bit22. The driver
  * doesn't decode these cause bits, so the mapping beyond FIFO fields is
  * an emulation assumption, not proof from a hardware manual.
- * Shifting is synchronous with backpressure, not timed; DMA is excluded.
+ * Shifting is synchronous with backpressure, not timed. SmartIO DMA below
+ * consumes the same slave byte stream when mode bit6 is selected.
  */
 #define SPI_FIFO_SIZE 16
-#define SPI_PACKET_SIZE 512
+#define SPI_PACKET_SIZE 0x10010
 
 typedef struct A7Touch {
     uint8_t tx[SPI_PACKET_SIZE], reply[SPI_PACKET_SIZE];
@@ -83,6 +84,11 @@ typedef struct A7Touch {
     unsigned memory_count;
     bool read_pending;
     uint8_t mode, ack_status;
+    uint16_t boot_status;
+    uint32_t firmware_bytes, firmware_checksum;
+    uint8_t firmware[SPI_PACKET_SIZE];
+    uint32_t firmware_length; /* latest accepted image/block, bounded */
+    bool booted;
 } A7Touch;
 
 typedef struct A7SPI {
@@ -124,6 +130,12 @@ typedef struct AnsMailbox {
     uint64_t asp_cmd_phys;
 } AnsMailbox;
 
+typedef struct SioDMA {
+    uint32_t handle, length;
+    uint8_t tag;
+    bool configured, active;
+} SioDMA;
+
 typedef struct SioMailbox {
     uint32_t inbox_ctrl;
     uint32_t inbox_int_en;
@@ -141,6 +153,7 @@ typedef struct SioMailbox {
     uint32_t params[256];
     uint64_t dma_seg_phys;
     uint32_t dma_seg_count;
+    SioDMA spi_dma[2]; /* DeviceTree SPI1 endpoints 22 TX / 23 RX */
     uint64_t aes_op_phys;
     uint32_t aes_op_count;
     uint64_t disabled_keys;
@@ -719,8 +732,8 @@ static int spi_index(A7Peripheral *p)
  * f88d0c..9c (D3 endian/rows/cols/BE bcd), f88fc0 (D9 two LE u32).
  * Firmware caveat: deviceHasFirmware f8a05c reads guest object+c1;
  * f86d10..20 sets it after loader success. There is no SPI firmware-query
- * opcode, and C9's claimed upload bypass is unverified. Returning the
- * accepted 4ad1 token does not itself set that cached flag.
+ * opcode. The loader below accepts the wire image and boot commands;
+ * the native timer sets the cached flag only after loader success.
  * N1 uses E2 for interface info (f9065c: version RX[2], LE max RX[3:5]),
  * E3 for metadata (f908c8: error RX[2], LE length RX[3:5]), E6/E7 for
  * data (f90de4/f9106c: payload RX[3..], excluding report ID).
@@ -734,6 +747,8 @@ static const struct {
     { 0xd9, 8, { 0x80, 0x02, 0, 0, 0x70, 0x04, 0, 0 } },
     { 0xd7, 1, { 0 } },
     { 0xab, 1, { 0 } },
+    /* f88ee8..f88f2c copies A1 to Sensor Region Param; no decode here. */
+    { 0xa1, 1, { 0 } },
 };
 
 static const uint8_t *touch_report(A7Touch *t, uint8_t id, unsigned *len)
@@ -777,7 +792,53 @@ static uint32_t touch_memory_read(A7Touch *t, uint32_t address)
 static void touch_finish(A7Touch *t, unsigned len)
 {
     uint8_t *b = t->tx;
-    if (len == 8 && b[0] == 0x1c && b[1] == 0x73 &&
+    /* HBPP raw boot image f9232c and framed firmware f925b0/f928e4.
+     * Retain the latest wire image and accounting; no firmware execution.
+     * Frame: 18 e1, 30 01, length/4 BE, address in BE low half first,
+     * header sum BE, word-swapped data, u32 sum in the same half order.
+     */
+    if (len > 512 || (len >= 16 && b[0] == 0x18 &&
+                      b[1] == 0xe1 && b[2] == 0x30 && b[3] == 1)) {
+        bool framed = b[0] == 0x18 && b[1] == 0xe1 &&
+                      b[2] == 0x30 && b[3] == 1;
+        bool valid = true;
+        unsigned payload = len;
+        uint32_t sum = 0;
+        bool idle = true;
+        for (unsigned i = 0; i < len; i++) {
+            sum += b[i];
+            idle = idle && b[i] == 0xff;
+        }
+        if (!framed && idle) { return; } /* RX-only dummy clocks */
+        if (framed) {
+            payload = (unsigned)lduw_be_p(b + 4) * 4;
+            valid = payload <= len - 16 &&
+                    touch_sum(b + 4, 6) == lduw_be_p(b + 10);
+            sum = 0;
+            if (valid) {
+                for (unsigned i = 0; i < payload; i++) { sum += b[12 + i]; }
+                valid = sum == touch_word(b + 12 + payload);
+            }
+        }
+        t->boot_status = valid ? 0x4bc1 : 0xdead;
+        if (valid) {
+            memcpy(t->firmware, b + (framed ? 12 : 0), payload);
+            t->firmware_length = payload;
+            t->firmware_bytes += payload;
+            t->firmware_checksum += sum;
+        }
+    } else if (len == 12 && b[0] == 0x1d && b[1] == 0x53 &&
+               t->firmware_bytes &&
+               touch_sum(b + 2, 8) == lduw_be_p(b + 10)) {
+        /* f92e6c..f92f30: final execute address/argument command. */
+        t->booted = true;
+        t->boot_status = 0;
+    } else if (len == 2 && b[0] == 0x1f && b[1] == 1 &&
+               t->firmware_bytes) {
+        /* f92220/f9402c: execute, then status helper and E2. */
+        t->booted = true;
+        t->boot_status = 0;
+    } else if (len == 8 && b[0] == 0x1c && b[1] == 0x73 &&
         touch_sum(b + 2, 4) == lduw_be_p(b + 6)) {
         t->read_value = touch_memory_read(t, touch_word(b + 2));
         t->read_pending = true;
@@ -825,6 +886,10 @@ static uint8_t touch_shift(A7Touch *t, unsigned pos, unsigned total, uint8_t tx)
         if (tx == 0x1a) {
             static const uint8_t sync[] = { 0x4a, 0xd1, 0x4a, 0xd1 };
             memcpy(r, sync, sizeof(sync));
+            if (total == 2 && t->boot_status) {
+                stw_be_p(r, t->boot_status);
+                t->boot_status = 0; /* one upload receipt; memory ops use 4ad1 */
+            }
             if (t->read_pending && total == 8) {
                 uint32_t v = t->read_value;
                 r[2] = v >> 8; r[3] = v;
@@ -903,9 +968,16 @@ static void spi_update(A7Peripheral *p)
     aic_update(p->owner);
 }
 
+static void sio_spi_dma_run(A7Peripheral *p);
+
 static void spi_run(A7Peripheral *p)
 {
     A7SPI *spi = &p->spi;
+    if (spi_index(p) == 0 && (ldl_le_p(p->regs + 4) & 0x40)) {
+        sio_spi_dma_run(p);
+        spi_update(p);
+        return;
+    }
     /* PIO enable + channel enable. SPI2/3 have an unconnected MISO line.
      * GPIO CS0 selection is performed by the guest; no GPIO IRQ modeled. */
     if (!(ldl_le_p(p->regs) & 1) ||
@@ -1720,6 +1792,8 @@ static void sio_outbox_push(A7State *s, uint64_t msg)
     }
 }
 
+static void sio_spi_dma_kick(A7State *s);
+
 static uint64_t sio_outbox_pop(A7State *s)
 {
     if (s->sio.outbox_count == 0) {
@@ -1735,7 +1809,123 @@ static uint64_t sio_outbox_pop(A7State *s)
     qemu_log_mask(LOG_UNIMP, "SIO outbox popped 0x%" PRIx64 " (remaining=%u)\n",
                   msg, s->sio.outbox_count);
     sio_update_irq(s);
+    sio_spi_dma_kick(s);
     return msg;
+}
+
+/* SmartIODMA: 91d558/91d5cc use handle*12 and (handle+2)*12.
+ * 91dff4 stores segment count at header+20. 91ed74 emits packed
+ * {u64 physical, u32 bytes}. Every descriptor and payload is RAM-only.
+ * Bound work per request and validate the entire list before any bus byte
+ * or guest write, including segments beyond the controller count.
+ */
+#define SIO_SPI_DMA_LIMIT MiB
+
+static bool sio_spi_dma_list(A7State *s, SioDMA *dma, uint8_t *buffer,
+                             bool receive)
+{
+    uint8_t header[24], segments[0x8000];
+    uint64_t table = s->sio.dma_seg_phys;
+    uint32_t capacity = s->sio.dma_seg_count;
+    uint32_t count, total = 0;
+    if (!table || capacity > 0xaaa || dma->handle >= capacity ||
+        capacity - dma->handle < 2 ||
+        !ans_read_ram(table + (uint64_t)dma->handle * 12,
+                      header, sizeof(header))) {
+        return false;
+    }
+    count = ldl_le_p(header + 20);
+    if (!count || count > capacity - dma->handle - 2) { return false; }
+    if (!ans_read_ram(table + ((uint64_t)dma->handle + 2) * 12,
+                      segments, (size_t)count * 12)) { return false; }
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *segment = segments + i * 12;
+        uint64_t address = ldq_le_p(segment);
+        uint32_t length = ldl_le_p(segment + 8);
+        if (!length || length > SIO_SPI_DMA_LIMIT - total ||
+            !ans_ram_range(address, length)) { return false; }
+        total += length;
+    }
+    if (!buffer) { dma->length = total; return true; }
+    if (total != dma->length) { return false; }
+    total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *segment = segments + i * 12;
+        uint64_t address = ldq_le_p(segment);
+        uint32_t length = ldl_le_p(segment + 8);
+        bool ok = receive ? ans_write_ram(address, buffer + total, length) :
+                            ans_read_ram(address, buffer + total, length);
+        if (!ok) { return false; }
+        total += length;
+    }
+    return true;
+}
+
+static void sio_spi_dma_complete(A7State *s, unsigned channel, bool ok)
+{
+    SioDMA *dma = &s->sio.spi_dma[channel];
+    /* 91eee0..ef94: 68, param bit7, original tag, exact byte count.
+     * 91db4c also consumes bit6 as channel idle (stop waiter).
+     * Short count is reported as IOReturn underrun by the native client.
+     */
+    qemu_log_mask(LOG_UNIMP,
+                  "SPI1 DMA EP=%u tag=%u bytes=%u complete=%s\n",
+                  22 + channel, dma->tag, dma->length, ok ? "ok" : "short");
+    dma->active = false;
+    sio_outbox_push(s, sio_pack_msg(22 + channel, dma->tag, 0x68,
+                                   0xc0, ok ? dma->length : 0));
+}
+
+static void sio_spi_dma_run(A7Peripheral *p)
+{
+    A7State *s = p->owner;
+    A7SPI *spi = &p->spi;
+    SioDMA *tx = &s->sio.spi_dma[0], *rx = &s->sio.spi_dma[1];
+    uint32_t clocks = MAX(ldl_le_p(p->regs + 0x34),
+                          ldl_le_p(p->regs + 0x4c));
+    unsigned completions = tx->active + rx->active;
+    if (!(ldl_le_p(p->regs) & 1) || !completions || !clocks ||
+        spi->shifted || s->sio.outbox_count > SIO_OUTBOX_CAPACITY - completions) {
+        return;
+    }
+    bool ok = clocks <= SIO_SPI_DMA_LIMIT && clocks <= SPI_PACKET_SIZE;
+    if (tx->active) { ok = sio_spi_dma_list(s, tx, NULL, false) && ok; }
+    if (rx->active) { ok = sio_spi_dma_list(s, rx, NULL, false) && ok; }
+    ok = ok && (!tx->active || tx->length <= clocks) &&
+               (!rx->active || rx->length <= clocks);
+    uint8_t *output = NULL, *input = NULL;
+    if (ok && tx->active) {
+        output = g_malloc(tx->length);
+        ok = sio_spi_dma_list(s, tx, output, false);
+    }
+    if (ok && rx->active) { input = g_malloc(rx->length); }
+    if (ok) {
+        spi->total = clocks;
+        for (uint32_t i = 0; i < clocks; i++) {
+            uint8_t byte = output && i < tx->length ? output[i] : 0xff;
+            uint8_t reply = touch_shift(&spi->touch, i, clocks, byte);
+            if (input && i < rx->length) { input[i] = reply; }
+        }
+        spi->shifted = clocks;
+        spi->causes |= 0x400000;
+        /* DMA drains RX even for a TX-only transfer; no PIO FIFO residue. */
+        spi->tx_count = spi->rx_count = 0;
+        if (input) { ok = sio_spi_dma_list(s, rx, input, true); }
+    }
+    g_free(input);
+    g_free(output);
+    if (tx->active) { sio_spi_dma_complete(s, 0, ok); }
+    if (rx->active) { sio_spi_dma_complete(s, 1, ok); }
+}
+
+static void sio_spi_dma_kick(A7State *s)
+{
+    for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
+        if (spi_index(&s->peripherals[i]) == 0) {
+            spi_run(&s->peripherals[i]);
+            return;
+        }
+    }
 }
 
 static bool sio_execute_aes(A7State *s, uint32_t slot_index)
@@ -1941,6 +2131,39 @@ static void sio_handle_inbox_msg(A7State *s, uint64_t msg)
             sio_outbox_push(s, sio_pack_msg(1, tag, supported ? 0x65 : 0x66, param, 0));
         } else {
             sio_outbox_push(s, sio_pack_msg(1, tag, 0x66, param, 0));
+        }
+    } else if (ep == 22 || ep == 23) {
+        SioDMA *dma = &s->sio.spi_dma[ep - 22];
+        if (op == 5) {
+            uint8_t config[20];
+            bool ok = !dma->active && data < s->sio.dma_seg_count &&
+                s->sio.dma_seg_count <= 0xaaa &&
+                s->sio.dma_seg_count - data >= 2 &&
+                s->sio.dma_seg_phys &&
+                ans_read_ram(s->sio.dma_seg_phys + (uint64_t)data * 12,
+                             config, sizeof(config));
+            dma->configured = ok;
+            sio_outbox_push(s, sio_pack_msg(ep, tag, ok ? 0x65 : 0x66, 0, 0));
+        } else if (op == 6) {
+            SioDMA next = { .handle = data, .tag = tag,
+                           .configured = dma->configured, .active = true };
+            if (!dma->configured || dma->active ||
+                !sio_spi_dma_list(s, &next, NULL, false)) {
+                sio_outbox_push(s, sio_pack_msg(ep, tag, 0x66, 0, 0));
+            } else {
+                *dma = next;
+                sio_spi_dma_kick(s); /* submission has no separate ACK */
+            }
+        } else if (op == 7) {
+            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x69,
+                                           dma->active ? dma->tag : 0, 0));
+        } else if (op == 8 &&
+                   s->sio.outbox_count <= SIO_OUTBOX_CAPACITY - 2) {
+            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x65, 0, 0));
+            if (dma->active) { sio_spi_dma_complete(s, ep - 22, false); }
+            else { sio_outbox_push(s, sio_pack_msg(ep, 0, 0x68, 0x40, 0)); }
+        } else {
+            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x66, 0, 0));
         }
     } else if (ep >= 2 && ep < 0x50) {
         /* AppleSmartIODMA */
