@@ -136,6 +136,8 @@ typedef struct SepMailbox {
     bool finish_reply_pending;
     bool os_active_pending;
     bool os_active_sent;
+    bool os_active_acked;           /* AP sent post-boot traffic after OS-active */
+    uint32_t os_active_retries;
     QEMUTimer *os_active_timer;
     uint32_t params[256];
     uint32_t send_ool_page[256];
@@ -1668,7 +1670,7 @@ static void sep_outbox_push(A7State *s, uint64_t msg)
 static void sep_os_active_timer_cb(void *opaque)
 {
     A7State *s = opaque;
-    if (!s->sep.os_active_pending || s->sep.os_active_sent) {
+    if (s->sep.os_active_acked || (!s->sep.os_active_pending && !s->sep.os_active_sent)) {
         return;
     }
     if (s->sep.outbox_count == SEP_OUTBOX_CAPACITY) {
@@ -1676,10 +1678,24 @@ static void sep_os_active_timer_cb(void *opaque)
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2000000);
         return;
     }
+    /* AppleSEPManager drops OS-active that arrives before it enters the
+     * booting state ("received OS Active message in unexpected state 2")
+     * and then panics "SEP/OS failed to boot". The AP starts endpoint
+     * traffic once it accepts the message, so resend until it does. */
+    if (s->sep.os_active_sent) {
+        if (s->sep.os_active_retries >= 8) {
+            return;
+        }
+        s->sep.os_active_retries++;
+        qemu_log_mask(LOG_UNIMP, "SEP software model OS-active resend %u (no AP traffic yet)\n",
+                      s->sep.os_active_retries);
+    } else {
+        qemu_log_mask(LOG_UNIMP, "SEP software model OS-active (not firmware execution)\n");
+    }
     s->sep.os_active_pending = false;
     s->sep.os_active_sent = true;
-    qemu_log_mask(LOG_UNIMP, "SEP software model OS-active (not firmware execution)\n");
     sep_outbox_push(s, sio_pack_msg(0, 0, 0x0d, 0, 0));
+    timer_mod(s->sep.os_active_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 250000000);
 }
 
 static uint64_t sep_outbox_pop(A7State *s)
@@ -1699,8 +1715,10 @@ static uint64_t sep_outbox_pop(A7State *s)
          * This virtual-time delay is model policy, not a measured SEP latency.
          * Native state 4 -> 5 ordering must also be checked in iOS probes.
          */
+        const char *delay = getenv("VPHONE_SEP_OSACTIVE_DELAY_NS"); /* race testing */
         timer_mod(s->sep.os_active_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2000000);
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (delay ? strtoll(delay, NULL, 0) : 2000000));
     }
     if (s->sep.outbox_count == 0) {
         s->sep.irq_armed = false;
@@ -1728,6 +1746,9 @@ static void sep_handle_inbox_msg(A7State *s, uint64_t msg)
                   "SEP software inbox: ep=0x%x tag=0x%x op=0x%x param=0x%x "
                   "data=0x%x phase=%u raw=0x%" PRIx64 "\n",
                   ep, tag, op, param, data, s->sep.boot_phase, msg);
+    if (s->sep.os_active_sent && ep != 0xff && ep != 0xfe) {
+        s->sep.os_active_acked = true;
+    }
     if (ep == 0) {
         if (s->sep.boot_phase != SEP_BOOT_FINISHED) {
             goto unsupported;

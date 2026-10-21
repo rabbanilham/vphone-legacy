@@ -448,3 +448,8 @@ df -h .
 ### 180 s after the fix (`probe-66-fixed`)
 - Run a: no panic; 6,947 replayed frames with up to 56 draws each. The screen leaves the boot logo and shows a SpringBoard UI: a white background, a blue ⓘ button at the bottom right, black blocks at the top, and the text drawn as streaks (`a/screen.png`). It looks like the iOS 7 setup / "slide to set up" UI. Text and some elements are wrong because the replay does not yet handle A8 glyph textures, transforms or texcoord sub-rects (next step 2).
 - Run b: kernel panic `"SEP/OS failed to boot"` (caller `0xffffff8000d47a30`), not seen before. It is probably SEP-model boot timing and needs its own investigation.
+
+### SEP "SEP/OS failed to boot" panic fixed (2026-10-21)
+- Cause: the SEP model sends OS-active (`ep0 op 0x0d`) 2 ms of virtual time after the AP pops the boot-finish reply. Virtual time follows host time, so when the kernel thread is delayed the message arrives before `AppleSEPManager` enters its booting state. The kernel logs `received OS Active message in unexpected state 2`, drops it, and later panics `"SEP/OS failed to boot"` (caller `0xffffff8000d47a30`; `probe-66-fixed/b`).
+- Fix (`sep_os_active_timer_cb`): after sending OS-active, the model resends it every 250 ms of virtual time, up to 8 times, until the AP sends any non-boot endpoint traffic (`ep != 0xff/0xfe`). That traffic only starts once the kernel has accepted OS-active.
+- Verified by forcing the race with `VPHONE_SEP_OSACTIVE_DELAY_NS=0` (test-only knob; `probe-67-sep-race` a/b): both runs hit "unexpected state 2", resent once, then logged `SEP booting` and `SEP/OS is alive`, with no panic. `sep_contract_test.py` still passes.
