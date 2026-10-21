@@ -43,7 +43,7 @@ entry in EL3h, with interrupts masked and MMU off. `x0` points to the monitor's
 six-u64 boot arguments; the actual firmware performs the kernel handoff.
 The default `boot-el=1` direct EL1h entry is used by synthetic fixtures.
 It exposes 1 GiB RAM
-and exactly one CPU. A nonexistent/empty image or invalid boot addresses fail.
+and one or two application CPUs (`-smp 1` or `-smp 2`, default one). A nonexistent/empty image or invalid boot addresses fail.
 
 The fixed scanout reads 640×1136 BGRX32 pixels at physical `0x83fc00000`, stride
 2560; `framebuffer=0xADDRESS` may override the in-RAM address. A black display
@@ -52,6 +52,19 @@ AppleH6PDisplayPipe register emulation or compositor compatibility is claimed.
 Input, graceful guest shutdown and iOS boot remain unverified. The experimental
 ASP software model below supports checked raw block I/O; successful native
 filesystem mount remains unverified.
+
+For dual-core experiments, put `cpus=2` in the loader boot arguments and use
+`-smp 2 -accel tcg,thread=single`. The runtime launcher reads the core count
+from the generated boot plan. CPU1 stays powered off until the guest writes
+its bit to PMGR `0x20e030008`. Native EL3 release enters the secure monitor's
+warm-reset trampoline at `0x800600000` with x0=0; direct EL1 fixtures enter
+`boot-entry` and distinguish cores through MPIDR. The monitor retains control
+of the kernel handoff. CPU error MMIO blocks at `0x202050000` and `0x202150000`
+provide storage, without emulating hardware error injection.
+
+After rebuilding, run `python3 backend/smp_contract_test.py` for the synthetic
+two-core startup and bidirectional/self IPI contract. Native iOS SMP execution
+remains unverified. Evidence and limitations are in [T16-smp.md](../research/T16-smp.md).
 
 ## Implemented contracts and limits
 
@@ -70,7 +83,7 @@ filesystem mount remains unverified.
 - UART0 at `0x20a0a0000`: S5L polled RX/TX status and FIFO, serial0 chardev;
   received bytes can assert IRQ 140. DMA/modem support is unimplemented.
 - AIC v1 at `0x20e100000`: 1024 IRQ mask/software-pending slots, prioritized
-  event/auto-mask behavior, one CPU, basic self-IPI and timer outputs to FIQ.
+  event/auto-mask behavior, per-core self/cross IPIs and timer outputs to each core's FIQ. IRQ target masks select the receiving core; source masks remain shared.
   Only UART is a hardware IRQ source; other peripherals are unimplemented.
 - PMGR, GPIO, 15 bridge ranges and 28 peripheral ranges now have experimental
   register storage/readback. PMGR power-state writes mirror target into actual

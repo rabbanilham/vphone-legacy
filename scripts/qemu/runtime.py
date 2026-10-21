@@ -199,7 +199,9 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
                 machine += f",system-image={system},data-image={data},system-writable=1"
                 if "utility" in storage_paths:
                     machine += ",utility-image=" + storage_paths["utility"].replace(",", ",,")
-            command = [backend["binary"], "-machine", machine, "-accel", "tcg", "-smp", "1", "-m", "1024M",
+            accelerator = "tcg,thread=single" if plan["cpu_count"] == 2 else "tcg"
+            command = [backend["binary"], "-machine", machine, "-accel", accelerator,
+                       "-smp", str(plan["cpu_count"]), "-m", "1024M",
                        "-kernel", plan["image"], "-display", "none" if headless else "cocoa",
                        "-qmp", f"unix:{qmp_path},server=on,wait=off", "-monitor", "none",
                        "-chardev", f"stdio,id=console,signal=off,logfile={logs / 'serial.log'}",
