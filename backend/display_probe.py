@@ -45,6 +45,32 @@ def memory(gs, addr, size):
     return bytes.fromhex(reply) if not reply.startswith('E') else b''
 
 
+def parse_hook_dumps(items):
+    """Bounded opt-in reads; multiple registers may be selected per hook."""
+    result = {}
+    for item in items:
+        name, spec = item.split('=', 1)
+        reg, length = spec.split(':', 1)
+        if not name or not re.fullmatch(r'x(?:[0-9]|[12][0-9]|30)', reg):
+            raise ValueError('hook dump requires name=x0..x30:length')
+        length = int(length, 0)
+        if not 1 <= length <= 4096:
+            raise ValueError('hook dump length must be 1..4096')
+        result.setdefault(name, []).append((int(reg[1:]), length))
+    return result
+
+
+def capture_hook_dumps(gs, registers, specs):
+    result = []
+    for reg, length in specs:
+        addr = registers[reg]
+        data = memory(gs, addr, length) if addr else b''
+        result.append(dict(register=f'x{reg}', address=hex(addr),
+                           requested=length, readable=len(data) == length,
+                           bytes=data.hex()))
+    return result
+
+
 def u64(gs, addr):
     data = memory(gs, addr, 8)
     return int.from_bytes(data, 'little') if len(data) == 8 else 0
@@ -142,6 +168,7 @@ def main():
     p.add_argument('--seconds', type=float, default=45)
     p.add_argument('--breakpoint', action='append', default=[], help='name=0xVA')
     p.add_argument('--returns', action='store_true')
+    p.add_argument('--hook-dump', action='append', default=[], help='name=xN:length, read up to 4096 bytes at a hook register (repeatable)')
     p.add_argument('--user-hooks', type=Path, help='Static shared-cache hook addresses, installed after verified runtime slide')
     p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout','duration'), default='first-pixel')
     p.add_argument('--step-count', type=int, default=1, help='Bounded instruction steps after each hook')
@@ -157,6 +184,10 @@ def main():
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     args = p.parse_args()
+    try:
+        hook_dumps = parse_hook_dumps(args.hook_dump)
+    except ValueError as exc:
+        p.error(str(exc))
     assert 0 < args.seconds <= 180
     assert 1 <= args.step_count <= 64
     out = args.output.resolve()
@@ -508,6 +539,8 @@ def main():
                                     assert rsp(gs,'s').startswith('T'); cont(); continue
                             event = dict(name=name, elapsed=clock.elapsed(), wall_elapsed=clock.wall(),
                                          pc=hex(pc), registers=[hex(v) for v in x], reply=payload)
+                            if name in hook_dumps:
+                                event['memory_dumps'] = capture_hook_dumps(gs, x, hook_dumps[name])
                             event['identity'] = caller_identity
                             if caller_identity.get('exec_fname'):
                                 event['exec_fname'] = caller_identity['exec_fname']

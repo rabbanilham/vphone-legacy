@@ -302,6 +302,20 @@ int main(void) {
     assert(!(state.device_irq[3] & (1u<<12)));
     uint8_t enable[16]={0xe4,0xbf,4,0x9d,1,9,0};
     stw_le_p(enable+14,touch_sum(enable,14));pio(p,enable,16,reply);
+    /* Full D9 descriptor ties raw coordinates to the HID normalization
+     * bounds, independent of family1 row/column pitch defaults. */
+    unsigned surface_len;
+    const uint8_t *surface=touch_report(&p->spi.touch,0xd9,&surface_len);
+    assert(surface_len==16 && ldl_le_p(surface)==5100 && ldl_le_p(surface+4)==9100);
+    assert(lduw_le_p(surface+8)==0 && lduw_le_p(surface+10)==0);
+    assert(lduw_le_p(surface+12)==640 && lduw_le_p(surface+14)==1136);
+    uint8_t surface_tx[21]={0xe3,0xd9};
+    pio(p,surface_tx,16,reply);
+    assert(reply[2]==0 && lduw_le_p(reply+3)==16);
+    surface_tx[0]=0xe6;surface_tx[2]=1;surface_tx[3]=16;
+    pio(p,surface_tx,sizeof(surface_tx),reply);
+    assert(!memcmp(reply+3,surface,16));
+    assert(lduw_le_p(reply+19)==touch_sum(reply,19));
     virtual_ns=70000000000LL;
     state.touch_steps=18;state.touch_duration_ns=300000000;
     state.touch_x0=60;state.touch_y0=1018;state.touch_x1=600;state.touch_y1=1018;
@@ -318,11 +332,26 @@ int main(void) {
     uint8_t *f=reply+5;
     assert(f[0]==0x74 && f[2]==26 && f[14]==1 && lduw_le_p(f+12)==30);
     assert(f[26]==1 && f[27]==1 && lduw_le_p(f+30)==60 && lduw_le_p(f+32)==118);
+    assert(f[28]==2 && f[29]==1); /* classified finger, not unidentified */
+    assert(lduw_le_p(f+38)==400 && lduw_le_p(f+40)==300);
     assert(lduw_le_p(f+44)==256 && !state.touch_irq_low);
+    assert(lduw_le_p(f+46)==256 && lduw_le_p(f+48)==256);
+    assert(lduw_le_p(f+50)==256 && lduw_le_p(f+52)==256);
     for (unsigned i=1;i<=20;i++) {
         virtual_ns=timer_deadline;touch_timer_cb(&state);
         pio(p,query,16,reply);pio(p,fetch,63,reply);
         assert(reply[32]==(i==20?7:i==1?3:4));
+        f=reply+5;
+        assert(f[26]==1 && f[28]==2);
+        assert(lduw_le_p(f+32)==118);
+        assert(lduw_le_p(f+38)==(i==20?0:400));
+        assert(lduw_le_p(f+40)==(i==20?0:300));
+        for (unsigned off=44;off<=52;off+=2) {
+            assert(lduw_le_p(f+off)==(i==20?0:256));
+        }
+        /* Normalize as mt_FillMTContactDirectFromBinary then HID's
+         * y inversion: (rawY-minY)/(maxY-minY) -> top-left pixels. */
+        assert(1136-lduw_le_p(f+32)==1018);
         assert(lduw_le_p(reply+35)==(i>=19?600:60+30*(i-1)));
         assert(lduw_le_p(reply+49)==(i==20?0:256));
     }
