@@ -1,8 +1,15 @@
 """Read-only task-specific CA thread snapshots; unmapped data remains unknown."""
 import bisect
 import json
+import os
 import struct
 from pathlib import Path
+
+# p_comm is truncated to 16 bytes ('com.apple.datami' is the DataMigration
+# XPC service). VPHONE_SNAPSHOT_PROCS adds comma-separated names.
+SNAPSHOT_PROCESSES = {'backboardd', 'SpringBoard', 'lsd', 'installd', 'com.apple.datami',
+                      *filter(None, os.environ.get('VPHONE_SNAPSHOT_PROCS', '').split(','))}
+
 
 def snapshot(gs, memory, u64, out, mapping_path, index_path, output_name='ca-thread-state.json'):
     phys=u64(gs,0xffffff8000694020);virt=u64(gs,0xffffff8000694018)
@@ -41,7 +48,7 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path, output_name='ca-thr
         while proc and proc not in seen and len(seen)<256:
             seen.add(proc);name=memory(gs,proc+0x254,16).split(b'\0')[0].decode(errors='replace')
             inventory.append(dict(name=name,pid=int.from_bytes(memory(gs,proc+0x10,4),'little'),proc=hex(proc)))
-            if name in ('backboardd','SpringBoard','lsd','installd'):
+            if name in SNAPSHOT_PROCESSES:
                 task=u64(gs,proc+0x18);vmap=u64(gs,task+0x28);pmap=u64(gs,vmap+0x58)
                 record=dict(process=name,pid=int.from_bytes(memory(gs,proc+0x10,4),'little'),task=hex(task),pmap=hex(pmap),threads=[])
                 head=task+0x48;thread=u64(gs,head);threads_seen=set()
