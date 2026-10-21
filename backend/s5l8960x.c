@@ -172,6 +172,10 @@ typedef struct SioMailbox {
     uint64_t dma_seg_phys;
     uint32_t dma_seg_count;
     SioDMA spi_dma[2]; /* DeviceTree SPI1 endpoints 22 TX / 23 RX */
+    /* Other AppleSmartIODMA endpoints (e.g. UART2_RX 65): submissions that
+     * have no modelled data source stay armed until a stop. */
+    uint8_t dma_pending[0x50][8];
+    uint8_t dma_pending_count[0x50];
     uint64_t aes_op_phys;
     uint32_t aes_op_count;
     uint64_t disabled_keys;
@@ -2694,12 +2698,32 @@ static void sio_handle_inbox_msg(A7State *s, uint64_t msg)
             sio_outbox_push(s, sio_pack_msg(ep, tag, 0x66, 0, 0));
         }
     } else if (ep >= 2 && ep < 0x50) {
-        /* AppleSmartIODMA */
-        if (op == 7) {
-            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x69, 0, 0));
+        /* AppleSmartIODMA, same contract as the SPI1 endpoints above:
+         * op06 is a synchronous submit (ACK now, op68 completes it), op07
+         * reports the active tag, and op08 stops. An async op66 here is
+         * fatal to the client ('unexpected asynchronous error', probe 113),
+         * so a stop completes each armed submission with zero bytes
+         * (param bit7 tagged report, bit6 idle on the last one). */
+        uint8_t *pending = s->sio.dma_pending[ep];
+        uint8_t *count = &s->sio.dma_pending_count[ep];
+        if (op == 6) {
+            if (*count < ARRAY_SIZE(s->sio.dma_pending[0])) {
+                pending[(*count)++] = tag;
+            }
+            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x65, 0, 0));
+        } else if (op == 7) {
+            sio_outbox_push(s, sio_pack_msg(ep, tag, 0x69,
+                                           *count ? pending[0] : 0, 0));
         } else if (op == 8) {
             sio_outbox_push(s, sio_pack_msg(ep, tag, 0x65, 0, 0));
-            sio_outbox_push(s, sio_pack_msg(ep, 0, 0x66, 0, 0));
+            if (!*count) {
+                sio_outbox_push(s, sio_pack_msg(ep, 0, 0x68, 0x40, 0));
+            }
+            for (unsigned i = 0; i < *count; i++) {
+                sio_outbox_push(s, sio_pack_msg(ep, pending[i], 0x68,
+                                               i + 1 == *count ? 0xc0 : 0x80, 0));
+            }
+            *count = 0;
         } else {
             sio_outbox_push(s, sio_pack_msg(ep, tag, 0x65, 0, 0));
         }
