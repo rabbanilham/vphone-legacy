@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -127,5 +128,39 @@ class ProbeStateTests(unittest.TestCase):
         bps = {}; user_expected = {}
         with self.assertRaises(AssertionError):
             install_exe_hooks(None, lambda gs, a, s: bytes(16), lambda gs, c: 'OK', 'backboardd', 0xe8000, hooks, expected, bps, user_expected)
+
+    def test_touch_owner_hooks_schema_and_contents(self):
+        path = Path(__file__).resolve().parent.parent / 'backend' / 'touch_owner_hooks.json'
+        self.assertTrue(path.exists(), 'backend/touch_owner_hooks.json must exist')
+        data = json.loads(path.read_text())
+        self.assertIn('symbols', data)
+        self.assertIn('exe_hooks', data)
+        self.assertIn('backboardd', data['exe_hooks'])
+        self.assertIn('suggested_hook_dumps', data)
+
+        # Check critical CA server and overlay symbols
+        for req_sym in ('ca_server_create_context', 'ca_server_context_created',
+                        'ca_server_local_context', 'ca_context_task_result',
+                        'pui_create_context', 'pui_set_visible', 'pui_dealloc'):
+            self.assertIn(req_sym, data['symbols'])
+            self.assertTrue(data['symbols'][req_sym].startswith('0x18'))
+
+        # Check critical backboardd overlay exe hooks
+        bb_hooks = data['exe_hooks']['backboardd']
+        for req_hook in ('bb_overlay_create', 'bb_overlay_created',
+                         'bb_overlay_dismiss_delay_trigger', 'bb_overlay_dismiss_worker',
+                         'bb_overlay_set_hidden', 'bb_overlay_release',
+                         'bb_sentinel_dismiss_call', 'bb_sentinel_checkin_dismiss_call'):
+            self.assertIn(req_hook, bb_hooks)
+            info = bb_hooks[req_hook]
+            self.assertTrue(info['address'].startswith('0x1000'))
+            self.assertEqual(len(info['expected']), 32)
+            bytes.fromhex(info['expected'])
+
+        # Check suggested dumps
+        self.assertIn('ca_context_task_result', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['ca_context_task_result'], ['x1:256'])
+        self.assertIn('ca_server_context_created', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['ca_server_context_created'], ['x21:184'])
 
 if __name__=='__main__':unittest.main()
