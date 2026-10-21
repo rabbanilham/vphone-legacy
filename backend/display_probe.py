@@ -584,6 +584,8 @@ def main():
                                             save_json(mapping_path, m_dict)
                             if name.startswith('bb_') and caller_identity.get('process') != 'backboardd':
                                 assert rsp(gs,'s').startswith('T');cont();continue
+                            if name.startswith('sb_') and caller_identity.get('process') != 'SpringBoard':
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if name.startswith('keybagd_') and caller_identity.get('process') != 'keybagd':
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if pc in user_expected:

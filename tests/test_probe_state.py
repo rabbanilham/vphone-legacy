@@ -163,4 +163,85 @@ class ProbeStateTests(unittest.TestCase):
         self.assertIn('ca_server_context_created', data['suggested_hook_dumps'])
         self.assertEqual(data['suggested_hook_dumps']['ca_server_context_created'], ['x21:184'])
 
+    def test_touch_queue_hooks_schema_and_contents(self):
+        path = Path(__file__).resolve().parent.parent / 'backend' / 'touch_queue_hooks.json'
+        self.assertTrue(path.exists(), 'backend/touch_queue_hooks.json must exist')
+        data = json.loads(path.read_text())
+        self.assertIn('symbols', data)
+        self.assertIn('exe_hooks', data)
+        self.assertIn('backboardd', data['exe_hooks'])
+        self.assertIn('SpringBoard', data['exe_hooks'])
+        self.assertIn('suggested_hook_dumps', data)
+        self.assertIn('known_return_sites', data)
+        self.assertIn('SpringBoard', data['known_return_sites'])
+        self.assertIn('exe_headers', data)
+        self.assertIn('SpringBoard', data['exe_headers'])
+
+        # Check critical queue IPC shared cache symbols
+        for req_sym in ('hid_connection_dispatch', 'hid_connection_enqueue_result',
+                        'hid_queue_enqueue', 'hid_data_queue_enqueue', 'hid_data_queue_enqueue_tail',
+                        'hid_data_queue_notify', 'hid_data_queue_notify_msg', 'hid_data_queue_notify_ret',
+                        'hid_queue_set_notify_port', 'hid_data_queue_set_port',
+                        'hid_server_create_queue', 'hid_server_start_queue', 'hid_server_stop_queue',
+                        'bks_register_callback', 'hid_client_schedule_runloop', 'hid_client_register_callback',
+                        'cf_mach_port_create_source', 'cf_mach_port_perform',
+                        'hid_client_queue_callback', 'hid_client_dequeued', 'hid_client_callback_call'):
+            self.assertIn(req_sym, data['symbols'])
+            self.assertTrue(data['symbols'][req_sym].startswith('0x18'))
+
+        # Check SpringBoard exe hooks
+        sb_hooks = data['exe_hooks']['SpringBoard']
+        for req_hook in ('sb_hid_monitor_create', 'sb_hid_monitor_callback'):
+            self.assertIn(req_hook, sb_hooks)
+            info = sb_hooks[req_hook]
+            self.assertTrue(info['address'].startswith('0x1000'))
+            self.assertEqual(len(info['expected']), 32)
+            bytes.fromhex(info['expected'])
+
+        # Check backboardd exe hooks
+        bb_hooks = data['exe_hooks']['backboardd']
+        for req_hook in ('bb_forward_task', 'bb_forward_task_conn_gate',
+                         'bb_forward_task_dispatch', 'bb_client_for_task',
+                         'bb_client_conn_added', 'bb_client_conn_added_worker',
+                         'bb_client_conn_added_cfport', 'bb_system_gesture_stealing_gate'):
+            self.assertIn(req_hook, bb_hooks)
+            info = bb_hooks[req_hook]
+            self.assertTrue(info['address'].startswith('0x1000'))
+            self.assertEqual(len(info['expected']), 32)
+            bytes.fromhex(info['expected'])
+
+        # Check suggested dumps
+        self.assertIn('hid_data_queue_enqueue', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['hid_data_queue_enqueue'], ['x0:32'])
+        self.assertIn('hid_data_queue_notify_msg', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['hid_data_queue_notify_msg'], ['sp:24'])
+        self.assertIn('cf_mach_port_perform', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['cf_mach_port_perform'], ['x1:24', 'x3:288'])
+        self.assertIn('hid_client_queue_created', data['suggested_hook_dumps'])
+        self.assertEqual(data['suggested_hook_dumps']['hid_client_queue_created'], ['x19:288'])
+
+    def test_springboard_exe_hooks_registration(self):
+        hooks = {
+            'sb_hid_monitor_create': '0x100068590',
+            'sb_hid_monitor_callback': {'address': '0x100068cac', 'expected': 'fd7bbfa9fd030091f44fbfa9f657bfa9'}
+        }
+        expected = {'sb_hid_monitor_create': 'fad20994f30300aa932600f993580494'}
+        bps = {}; user_expected = {}
+        slide = 0xe4000
+        mem_map = {
+            0x100068590 + slide: bytes.fromhex(expected['sb_hid_monitor_create']),
+            0x100068cac + slide: bytes.fromhex(hooks['sb_hid_monitor_callback']['expected'])
+        }
+        rsp_log = []
+        def mock_rsp(gs, cmd):
+            rsp_log.append(cmd)
+            return 'OK'
+        verified = install_exe_hooks(None, lambda gs, a, s: mem_map.get(a, b''), mock_rsp, 'SpringBoard', slide, hooks, expected, bps, user_expected)
+        self.assertEqual(len(verified), 2)
+        self.assertIn(0x100068590 + slide, bps)
+        self.assertEqual(bps[0x100068590 + slide], 'sb_hid_monitor_create')
+        self.assertEqual(user_expected[0x100068590 + slide], bytes.fromhex(expected['sb_hid_monitor_create']))
+        self.assertEqual(len(rsp_log), 2)
+        self.assertTrue(all(v['exe'] and v['process'] == 'SpringBoard' for v in verified))
+
 if __name__=='__main__':unittest.main()
