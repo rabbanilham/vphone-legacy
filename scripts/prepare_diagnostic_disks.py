@@ -160,18 +160,15 @@ def prepare_data():
 
 
 def seed_setup_done(data_mount, build_version="11D257"):
-    """Seed the state a device has after finishing Setup Assistant offline.
+    """Seed the preferences a device has after finishing Setup Assistant.
 
     Verified in 11D257 (agy A1 report, strings checked in the cache/lockdownd):
     - Preferences.framework PSSetupAssistantNeedsToRun (0x189522298) returns
       NO for ForceNoBuddy, and also checks SetupDone / SetupVersion (>= 5) /
       AssistantPresented; SpringBoard _SBUpdateBuddyMode (0x1000ded5c) then
       leaves buddy mode, so the lock screen unlocks to the home screen.
-    - lockdownd keeps "-ActivationState" = FactoryActivated without an
-      activation record ("No Ticket, but allowing factory activation"), and
-      SBLockdownManager reads "-BrickState" (must be false) from
-      /var/root/Library/Lockdown/data_ark.plist. Activation records are
-      signature-checked, so none are fabricated.
+    Activation state is deliberately left to the guest; this only records
+    that the Setup Assistant UI has been completed.
     """
     bplist = lambda value: plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
     purplebuddy = bplist({
@@ -194,13 +191,6 @@ def seed_setup_done(data_mount, build_version="11D257"):
     root = Path(data_mount) / "root/Library/Preferences"
     root.mkdir(parents=True, exist_ok=True)
     (root / "com.apple.purplebuddy.plist").write_bytes(purplebuddy)
-    lockdown = Path(data_mount) / "root/Library/Lockdown"
-    lockdown.mkdir(parents=True, exist_ok=True)
-    (lockdown / "data_ark.plist").write_bytes(bplist({
-        "-ActivationState": "FactoryActivated",
-        "-BrickState": False,
-        "com.apple.purplebuddy-SetupState": "SetupUsingAssistant",
-    }))
 
 
 def prepare_setup_done_variant():
@@ -213,7 +203,7 @@ def prepare_setup_done_variant():
     dev, mount = attach(target)
     try:
         seed_setup_done(mount)
-        print("[*] Seeded purplebuddy and lockdown setup-done state")
+        print("[*] Seeded purplebuddy setup-done preferences")
     finally:
         detach(dev)
     sha = digest(target)
