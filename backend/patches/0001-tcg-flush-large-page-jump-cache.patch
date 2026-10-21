@@ -1,0 +1,37 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -510,6 +510,8 @@
+         tlb_debug("forcing full flush midx %d (%016"
+                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
+                   midx, lp_addr, lp_mask);
++        /* The invalidated mapping can cover more than the requested pages. */
++        tcg_flush_jmp_cache(cpu);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+     } else {
+         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+@@ -683,6 +685,8 @@
+         tlb_debug("forcing full flush midx %d ("
+                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
+                   midx, addr, mask, len);
++        /* The invalidated mapping can cover more than the requested pages. */
++        tcg_flush_jmp_cache(cpu);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+         return;
+     }
+@@ -696,6 +700,8 @@
+         tlb_debug("forcing full flush midx %d ("
+                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
+                   midx, d->large_page_addr, d->large_page_mask);
++        /* The invalidated mapping can cover more than the requested pages. */
++        tcg_flush_jmp_cache(cpu);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+         return;
+     }
+diff --git a/target/arm/tcg/tlb-insns.c b/target/arm/tcg/tlb-insns.c
+--- a/target/arm/tcg/tlb-insns.c
++++ b/target/arm/tcg/tlb-insns.c
+@@ -437,2 +437,3 @@
+     CPUState *cs = env_cpu(env);
++    /* The common TCG flush code handles mappings larger than one page. */
+     int mask = vae1_tlbmask(env);
