@@ -46,6 +46,13 @@ def main():
         path = source / relative
         original = subprocess.check_output(['git', '-C', str(source), 'show', f'HEAD:{relative}'])
         path.write_bytes(original + addition.encode())
+    # Upstream fixes kept in the repo: restore each touched file to the
+    # pinned commit, then apply, so rebuilds stay idempotent.
+    for patch in sorted((BACKEND / 'patches').glob('*.patch')):
+        touched = [line[6:].strip() for line in patch.read_text().splitlines()
+                   if line.startswith('+++ b/')]
+        run(['git', '-C', source, 'checkout', '--', *touched])
+        run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
     pcs = [Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2')]

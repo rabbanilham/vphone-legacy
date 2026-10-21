@@ -154,6 +154,8 @@ def main():
     p.add_argument('--meta-dump', action='store_true', help='On the first meta_wait, save AGXMetaFirmware state, pointer translations and guest RAM')
     p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
+    p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
+    p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     args = p.parse_args()
     assert 0 < args.seconds <= 180
     assert 1 <= args.step_count <= 64
@@ -234,7 +236,7 @@ def main():
         cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=single',
                '-smp', '1', '-m', '1024M', '-kernel', plan['image'], '-display', 'none',
                '-serial', f'file:{out}/serial.log', '-S', '-qmp', f'unix:{qmp},server=on,wait=off',
-               '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')]
+               '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')] + args.qemu_arg
         if bps:
             cmd += ['-gdb', f'unix:{gdb},server=on,wait=off']
         for image in plan.get('auxiliary_images', []):
@@ -449,6 +451,11 @@ def main():
                                         bps[static+slide]=uname
                                         user_expected[static+slide]=expected
                                         verified.append(dict(name=uname,static=hex(static),runtime=hex(static+slide),bytes=actual.hex(),expected=expected.hex(),mapped_at_install=bool(actual)))
+                                    for item in args.user_va_hook:
+                                        uname, va = item.split('=', 1); va = int(va, 0)
+                                        assert rsp(gs,f'Z0,{va:x},4')=='OK'
+                                        bps[va]=uname
+                                        verified.append(dict(name=uname,runtime=hex(va),absolute=True))
                                     save_json(out/'user-hook-mapping.json',dict(slide=hex(slide),hooks=verified))
                                     user_installed=True;break
                             if name.startswith('keybagd_') and caller_identity.get('process') != 'keybagd':
@@ -829,7 +836,8 @@ def main():
                                 if args.step_count > 1:
                                     sr = struct.unpack_from('<33Q', bytes.fromhex(rsp(gs,'g')))
                                     steps.append(dict(pc=hex(sr[32]),x0=hex(sr[0]),x1=hex(sr[1]),x8=hex(sr[8]),
-                                                      bytes=memory(gs,sr[32],4).hex()))
+                                                      x16=hex(sr[16]),x19=hex(sr[19]),x20=hex(sr[20]),x21=hex(sr[21]),
+                                                      lr=hex(sr[30]),bytes=memory(gs,sr[32],4).hex()))
                             if steps:
                                 event['steps'] = steps
                                 save_json(out / 'breakpoints.json', events)

@@ -1,0 +1,42 @@
+diff --git a/target/arm/tcg/tlb-insns.c b/target/arm/tcg/tlb-insns.c
+index b24eb57..9135405 100644
+--- a/target/arm/tcg/tlb-insns.c
++++ b/target/arm/tcg/tlb-insns.c
+@@ -434,12 +434,14 @@ static void tlbi_aa64_vae3_write(CPUARMState *env, const ARMCPRegInfo *ri,
+ static void tlbi_aa64_vae1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                    uint64_t value)
+ {
++    /*
++     * vphone-legacy: iOS 7 on s5l8960x keeps executing stale code after a
++     * by-VA flush (dlclose/dlopen of HID plugins at the same address), which
++     * a full EL1&0 flush avoids. Flush every VA for the regime instead.
++     */
+     CPUState *cs = env_cpu(env);
+-    int mask = vae1_tlbmask(env);
+-    uint64_t pageaddr = sextract64(value << 12, 0, 56);
+-    int bits = vae1_tlbbits(env, pageaddr);
+ 
+-    tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr, mask, bits);
++    tlb_flush_by_mmuidx_all_cpus_synced(cs, vae1_tlbmask(env));
+ }
+ 
+ static void tlbi_aa64_vae1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+@@ -451,15 +453,14 @@ static void tlbi_aa64_vae1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+      * since we don't support flush-for-specific-ASID-only or
+      * flush-last-level-only.
+      */
++    /* vphone-legacy: see tlbi_aa64_vae1is_write. */
+     CPUState *cs = env_cpu(env);
+     int mask = vae1_tlbmask(env);
+-    uint64_t pageaddr = sextract64(value << 12, 0, 56);
+-    int bits = vae1_tlbbits(env, pageaddr);
+ 
+     if (tlb_force_broadcast(env)) {
+-        tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr, mask, bits);
++        tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
+     } else {
+-        tlb_flush_page_bits_by_mmuidx(cs, pageaddr, mask, bits);
++        tlb_flush_by_mmuidx(cs, mask);
+     }
+ }
+ 

@@ -420,3 +420,27 @@ df -h .
 1. Root-cause the backboardd CompassPlugIn crash above.
 2. Generalise beyond axis-aligned quads: transforms, texcoord sub-rects, A8 glyph textures, per-draw opacity, twiddled textures. Use frame dumps from later in boot (SpringBoard UI) to find what is missing.
 3. Fix the intermittent CommCenter baseband data abort (`0xf100f8`).
+
+
+---
+
+## 17. Root cause of the backboardd/SpringBoard crash loops: stale QEMU TLB after TLBI VAE1IS (Claude, 2026-10-21)
+
+### Finding
+- With `-icount shift=N,sleep=off` (via `display_probe.py --qemu-arg`) runs are fully deterministic (identical slide, pids, registers). `shift=1` reproduces the CompassPlugIn crash every time (`bisect/icount-s1/{a,b}`: identical crash report and registers).
+- backboardd loads and unloads its HID filter plugins (CompassPlugIn, CompassBacklightCompensation) alternately **at the same VA** (`0x102aa0000`). This is normal CFPlugIn behaviour.
+- Single-stepping `CompassPlugIn::Release` (`--user-va-hook cp_release=0x102aa3414 --step-count 24`, `bisect/icount-s1-trace`) shows the CPU **executing CompassBacklightCompensation instructions while the guest page tables map CompassPlugIn** at that VA. Example: `0x341c → 0x343c`, which is CBC's `cbnz`. Execution follows a stale translation.
+- iOS does flush correctly: `TLBI VAE1IS` is issued for every plugin page (54× each in the trace). The kernel helpers at `0xffffff8000227040–0x2270c4` are standard.
+- Experiments on the deterministic crash (flush mode → result): per-4K page flush (QEMU's bits/range path or a plain page flush) → crash; 16 KiB block → crash; 2 MiB block → OK; all VAs of the EL1&0 mmu indexes → OK; full flush → OK. Why QEMU's per-page flush misses entries more than 16 KiB away but within 2 MiB is not yet understood.
+
+### Fix
+- `backend/patches/0001-tlbi-vae1-flush-regime.patch`: `tlbi_aa64_vae1is_write` / `tlbi_aa64_vae1_write` flush every VA of the EL1&0 regime (`vae1_tlbmask`). `scripts/qemu/build_backend.py` now applies every `backend/patches/*.patch` to the pinned upstream files (restoring them from the pinned commit first). Boot speed is unchanged (`bisect/perf`: bks_checkin 23.3 s vs 22.2 s, wall 77.7 s vs 77.9 s).
+- Verification:
+  - Deterministic shift=1: 0/1 backboardd crash (was 1/1).
+  - `bisect/fixed`, 8 normal runs × 75 s: **0/8 backboardd crashes (was 30–50 %), SpringBoard never restarts (it used to restart in most runs), no panics, 474–841 replayed CA frames per run.**
+- Remaining: SpringBoard still restarts once in the deterministic icount shift=1 run (`fixed-s1`, pids 47 → 107). It may be timing-related under icount and should be re-checked. The intermittent CommCenter `0xf100f8` panic (§10/§16) may also have come from this bug; watch for it.
+
+### Tools added
+- `backend/crash_batch.py`: N identical probes; counts backboardd respawns.
+- `display_probe.py`: `--qemu-arg` (e.g. `-icount`), `--user-va-hook name=0xVA` (absolute user breakpoints), `hidf_*` IOHIDServiceFilter capture; steps record x16/x19–x21/lr.
+- `VPHONE_AGX_HLE=0` switch in `s5l8960x.c`.
