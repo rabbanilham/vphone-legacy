@@ -32,6 +32,47 @@ def digest(path):
     return h.hexdigest()
 
 
+def seed_migration_preferences(data_mount, build_version="11D257"):
+    """Seed migration preferences to prevent both backboardd and accountsd from triggering DataMigration.
+
+    1. com.apple.migration.plist:
+       DMPerformMigrationIfNeeded (DataMigration.framework) compares LastSystemVersion in
+       com.apple.migration with ProductBuildVersion. If absent or mismatched, backboardd
+       calls DMPerformMigration, blocking system app check-in. On successful skip, it also
+       records PreMigrationSystemVersion.
+
+    2. com.apple.accountsd.plist:
+       -[ACDServer init] (AccountsDaemon.framework) calls +[ACAccountMigrationLock migrationFinished],
+       which reads LastMigrationSystemVersion from com.apple.accountsd. If absent or mismatched with
+       _currentSystemVersion, accountsd calls _DMPerformMigration("accountsd needs migration to finish"),
+       launching com.apple.datamigrator (pid 84) at ~16.8 s. The migrator creates a PUIProgressWindow
+       CA context at level 2999.0 that never hides because plugin MobileSlideShow hangs waiting on
+       assetsd (com.apple.PersistentURLTranslator.Gatekeeper), swallowing all touch events.
+
+    Seeding both preference files for 'mobile' and 'root' ensures that:
+    - backboardd skips migration (dm_skip).
+    - accountsd logs 'Account migration has already occurred. No need to block non-migration connections.'
+      and bypasses DMPerformMigration entirely.
+    """
+    migration_payload = plistlib.dumps(
+        {
+            "LastSystemVersion": build_version,
+            "PreMigrationSystemVersion": build_version,
+        },
+        fmt=plistlib.FMT_BINARY,
+    )
+    accountsd_payload = plistlib.dumps(
+        {"LastMigrationSystemVersion": build_version},
+        fmt=plistlib.FMT_BINARY,
+    )
+
+    for home in ("mobile", "root"):
+        prefs = Path(data_mount) / home / "Library/Preferences"
+        prefs.mkdir(parents=True, exist_ok=True)
+        (prefs / "com.apple.migration.plist").write_bytes(migration_payload)
+        (prefs / "com.apple.accountsd.plist").write_bytes(accountsd_payload)
+
+
 def attach(image_path, readonly=False):
     cmd = ["hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nobrowse"]
     if readonly:
@@ -106,17 +147,9 @@ def prepare_data():
             systembag_path.chmod(0o644)
             print(f"[*] Wrote systembag.kb to {systembag_path}")
 
-            # DMPerformMigrationIfNeeded (DataMigration.framework) compares the
-            # com.apple.migration LastSystemVersion preference with the running
-            # build and, on a mismatch, blocks backboardd on com.apple.datamigrator
-            # for ~80 s before SpringBoard's system app check-in can finish.
-            # Record the state a device has after its first post-restore boot.
-            migration = plistlib.dumps({"LastSystemVersion": "11D257"}, fmt=plistlib.FMT_BINARY)
-            for home in ("mobile", "root"):
-                prefs = data_mount / home / "Library/Preferences"
-                prefs.mkdir(parents=True, exist_ok=True)
-                (prefs / "com.apple.migration.plist").write_bytes(migration)
-            print("[*] Wrote com.apple.migration.plist (LastSystemVersion=11D257)")
+            # Seed migration preferences for backboardd and accountsd
+            seed_migration_preferences(data_mount, "11D257")
+            print("[*] Wrote com.apple.migration.plist and com.apple.accountsd.plist (11D257)")
         finally:
             detach(data_dev)
     finally:
