@@ -506,6 +506,28 @@ def main():
                             if caller_identity.get('vnode_path'):
                                 event['vnode_path'] = caller_identity['vnode_path']
                             event['instruction_bytes'] = memory(gs, pc, 16).hex()
+                            if name.startswith('hidf_'):
+                                # IOHIDServiceFilter (x0) -> plugin interfaces at +0x10/+0x18.
+                                # For CompassPlugIn, vtable - 0x4108 is the image base;
+                                # record its lazy pointers, stubs and stub helper.
+                                obs = dict(filter=hex(x[0]), filter_bytes=memory(gs, x[0], 0x30).hex())
+                                for slot in (0x10, 0x18):
+                                    inst = u64(gs, x[0] + slot) if len(memory(gs, x[0] + slot, 8)) == 8 else 0
+                                    if not inst:
+                                        continue
+                                    head = memory(gs, inst, 0x40)
+                                    entry = dict(instance=hex(inst), bytes=head.hex())
+                                    if len(head) >= 8:
+                                        vt = int.from_bytes(head[:8], 'little')
+                                        base = vt - 0x4108
+                                        entry['vtable'] = hex(vt)
+                                        if base & 0xfff == 0 and memory(gs, base, 4) == bytes.fromhex('cffaedfe'):
+                                            entry['compass_base'] = hex(base)
+                                            entry['la_symbol_ptr'] = memory(gs, base + 0x4030, 0xc0).hex()
+                                            entry['stubs'] = memory(gs, base + 0x3c3c, 0x120).hex()
+                                            entry['stub_helper'] = memory(gs, base + 0x3d5c, 0x138).hex()
+                                    obs[hex(slot)] = entry
+                                event['hidf'] = obs
                             if name == 'keybagd_systembag_load_before':
                                 event['contract_observation']=dict(verified_user_mapping=keybagd_installed)
                             if name in ('keybagd_read_plist','keybagd_open_result_before','keybagd_errno_before') and not pending:
