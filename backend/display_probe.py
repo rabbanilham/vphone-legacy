@@ -104,6 +104,13 @@ def dispatch_release_evidence(gs, registers):
             result[label].update(invoke=hex(invoke), descriptor=hex(descriptor))
             for key, ptr in (('invoke_bytes', invoke), ('descriptor_bytes', descriptor)):
                 result[label][key] = memory(gs, ptr, 64).hex() if 0 < ptr < (1 << 64) - 64 else ''
+            for offset in (0x20, 0x28):
+                if len(data) < offset + 8:
+                    continue
+                ptr = struct.unpack_from('<Q', data, offset)[0]
+                captured = memory(gs, ptr, 128) if 0 < ptr < (1 << 64) - 128 else b''
+                result[label][f'capture_{offset:x}_candidate'] = dict(
+                    address=hex(ptr), bytes=captured.hex(), readable=len(captured) == 128)
     # The observed drain keeps the pthread/TLS base in x24. Its current
     # queue slot is +0xa0; verify the captured header before interpreting it.
     tls = registers[24]
@@ -115,6 +122,52 @@ def dispatch_release_evidence(gs, registers):
         if len(head) >= 0x68:
             label = int.from_bytes(head[0x60:0x68], 'little')
             result['queue_candidate']['label_bytes'] = memory(gs, label, 128).hex() if 0 < label < (1 << 64) - 128 else ''
+    return result
+
+
+def compiler_connection_evidence(gs, registers, name):
+    """T15 exact-PC layouts, before executing the hooked instruction.
+
+    These hooks belong to AGXCompilerConnection's XPC implementation and
+    AGXGLDriver. Keep raw bytes: a freed C++ object may now be a CFString.
+    No type is inferred from the address or from the contents of freed RAM.
+    """
+    def read_at(addr, size):
+        data = memory(gs, addr, size) if 0 < addr <= (1 << 64) - size else b''
+        return dict(address=hex(addr), bytes=data.hex(), readable=len(data) == size)
+
+    result = {}
+    if name == 'sb_compiler_reply_invoke':
+        block = read_at(registers[0], 0x30)
+        result['block'] = block
+        data = bytes.fromhex(block['bytes'])
+        obj = struct.unpack_from('<Q', data, 0x20)[0] if len(data) == 0x30 else 0
+        if len(data) == 0x30:
+            result['captured_reply'] = read_at(struct.unpack_from('<Q', data, 0x28)[0], 96)
+    elif name in ('sb_compiler_ctor_ready', 'sb_compiler_reply_after_xpc_release',
+                  'sb_compiler_delete'):
+        obj = registers[19]
+    elif name == 'sb_compiler_reply_enqueue':
+        obj = registers[20]
+        result['stack_block'] = read_at(registers[31], 0x30)
+    elif name == 'sb_compiler_request_reply':
+        obj = registers[24]
+        result['reply_status'] = hex(registers[22])
+    elif name in ('sb_compiler_owner_created', 'sb_compiler_owner_destroy'):
+        owner = registers[19] if name == 'sb_compiler_owner_created' else registers[0]
+        result['owner'] = read_at(owner, 0x290)
+        slot = read_at(owner + 0x280, 8) if owner else read_at(0, 8)
+        result['owner_connection_slot'] = slot
+        obj = int.from_bytes(bytes.fromhex(slot['bytes']), 'little') if slot['readable'] else 0
+    else:
+        obj = registers[0]
+    result['connection_candidate'] = read_at(obj, 128)
+    data = bytes.fromhex(result['connection_candidate']['bytes'])
+    if len(data) >= 0x28:
+        result['words'] = [hex(v) for v in struct.unpack_from('<5Q', data)]
+        for key, offset in (('queue_candidate', 8), ('xpc_candidate', 0x18),
+                            ('last_reply_candidate', 0x20)):
+            result[key] = read_at(struct.unpack_from('<Q', data, offset)[0], 96)
     return result
 
 
@@ -676,6 +729,8 @@ def main():
                             event['identity'] = caller_identity
                             if name == 'sb_dispatch_release_unaligned':
                                 event['dispatch_release'] = dispatch_release_evidence(gs, x)
+                            if name.startswith('sb_compiler_'):
+                                event['compiler_connection'] = compiler_connection_evidence(gs, x, name)
                             if caller_identity.get('exec_fname'):
                                 event['exec_fname'] = caller_identity['exec_fname']
                             if caller_identity.get('vnode_path'):

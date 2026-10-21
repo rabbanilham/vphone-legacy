@@ -1,0 +1,21 @@
+{
+  "cache_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "sb_compiler_ctor_ready": "0x1851bf1ac",
+    "sb_compiler_release_reply": "0x1851bf240",
+    "sb_compiler_reply_enqueue": "0x1851bf298",
+    "sb_compiler_reply_invoke": "0x1851bf2ac",
+    "sb_compiler_reply_after_xpc_release": "0x1851bf2c0",
+    "sb_compiler_request_reply": "0x1851bf5a4",
+    "sb_compiler_destroy": "0x1851bf1e8",
+    "sb_compiler_delete": "0x1851bf1d4",
+    "sb_compiler_owner_created": "0x18026f2d0",
+    "sb_compiler_owner_destroy": "0x18026f46c"
+  },
+  "notes": {
+    "purpose": "T15: SpringBoard-only XPCCompilerConnection lifetime trace. Capture construction, reply status, enqueue, invoke before/after xpc_release, destruction and pre-delete. Object and pointees are raw candidates; freed memory is not typed.",
+    "images": "AGXCompilerConnection at unslid 0x1851bc000 and AGXGLDriver at 0x180260000 are present in the cache's own image table but absent from cache-index.json images. Hook installation uses the index mappings and verifies the actual cache instruction bytes.",
+    "limits": "Use --max-hits sb_compiler_=128 and check counts for saturation. These focused hooks avoid the global dispatch_release breakpoint. No guest memory/register writes."
+  }
+}
