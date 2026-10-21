@@ -28,21 +28,38 @@ class SPIDMAContractTests(unittest.TestCase):
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <inttypes.h>
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define MiB (1024U * 1024U)
 #define GiB (1024ULL * MiB)
 #define RAM_BASE UINT64_C(0x800000000)
 #define NUM_PERIPHERALS 1
 #define SIO_OUTBOX_CAPACITY 64
+#define GPIO_SIZE 0x100000
+#define QEMU_CLOCK_VIRTUAL 0
+#define error_report(...) ((void)0)
+static int64_t virtual_ns, timer_deadline;
+static int64_t qemu_clock_get_ns(int clock) { (void)clock; return virtual_ns; }
+static void timer_mod(void *t, int64_t n) { (void)t; timer_deadline=n; }
+static void timer_del(void *t) { (void)t; timer_deadline=0; }
 #define LOG_UNIMP 0
 #define LOG_GUEST_ERROR 0
-#define qemu_log_mask(...) ((void)0)
+static void test_log(int mask, ...) { (void)mask; }
+#define qemu_log_mask(...) test_log(__VA_ARGS__)
+#define HWADDR_PRIx PRIx64
+
 #define g_malloc malloc
 #define g_free free
 #define MEMTXATTRS_UNSPECIFIED 0
 #define MEMTX_OK 0
 typedef uint64_t hwaddr;
+static void mmio_trace(const char *n, const char *o, hwaddr a, unsigned z, uint64_t v) {
+    (void)n; (void)o; (void)a; (void)z; (void)v;
+}
 typedef void QEMUTimer;
 typedef struct A7State A7State;
 static uint16_t lduw_le_p(const void *v) {
@@ -76,6 +93,10 @@ typedef struct A7Peripheral {
         harness += r'''
 struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
+    uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
+    int64_t touch_start_ns, touch_duration_ns;
+    unsigned touch_step, touch_steps;
+    int touch_x0, touch_y0, touch_x1, touch_y1;
 };
 static void aic_update(A7State *s) { (void)s; }
 static uint8_t ram[MiB];
@@ -96,6 +117,7 @@ static int address_space_write(void *as, hwaddr a, int attrs, const void *b, siz
     memcpy(ram+a-RAM_BASE,b,n); return 0;
 }
 '''
+        harness += extract('static void touch_gpio_update(', 'static const MemoryRegionOps gpio_ops')
         harness += extract('static int spi_index(', 'static int i2c_index(')
         harness += extract('static bool ans_ram_range(', 'static bool ans_file_io(')
         harness += extract('static uint64_t sio_pack_msg(', 'static void sio_update_irq(')
@@ -143,7 +165,9 @@ static void pio(A7Peripheral *p, const uint8_t *bytes, unsigned n, uint8_t *repl
 int main(void) {
     A7Peripheral *p=&state.peripherals[0]; p->owner=&state;
     p->base=UINT64_C(0x20a084000); p->regs=regs;
-    uint8_t probe[16]={0x1a,0xa1}, reply[32];
+    static uint8_t gpio[GPIO_SIZE]; state.gpio_regs=gpio;
+    p->spi.touch.owner=&state;
+    uint8_t probe[16]={0x1a,0xa1}, reply[128];
     for (unsigned i=2;i<16;i+=2) { probe[i]=0x18;probe[i+1]=0xe1; }
     spi_write(p,0,0xd); pio(p,probe,16,reply);
     assert(!memcmp(reply,"\x4a\xd1\x4a\xd1",4));
@@ -228,6 +252,70 @@ int main(void) {
     spi_write(p,4,0x4058);expect(2,23,145,0x65,0,0);expect(3,23,145,0x68,0xc0,1024);
     assert(p->spi.touch.firmware_bytes==uploaded);
     assert(mmio_attempts==0);
+    /* Start reporting, then consume native EB reset-complete and contact.
+     * Queries must leave the FIFO intact, including the initial duplicate. */
+    setenv("VPHONE_TOUCH_SCRIPT","70,60,1018,600,1018,0.3",1);
+    touch_script_reset(&state);
+    assert(timer_deadline==70000000000LL && state.touch_steps==18);
+    assert(state.touch_x0==60 && state.touch_y1==1018);
+    setenv("VPHONE_TOUCH_SCRIPT","nan,60,1018,600,1018,0.3",1);
+    touch_script_reset(&state); assert(timer_deadline==0);
+    unsetenv("VPHONE_TOUCH_SCRIPT"); touch_script_reset(&state);
+    uint8_t start[16]={0xe4,0x70,1,1};
+    stw_le_p(start+14,touch_sum(start,14));
+    pio(p,start,16,reply);
+    assert(state.touch_irq_low && p->spi.touch.frame_count==1);
+    assert(!(state.device_irq[3] & (1u<<12))); /* disabled */
+    stl_le_p(gpio+88,0x20a);touch_gpio_update(&state);
+    assert(state.device_irq[3] & (1u<<12));
+    uint8_t query[16]={0xeb,1};
+    pio(p,query,16,reply); assert(lduw_le_p(reply+1)==4);
+    assert(lduw_le_p(reply+14)==touch_sum(reply,14));
+    query[1]=2;pio(p,query,16,reply);assert(lduw_le_p(reply+1)==4);
+    gpio_write(&state,0x800,1u<<22,4);
+    assert(gpio_read(&state,0x800,4)==(1u<<22)); /* active level re-latches */
+    uint8_t fetch[64]={0xeb,2,1};
+    stw_le_p(fetch+7,touch_sum(fetch,3));
+    pio(p,fetch,9,reply);assert(!memcmp(reply+5,"\x60\x02",2));
+    assert(!(touch_sum(reply,5)&255));
+    assert(lduw_le_p(reply+7)==0x62 && !state.touch_irq_low);
+    /* Level must re-latch W1C until SPI consumption releases the line. */
+    gpio_write(&state,0x800,1u<<22,4);
+    assert(gpio_read(&state,88,4)==0x20b);
+    assert(!(state.device_irq[3] & (1u<<12)));
+    virtual_ns=70000000000LL;
+    state.touch_steps=18;state.touch_duration_ns=300000000;
+    state.touch_x0=60;state.touch_y0=1018;state.touch_x1=600;state.touch_y1=1018;
+    touch_timer_cb(&state);
+    assert(timer_deadline==virtual_ns+300000000/18);
+    pio(p,query,16,reply);assert(lduw_le_p(reply+1)==58);
+    /* Short/malformed data read cannot consume the queued down. */
+    pio(p,fetch,8,reply);assert(p->spi.touch.frame_count==1);
+    memset(fetch+3,0,sizeof(fetch)-3);
+    stw_le_p(fetch+61,touch_sum(fetch,3));
+    pio(p,fetch,63,reply);
+    assert(!(touch_sum(reply,5)&255));
+    assert(lduw_le_p(reply+61)==touch_sum(reply+5,56));
+    uint8_t *f=reply+5;
+    assert(f[0]==0x74 && f[2]==26 && f[14]==1 && lduw_le_p(f+12)==30);
+    assert(f[26]==1 && f[27]==1 && lduw_le_p(f+30)==60 && lduw_le_p(f+32)==118);
+    assert(lduw_le_p(f+44)==256 && !state.touch_irq_low);
+    for (unsigned i=1;i<=20;i++) {
+        virtual_ns=timer_deadline;touch_timer_cb(&state);
+        pio(p,query,16,reply);pio(p,fetch,63,reply);
+        assert(reply[32]==(i==20?7:i==1?3:4));
+        assert(lduw_le_p(reply+35)==(i>=19?600:60+30*(i-1)));
+        assert(lduw_le_p(reply+49)==(i==20?0:256));
+    }
+    assert(p->spi.touch.frame_count==0 && !state.touch_irq_low);
+    /* All seven status words in a group feed the same upstream AIC IRQ. */
+    stl_le_p(gpio+0x800,0);stl_le_p(gpio+0x800+24,1);
+    touch_gpio_update(&state);assert(state.device_irq[3]&(1u<<12));
+    stl_le_p(gpio+0x800+24,0);touch_gpio_update(&state);
+    stl_le_p(gpio+88,0x20e);touch_gpio_level(&state,true);
+    assert(!(state.device_irq[3]&(1u<<12)));
+    stl_le_p(gpio+88,0x20a);touch_gpio_update(&state);
+    assert(state.device_irq[3]&(1u<<12));
     return 0;
 }
 '''
