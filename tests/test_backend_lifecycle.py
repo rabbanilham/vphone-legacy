@@ -298,6 +298,8 @@ class SepControlEndpointTests(unittest.TestCase):
         self.assertEqual((rep >> 48) & 0xffff, 0)
 
 
+@unittest.skipUnless((PROJECT / "backend/bin/qemu-system-aarch64").exists(),
+                     "Build backend for executable SEP contract")
 class SepExecutableContractTests(unittest.TestCase):
     def test_native_keybag_query_and_lock_reply_contract(self):
         sys.path.insert(0, str(PROJECT / 'backend'))

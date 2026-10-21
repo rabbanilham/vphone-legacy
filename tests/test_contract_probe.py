@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 import contract_probe
 
@@ -146,7 +147,15 @@ class ContractProbeTests(unittest.TestCase):
             self.assertFalse(contract_probe.summarize(root)['source_media_verified'])
 
     def test_preset_retains_boot_inputs_and_ca_stop_condition(self):
-        cmd = contract_probe.command(Path('/tmp/probe12-test'))
+        # Exercise argument preservation without a local diagnostic run directory.
+        invocation = ['--plan', '/tmp/boot-plan-art/boot_plan.json',
+                      '--diagnostic-system', '/tmp/system-diagnostic-sep.raw',
+                      '--user-hooks', '/tmp/user-hooks.json']
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, 'probe-invocation.json', invocation)
+            with patch.object(contract_probe, 'PROBE11', root):
+                cmd = contract_probe.command(Path('/tmp/probe12-test'))
         self.assertIn('ca-scanout', cmd)
         self.assertEqual(cmd[cmd.index('--seconds') + 1], '90')
         self.assertIn('--returns', cmd)
