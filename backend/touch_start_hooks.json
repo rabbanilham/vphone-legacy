@@ -1,0 +1,13 @@
+{
+  "cache_path": "backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "mt_ui_locked": "0x187ccc828",
+    "mt_get_report": "0x187cccfcc",
+    "mt_set_report": "0x187cccfec",
+    "mt_detection_mode": "0x187cd39b8",
+    "mt_get_detectable": "0x187cd3848",
+    "mt_get_suppressing": "0x187cd392c",
+    "mt_zephyr_input_control": "0x187cd2490"
+  }
+}

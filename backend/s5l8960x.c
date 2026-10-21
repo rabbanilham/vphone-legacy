@@ -91,6 +91,7 @@ typedef struct A7Touch {
     bool booted;
     A7State *owner;
     uint8_t reporting, sequence;
+    uint8_t input_control[4], face_detection, input_reports;
     uint8_t frames[64][56], frame_len[64];
     unsigned frame_head, frame_count;
 } A7Touch;
@@ -227,6 +228,7 @@ struct A7State {
     bool touch_irq_low;
     QEMUTimer *touch_timer;
     int64_t touch_start_ns, touch_duration_ns;
+    bool touch_force;
     unsigned touch_step, touch_steps;
     int touch_x0, touch_y0, touch_x1, touch_y1;
     uint8_t rx[256];
@@ -787,7 +789,8 @@ static int spi_index(A7Peripheral *p)
 }
 
 /* Chosen device identity, not a dump of an actual N53 controller.
- * Report consumers: f88b7c (D0, BE max packet), f88c60 (D1 family),
+ * N1 E2 supplies interface info; D0 is the sensor region descriptor.
+ * Report consumers: f88c60 (D1 family),
  * f88d0c..9c (D3 endian/rows/cols/BE bcd), f88fc0 (D9 two LE u32).
  * Firmware caveat: deviceHasFirmware f8a05c reads guest object+c1;
  * f86d10..20 sets it after loader success. There is no SPI firmware-query
@@ -800,13 +803,20 @@ static int spi_index(A7Peripheral *p)
 static const struct {
     uint8_t id, len, data[16];
 } touch_reports[] = {
-    { 0xd0, 3, { 0x11, 0x05, 0x00 } },
+    /* N1 E2 supplies interface info. D0 here is Sensor Region Descriptor,
+     * parsed as count + count*7 bytes (187cd0788), NOT interface info.
+     * No explicit regions: userland uses its surface-dimension fallback. */
+    { 0xd0, 1, { 0 } },
     { 0xd1, 1, { 0x01 } },
     { 0xd3, 5, { 0x01, 0x10, 0x1b, 0x02, 0x66 } },
     { 0xd9, 8, { 0x80, 0x02, 0, 0, 0x70, 0x04, 0, 0 } },
     { 0xd7, 1, { 0 } },
     { 0xab, 1, { 0 } },
     { 0x70, 1, { 0 } },
+    /* 187cd3760: two device-endian u16 masks, detectable/suppressing. */
+    { 0xbf, 4, { 0 } },
+    { 0xaf, 1, { 0 } },
+    { 0xc8, 1, { 0 } },
     /* f88ee8..f88f2c copies A1 to Sensor Region Param; no decode here. */
     { 0xa1, 1, { 0 } },
 };
@@ -817,7 +827,10 @@ static const uint8_t *touch_report(A7Touch *t, uint8_t id, unsigned *len)
         if (touch_reports[i].id == id) {
             *len = touch_reports[i].len;
             return id == 0xab ? &t->mode :
-                   id == 0x70 ? &t->reporting : touch_reports[i].data;
+                   id == 0x70 ? &t->reporting :
+                   id == 0xbf ? t->input_control :
+                   id == 0xaf ? &t->face_detection :
+                   id == 0xc8 ? &t->input_reports : touch_reports[i].data;
         }
     }
     *len = 0;
@@ -876,12 +889,52 @@ static A7Touch *touch_device(A7State *s)
     return NULL;
 }
 
+/* Report70 is MTDeviceSetUILocked, not MTDeviceStart. Normal embedded
+ * detection modes use BF (187cd39b8); standard mode0 uses mask 019d
+ * (including bit2). Treat bit2 as contact enable for this personality.
+ * UI lock (70=1) disables contact delivery. */
+static bool touch_reporting_enabled(A7Touch *t)
+{
+    return t->reporting != 1 && (lduw_le_p(t->input_control) & 4);
+}
+
+static void touch_boot_complete(A7Touch *t)
+{
+    for (unsigned i = 0; i < t->frame_count; i++) {
+        unsigned at = (t->frame_head + i) % ARRAY_SIZE(t->frames);
+        if (t->frame_len[at] == 2 && t->frames[at][0] == 0x60 &&
+            t->frames[at][1] == 2) { return; }
+    }
+    const uint8_t ready[] = { 0x60, 2 };
+    touch_enqueue(t, ready, sizeof(ready));
+}
+
+/* A stop cancels contact data, not the asynchronous boot completion that
+ * lets MultitouchHID restore its deferred InputDetectionMode (7af4/68ec).
+ * Compact in FIFO order; never discard a boot notification awaiting EB. */
+static void touch_stop_contacts(A7Touch *t)
+{
+    unsigned kept = 0;
+    for (unsigned i = 0; i < t->frame_count; i++) {
+        unsigned at = (t->frame_head + i) % ARRAY_SIZE(t->frames);
+        if (t->frame_len[at] == 2 && t->frames[at][0] == 0x60 &&
+            t->frames[at][1] == 2) {
+            unsigned to = (t->frame_head + kept++) % ARRAY_SIZE(t->frames);
+            memcpy(t->frames[to], t->frames[at], 2);
+            t->frame_len[to] = 2;
+        }
+    }
+    t->frame_count = kept;
+    touch_gpio_level(t->owner, kept != 0);
+}
+
 static void touch_timer_cb(void *opaque)
 {
     A7State *s = opaque;
     A7Touch *t = touch_device(s);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    if (!t || t->reporting != 1 || t->frame_count == 64) {
+    if (!t || (!s->touch_force && !touch_reporting_enabled(t)) ||
+        t->frame_count == 64) {
         timer_mod(s->touch_timer, now + 16666667);
         return;
     }
@@ -894,8 +947,10 @@ static void touch_timer_cb(void *opaque)
     /* 187cd2028 resets per-ID history on state1; 187cd1d34 copies the
      * raw state. HID 4e70..7c treats states3/4 as touching, not 6/16. */
     touch_contact(t, step == 0 ? 1 : step == 1 ? 3 : step > n + 1 ? 7 : 4, x, y);
-    qemu_log_mask(LOG_UNIMP, "A7 TOUCH step=%u/%u x=%d y=%d queued=%u ns=%" PRId64 "\n",
-                  step, n, x, y, t->frame_count, now);
+    qemu_log_mask(LOG_UNIMP, "A7 TOUCH step=%u/%u x=%d y=%d queued=%u ns=%"
+                  PRId64 " forced=%u ui=%u detectable=%04x\n",
+                  step, n, x, y, t->frame_count, now, s->touch_force,
+                  t->reporting, lduw_le_p(t->input_control));
     if (s->touch_step++ <= n + 1) {
         timer_mod(s->touch_timer, now + s->touch_duration_ns / n);
     }
@@ -904,10 +959,12 @@ static void touch_timer_cb(void *opaque)
 static void touch_script_reset(A7State *s)
 {
     const char *script = getenv("VPHONE_TOUCH_SCRIPT");
+    const char *force = getenv("VPHONE_TOUCH_FORCE");
     double start, duration;
     int x0, y0, x1, y1, used = 0;
     timer_del(s->touch_timer);
     s->touch_step = 0;
+    s->touch_force = force && !strcmp(force, "1");
     if (!script || !*script) { return; }
     if (sscanf(script, "%lf,%d,%d,%d,%d,%lf%n", &start, &x0, &y0,
                &x1, &y1, &duration, &used) != 6 || script[used] ||
@@ -997,6 +1054,9 @@ static void touch_finish(A7Touch *t, unsigned len)
         /* f92e6c..f92f30: final execute address/argument command. */
         t->booted = true;
         t->boot_status = 0;
+        /* Final HBPP execute, not intermediate 1f01: firmware can now
+         * announce boot independently of UI reporting policy. */
+        touch_boot_complete(t);
     } else if (len == 2 && b[0] == 0x1f && b[1] == 1 &&
                t->firmware_bytes) {
         /* f92220/f9402c: execute, then status helper and E2. */
@@ -1021,22 +1081,37 @@ static void touch_finish(A7Touch *t, unsigned len)
             t->value[i] = (old & ~mask) | (value & mask);
         }
     } else if (len == 16 && b[0] == 0xe4) {
-        t->ack_status = b[2] > 11 ||
+        unsigned report_len;
+        const uint8_t *report = touch_report(t, b[1], &report_len);
+        t->ack_status = !report || b[2] != report_len || b[2] > 11 ||
                         touch_sum(b, 14) != lduw_le_p(b + 14);
         /* f91588..dc: opcode,id,length,data; E1 RX[8]==0 acknowledges
          * SetReport (f9167c..a8 / f91a48). */
         if (!t->ack_status && b[1] == 0xab && b[2] == 1) {
             t->mode = b[3];
         }
+        if (!t->ack_status && b[1] == 0xbf && b[2] == 4) {
+            bool was_enabled = touch_reporting_enabled(t);
+            memcpy(t->input_control, b + 3, 4);
+            if (was_enabled && !touch_reporting_enabled(t)) {
+                touch_stop_contacts(t);
+            }
+        }
+        if (!t->ack_status && b[1] == 0xaf && b[2] == 1) {
+            t->face_detection = b[3];
+        }
+        if (!t->ack_status && b[1] == 0xc8 && b[2] == 1) {
+            t->input_reports = b[3];
+        }
         if (!t->ack_status && b[1] == 0x70 && b[2] == 1) {
             t->reporting = b[3];
-            if (t->reporting == 1) {
-                /* 187cce0e8..210: reset-complete report initializes parser. */
-                const uint8_t ready[] = { 0x60, 2 };
-                touch_enqueue(t, ready, sizeof(ready));
-            } else {
-                t->frame_count = 0;
-                touch_gpio_level(t->owner, false);
+            memset(t->input_control, 0, sizeof(t->input_control));
+            touch_stop_contacts(t);
+            if (t->reporting == 2 && t->booted) {
+                /* Exiting UI lock resets the firmware reporting session.
+                 * Announce completion even if boot's earlier notification
+                 * was drained before a userland client subscribed. */
+                touch_boot_complete(t);
             }
         }
     } else if (len >= 6 && b[0] == 0x92 &&

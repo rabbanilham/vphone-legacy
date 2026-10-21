@@ -254,16 +254,29 @@ SPI reads lag; full-queue backpressure stretches the gesture. Unset the variable
 to disable injection. One swipe per machine reset is supported; there is no
 interactive monitor command.
 
-Report 0x70 controls reporting (1 starts, 2 stops). Start queues a reset-complete
-report; touch data uses HBPP EB phase-0 length / phase-1 data exchanges, LE
+Report 0x70 is UI lock control (`MTDeviceSetUILocked`): 1 enters UI lock,
+2 exits it. The firmware model queues reset-complete `60 02` at final execute
+and on unlock; it preserves a pending notification across policy changes.
+MultitouchHID uses that notification to restore its deferred InputDetectionMode.
+Report 0xbf contains two LE 16-bit masks (detectable inputs, inputs suppressing
+fingers); the injector waits for detectable bit2 with UI lock inactive. Reports
+0xaf and 0xc8 retain the face-detection and input-report controls used by that path.
+The earlier requirement for 0x70=1 was incorrect.
+
+For diagnostics only, `VPHONE_TOUCH_FORCE=1` bypasses the reporting gate while
+retaining the same script timing, FIFO and IRQ protocol. It defaults off and
+does not change the values returned by reports 0x70 or 0xbf. A forced gesture
+alone does not demonstrate that native startup policy works.
+
+Touch data uses HBPP EB phase-0 length / phase-1 data exchanges, LE
 checksums, and GPIO22 through GPIOIC group0 / AIC108. The chosen contact
 personality is report 0x74 with a 26-byte header and a 30-byte contact. D3's
 endian byte is 1 (LE); its rows/columns and D9 dimensions retain the existing
 16×27 and 640×1136 personality. These are modeled values, not captured sensor
 firmware output. End-to-end iOS behavior requires integrator validation.
 
-Run `python3 backend/touch_input_contract_test.py` against the rebuilt QEMU
-for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
+Run `python3 backend/touch_input_contract_test.py` and its diagnostic `--force`
+variant against the rebuilt QEMU for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
 actual source with host stubs and exercises a complete gesture under ASan/UBSan.
 For a live screen probe, use `backend/display_probe.py --stop-condition duration`
 with `--seconds 90` so it continues through the scheduled gesture; this mode

@@ -95,6 +95,7 @@ struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
     uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
     int64_t touch_start_ns, touch_duration_ns;
+    bool touch_force;
     unsigned touch_step, touch_steps;
     int touch_x0, touch_y0, touch_x1, touch_y1;
 };
@@ -252,7 +253,15 @@ int main(void) {
     spi_write(p,4,0x4058);expect(2,23,145,0x65,0,0);expect(3,23,145,0x68,0xc0,1024);
     assert(p->spi.touch.firmware_bytes==uploaded);
     assert(mmio_attempts==0);
-    /* Start reporting, then consume native EB reset-complete and contact.
+    /* Final execute queued boot-complete before UI policy, preserved by
+     * the normal deferred-unlock 70=2. It must not wait for 70=1. */
+    assert(p->spi.touch.frame_count==1);
+    uint8_t stop[16]={0xe4,0x70,1,2};
+    stw_le_p(stop+14,touch_sum(stop,14));pio(p,stop,16,reply);
+    assert(p->spi.touch.frame_count==1 && p->spi.touch.reporting==2);
+    /* Clear only for the independent unlock reporting contract below. */
+    p->spi.touch.frame_count=0;touch_gpio_level(&state,false);
+    /* Unlock UI, then consume native EB reset-complete and contact.
      * Queries must leave the FIFO intact, including the initial duplicate. */
     setenv("VPHONE_TOUCH_SCRIPT","70,60,1018,600,1018,0.3",1);
     touch_script_reset(&state);
@@ -261,7 +270,7 @@ int main(void) {
     setenv("VPHONE_TOUCH_SCRIPT","nan,60,1018,600,1018,0.3",1);
     touch_script_reset(&state); assert(timer_deadline==0);
     unsetenv("VPHONE_TOUCH_SCRIPT"); touch_script_reset(&state);
-    uint8_t start[16]={0xe4,0x70,1,1};
+    uint8_t start[16]={0xe4,0x70,1,2};
     stw_le_p(start+14,touch_sum(start,14));
     pio(p,start,16,reply);
     assert(state.touch_irq_low && p->spi.touch.frame_count==1);
@@ -283,6 +292,8 @@ int main(void) {
     gpio_write(&state,0x800,1u<<22,4);
     assert(gpio_read(&state,88,4)==0x20b);
     assert(!(state.device_irq[3] & (1u<<12)));
+    uint8_t enable[16]={0xe4,0xbf,4,0x9d,1,9,0};
+    stw_le_p(enable+14,touch_sum(enable,14));pio(p,enable,16,reply);
     virtual_ns=70000000000LL;
     state.touch_steps=18;state.touch_duration_ns=300000000;
     state.touch_x0=60;state.touch_y0=1018;state.touch_x1=600;state.touch_y1=1018;
@@ -308,6 +319,55 @@ int main(void) {
         assert(lduw_le_p(reply+49)==(i==20?0:256));
     }
     assert(p->spi.touch.frame_count==0 && !state.touch_irq_low);
+    /* Reproduce the probe84 stop -> BF metadata/read/modify/write path. */
+    pio(p,stop,16,reply);
+    stw_le_p(fetch+7,touch_sum(fetch,3));pio(p,fetch,9,reply); /* drain fresh unlock notification */
+    assert(!touch_reporting_enabled(&p->spi.touch));
+    unsigned before=state.touch_step;
+    touch_timer_cb(&state);assert(state.touch_step==before);
+    uint8_t bfmeta[16]={0xe3,0xbf};
+    pio(p,bfmeta,16,reply);
+    assert(reply[2]==0 && lduw_le_p(reply+3)==4);
+    uint8_t bfget[16]={0xe6,0xbf,1,4};
+    pio(p,bfget,16,reply);assert(ldl_le_p(reply+3)==0);
+    uint8_t bfset[16]={0xe4,0xbf,4,0x9d,1,9,0};
+    stw_le_p(bfset+14,touch_sum(bfset,14));
+    pio(p,bfset,16,reply);assert(!p->spi.touch.ack_status);
+    assert(touch_reporting_enabled(&p->spi.touch));
+    assert(p->spi.touch.reporting==2); /* BF is sufficient */
+    pio(p,bfget,16,reply);assert(ldl_le_p(reply+3)==0x0009019d);
+    /* Wrong size/checksum must preserve control and return E1 failure. */
+    bfset[2]=3;stw_le_p(bfset+14,touch_sum(bfset,14));
+    pio(p,bfset,16,reply);assert(p->spi.touch.ack_status);
+    assert(ldl_le_p(p->spi.touch.input_control)==0x0009019d);
+    bfset[2]=4;bfset[14]^=1;
+    pio(p,bfset,16,reply);assert(p->spi.touch.ack_status);
+    uint8_t ack[16]={0xe1};pio(p,ack,16,reply);assert(reply[8]==1);
+    for (unsigned i=0;i<2;i++) {
+        uint8_t control[16]={0xe4,i?0xc8:0xaf,1,i?9:1};
+        stw_le_p(control+14,touch_sum(control,14));pio(p,control,16,reply);
+        pio(p,ack,16,reply);assert(reply[8]==0);
+        uint8_t get[16]={0xe6,control[1],1,1};pio(p,get,16,reply);
+        assert(reply[3]==control[3] && lduw_le_p(reply+14)==touch_sum(reply,14));
+    }
+    /* UI lock must suppress even a retained/rewritten BF finger mask. */
+    uint8_t lock[16]={0xe4,0x70,1,1};
+    stw_le_p(lock+14,touch_sum(lock,14));pio(p,lock,16,reply);
+    bfset[2]=4;stw_le_p(bfset+14,touch_sum(bfset,14));pio(p,bfset,16,reply);
+    assert(!touch_reporting_enabled(&p->spi.touch));
+    const uint8_t *regions=touch_report(&p->spi.touch,0xd0,&report_len);
+    assert(report_len==1 && regions[0]==0); /* valid empty region list */
+    /* Opt-in force bypasses policy only; never rewrites report70 or BF. */
+    setenv("VPHONE_TOUCH_FORCE","true",1);touch_script_reset(&state);
+    assert(!state.touch_force);
+    setenv("VPHONE_TOUCH_FORCE","1",1);touch_script_reset(&state);
+    assert(state.touch_force);
+    pio(p,stop,16,reply);stw_le_p(fetch+7,touch_sum(fetch,3));pio(p,fetch,9,reply);state.touch_step=0;
+    touch_timer_cb(&state);assert(p->spi.touch.frame_count==1);
+    assert(p->spi.touch.reporting==2 && ldl_le_p(p->spi.touch.input_control)==0);
+    pio(p,fetch,63,reply);assert(p->spi.touch.frame_count==0);
+    unsetenv("VPHONE_TOUCH_FORCE");touch_script_reset(&state);
+    assert(!state.touch_force);
     /* All seven status words in a group feed the same upstream AIC IRQ. */
     stl_le_p(gpio+0x800,0);stl_le_p(gpio+0x800+24,1);
     touch_gpio_update(&state);assert(state.device_irq[3]&(1u<<12));
