@@ -541,3 +541,10 @@ df -h .
 ### Tools
 - `backend/live_run.py`: interactive Cocoa window (same plan/disk clones as probes). `--plan .../boot-plan-smp/boot_plan.json` with `VPHONE_TCG_THREAD=multi` for the dual-core run.
 - Hook sets: backend/touch_*_hooks.json, sb_restart_hooks.json, compiler_connection_hooks.json; display_probe supports `exe_hooks` (backboardd/SpringBoard slides), `--hook-dump name=reg[+off]:len`, `sb_`/`bb_` process filters. Avoid VA-global hooks on very hot functions (cf_mach_port_perform, MIG server paths): they stall the boot.
+
+### Milestone: "slide to set up" works -> Setup.app language list (probe-126, 2026-10-22)
+- Command (SMP plan, MTTCG, Cocoa window):
+  `VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi VPHONE_TOUCH_SCRIPT='at=125;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up' .venv/bin/python backend/display_probe.py --plan backend/evidence/keybag-contract-20261015/boot-plan-smp/boot_plan.json ...`
+- Why the earlier fast swipes failed (verified with SpringBoard exe hooks, `backend/evidence/keybag-contract-20261015/sb-scroll-hooks.json`): SBLockScreenScrollView pages 1 -> 0 (320 pt pages) and needs > 50 % travel or a flick. SpringBoard's main thread processes HID events late, UIKit coalesces them, so the pan saw Began -> one Changed (offset 278.5, only 41 pt) -> Ended with velocity 0 and bounced back. A slow 3 s drag with a 1 s hold lets a Changed with offset 63 (percent 0.8) arrive before release -> page 0 -> lockScreenView:didScrollToPage:0 -> unlock -> Setup.app.
+- y=1036 compensates MultitouchHID's fingertip offset (~16 px up). Leftward drags never start the pan.
+- Remaining artefact: an oversized, distorted "Searching" status-bar text drawn across the top (replay bug).
