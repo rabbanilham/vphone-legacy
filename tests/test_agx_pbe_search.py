@@ -21,7 +21,7 @@ class PBESearchTests(unittest.TestCase):
         root = Path(cls.temp.name)
         source = SOURCE.read_text()
         helpers = source[source.index('static void agx_pbe_scan('):
-                         source.index('static void agx_frame_dump(')]
+                         source.index('static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n);')]
         # One context buffer and one firmware META buffer, each a single page.
         # The page following each is unmapped: reads must stop there.
         harness = r'''
