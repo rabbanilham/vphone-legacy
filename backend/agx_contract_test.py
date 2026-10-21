@@ -12,7 +12,9 @@ A synthetic type-1 render logs RT0 translation and the first discontinuity.
 Context and CAT_BASE0 fallback runs (fill unset and 11223344) check
 no-doorbell ring-3 binds, opt-in little-endian pixel writes,
 noncontiguous pages, and untouched padding. The context/no-fill case also
-checks one exact PBE hit in a referenced buffer. Requires a rebuilt QEMU binary.
+checks one exact PBE hit in a referenced buffer. Replay cases check two synthetic
+quad draws into a PBE target with the default environment and the explicit
+opt-out. Requires a rebuilt QEMU binary.
 """
 import json
 import os
@@ -98,6 +100,80 @@ def data_blob(context=True, pbe=False):
     return bytes(blob)
 
 
+REPLAY_TARGET = 0x400000000
+REPLAY_TEXELS = (0xff010203, 0xff102030, 0xff405060, 0xff708090,
+                 0xffa0b0c0, 0xffd0e0f0, 0xff123456, 0xffabcdef)
+
+
+def replay_blob():
+    """Extend the context fixture with a TA queue, two quads and EOT/PBE state."""
+    blob = bytearray(data_blob())
+    def put(pa, fmt, *values): struct.pack_into(fmt, blob, pa - DATA, *values)
+    def page():
+        pa = DATA + len(blob)
+        blob.extend(bytes(0x1000))
+        return pa
+    directories, tables = {}, {}
+    def map_page(gva):
+        ci, di, ti = (gva >> 30) & 0x3ff, (gva >> 21) & 0x1ff, (gva >> 12) & 0x1ff
+        if ci not in directories:
+            directories[ci] = page()
+            put(CTX_PC + ci * 4, '<I', ((directories[ci] >> 12) << 4) | 1)
+        if (ci, di) not in tables:
+            tables[ci, di] = page()
+            put(directories[ci] + di * 8, '<Q', tables[ci, di] | 1)
+        pa = page()
+        put(tables[ci, di] + ti * 8, '<Q', pa | 1)
+        return pa
+
+    state_gva = 0x10000000
+    state = map_page(state_gva)
+    pds = map_page(0x600001000)
+    fragment = map_page(0x680001000)
+    # Map all 40 KiB of the first 16-row strip, with sentinel pixels/padding.
+    target_pages = [map_page(REPLAY_TARGET + offset) for offset in range(0, 0xa000, 0x1000)]
+    for pa in target_pages:
+        blob[pa - DATA:pa - DATA + 0x1000] = b'\xa5' * 0x1000
+
+    # Register the TA queue first so its type-0 command is retained before RT.
+    put(SHARED_9 + 0x8f0, '<I', 2)
+    put(SHARED_B + 0x140, '<3I', 1, 0, QUEUE_META + 0x800)
+    put(SHARED_B + 0x158, '<3I', 1, 0, QUEUE_META)
+    put(QUEUE + 0x800, '<3I', 0, QUEUE_META + 0x830, QUEUE_META + 0x870)
+    put(QUEUE + 0x830, '<13I', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4)
+    put(QUEUE + 0x870, '<I', QUEUE_META + 0x900)
+    put(QUEUE + 0x900, '<2I', 0, CONTEXT_ID)
+    put(QUEUE + 0x968, '<Q', state_gva)
+
+    # VDM state: vertex PDS data/code and two extra words; PPP; six vertices.
+    stream = []
+    for vs, ppp in ((0x1000, state_gva + 0x100), (0x1020, state_gva + 0x110)):
+        stream += [0x4c000000 | (1 << 27) | (1 << 26), vs, 0, 0, 0,
+                   1 << 8, ppp, 0x6a000600, 6, 0]
+    stream += [0xc0000000]
+    put(state, '<' + 'I' * len(stream), *stream)
+    put(state + 0x100, '<I', 0)  # solid PPP has no texture pointer
+    put(state + 0x110, '<I', 0x80001000)
+    put(pds, '<IIQ', 20, 0, state_gva + 0x200)
+    put(pds + 0x20, '<IIQ', 24, 0, state_gva + 0x300)
+    for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+        put(state + 0x200 + i * 20, '<4fI', u * 8, v * 4, 0, 1, 0xff112233)
+        put(state + 0x300 + i * 24, '<6f', 2 + u * 4, v * 2, 0, 1, u, v)
+    put(fragment, '<Q', state_gva + 0x400)
+    texture_gva = state_gva + 0x500
+    q = (texture_gva >> 2) << 16
+    put(state + 0x400, '<4I', 0, (2 - 1) << 16 | (4 - 1) << 2,
+        q & 0xffffffff, q >> 32)
+    for y in range(2):
+        put(state + 0x500 + y * 64, '<4I', *REPLAY_TEXELS[y * 4:y * 4 + 4])
+    # EOT PDS word 2 -> PBE words -> target, not the legacy cmd+0x68 fallback.
+    put(QUEUE + 0x300 + 0x1bc, '<2I', 0x1080, 12)
+    put(pds + 0x80, '<3I', 0, 0, state_gva + 0x600)
+    put(state + 0x600, '<2I', (REPLAY_TARGET >> 2) & 0xffffffff, REPLAY_TARGET >> 34)
+    put(QUEUE + 0x370, '<2I', 4 - 1, 8 - 1)
+    return bytes(blob), target_pages
+
+
 def fixture(wait_context=False):
     code = move64(1, SGX1 + 0x10000) + move64(3, SGX1 + 0x1000) + move64(4, RESULT)
     code += move64(7, AIC) + move64(8, AIC + 0x4000) + move64(9, SGX0)
@@ -129,12 +205,13 @@ def fixture(wait_context=False):
     return struct.pack('<' + 'I' * len(code), *code)
 
 
-def run_case(fill, context=True):
+def run_case(fill, context=True, replay=None):
     with tempfile.TemporaryDirectory(prefix='a7agx-', dir='/tmp') as directory:
         root = Path(directory)
         (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None))
-        pbe = context and fill is None
-        (root / 'data.bin').write_bytes(data_blob(context, pbe))
+        pbe = context and fill is None and replay is None
+        blob, target_pages = replay_blob() if replay is not None else (data_blob(context, pbe), [])
+        (root / 'data.bin').write_bytes(blob)
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
                '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
                '-device', f'loader,file={root}/data.bin,addr={DATA:#x},force-raw=on',
@@ -143,6 +220,12 @@ def run_case(fill, context=True):
         env = os.environ.copy()
         env.pop('VPHONE_AGX_RT_FILL', None)
         env.pop('VPHONE_AGX_PBE_SEARCH', None)
+        if replay is not None:
+            # Exercise the default, even when the invoking shell sets replay.
+            for key in ('VPHONE_AGX_REPLAY', 'VPHONE_AGX_FRAME_DUMP'):
+                env.pop(key, None)
+            if not replay:
+                env['VPHONE_AGX_REPLAY'] = '0'
         if pbe:
             env['VPHONE_AGX_PBE_SEARCH'] = '1'
         if fill is not None:
@@ -170,7 +253,7 @@ def run_case(fill, context=True):
                 assert words(RESULT + 8, 1) == [0x10000 | 84], 'no completion interrupt'
                 assert words(QUEUE + 0x200, 1) == [0x1234], 'stamp not stored'
                 assert words(QUEUE + 0x30, 1) == [2], 'queue read index not advanced'
-                assert words(SHARED_9 + 0x8e0, 1) == [1], 'host ring 1 read index not advanced'
+                assert words(SHARED_9 + 0x8e0, 1) == [2 if replay is not None else 1], 'host ring 1 read index not advanced'
                 if context:
                     assert words(SHARED_9 + 0x920, 1) == [3], 'ring 3 read index not advanced'
                     assert words(PC + ((RT_GVA >> 30) & 0x3ff) * 4, 1) == [0], 'RT mapped in CAT_BASE0'
@@ -181,6 +264,21 @@ def run_case(fill, context=True):
                     assert words(page, 4) == [expected] * 3 + [0xa5a5a5a5], 'RT pixels/padding'
                 assert words(RT_PA + 0x1000, 1) == [0], 'physical hole overwritten'
                 assert words(RT_LAST, 1) == [0xa5a5a5a5], 'probe-only end page overwritten'
+                if replay is not None:
+                    assert words(QUEUE + 0x830, 1) == [1], 'TA queue not drained'
+                    actual = bytearray()
+                    for i, pa in enumerate(target_pages):
+                        path = root / f'target-{i}.bin'
+                        command(fp, 'pmemsave', {'val': pa, 'size': 0x1000, 'filename': str(path)})
+                        actual.extend(path.read_bytes())
+                    expected_pixels = [0xa5a5a5a5] * (640 * 16)
+                    if replay:
+                        for y in range(4):
+                            for x in range(8):
+                                expected_pixels[y * 640 + x] = (
+                                    REPLAY_TEXELS[y * 4 + x - 2] if y < 2 and 2 <= x < 6
+                                    else 0xff112233)
+                    assert actual == struct.pack('<10240I', *expected_pixels), 'replay pixels/padding'
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
             trace = (root / 'trace.log').read_text()
@@ -191,9 +289,20 @@ def run_case(fill, context=True):
                         'off 0x100 width 64 value 0x40047000 surface 0x400470000 shift 4') in hits[0], hits
             else:
                 assert not hits, hits
+            if replay is not None:
+                replay_lines = [line for line in trace.splitlines() if 'AGX replay target ' in line]
+                expected_replay = [f'AGX replay target 0x{REPLAY_TARGET:x} draws 2'] if replay else []
+                assert replay_lines == expected_replay, replay_lines
+                if not replay:
+                    assert 'AGX replay' not in trace, trace
+                assert (f'AGX RT pbe target cmd 0x{QUEUE_META + 0x300:x} '
+                        f'surface 0x{REPLAY_TARGET:x} pa 0x{target_pages[0]:x}') in trace, trace
+            rt_gva = REPLAY_TARGET if replay is not None else RT_GVA
+            rt_pa = target_pages[0] if replay is not None else RT_PA
+            dimensions = 'w 8 h 4' if replay is not None else 'w 3 h 2'
             expected_line = (f'AGX RT queue 0x{QUEUE_META:x} cmd 0x{QUEUE_META + 0x300:x} '
-                             f'ch {CONTEXT_ID} rt0 gva 0x{RT_GVA:x} pa 0x{RT_PA:x} '
-                             'fmt 0x20007fc w 3 h 2 load 0x2')
+                             f'ch {CONTEXT_ID} rt0 gva 0x{rt_gva:x} pa 0x{rt_pa:x} '
+                             f'fmt 0x20007fc {dimensions} load 0x2')
             assert expected_line in trace, trace
             catalogue = CTX_PC if context else PC
             source = 'context slot' if context else 'CAT_BASE0 fallback'
@@ -204,6 +313,8 @@ def run_case(fill, context=True):
                 assert trace.index(bind) < trace.index(expected_line), 'RT traced before bind'
                 assert 'AGX META: host ring 3 skipped type 99 slot 0' in trace
                 assert 'AGX META: host ring 3 skipped type 3 slot 16' in trace
+            if replay is not None:
+                return
             assert f'last gva 0x{RT_GVA + 0x2c5000:x} pa 0x{RT_LAST:x} mapped 1 contiguous 0' in trace
             assert f'offset 0x1000 gva 0x{RT_GVA + 0x1000:x} expected 0x{RT_PA + 0x1000:x} pa 0x{RT_SECOND:x}' in trace
         finally:
@@ -214,11 +325,14 @@ def main():
     for context in (True, False):
         run_case(None, context)
         run_case('11223344', context)
+    run_case(None, replay=True)
+    run_case(None, replay=False)
+    print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')
     print('PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback')
     print('PASS: AGX RT trace; opt-in fill follows noncontiguous GPU mappings and preserves padding')
     print('PASS: AGX META boot program -> one type-0 alive entry on firmware ring 0 and AIC IRQ 84; empty program posts nothing')
     print('PASS: AGX doorbell 0x11 -> channel queue registered, type-4 stamp stored, type-1 completion event and IRQ 84')
-    print('Synthetic AGX host-interface contract only; no GPU command execution or iOS rendering inferred.')
+    print('Synthetic AGX host-interface and quad replay contract only; no iOS rendering inferred.')
 
 
 if __name__ == '__main__': main()
