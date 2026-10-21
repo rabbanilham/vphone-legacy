@@ -516,3 +516,28 @@ df -h .
 - The clipped Japanese "slide to set up" came from the layout. The replay wrote every render target (and read every GPU-rendered texture) with the display's 16-row-strip / 2560-pitch layout. Offscreen layers are mapped **densely** (the 608×64 backdrop has exactly 38 pages = 608×64×4), so rows past ≈41 fell outside the mapping and were dropped.
 - `agx_surface_layout()`: strip layout (pitch 2560) when the surface mapping has the display's hole at `base + 0xa000` (and `+0x9000` is mapped); otherwise dense rows with a 16-pixel aligned pitch. It is used for the pass target and for TSW layout-1 textures; `decode_tsw` mirrors it offline.
 - Live (`probe-78-layout`): the slide-to-set-up label is intact in every language seen (pt, de, fr, ja "スライドで設定", zh "滑动来设置", en, es, nl); contact sheet in `probe-78-layout/bottom-bars.png`.
+
+## 20. Touch input end to end, PMU/RTC, dual-core SMP (Claude + Codex + agy, 2026-10-21/22)
+
+### Touch pipeline (all verified with hooks)
+- SPI1 PIO + SmartIO DMA + HBPP slave (T1/T2): firmware upload works (`downloaded 64344 bytes of firmware data ("0x0266.bin")`); op06 DMA submit is synchronous (ACK 0x65, completion op68).
+- HBPP touch reporting (T3-T5): report 0x74 contact frames (26-byte header, 30-byte record, identity 2 = finger, states 1/3/4/7), D9 with explicit raw bounds, BF input-detection masks; inject with `VPHONE_TOUCH_SCRIPT='start,x0,y0,x1,y1,duration'` (pixels, guest seconds).
+- GPIO22 touch IRQ is a **falling-edge** interrupt (IOKit flags bit0 = level; flags 0 -> type 0xa edge); a level latch livelocks GPIOIC's ack-and-rescan loop.
+- DataMigration window swallowed touches: `accountsd` launches com.apple.datamigrator unless `com.apple.accountsd` `LastMigrationSystemVersion` is seeded; MobileSlideShow.migrator then waits forever on assetsd and its PUIProgressWindow context wins CA hit-testing. `scripts/prepare_diagnostic_disks.py` now seeds it; data disk regenerated (old one kept as `data-diagnostic-systembag-pre-accountsd.raw`).
+- With SMP + MTTCG (below), backboardd routes the swipe to SpringBoard's UIKit client and `__UIApplicationHandleHIDEvent` runs 21x (probe-119). **The greeting still does not advance** - next: UIKit/gesture level (sendEvent, SBLockScreenScrollView gesture, timing/coordinates).
+
+### Clock and PMU (T14)
+- D2045 PMU on I2C0 addr 0x74 modelled (16-bit BE register addresses, RTC LE u32 at 0x5c6 + offset 0x4004, ADC completion via event 0x5b bit1 on GPIO15). Guest date is now correct (was 2106 from failed RTC reads). `VPHONE_RTC_EPOCH` pins the time.
+- Side effect fixed: generic SmartIO DMA endpoints (e.g. UART2_RX EP 65) must finish stopped submissions with op68, never async op66 (panic).
+
+### SpringBoard restart = guest race exposed by one CPU (T13/T15)
+- SpringBoard crashed every boot in dispatch_release(0x10000078c): AGXCompilerConnection `XPCCompilerConnection::ReleaseReply` enqueues a block holding raw `this`; AGXGLDriver deletes the connection before the worker runs (probe-116 timeline). On one emulated core the worker waited ~160 ms.
+- **SMP (T16)**: 2 Cortex-A57 APs, CPU1 released via PMGR +0x30004/+0x30008 into the monitor warm-reset trampoline, per-CPU AIC IPI/IAR (+0x2000 window, SEND +0x2008 bit31 self, ACK +0x200c), per-CPU timers/c15. Boot plan `backend/evidence/keybag-contract-20261015/boot-plan-smp/` (boot-args `cpus=2`, `cpu_count` 2); display_probe/live_run take `-smp` from the plan and `VPHONE_TCG_THREAD` (default single).
+- SpringBoard restarts: 1/4 runs with thread=single, **0/4 with `VPHONE_TCG_THREAD=multi`** (no panics).
+
+### QEMU root cause (T12)
+- See section 17 addendum: jump-cache not cleared when a page flush escalates; precise patch `backend/patches/0001-tcg-flush-large-page-jump-cache.patch`.
+
+### Tools
+- `backend/live_run.py`: interactive Cocoa window (same plan/disk clones as probes). `--plan .../boot-plan-smp/boot_plan.json` with `VPHONE_TCG_THREAD=multi` for the dual-core run.
+- Hook sets: backend/touch_*_hooks.json, sb_restart_hooks.json, compiler_connection_hooks.json; display_probe supports `exe_hooks` (backboardd/SpringBoard slides), `--hook-dump name=reg[+off]:len`, `sb_`/`bb_` process filters. Avoid VA-global hooks on very hot functions (cf_mach_port_perform, MIG server paths): they stall the boot.
