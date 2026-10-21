@@ -395,7 +395,18 @@ df -h .
 - `agx_replay_enabled()` is on unless `VPHONE_AGX_REPLAY=0`. `backend/agx_contract_test.py` covers it: a VDM stream with one solid and one textured quad must produce exact pixels, and `VPHONE_AGX_REPLAY=0` must leave the target untouched.
 - Probe 61 (no env vars, 2 runs, no panic): d2 replays 2,052 frames (logo + progress bar). d1 replays only 1 because **the guest stalls**: backboardd stops submitting after 3 kicks. In d1 at 170 s there is no `CA::Render::Server` thread, `IOMFBServer::set_next_update` is blocked in `kern_EnableVSyncNotifications` (IOMobileFramebuffer user client), and `CA::Context::commit_transaction` is blocked sending to the render server. The same run-to-run variance (1 to ~2,000 type-1 commands) existed before replay, so this is a separate vsync/IOMFB problem.
 
+### Render stall = backboardd crash loop in CompassPlugIn (2026-10-21, open)
+- The stalled runs are **backboardd crash-loops**: pid 17 → 98 → 104 → … about every 10 s. After the last respawn the render server wedges in `kern_EnableVSyncNotifications`.
+- Real iOS crash reports, read from the data disk, are kept in `probe-62-crash/c1/crashlogs/` and `probe-64-nooscar-crash/k2/crashlogs/`. Run `display_probe.py` directly (not `parallel_probe.py`) so `images/` survives, read `/var/mobile/Library/Logs/CrashReporter` from `images/data.raw` (read-only attach), then run `probe_cleanup.py`.
+- Every backboardd crash is thread 0 in `/System/Library/HIDPlugins/CompassPlugIn.plugin`, called from `_IOHIDEventSystemCreate → __IOHIDServiceCreate → _IOHIDServiceFilterCreate → CFRelease → __IOHIDServiceFilterRelease → CompassPlugIn::Release`:
+  - Crash A: `objc_msgSend` with a garbage isa; the faulting address always ends in `…beb8`. This fits `CFRelease(this->factoryID)` at `+0x3440` on a corrupted instance.
+  - Crash B: `this == -1` in `setMagnetometerDac` (`+0x3958`).
+  - The plugin is an IOHIDServiceFilter: it is instantiated for every HID service and matches `0xff00/0x0a` with `IONameMatch == "compass,akm8973s"`. agy report C7 decodes its layout.
+- **Hiding the M7 'oscar' node does not fix it.** `boot-plan-vram-nooscar` (name/compatible `oscar` → `oscax`, evidence only): 3 of 4 runs still restart backboardd once, with the same crash A. agy C7's Oscar/UART2 root cause is wrong.
+- **The problem predates this session.** Across all probes, backboardd respawns appear in probe 30a, 36, 39r1, 41, 44, 45–58, 60r2, 61d1, 62c1 and 63; many other runs are clean. SpringBoard also crashes in some runs (thread 4 SIGSEGV, `probe-64…/k1`). The pattern (deterministic code, about 50 % failure, a corrupted object) suggests memory corruption or a race exposed by emulator timing.
+- Next: hook `__IOHIDServiceFilterRelease` / `_IOHIDServiceFilterCreate` in IOKit (shared cache; derive unslid addresses from the crash-report image bases) to log filter object, refcount and `factoryID` per call. Also run a batch with AGX HLE writes reduced to find a correlation.
+
 ### Next
-1. Investigate the intermittent render stall (IOMFB vsync enable path, display vblank IRQ timing; compare d1 and d2 of probe 61).
+1. Root-cause the backboardd CompassPlugIn crash above.
 2. Generalise beyond axis-aligned quads: transforms, texcoord sub-rects, A8 glyph textures, per-draw opacity, twiddled textures. Use frame dumps from later in boot (SpringBoard UI) to find what is missing.
 3. Fix the intermittent CommCenter baseband data abort (`0xf100f8`).
