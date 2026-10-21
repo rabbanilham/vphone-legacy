@@ -545,20 +545,20 @@ def main():
                                         verified.append(dict(name=uname,runtime=hex(va),absolute=True))
                                     mapping_dict = dict(slide=hex(slide),hooks=verified)
                                     if 'exe_hooks' in user_hooks and 'backboardd' in user_hooks['exe_hooks']:
-                                        proc = 'backboardd'
-                                        hdr_hex = user_hooks.get('exe_headers', {}).get(proc, 'cffaedfe0c0000010000000002000000')
+                                        exe_proc = 'backboardd'
+                                        hdr_hex = user_hooks.get('exe_headers', {}).get(exe_proc, 'cffaedfe0c0000010000000002000000')
                                         hdr = bytes.fromhex(hdr_hex)
-                                        known = user_hooks.get('known_return_sites', {}).get(proc, {})
-                                        exe_slide = derive_exe_slide(gs, memory, proc, hdr, known)
+                                        known = user_hooks.get('known_return_sites', {}).get(exe_proc, {})
+                                        exe_slide = derive_exe_slide(gs, memory, exe_proc, hdr, known)
                                         if exe_slide is not None:
-                                            exe_exp = user_hooks.get('exe_expected', {}).get(proc, {})
-                                            exe_path = user_hooks.get('exe_paths', {}).get(proc)
-                                            exe_v = install_exe_hooks(gs, memory, rsp, proc, exe_slide, user_hooks['exe_hooks'][proc], exe_exp, bps, user_expected, exe_path=exe_path)
+                                            exe_exp = user_hooks.get('exe_expected', {}).get(exe_proc, {})
+                                            exe_path = user_hooks.get('exe_paths', {}).get(exe_proc)
+                                            exe_v = install_exe_hooks(gs, memory, rsp, exe_proc, exe_slide, user_hooks['exe_hooks'][exe_proc], exe_exp, bps, user_expected, exe_path=exe_path)
                                             verified.extend(exe_v)
-                                            exe_slides[proc] = exe_slide
-                                            exe_installed[proc] = True
+                                            exe_slides[exe_proc] = exe_slide
+                                            exe_installed[exe_proc] = True
                                             mapping_dict['exe_slide'] = hex(exe_slide)
-                                            mapping_dict['exe_slides'] = {proc: hex(exe_slide)}
+                                            mapping_dict['exe_slides'] = {exe_proc: hex(exe_slide)}
                                     save_json(out/'user-hook-mapping.json',mapping_dict)
                                     user_installed=True;break
                             if user_hooks and 'exe_hooks' in user_hooks:
