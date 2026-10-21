@@ -404,7 +404,7 @@ def main():
                    f"system-image={images}/system.raw,data-image={images}/data.raw,"
                    f"utility-image={images}/utility.raw,system-writable=1")
         cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=single',
-               '-smp', '1', '-m', '1024M', '-kernel', plan['image'], '-display', 'none',
+               '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M', '-kernel', plan['image'], '-display', 'none',
                '-serial', f'file:{out}/serial.log', '-S', '-qmp', f'unix:{qmp},server=on,wait=off',
                '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')] + args.qemu_arg
         if bps:
