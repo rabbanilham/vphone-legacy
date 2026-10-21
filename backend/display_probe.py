@@ -50,22 +50,28 @@ def parse_hook_dumps(items):
     result = {}
     for item in items:
         name, spec = item.split('=', 1)
-        reg, length = spec.split(':', 1)
-        if not name or not re.fullmatch(r'x(?:[0-9]|[12][0-9]|30)', reg):
-            raise ValueError('hook dump requires name=x0..x30:length')
+        address, length = spec.split(':', 1)
+        match = re.fullmatch(r'(x(?:[0-9]|[12][0-9]|30)|sp)([+-](?:0x[0-9a-fA-F]+|[0-9]+))?', address)
+        if not name or not match:
+            raise ValueError('hook dump requires name=x0..x30|sp[+/-offset]:length')
+        reg, displacement = match.groups()
+        offset = int(displacement, 0) if displacement else 0
+        if abs(offset) > 4096:
+            raise ValueError('hook dump offset must be -4096..4096')
         length = int(length, 0)
         if not 1 <= length <= 4096:
             raise ValueError('hook dump length must be 1..4096')
-        result.setdefault(name, []).append((int(reg[1:]), length))
+        result.setdefault(name, []).append((31 if reg == 'sp' else int(reg[1:]), length, offset))
     return result
 
 
 def capture_hook_dumps(gs, registers, specs):
     result = []
-    for reg, length in specs:
-        addr = registers[reg]
-        data = memory(gs, addr, length) if addr else b''
-        result.append(dict(register=f'x{reg}', address=hex(addr),
+    for reg, length, offset in specs:
+        base = registers[reg]
+        addr = base + offset
+        data = memory(gs, addr, length) if base and 0 < addr < (1 << 64) and addr + length <= (1 << 64) else b''
+        result.append(dict(register='sp' if reg == 31 else f'x{reg}', offset=offset, address=hex(addr),
                            requested=length, readable=len(data) == length,
                            bytes=data.hex()))
     return result
@@ -168,7 +174,7 @@ def main():
     p.add_argument('--seconds', type=float, default=45)
     p.add_argument('--breakpoint', action='append', default=[], help='name=0xVA')
     p.add_argument('--returns', action='store_true')
-    p.add_argument('--hook-dump', action='append', default=[], help='name=xN:length, read up to 4096 bytes at a hook register (repeatable)')
+    p.add_argument('--hook-dump', action='append', default=[], help='name=xN|sp[+/-offset]:length, bounded read-only register-relative dump (repeatable; offset +/-4096, length 1..4096)')
     p.add_argument('--user-hooks', type=Path, help='Static shared-cache hook addresses, installed after verified runtime slide')
     p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout','duration'), default='first-pixel')
     p.add_argument('--step-count', type=int, default=1, help='Bounded instruction steps after each hook')
