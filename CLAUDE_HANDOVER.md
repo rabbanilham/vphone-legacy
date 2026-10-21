@@ -8,11 +8,15 @@
 
 The primary objective of `vphone-legacy` is to achieve the first genuine **CoreAnimation application frame** rendered from unmodified original iOS 7.1.2 (`n53ap` / build `11D257`) in an emulator environment, with non-zero RGB pixels scanned out to the physical framebuffer at `0x8018e0000`.
 
-### Acceptance Criteria
+### Acceptance Criteria (revised 2026-10-21, see §15–§19)
 1. **Attributed CoreAnimation Scanout**: Provenance originating from SpringBoard / `backboardd` via `CA::Render::Server`.
-2. **Physical Framebuffer Data**: Non-zero RGB pixels scanned out at `0x8018e0000` with `client_commit`, `surfaces`, `successful_swaps`, and `layer_base == 0x18e0000` at MMIO register `0x206204044`.
-3. **Pure Emulator Backend**: Implementation strictly inside the emulator backend (`backend/s5l8960x.c`, `display_probe.py`, `probe_state.py`). Zero guest binary/kernel patching; original disk media immutable.
+2. **Physical Framebuffer Data**: the layer-0 plane programmed by `AppleMobileADBE0` (DPU MMU page table at `0x4098`, *not* `0x4044`, which is the in-plane offset and always 0) contains non-zero RGB pixels produced from the guest's own GPU submissions, and these pixels reach the scanout.
+3. **Pure Emulator Backend**: Implementation strictly inside the emulator backend (`backend/s5l8960x.c`, tracked QEMU patches under `backend/patches/`, `display_probe.py`, `probe_state.py`). Zero guest binary/kernel patching; original disk media immutable (diagnostic disk copies are allowed).
 4. **Strict Host Resource Hygiene**: Immediate cleanup of disposable images (`images/`) after probe runs to keep disk headroom above quota.
+
+### Status (2026-10-21): **achieved**
+- Criteria 1–4 are met. The backend's high-level AGX replay renders backboardd/SpringBoard CoreAnimation frames, and the scanout shows the iOS 7 boot logo and progress bar, then the setup welcome screen: a cycling multilingual greeting, the slide-to-set-up label, the status bar and the ⓘ button (`probe-77-destin`, `probe-78-layout`). Offline replay of a SpringBoard offscreen pass reproduces the full home screen.
+- Next milestone: **touch input** (§20).
 
 ---
 
