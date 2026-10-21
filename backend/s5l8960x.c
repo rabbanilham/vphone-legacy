@@ -29,6 +29,7 @@
 #include "crypto/aes.h"
 #include "ui/console.h"
 #include <sys/file.h>
+#include <math.h>
 
 #define TYPE_A7 MACHINE_TYPE_NAME("s5l8960x")
 OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
@@ -177,6 +178,11 @@ struct A7State {
     uint64_t agx_ctx_cat[16]; /* Hardware slots: context_id + 3. */
     uint8_t agx_last_ta[16][0x280];
     uint32_t agx_last_ta_queue[16];
+    /* Recent TA commands per context: a 3D command pairs with the TA whose
+     * +0x14 parameter-buffer address equals its own +0x10 (TA for the next
+     * frame is often consumed before the current 3D pass). */
+    uint8_t agx_ta_ring[16][8][0x280];
+    uint8_t agx_ta_ring_next[16];
     bool agx_last_ta_valid[16];
     unsigned agx_frame_dump_count;
     uint64_t agx_frame_dump_seen;     /* qualifying frames seen, for SKIP/EVERY */
@@ -2976,6 +2982,23 @@ static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
  * commands, then {u64 GVA, u64 PA, u8 page[4096]} records. No filtering:
  * aliases and every valid PC/PD/PT mapping are retained, up to 96 MiB total.
  */
+/* The TA command whose parameter buffer (+0x14) matches a 3D command's
+ * (+0x10), newest first; NULL when it has not been seen. */
+static const uint8_t *agx_find_ta(A7State *s, uint32_t context, const uint8_t *render)
+{
+    uint32_t param = ldl_le_p(render + 0x10);
+    if (context >= ARRAY_SIZE(s->agx_ta_ring)) {
+        return NULL;
+    }
+    for (unsigned i = 1; i <= 8; i++) {
+        const uint8_t *ta = s->agx_ta_ring[context][(uint8_t)(s->agx_ta_ring_next[context] - i) % 8];
+        if (ldl_le_p(ta) == 0 && ldl_le_p(ta + 0x14) == param && param) {
+            return ta;
+        }
+    }
+    return NULL;
+}
+
 static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n);
 
 /* Count index-list (draw) blocks in a TA command's VDM stream. */
@@ -3005,6 +3028,7 @@ static unsigned agx_vdm_draw_count(A7State *s, uint64_t cat, const uint8_t *ta)
 static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
                            uint64_t target, uint32_t queue, const uint8_t *raw)
 {
+    const uint8_t *dump_ta = agx_find_ta(s, context, raw) ?: s->agx_last_ta[context];
     const char *dir = getenv("VPHONE_AGX_FRAME_DUMP");
     const char *count_env = getenv("VPHONE_AGX_FRAME_DUMP_COUNT");
     unsigned limit = 3, number;
@@ -3062,7 +3086,7 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
     stq_le_p(header + 56, s->disp_mmu_table);
     if (fwrite(header, 1, sizeof(header), out) != sizeof(header) ||
         fwrite(raw, 1, 0x280, out) != 0x280 ||
-        fwrite(s->agx_last_ta[context], 1, 0x280, out) != 0x280 ||
+        fwrite(dump_ta, 1, 0x280, out) != 0x280 ||
         address_space_read(&address_space_memory, cat, MEMTXATTRS_UNSPECIFIED,
                            pc, sizeof(pc)) != MEMTX_OK) {
         goto done;
@@ -3124,7 +3148,7 @@ finish:
     ta_hex = g_malloc(0x280 * 2 + 1);
     render_hex = g_malloc(0x280 * 2 + 1);
     for (unsigned i = 0; i < 0x280; i++) {
-        snprintf(ta_hex + i * 2, 3, "%02x", s->agx_last_ta[context][i]);
+        snprintf(ta_hex + i * 2, 3, "%02x", dump_ta[i]);
         snprintf(render_hex + i * 2, 3, "%02x", raw[i]);
     }
     result = fprintf(json,
@@ -3298,6 +3322,51 @@ static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
 /* High-level replay of a CoreAnimation frame: walk the TA VDM stream and
  * draw each axis-aligned quad (solid vertex colour or one BGRA texture,
  * premultiplied src-over) into the 640x1136 colour target. */
+/* The orthographic vertex matrix (column-major 4x4) referenced from the
+ * vertex PDS data maps CA's screen-space positions to NDC; returns
+ * {m00, m11, m30, m31}. */
+static bool agx_replay_matrix(A7State *s, uint64_t cat, uint64_t vs_data, float m4[4])
+{
+    static const unsigned zeros[] = { 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 14 };
+    uint32_t words[20];
+    if (!agx_ctx_read(s, cat, vs_data, words, sizeof(words))) {
+        return false;
+    }
+    for (unsigned k = 4; k < 20; k += 2) {
+        uint64_t ptr = words[k] | ((uint64_t)words[k + 1] << 32);
+        float m[16];
+        bool ortho = true;
+        if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40) ||
+            !agx_ctx_read(s, cat, ptr, m, sizeof(m))) {
+            continue;
+        }
+        for (unsigned z = 0; z < ARRAY_SIZE(zeros); z++) {
+            ortho &= m[zeros[z]] == 0;
+        }
+        if (ortho && fabsf(m[15] - 1) < 1e-6f && m[0] != 0 && m[5] != 0) {
+            m4[0] = m[0]; m4[1] = m[5]; m4[2] = m[12]; m4[3] = m[13];
+            return true;
+        }
+    }
+    return false;
+}
+
+/* PPP viewport block: x scale, x offset, y scale, y offset, 0.5, 0.5. */
+static bool agx_replay_viewport(const uint32_t *ppp, unsigned n, float vp[4])
+{
+    for (unsigned i = 0; i + 5 < n; i++) {
+        if (ppp[i] == ppp[i + 1] && ppp[i + 2] == ppp[i + 3] &&
+            ppp[i + 4] == 0x3f000000 && ppp[i + 5] == 0x3f000000 &&
+            ppp[i] >= 0x3f800000 && ppp[i] < 0x46000000) {
+            for (unsigned j = 0; j < 4; j++) {
+                memcpy(&vp[j], &ppp[i + j], 4);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height)
 {
@@ -3308,6 +3377,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
     width = MIN(width, 640u);
     height = MIN(height, 1136u);
+    /* Default viewport covers the pass; PPP state updates it. */
+    float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
     for (unsigned guard = 0; guard < 4096; guard++) {
         uint32_t w[5];
         if (!agx_ctx_read(s, cat, pc, w, 4)) {
@@ -3343,6 +3414,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             if (!agx_ctx_read(s, cat, gva, ppp, ppp_count * 4)) {
                 ppp_count = 0;
             }
+            agx_replay_viewport(ppp, ppp_count, vp);
             pc += 8;
         } else if (kind == 3) {
             uint32_t stride, count;
@@ -3357,13 +3429,20 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             pc += 12;
             count = MIN(w[1], 64u);
             if (!vs_data || !agx_ctx_read(s, cat, vs_data, &stride, 4) ||
-                !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 16 || stride > 64) {
+                !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 12 || stride > 64) {
                 continue;
             }
+            float m4[4];
+            bool transformed = agx_replay_matrix(s, cat, vs_data, m4);
             for (unsigned i = 0; i < count; i++) {
                 float xy[2];
                 if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
                     break;
+                }
+                if (transformed) {
+                    /* screen-space position -> NDC -> pass pixels */
+                    xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
+                    xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
                 }
                 minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
                 miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
@@ -3390,8 +3469,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     v0 = MIN(v0, t[1]); v1 = MAX(v1, t[1]);
                 }
             }
-            int x0 = MAX(0, (int)minx), y0 = MAX(0, (int)miny);
-            int x1 = MIN((int)width, (int)maxx), y1 = MIN((int)height, (int)maxy);
+            int x0 = MAX(0, (int)lroundf(minx)), y0 = MAX(0, (int)lroundf(miny));
+            int x1 = MIN((int)width, (int)lroundf(maxx)), y1 = MIN((int)height, (int)lroundf(maxy));
             if (x0 >= x1 || y0 >= y1 || !(u1 >= u0) || !(v1 >= v0)) {
                 continue;
             }
@@ -3569,8 +3648,12 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
         /* Optional: only dump frames with at least MIN_DRAWS draws (CA
          * redraws only dirty regions, so most frames are small). */
         const char *min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
-        if (!min_env || agx_vdm_draw_count(s, cat_base, s->agx_last_ta[context_id]) >=
-                        strtoul(min_env, NULL, 0)) {
+        const uint8_t *dump_ta = agx_find_ta(s, context_id, raw);
+        bool offscreen = (ldl_le_p(raw + 0x74) & 0xffff) != 639 ||
+                         (ldl_le_p(raw + 0x70) & 0xffff) != 1135;
+        if ((!getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") || offscreen) &&
+            (!min_env || (dump_ta && agx_vdm_draw_count(s, cat_base, dump_ta) >=
+                                     strtoul(min_env, NULL, 0)))) {
             agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
         }
     }
@@ -3600,14 +3683,12 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
     /* +0x70/+0x74 carry flags above the max x/y in bits [15:0]. */
     uint32_t pass_w = (ldl_le_p(raw + 0x74) & 0xffff) + 1;
     uint32_t pass_h = (ldl_le_p(raw + 0x70) & 0xffff) + 1;
-    /* Offscreen passes (e.g. 608x64 blur backdrops) position their screen-
-     * space geometry through vertex-shader uniforms the replay does not
-     * model yet; replaying them untransformed paints status-bar quads into
-     * the backdrop. Only full-screen passes are replayed for now. */
-    if (pbe_target && context_cat && agx_replay_enabled() &&
-        pass_w == 640 && pass_h == 1136 &&
-        context_id < ARRAY_SIZE(s->agx_last_ta) && s->agx_last_ta_queue[context_id]) {
-        agx_replay_frame(s, cat_base, s->agx_last_ta[context_id], pbe_target, pass_w, pass_h);
+    /* Each 3D pass replays the TA that shares its parameter buffer; vertex
+     * positions go through the pass's own matrix and viewport, so offscreen
+     * passes (e.g. 608x64 backdrops) land in their own coordinate space. */
+    const uint8_t *pass_ta = agx_find_ta(s, context_id, raw);
+    if (pbe_target && context_cat && agx_replay_enabled() && pass_ta) {
+        agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h);
     }
     /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
      * colour target comes from the end-of-tile PBE state when available. */
@@ -3784,6 +3865,8 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
                 uint8_t ta[0x280];
                 if (agx_gpu_access(s, agx_meta_gva(address), ta, sizeof(ta), false)) {
                     memcpy(s->agx_last_ta[context], ta, sizeof(ta));
+                    memcpy(s->agx_ta_ring[context][s->agx_ta_ring_next[context]++ % 8],
+                           ta, sizeof(ta));
                     s->agx_last_ta_valid[context] = true;
                     s->agx_last_ta_queue[context] = block;
                 }
@@ -4083,6 +4166,8 @@ static void a7_reset(void *opaque)
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     memset(s->agx_last_ta, 0, sizeof(s->agx_last_ta));
     memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
+    memset(s->agx_ta_ring, 0, sizeof(s->agx_ta_ring));
+    memset(s->agx_ta_ring_next, 0, sizeof(s->agx_ta_ring_next));
     memset(s->agx_last_ta_valid, 0, sizeof(s->agx_last_ta_valid));
     s->agx_frame_dump_count = 0;
     s->agx_frame_dump_seen = 0;

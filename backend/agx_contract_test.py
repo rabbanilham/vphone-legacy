@@ -144,6 +144,9 @@ def replay_blob():
     put(QUEUE + 0x870, '<I', QUEUE_META + 0x900)
     put(QUEUE + 0x900, '<2I', 0, CONTEXT_ID)
     put(QUEUE + 0x968, '<Q', state_gva)
+    # The 3D command pairs with this TA through the parameter buffer address.
+    put(QUEUE + 0x900 + 0x14, '<I', 0xc0460730)
+    put(QUEUE + 0x300 + 0x10, '<I', 0xc0460730)
 
     # VDM state: vertex PDS data/code and two extra words; PPP; six vertices.
     stream = []

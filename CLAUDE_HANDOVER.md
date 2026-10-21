@@ -480,3 +480,12 @@ df -h .
 ### Next
 1. Recover the vertex-shader transform (uniforms reachable from the vertex PDS data) so offscreen passes can be replayed into their own coordinate space.
 2. Approximate the vibrancy passes (luma-weighted tint of the backdrop) instead of skipping them, so text drawn through them appears.
+
+
+---
+
+## 19. TA/3D pairing and vertex transform (Claude, 2026-10-21)
+- **Pairing**: a 3D (type-1) command belongs to the TA (type-0) command whose `+0x14` parameter-buffer META address equals the 3D's `+0x10`. The TA for the next pass is often consumed before the current 3D pass, so "last TA" was wrong for offscreen passes. The backend now keeps the last 8 TA commands per context (`agx_ta_ring`) and `agx_find_ta()` pairs them; the replay and the frame dumps use the paired TA. Verified: offscreen 608×64 / 640×64 passes now pair with TAs reporting the same size at TA `+0x54/+0x58`.
+- **Vertex transform**: CA vertices stay in screen space. The vertex PDS data (`+0x10…`) references a column-major orthographic matrix uniform (`m00 = 2/W`, `m11 = 2/H`, `m30`/`m31` translation; e.g. the 608×64 backdrop of screen rect (20,990)–(628,1054) has `2/608`, `2/64`, `-1.0658`, `-31.938`). The PPP viewport block is `a, a, b, b, 0.5, 0.5` (x scale/offset, y scale/offset) and persists across draws. Pixel = (M·pos)·scale + offset. Implemented in `agx_replay_matrix` / `agx_replay_viewport` (C) and `find_matrix` / `find_viewport` (offline). Offscreen passes are replayed again, and stride-12 position-only draws (backdrop copies) are accepted.
+- `VPHONE_AGX_FRAME_DUMP_OFFSCREEN=1` dumps only non-640×1136 passes (`probe-74-offscreen`). Offline replay of the 608×64 pass shows "› slide to set up" in white on its dark backdrop (`slide-to-set-up-offline.png`).
+- Live (`probe-75-transform`, 2 × 180 s, no panic): unchanged visually (status bar + ⓘ). The display-pass draw that composites the 608×64 surface goes through a vibrancy shader, which the replay still skips; this is step 2 (agy report C8 in progress).

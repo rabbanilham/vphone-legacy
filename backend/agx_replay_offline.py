@@ -12,7 +12,7 @@ sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
 from agx_frame import Frame
 
 PDS_HEAP = 0x600000000
-W, H = 640, 1136
+W, H = 640, 1136  # output canvas; offscreen passes use the top-left corner
 
 
 def png(path, w, h, rgba):
@@ -24,10 +24,40 @@ def png(path, w, h, rgba):
                            chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
 
 
+def find_viewport(ppp):
+    """PPP viewport block: x scale, x offset, y scale, y offset, then 0.5, 0.5."""
+    for i in range(len(ppp) - 5):
+        if (ppp[i] == ppp[i + 1] and ppp[i + 2] == ppp[i + 3] and
+                ppp[i + 4] == ppp[i + 5] == 0x3f000000 and 0x3f800000 <= ppp[i] < 0x46000000):
+            f32 = lambda w: struct.unpack('<f', struct.pack('<I', w))[0]
+            return f32(ppp[i]), f32(ppp[i + 1]), f32(ppp[i + 2]), f32(ppp[i + 3])
+    return None
+
+
+def find_matrix(f, vs_data):
+    """Orthographic vertex matrix (column-major 4x4) referenced by the vertex PDS data."""
+    try:
+        words = [f.u32(vs_data + 4 * k) for k in range(20)]
+    except KeyError:
+        return None
+    for k in range(4, 20, 2):
+        ptr = words[k] | (words[k + 1] << 32)
+        if not 0x1000 <= ptr < (1 << 40):
+            continue
+        try:
+            m = struct.unpack('<16f', f.read(ptr, 64))
+        except KeyError:
+            continue
+        zeros = (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 14)
+        if abs(m[15] - 1) < 1e-6 and m[0] and m[5] and all(m[z] == 0 for z in zeros):
+            return m[0], m[5], m[12], m[13]
+    return None
+
+
 def walk(f):
-    """Yield (vertex_pds_data, ppp_words, draw_words) per draw."""
+    """Yield (vertex_pds_data, ppp_words, draw_words, viewport) per draw."""
     pc = struct.unpack_from('<Q', f.ta_command, 0x68)[0]
-    vs_data, ppp = None, []
+    vs_data, ppp, viewport = None, [], None
     for _ in range(4096):
         w0 = f.u32(pc)
         kind = w0 >> 29
@@ -47,10 +77,11 @@ def walk(f):
             count = (w0 >> 8) & 0xfffff
             gva = ((w0 & 0xff) << 32) | (f.u32(pc + 4) & ~3)
             ppp = [f.u32(gva + 4 * i) for i in range(count)]
+            viewport = find_viewport(ppp) or viewport
             pc += 8
         elif kind == 3:
             draw = [f.u32(pc + 4 * i) for i in range(3)]
-            yield vs_data, ppp, draw
+            yield vs_data, ppp, draw, viewport
             pc += 12
         else:
             raise ValueError(f'unknown VDM block {w0:#x} at {pc:#x}')
@@ -134,13 +165,21 @@ def texel(f, tex, x, y):
 def main():
     f = Frame(sys.argv[1])
     fb = bytearray(W * H * 4)
-    for vs_data, ppp, draw in walk(f):
+    pw = (struct.unpack_from('<I', f.type1_command, 0x74)[0] & 0xffff) + 1
+    ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
+    for vs_data, ppp, draw, viewport in walk(f):
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
-        xs = [v[0] for v in vs]
-        ys = [v[1] for v in vs]
-        x0, x1 = max(0, int(min(xs))), min(W, int(max(xs)))
-        y0, y1 = max(0, int(min(ys))), min(H, int(max(ys)))
+        m = find_matrix(f, vs_data)
+        vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
+        if m:   # screen-space position -> NDC -> pass pixels
+            xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs]
+            ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs]
+        else:
+            xs = [v[0] for v in vs]
+            ys = [v[1] for v in vs]
+        x0, x1 = max(0, int(round(min(xs)))), min(W, pw, int(round(max(xs))))
+        y0, y1 = max(0, int(round(min(ys)))), min(H, ph, int(round(max(ys))))
         tex = texture(f, ppp)
         print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
               (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
