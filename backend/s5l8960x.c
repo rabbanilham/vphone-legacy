@@ -173,6 +173,10 @@ struct A7State {
     QEMUTimer *agx_kick_timer;
     uint64_t agx_cat_base;
     uint64_t agx_ctx_cat[16]; /* Hardware slots: context_id + 3. */
+    uint8_t agx_last_ta[16][0x280];
+    uint32_t agx_last_ta_queue[16];
+    bool agx_last_ta_valid[16];
+    unsigned agx_frame_dump_count;
     uint64_t agx_shared_gva;
     uint32_t agx_meta_alive_count;
     uint32_t agx_queues[32];
@@ -2946,6 +2950,163 @@ static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
     }
 }
 
+/* AGXF v1: 64-byte LE header (see agx_frame.py), two 0x280-byte
+ * commands, then {u64 GVA, u64 PA, u8 page[4096]} records. No filtering:
+ * aliases and every valid PC/PD/PT mapping are retained, up to 96 MiB total.
+ */
+static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
+                           uint64_t target, uint32_t queue, const uint8_t *raw)
+{
+    const char *dir = getenv("VPHONE_AGX_FRAME_DUMP");
+    const char *count_env = getenv("VPHONE_AGX_FRAME_DUMP_COUNT");
+    unsigned limit = 3, number;
+    int result, close_result;
+    uint64_t parsed;
+    uint8_t header[64] = {0}, pc[4096], pd[4096], pt[4096];
+    uint8_t record[16 + 4096];
+    uint64_t pages = 0;
+    bool capped = false, ok = false;
+    FILE *out = NULL, *json = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *json_path = NULL;
+    g_autofree char *ta_hex = NULL;
+    g_autofree char *render_hex = NULL;
+
+    if (!dir || !*dir) {
+        return;
+    }
+    if (count_env) {
+        if (qemu_strtou64(count_env, NULL, 10, &parsed) || parsed > UINT_MAX) {
+            qemu_log_mask(LOG_GUEST_ERROR, "AGX FRAME invalid dump count: %s\n", count_env);
+            return;
+        }
+        limit = parsed;
+    }
+    if (s->agx_frame_dump_count >= limit) {
+        return;
+    }
+    number = ++s->agx_frame_dump_count;
+    path = g_strdup_printf("%s/frame-%u.bin", dir, number);
+    json_path = g_strdup_printf("%s/frame-%u.json", dir, number);
+    if (g_mkdir_with_parents(dir, 0755) < 0 || !(out = fopen(path, "wb"))) {
+        goto done;
+    }
+    memcpy(header, "AGXF", 4);
+    stl_le_p(header + 4, 1);
+    stl_le_p(header + 8, context);
+    stq_le_p(header + 16, cat);
+    stq_le_p(header + 24, target);
+    stl_le_p(header + 32, 0x280);
+    stl_le_p(header + 36, 0x280);
+    stl_le_p(header + 40, queue);
+    stl_le_p(header + 44, s->agx_last_ta_queue[context]);
+    stq_le_p(header + 56, s->disp_mmu_table);
+    if (fwrite(header, 1, sizeof(header), out) != sizeof(header) ||
+        fwrite(raw, 1, 0x280, out) != 0x280 ||
+        fwrite(s->agx_last_ta[context], 1, 0x280, out) != 0x280 ||
+        address_space_read(&address_space_memory, cat, MEMTXATTRS_UNSPECIFIED,
+                           pc, sizeof(pc)) != MEMTX_OK) {
+        goto done;
+    }
+    for (unsigned i = 0; i < 1024; i++) {
+        uint32_t pce = ldl_le_p(pc + i * 4);
+        if (!(pce & 1)) {
+            continue;
+        }
+        if (address_space_read(&address_space_memory, (uint64_t)(pce >> 4) << 12,
+                               MEMTXATTRS_UNSPECIFIED, pd, sizeof(pd)) != MEMTX_OK) {
+            goto done;
+        }
+        for (unsigned j = 0; j < 512; j++) {
+            uint64_t pde = ldq_le_p(pd + j * 8);
+            if (!(pde & 1)) {
+                continue;
+            }
+            if (address_space_read(&address_space_memory, pde & UINT64_C(0xfffffff000),
+                                   MEMTXATTRS_UNSPECIFIED, pt, sizeof(pt)) != MEMTX_OK) {
+                goto done;
+            }
+            for (unsigned k = 0; k < 512; k++) {
+                uint64_t pte = ldq_le_p(pt + k * 8);
+                uint64_t gva = ((uint64_t)i << 30) | ((uint64_t)j << 21) |
+                               ((uint64_t)k << 12);
+                uint64_t pa = pte & UINT64_C(0xfffffff000);
+                if (!(pte & 1)) {
+                    continue;
+                }
+                if (sizeof(header) + 2 * 0x280 + (pages + 1) * sizeof(record) >
+                    96 * MiB) {
+                    capped = true;
+                    goto finish;
+                }
+                stq_le_p(record, gva);
+                stq_le_p(record + 8, pa);
+                if (address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                       record + 16, 4096) != MEMTX_OK ||
+                    fwrite(record, 1, sizeof(record), out) != sizeof(record)) {
+                    goto done;
+                }
+                pages++;
+            }
+        }
+    }
+finish:
+    stl_le_p(header + 12, (s->agx_last_ta_valid[context] ? 1 : 0) | (capped ? 2 : 0));
+    stq_le_p(header + 48, pages);
+    if (fseek(out, 0, SEEK_SET) ||
+        fwrite(header, 1, sizeof(header), out) != sizeof(header)) {
+        goto done;
+    }
+    result = fclose(out);
+    out = NULL;
+    if (result || !(json = fopen(json_path, "w"))) {
+        goto done;
+    }
+    ta_hex = g_malloc(0x280 * 2 + 1);
+    render_hex = g_malloc(0x280 * 2 + 1);
+    for (unsigned i = 0; i < 0x280; i++) {
+        snprintf(ta_hex + i * 2, 3, "%02x", s->agx_last_ta[context][i]);
+        snprintf(render_hex + i * 2, 3, "%02x", raw[i]);
+    }
+    result = fprintf(json,
+                     "{\n  \"magic\": \"AGXF\", \"version\": \"0x1\", "
+                     "\"context_id\": \"0x%x\", \"flags\": \"0x%x\",\n"
+                     "  \"catalogue_pa\": \"0x%llx\", \"pbe_target\": \"0x%llx\",\n"
+                     "  \"type1_size\": \"0x280\", \"ta_size\": \"0x280\", "
+                     "\"queue\": \"0x%x\", \"ta_queue\": \"0x%x\",\n"
+                     "  \"display_mmu_table\": \"0x%llx\", \"record_count\": %llu, "
+                     "\"capped\": %s, \"ta_valid\": %s,\n"
+                     "  \"type1_command\": \"%s\",\n  \"ta_command\": \"%s\"\n}\n",
+                     context, (unsigned)ldl_le_p(header + 12),
+                     (unsigned long long)cat, (unsigned long long)target,
+                     queue, s->agx_last_ta_queue[context],
+                     (unsigned long long)s->disp_mmu_table, (unsigned long long)pages,
+                     capped ? "true" : "false", s->agx_last_ta_valid[context] ? "true" : "false",
+                     render_hex, ta_hex);
+    close_result = fclose(json);
+    json = NULL;
+    ok = result >= 0 && !close_result;
+done:
+    if (out) {
+        fclose(out);
+    }
+    if (json) {
+        fclose(json);
+    }
+    if (!ok) {
+        unlink(path);
+        unlink(json_path);
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX FRAME dump %u failed: %s (I/O or guest memory read)\n",
+                      number, path);
+        return;
+    }
+    if (capped) {
+        qemu_log_mask(LOG_UNIMP, "AGX FRAME dump %u capped at 96 MiB\n", number);
+    }
+    qemu_log_mask(LOG_UNIMP, "AGX FRAME dump %u %s %llu pages\n",
+                  number, path, (unsigned long long)pages);
+}
+
 /* Diagnostic only: RT0 is a GPU VA, not a META pointer (B1 sections 2/5). */
 static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
 {
@@ -3059,6 +3220,9 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
                               (unsigned long long)s->framebuffer);
             }
         }
+    }
+    if (context_id == 1 && context_cat && pbe_target && s->disp_mmu_table) {
+        agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
     }
     /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
      * colour target comes from the end-of-tile PBE state when available. */
@@ -3229,6 +3393,16 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
                           block, command[1], command[2], command[3]);
         } else if (command[0] != 4) {
+            if (command[0] == 0 && getenv("VPHONE_AGX_FRAME_DUMP") &&
+                command[1] < ARRAY_SIZE(s->agx_last_ta)) {
+                uint32_t context = command[1];
+                uint8_t ta[0x280];
+                if (agx_gpu_access(s, agx_meta_gva(address), ta, sizeof(ta), false)) {
+                    memcpy(s->agx_last_ta[context], ta, sizeof(ta));
+                    s->agx_last_ta_valid[context] = true;
+                    s->agx_last_ta_queue[context] = block;
+                }
+            }
             if (command[0] == 1) {
                 agx_trace_rt(s, block, address);
             }
@@ -3517,6 +3691,10 @@ static void a7_reset(void *opaque)
     s->agx_cat_base = 0;
     s->disp_mmu_table = 0;
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
+    memset(s->agx_last_ta, 0, sizeof(s->agx_last_ta));
+    memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
+    memset(s->agx_last_ta_valid, 0, sizeof(s->agx_last_ta_valid));
+    s->agx_frame_dump_count = 0;
     s->agx_shared_gva = 0;
     s->agx_queue_count = 0;
     s->agx_pending_doorbells = 0;
