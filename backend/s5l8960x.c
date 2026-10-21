@@ -1054,9 +1054,10 @@ static void touch_finish(A7Touch *t, unsigned len)
         /* f92e6c..f92f30: final execute address/argument command. */
         t->booted = true;
         t->boot_status = 0;
-        /* Final HBPP execute, not intermediate 1f01: firmware can now
-         * announce boot independently of UI reporting policy. */
-        touch_boot_complete(t);
+        /* Do not assert the level-low line yet: before the driver attaches
+         * its handler, GPIOIC ec9a28..b04 acks and rescans forever while it
+         * stays low (probe 85 livelock). Boot completion is announced on
+         * the later 70 write instead. */
     } else if (len == 2 && b[0] == 0x1f && b[1] == 1 &&
                t->firmware_bytes) {
         /* f92220/f9402c: execute, then status helper and E2. */

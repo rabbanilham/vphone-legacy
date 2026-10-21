@@ -253,9 +253,10 @@ int main(void) {
     spi_write(p,4,0x4058);expect(2,23,145,0x65,0,0);expect(3,23,145,0x68,0xc0,1024);
     assert(p->spi.touch.firmware_bytes==uploaded);
     assert(mmio_attempts==0);
-    /* Final execute queued boot-complete before UI policy, preserved by
-     * the normal deferred-unlock 70=2. It must not wait for 70=1. */
-    assert(p->spi.touch.frame_count==1);
+    /* Final execute must not assert the line before the driver attaches
+     * its GPIO handler (probe 85 livelock); the deferred-unlock 70=2
+     * announces boot completion instead. It must not wait for 70=1. */
+    assert(p->spi.touch.frame_count==0 && !state.touch_irq_low);
     uint8_t stop[16]={0xe4,0x70,1,2};
     stw_le_p(stop+14,touch_sum(stop,14));pio(p,stop,16,reply);
     assert(p->spi.touch.frame_count==1 && p->spi.touch.reporting==2);
