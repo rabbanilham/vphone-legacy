@@ -444,6 +444,12 @@ df -h .
   - `bisect/fixed`, 8 normal runs × 75 s: **0/8 backboardd crashes (was 30–50 %), SpringBoard never restarts (it used to restart in most runs), no panics, 474–841 replayed CA frames per run.**
 - Remaining: SpringBoard still restarts once in the deterministic icount shift=1 run (`fixed-s1`, pids 47 → 107). It may be timing-related under icount and should be re-checked. The intermittent CommCenter `0xf100f8` panic (§10/§16) may also have come from this bug; watch for it.
 
+### Root cause found (2026-10-22, Codex T12 + Claude verification)
+- QEMU defect, not a guest problem: when a by-VA flush hits an address inside the recorded large-page region (`accel/tcg/cputlb.c` `tlb_flush_page_locked` / the bits-range worker), it flushes the whole MMU index but clears the per-vCPU `tb_jmp_cache` only for the requested page. `cpu-exec.c` accepts jump-cache hits by virtual PC without re-translating, so TBs for other pages of the old mapping keep running.
+- `backend/patches/0001-tcg-flush-large-page-jump-cache.patch` clears the whole jump cache in exactly those escalated branches. The broad VAE1 flush is kept as `0001-tlbi-vae1-flush-regime.patch.fallback` (not applied).
+- Verified: `backend/tlb_contract_test.py` (block + page remap, VAE1/VAE1IS, TBI on/off) FAILS on pristine QEMU (second result stays 0x11) and PASSES with the patch; deterministic `-icount shift=1` iOS run: no backboardd crash; 6 normal runs: 0/6 backboardd crashes.
+- SpringBoard still restarts once in most runs (3/4 with the broad fallback too) — unrelated to this patch; agy T8 attributes it to the ~20 s launch watchdog.
+
 ### Tools added
 - `backend/crash_batch.py`: N identical probes; counts backboardd respawns.
 - `display_probe.py`: `--qemu-arg` (e.g. `-icount`), `--user-va-hook name=0xVA` (absolute user breakpoints), `hidf_*` IOHIDServiceFilter capture; steps record x16/x19–x21/lr.
