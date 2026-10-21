@@ -109,14 +109,20 @@ static bool sio_execute_aes(A7State *s, uint32_t n) { (void)s; (void)n; return f
         harness += extract('/* SmartIODMA:', 'static bool sio_execute_aes(')
         harness += extract('static void sio_handle_inbox_msg(', 'static void sep_update_irq(')
         harness += r'''
+#include <stdio.h>
 static A7State state;
 static uint8_t regs[0x100];
 static void inbox(unsigned ep, unsigned tag, unsigned op, unsigned param, uint32_t data) {
     sio_handle_inbox_msg(&state,sio_pack_msg(ep,tag,op,param,data));
 }
+static void drain(void) {
+    state.sio.outbox_count=state.sio.outbox_head=state.sio.outbox_tail=0;
+}
 static void expect(unsigned slot, unsigned ep, unsigned tag, unsigned op,
                    unsigned param, uint32_t data) {
     assert(slot < state.sio.outbox_count);
+    if (state.sio.outbox_queue[slot]!=sio_pack_msg(ep,tag,op,param,data))
+        fprintf(stderr,"expect slot %u tag %u op %x got %llx\\n",slot,tag,op,(unsigned long long)state.sio.outbox_queue[slot]);
     assert(state.sio.outbox_queue[slot]==sio_pack_msg(ep,tag,op,param,data));
 }
 static void segment(unsigned handle, unsigned index, hwaddr address, unsigned len) {
@@ -144,14 +150,15 @@ int main(void) {
     inbox(0,1,3,1,(RAM_BASE+0x1000)>>12); inbox(0,2,3,2,32);
     inbox(22,129,5,0,0); expect(2,22,129,0x65,0,0);
     inbox(23,129,5,0,0); expect(3,23,129,0x65,0,0);
-    state.sio.outbox_count=0;
+    drain();
     for (unsigned i=0;i<0xfb58;i++) { ram[0x2000+i]=i; }
     descriptor(0,2); segment(0,0,RAM_BASE+0x2000,7);
     segment(0,1,RAM_BASE+0x2007,0xfb58-7);
-    inbox(22,130,6,0,0); assert(state.sio.outbox_count==0);
-    inbox(22,131,7,0,0); expect(0,22,131,0x69,130,0);
+    inbox(22,130,6,0,0); expect(0,22,130,0x65,0,0);
+    assert(state.sio.outbox_count==1);
+    inbox(22,131,7,0,0); expect(1,22,131,0x69,130,0);
     spi_write(p,0x34,0); spi_write(p,0x4c,0xfb58); spi_write(p,4,0x4058);
-    expect(1,22,130,0x68,0xc0,0xfb58);
+    expect(2,22,130,0x68,0xc0,0xfb58);
     assert(spi_read(p,8)==0x400000 && !(state.device_irq[4]&(1<<9)));
     assert(p->spi.touch.firmware_bytes==0xfb58);
     pio(p,probe,2,reply); assert(reply[0]==0x4b && reply[1]==0xc1);
@@ -171,24 +178,25 @@ int main(void) {
     memset(ram+0x2000,0,16);ram[0x2000]=0xe2;
     descriptor(4,2);segment(4,0,RAM_BASE+0x2000,3);segment(4,1,RAM_BASE+0x2003,13);
     descriptor(8,2);segment(8,0,RAM_BASE+0x20000,5);segment(8,1,RAM_BASE+0x20005,11);
-    state.sio.outbox_count=0;
+    drain();
     inbox(23,132,6,0,8);inbox(22,133,6,0,4);
     spi_write(p,0x34,16);spi_write(p,0x4c,16);spi_write(p,4,0x204058);
-    expect(0,22,133,0x68,0xc0,16);expect(1,23,132,0x68,0xc0,16);
+    expect(0,23,132,0x65,0,0);expect(1,22,133,0x65,0,0);
+    expect(2,22,133,0x68,0xc0,16);expect(3,23,132,0x68,0xc0,16);
     assert(ram[0x20000]==0xe2 && ram[0x20002]==0x11 && ram[0x20004]==5);
     assert(lduw_le_p(ram+0x2000e)==touch_sum(ram+0x20000,14));
     assert(state.device_irq[4]&(1<<9));spi_write(p,8,0x40000f);
     assert(!(state.device_irq[4]&(1<<9)));spi_write(p,4,0x4018);
     /* MMIO anywhere in the list rejects all work without reaching the bus. */
-    segment(4,1,p->base,13);state.sio.outbox_count=0;
+    segment(4,1,p->base,13);drain();
     inbox(22,134,6,0,4);expect(0,22,134,0x66,0,0);assert(mmio_attempts==0);
     segment(4,1,RAM_BASE+0x2003,13);
     inbox(22,135,6,0,4);inbox(22,136,8,0,0);
-    expect(1,22,136,0x65,0,0);expect(2,22,135,0x68,0xc0,0);
+    expect(1,22,135,0x65,0,0);expect(2,22,136,0x65,0,0);expect(3,22,135,0x68,0xc0,0);
     /* RX-only emits dummy clocks and completion; mode may precede submit. */
-    state.sio.outbox_count=0;
+    drain();
     spi_write(p,0x34,16);spi_write(p,0x4c,16);spi_write(p,4,0x4058);
-    inbox(23,140,6,0,8);expect(0,23,140,0x68,0xc0,16);
+    inbox(23,140,6,0,8);expect(0,23,140,0x65,0,0);expect(1,23,140,0x68,0xc0,16);
     for (unsigned i=0;i<16;i++) { assert(ram[0x20000+i]==0xff); }
     spi_write(p,4,0x4018);
     /* Reserve space for BOTH completions before shifting any slave byte. */
@@ -196,7 +204,7 @@ int main(void) {
     spi_write(p,0x34,16);spi_write(p,0x4c,16);
     state.sio.outbox_count=63;spi_write(p,4,0x4058);
     assert(p->spi.shifted==0 && state.sio.spi_dma[0].active);
-    state.sio.outbox_count=0;sio_spi_dma_kick(&state);
+    drain();sio_spi_dma_kick(&state);
     expect(0,22,142,0x68,0xc0,16);expect(1,23,141,0x68,0xc0,16);
     spi_write(p,4,0x4018);
     uint8_t final_execute[12]={0x1d,0x53,0,0,0,0,0,1};
@@ -206,10 +214,10 @@ int main(void) {
     unsigned report_len;assert(touch_report(&p->spi.touch,0xa1,&report_len));
     assert(report_len==1);
     /* Malformed table bounds/zero lengths and repeated idle stop. */
-    state.sio.outbox_count=0;inbox(22,137,6,0,31);expect(0,22,137,0x66,0,0);
+    drain();inbox(22,137,6,0,31);expect(0,22,137,0x66,0,0);
     segment(4,0,RAM_BASE+0x2000,0);inbox(22,138,6,0,4);expect(1,22,138,0x66,0,0);
     inbox(22,139,8,0,0);expect(2,22,139,0x65,0,0);expect(3,22,0,0x68,0x40,0);
-    state.sio.outbox_count=0;
+    drain();
     descriptor(4,0);inbox(22,143,6,0,4);expect(0,22,143,0x66,0,0);
     descriptor(4,1);segment(4,0,UINT64_MAX-3,16);
     inbox(22,144,6,0,4);expect(1,22,144,0x66,0,0);
@@ -217,7 +225,7 @@ int main(void) {
     unsigned uploaded=p->spi.touch.firmware_bytes;
     descriptor(8,1);segment(8,0,RAM_BASE+0x20000,1024);
     inbox(23,145,6,0,8);spi_write(p,0x34,1024);spi_write(p,0x4c,1024);
-    spi_write(p,4,0x4058);expect(2,23,145,0x68,0xc0,1024);
+    spi_write(p,4,0x4058);expect(2,23,145,0x65,0,0);expect(3,23,145,0x68,0xc0,1024);
     assert(p->spi.touch.firmware_bytes==uploaded);
     assert(mmio_attempts==0);
     return 0;

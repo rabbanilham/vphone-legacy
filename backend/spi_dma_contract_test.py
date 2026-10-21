@@ -59,7 +59,8 @@ def fixture():
         reply(ep, 129, 0x65)
     segments(0, [(TX, 7), (TX + 7, 0xfb58 - 7)])
     send(22, 130, 6)
-    read(SIO + 0x1020, 0x20000)  # no ACK or premature completion
+    reply(22, 130, 0x65)  # synchronous ACK only
+    read(SIO + 0x1020, 0x20000)  # no premature completion
     send(22, 131, 7)
     reply(22, 131, 0x69, 130)
     write(SPI, 0xd)
@@ -85,7 +86,9 @@ def fixture():
     segments(4, [(TX, 3), (TX + 3, 13)])
     segments(8, [(RX, 5), (RX + 5, 11)])
     send(23, 132, 6, data=8)  # native RX is armed before TX
+    reply(23, 132, 0x65)
     send(22, 133, 6, data=4)
+    reply(22, 133, 0x65)
     write(SPI + 0x34, 16)
     write(SPI + 0x4c, 16)
     write(SPI + 4, 0x204058)
@@ -100,6 +103,7 @@ def fixture():
     write(SPI + 4, 0x4018)
     # RX-only clocks 0xff dummy TX and scatters the disconnected response.
     send(23, 134, 6, data=8)
+    reply(23, 134, 0x65)
     write(SPI + 0x34, 16)
     write(SPI + 0x4c, 16)
     write(SPI + 4, 0x4058)
@@ -109,6 +113,7 @@ def fixture():
     # Cancel armed work before mode enable; original request receives a
     # short completion and stop receives ACK, then idle flag on completion.
     send(22, 135, 6, data=4)
+    reply(22, 135, 0x65)
     send(22, 136, 8)
     reply(22, 136, 0x65)
     reply(22, 135, 0x68, 0xc0)

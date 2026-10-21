@@ -2151,8 +2151,11 @@ static void sio_handle_inbox_msg(A7State *s, uint64_t msg)
                 !sio_spi_dma_list(s, &next, NULL, false)) {
                 sio_outbox_push(s, sio_pack_msg(ep, tag, 0x66, 0, 0));
             } else {
+                /* Submission goes through synchronousMessage (91af64 panics
+                 * on a missing reply): ACK now, op68 completes it later. */
                 *dma = next;
-                sio_spi_dma_kick(s); /* submission has no separate ACK */
+                sio_outbox_push(s, sio_pack_msg(ep, tag, 0x65, 0, 0));
+                sio_spi_dma_kick(s);
             }
         } else if (op == 7) {
             sio_outbox_push(s, sio_pack_msg(ep, tag, 0x69,
