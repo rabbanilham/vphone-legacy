@@ -14,7 +14,8 @@ no-doorbell ring-3 binds, opt-in little-endian pixel writes,
 noncontiguous pages, and untouched padding. The context/no-fill case also
 checks one exact PBE hit in a referenced buffer. Replay cases check two synthetic
 quad draws into a PBE target with the default environment and the explicit
-opt-out. Requires a rebuilt QEMU binary.
+opt-out, TA pairing, transforms, dense targets, dest-in masks and vibrancy.
+Requires an existing QEMU binary built with the replay rules under test.
 """
 import json
 import os
@@ -105,8 +106,28 @@ REPLAY_TEXELS = (0xff010203, 0xff102030, 0xff405060, 0xff708090,
                  0xffa0b0c0, 0xffd0e0f0, 0xff123456, 0xffabcdef)
 
 
-def replay_blob():
-    """Extend the context fixture with a TA queue, two quads and EOT/PBE state."""
+# Exact CA mask program: its first 64 bytes identify AGX_USC_DEST_IN.
+REPLAY_MASK_CODE = bytes.fromhex(
+    '4520b002c44010c0400002806aff4620f44c806080048880a00002806aff280a9400'
+    '11f01b8222221000a0a30020398a80940011f01b8222221000a1a30021ff')
+REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'vibrancy-dark', 'vibrancy-light')
+
+
+def blend_vibrancy(dst, src):
+    """Integer CA darken/lightenSourceOver oracle, including alpha and truncation."""
+    d = [(dst >> shift) & 255 for shift in range(0, 32, 8)]
+    s = [(src >> shift) & 255 for shift in range(0, 32, 8)]
+    y = (54 * d[2] + 183 * d[1] + 19 * d[0]) >> 8
+    y1 = 255 - y if sum(s[:3]) > 384 else y
+    y2 = y1 * y1 // 255
+    f = y2 * y2 // 255
+    s = [c * f // 255 for c in s]
+    return sum(min(s[c] + d[c] * (255 - s[3]) // 255, 255) << (8 * c)
+               for c in range(4))
+
+
+def replay_blob(case=True):
+    """Build a replay case and its full physical target oracle using context mappings."""
     blob = bytearray(data_blob())
     def put(pa, fmt, *values): struct.pack_into(fmt, blob, pa - DATA, *values)
     def page():
@@ -130,8 +151,13 @@ def replay_blob():
     state = map_page(state_gva)
     pds = map_page(0x600001000)
     fragment = map_page(0x680001000)
-    # Map all 40 KiB of the first 16-row strip, with sentinel pixels/padding.
-    target_pages = [map_page(REPLAY_TARGET + offset) for offset in range(0, 0xa000, 0x1000)]
+    # Original cases retain the display hole; new cases map through +0xa000.
+    # The extra pages are guards too: compare every byte, including row padding.
+    synthetic = isinstance(case, str)
+    width, height = ((40, 40) if case == 'dense' else (16, 16)) if synthetic else (640, 1136)
+    pitch = ((width + 15) & ~15) * 4 if synthetic else 2560
+    target_pages = [map_page(REPLAY_TARGET + offset)
+                    for offset in range(0, 0xb000 if synthetic else 0xa000, 0x1000)]
     for pa in target_pages:
         blob[pa - DATA:pa - DATA + 0x1000] = b'\xa5' * 0x1000
 
@@ -174,9 +200,99 @@ def replay_blob():
     put(QUEUE + 0x300 + 0x1bc, '<2I', 0x1080, 12)
     put(pds + 0x80, '<3I', 0, 0, state_gva + 0x600)
     put(state + 0x600, '<2I', (REPLAY_TARGET >> 2) & 0xffffffff, REPLAY_TARGET >> 34)
-    # Full-screen pass (max y/x with flag bits above [15:0]); offscreen passes are not replayed.
-    put(QUEUE + 0x370, '<2I', 0x60000000 | (1136 - 1), 0xa0000000 | (640 - 1))
-    return bytes(blob), target_pages
+    # Pass dimensions are max y/x in low 16 bits, with unrelated flags above.
+    put(QUEUE + 0x370, '<2I', 0x60000000 | (height - 1), 0xa0000000 | (width - 1))
+    expected = bytearray(b'\xa5' * (len(target_pages) * 0x1000))
+    def expect_rect(rect, pixel):
+        x0, y0, x1, y1 = rect
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                struct.pack_into('<I', expected, y * pitch + x * 4, pixel(x, y))
+    draws, ta_count = 2, 1
+    if case is True:
+        expect_rect((0, 0, 8, 4), lambda x, y: 0xff112233)
+        expect_rect((2, 0, 6, 2), lambda x, y: REPLAY_TEXELS[y * 4 + x - 2])
+    if synthetic:
+        assert case in REPLAY_CASES, case
+        expected[:] = b'\xa5' * len(expected)
+        if case in ('pairing', 'transform', 'dense'):
+            # One solid draw; terminate before the original texture draw.
+            put(state + 10 * 4, '<I', 0xc0000000)
+            draws = 1
+            rect = (0, 0, 8, 4)
+            if case == 'pairing':
+                # Both TAs precede 3D; +0x10 selects the SECOND-to-last TA.
+                ta_count = 2
+                put(QUEUE + 0x830 + 8 * 4, '<I', ta_count)
+                put(QUEUE + 0x874, '<I', QUEUE_META + 0xc00)
+                put(QUEUE + 0xc00, '<2I', 0, CONTEXT_ID)
+                put(QUEUE + 0xc14, '<I', 0xc0460830)
+                put(QUEUE + 0xc68, '<Q', state_gva + 0x700)
+                put(state + 0x700, '<11I', 0x4c000000, 0x1100, 0, 0, 0,
+                    1 << 8, state_gva + 0x100, 0x6a000600, 6, 0, 0xc0000000)
+                put(pds + 0x100, '<IIQ', 20, 0, state_gva + 0x800)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x800 + i * 20, '<4fI', u * 8, v * 4, 0, 1, 0xffaabbcc)
+            elif case == 'transform':
+                # W=H=16 orthographic matrix, screen rect (34,50)-(42,54).
+                # A 4/4 viewport (different from the pass default 8/8) gives
+                # pixel x=x_screen/2-15, y=y_screen/2-23 -> (2,2)-(6,4).
+                put(pds + 0x10, '<Q', state_gva + 0x900)
+                matrix = [0.] * 16
+                matrix[0] = matrix[5] = 2 / 16
+                matrix[12], matrix[13], matrix[15] = -4.75, -6.75, 1.
+                put(state + 0x900, '<16f', *matrix)
+                put(state + 5 * 4, '<I', 6 << 8)
+                put(state + 0x100, '<6f', 4, 4, 4, 4, .5, .5)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x200 + i * 20, '<4fI', 34 + u * 8, 50 + v * 4, 0, 1, 0xff112233)
+                rect = (2, 2, 6, 4)
+            elif case == 'dense':
+                # 40 pixels need 48-pixel/192-byte rows, crossing page boundaries
+                # and the 16-row boundary. Eight padding pixels stay untouched.
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x200 + i * 20, '<4fI', u * 40, v * 40, 0, 1, 0xff112233)
+                rect = (0, 0, 40, 40)
+            expect_rect(rect, lambda x, y: 0xff112233)
+        else:
+            destination = 0xff907050
+            for i in range(6):
+                put(state + 0x200 + i * 20 + 16, '<I', destination)
+            expect_rect((0, 0, 8, 4), lambda x, y: destination)
+            if case == 'dest-in':
+                # PPP[7] -> PDS state -> USC offset -> exact 64 code bytes.
+                put(state + 15 * 4, '<I', 8 << 8)
+                put(state + 0x110 + 7 * 4, '<I', 0x1200)
+                put(pds + 0x200, '<I', 0x1000)
+                usc = map_page(0x700001000)
+                assert len(REPLAY_MASK_CODE) == 64
+                fingerprint = 0xcbf29ce484222325
+                for byte in REPLAY_MASK_CODE:
+                    fingerprint = ((fingerprint ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+                assert fingerprint == 0x4ee01acc47551344
+                put(usc, '<64s', REPLAY_MASK_CODE)
+                alphas = (0, 64, 128, 255, 255, 128, 64, 0)
+                for y in range(2):
+                    put(state + 0x500 + y * 64, '<4I',
+                        *(a << 24 | 0x123456 for a in alphas[y * 4:y * 4 + 4]))
+                def masked(x, y):
+                    a = alphas[y * 4 + x - 2]
+                    return sum(((destination >> c) & 255) * a // 255 << c for c in range(0, 32, 8))
+                expect_rect((2, 0, 6, 2), masked)
+            else:
+                # Luma constants, four sampler words, then the TSW at +28.
+                q = (texture_gva >> 2) << 16
+                put(state + 0x400, '<11I', 0x3d93a000, 0x3e59a000, 0x3f372000,
+                    0xfff, 0x2400, 0, 0, 0x60008864, 1 << 16 | 3 << 2,
+                    q & 0xffffffff, q >> 32)
+                tint = 0xc0204060 if case == 'vibrancy-dark' else 0xc0d0e0f0
+                put(pds + 0x20, '<I', 28)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x300 + i * 28, '<4fI2f', 2 + u * 4, v * 2, 0, 1, tint, u, v)
+                for y in range(2):
+                    put(state + 0x500 + y * 64, '<4I', *([0xffffffff] * 4))
+                expect_rect((2, 0, 6, 2), lambda x, y: blend_vibrancy(destination, tint))
+    return bytes(blob), target_pages, bytes(expected), (width, height), draws, ta_count
 
 
 def fixture(wait_context=False):
@@ -215,7 +331,10 @@ def run_case(fill, context=True, replay=None):
         root = Path(directory)
         (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None))
         pbe = context and fill is None and replay is None
-        blob, target_pages = replay_blob() if replay is not None else (data_blob(context, pbe), [])
+        if replay is not None:
+            blob, target_pages, replay_expected, dims, draws, ta_count = replay_blob(replay)
+        else:
+            blob, target_pages = data_blob(context, pbe), []
         (root / 'data.bin').write_bytes(blob)
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
                '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
@@ -270,20 +389,13 @@ def run_case(fill, context=True, replay=None):
                 assert words(RT_PA + 0x1000, 1) == [0], 'physical hole overwritten'
                 assert words(RT_LAST, 1) == [0xa5a5a5a5], 'probe-only end page overwritten'
                 if replay is not None:
-                    assert words(QUEUE + 0x830, 1) == [1], 'TA queue not drained'
+                    assert words(QUEUE + 0x830, 1) == [ta_count], 'TA queue not drained'
                     actual = bytearray()
                     for i, pa in enumerate(target_pages):
                         path = root / f'target-{i}.bin'
                         command(fp, 'pmemsave', {'val': pa, 'size': 0x1000, 'filename': str(path)})
                         actual.extend(path.read_bytes())
-                    expected_pixels = [0xa5a5a5a5] * (640 * 16)
-                    if replay:
-                        for y in range(4):
-                            for x in range(8):
-                                expected_pixels[y * 640 + x] = (
-                                    REPLAY_TEXELS[y * 4 + x - 2] if y < 2 and 2 <= x < 6
-                                    else 0xff112233)
-                    assert actual == struct.pack('<10240I', *expected_pixels), 'replay pixels/padding'
+                    assert actual == replay_expected, f'{replay!r}: replay pixels/padding'
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
             trace = (root / 'trace.log').read_text()
@@ -296,7 +408,7 @@ def run_case(fill, context=True, replay=None):
                 assert not hits, hits
             if replay is not None:
                 replay_lines = [line for line in trace.splitlines() if 'AGX replay target ' in line]
-                expected_replay = [f'AGX replay target 0x{REPLAY_TARGET:x} draws 2'] if replay else []
+                expected_replay = [f'AGX replay target 0x{REPLAY_TARGET:x} draws {draws}'] if replay else []
                 assert replay_lines == expected_replay, replay_lines
                 if not replay:
                     assert 'AGX replay' not in trace, trace
@@ -304,7 +416,7 @@ def run_case(fill, context=True, replay=None):
                         f'surface 0x{REPLAY_TARGET:x} pa 0x{target_pages[0]:x}') in trace, trace
             rt_gva = REPLAY_TARGET if replay is not None else RT_GVA
             rt_pa = target_pages[0] if replay is not None else RT_PA
-            dimensions = 'w 640 h 1136' if replay is not None else 'w 3 h 2'
+            dimensions = f'w {dims[0]} h {dims[1]}' if replay is not None else 'w 3 h 2'
             expected_line = (f'AGX RT queue 0x{QUEUE_META:x} cmd 0x{QUEUE_META + 0x300:x} '
                              f'ch {CONTEXT_ID} rt0 gva 0x{rt_gva:x} pa 0x{rt_pa:x} '
                              f'fmt 0x20007fc {dimensions} load 0x2')
@@ -332,6 +444,9 @@ def main():
         run_case('11223344', context)
     run_case(None, replay=True)
     run_case(None, replay=False)
+    for case in REPLAY_CASES:
+        run_case(None, replay=case)
+        print(f'PASS: AGX replay {case}: exact guest physical pixels and padding')
     print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')
     print('PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback')
     print('PASS: AGX RT trace; opt-in fill follows noncontiguous GPU mappings and preserves padding')
