@@ -159,6 +159,68 @@ def prepare_data():
     return target, sha
 
 
+def seed_setup_done(data_mount, build_version="11D257"):
+    """Seed the state a device has after finishing Setup Assistant offline.
+
+    Verified in 11D257 (agy A1 report, strings checked in the cache/lockdownd):
+    - Preferences.framework PSSetupAssistantNeedsToRun (0x189522298) returns
+      NO for ForceNoBuddy, and also checks SetupDone / SetupVersion (>= 5) /
+      AssistantPresented; SpringBoard _SBUpdateBuddyMode (0x1000ded5c) then
+      leaves buddy mode, so the lock screen unlocks to the home screen.
+    - lockdownd keeps "-ActivationState" = FactoryActivated without an
+      activation record ("No Ticket, but allowing factory activation"), and
+      SBLockdownManager reads "-BrickState" (must be false) from
+      /var/root/Library/Lockdown/data_ark.plist. Activation records are
+      signature-checked, so none are fabricated.
+    """
+    bplist = lambda value: plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
+    purplebuddy = bplist({
+        "SetupDone": True,
+        "SetupFinishedAllSteps": True,
+        "SetupVersion": 5,
+        "AssistantPresented": True,
+        "SetupState": "SetupUsingAssistant",
+        "ForceNoBuddy": True,
+    })
+    mobile = Path(data_mount) / "mobile/Library/Preferences"
+    mobile.mkdir(parents=True, exist_ok=True)
+    (mobile / "com.apple.purplebuddy.plist").write_bytes(purplebuddy)
+    (mobile / "com.apple.purplebuddy.notbackedup.plist").write_bytes(bplist({
+        "CloudConfigPresented": True,
+        "LocationServices2Presented": True,
+        "ShouldRunKeychainSyncMiniBuddy": False,
+        "ShouldRunMesaMiniBuddy": False,
+    }))
+    root = Path(data_mount) / "root/Library/Preferences"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "com.apple.purplebuddy.plist").write_bytes(purplebuddy)
+    lockdown = Path(data_mount) / "root/Library/Lockdown"
+    lockdown.mkdir(parents=True, exist_ok=True)
+    (lockdown / "data_ark.plist").write_bytes(bplist({
+        "-ActivationState": "FactoryActivated",
+        "-BrickState": False,
+        "com.apple.purplebuddy-SetupState": "SetupUsingAssistant",
+    }))
+
+
+def prepare_setup_done_variant():
+    """Copy the prepared data disk and add the setup-done state to the copy."""
+    source = DIAG_DIR / "data-diagnostic-systembag.raw"
+    target = DIAG_DIR / "data-diagnostic-setupdone.raw"
+    if target.exists():
+        target.unlink()
+    shutil.copyfile(source, target)
+    dev, mount = attach(target)
+    try:
+        seed_setup_done(mount)
+        print("[*] Seeded purplebuddy and lockdown setup-done state")
+    finally:
+        detach(dev)
+    sha = digest(target)
+    print(f"[+] Prepared {target} (SHA256: {sha})")
+    return target, sha
+
+
 def main():
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
     sys_img, sys_sha = prepare_system()
@@ -169,4 +231,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--setup-done-variant"]:
+        prepare_setup_done_variant()
+    else:
+        main()
