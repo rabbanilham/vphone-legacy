@@ -10,9 +10,10 @@ class ProbeStateTests(unittest.TestCase):
     def test_opt_in_hook_dumps_bound_reads_and_preserve_failures(self):
         self.assertEqual(parse_hook_dumps([]), {})
         specs = parse_hook_dumps(['frame=x25:96', 'frame=x1:0x10'])
-        self.assertEqual(specs, {'frame': [(25, 96), (1, 16)]})
-        for invalid in ['frame=x31:8', 'frame=sp:8', 'frame=x1:0',
-                        'frame=x1:4097', 'frame=x1:-1', '=x0:8']:
+        self.assertEqual(specs, {'frame': [(25, 96, 0), (1, 16, 0)]})
+        for invalid in ['frame=x31:8', 'frame=x32:8', 'frame=x1:0',
+                        'frame=x1:4097', 'frame=x1:-1', '=x0:8',
+                        'frame=sp+4097:8', 'frame=x1-4097:8', 'frame=sp+:8']:
             with self.assertRaises(ValueError): parse_hook_dumps([invalid])
         regs = [0] * 31; regs[25] = 0x1234
         with patch('display_probe.memory', return_value=b'abc') as read:
@@ -22,6 +23,23 @@ class ProbeStateTests(unittest.TestCase):
         self.assertFalse(dumps[0]['readable'])
         self.assertEqual(dumps[1]['address'], '0x0')
         self.assertFalse(dumps[1]['readable'])
+
+    def test_hook_stack_offsets_do_not_read_null_or_wrapped_addresses(self):
+        specs = parse_hook_dumps(['gate=sp+0x1c0:192', 'gate=x29-16:8'])['gate']
+        regs = [0] * 32
+        regs[31] = 0x10000
+        with patch('display_probe.memory', return_value=bytes(192)) as read:
+            dumps = capture_hook_dumps(None, regs, specs)
+        read.assert_called_once_with(None, 0x101c0, 192)
+        self.assertEqual(dumps[0]['register'], 'sp')
+        self.assertEqual(dumps[0]['offset'], 0x1c0)
+        self.assertFalse(dumps[1]['readable'])
+        regs[29] = 8
+        regs[31] = (1 << 64) - 1
+        with patch('display_probe.memory') as read:
+            dumps = capture_hook_dumps(None, regs, specs)
+        read.assert_not_called()
+        self.assertTrue(all(not dump['readable'] for dump in dumps))
 
     def test_instruction_page_fault_is_deferred_and_wrong_image_rejected(self):
         expected=bytes(range(16))
