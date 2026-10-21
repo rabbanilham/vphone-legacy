@@ -21,7 +21,7 @@ class PBESearchTests(unittest.TestCase):
         root = Path(cls.temp.name)
         source = SOURCE.read_text()
         helpers = source[source.index('static void agx_pbe_scan('):
-                         source.index('/* Diagnostic only: RT0')]
+                         source.index('static void agx_frame_dump(')]
         # One context buffer and one firmware META buffer, each a single page.
         # The page following each is unmapped: reads must stop there.
         harness = r'''
