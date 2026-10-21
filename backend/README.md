@@ -256,16 +256,56 @@ The optional `--keybagd-loader-hooks` mode stops on directly observed open failu
 
 ## Scripted n53 touch input
 
-After rebuilding the backend, set `VPHONE_TOUCH_SCRIPT=start_s,x0,y0,x1,y1,duration_s`
-on the QEMU process. For example, `VPHONE_TOUCH_SCRIPT='70,60,1018,600,1018,0.3'`
-drags across the setup slider at 70 seconds of QEMU virtual time. Coordinates
-are framebuffer pixels with a top-left origin (640×1136). The model emits a
-path start, down, interpolated moves at approximately 60 Hz including the endpoint, then
-an up one interval later, all with contact ID 1. If userland has not enabled
-reporting yet, the gesture waits. A bounded FIFO preserves transitions when
-SPI reads lag; full-queue backpressure stretches the gesture. Unset the variable
-to disable injection. One swipe per machine reset is supported; there is no
-interactive monitor command.
+After rebuilding the backend, set `VPHONE_TOUCH_SCRIPT` on the QEMU process.
+The existing six-field swipe form remains supported:
+
+```sh
+VPHONE_TOUCH_SCRIPT='125,60,1018,600,1018,0.3'
+```
+
+Fields are `start_s,x0,y0,x1,y1,duration_s`. Coordinates are integer framebuffer
+pixels with a top-left origin (X 0..640, Y 0..1136), not UIKit points.
+Start is seconds of QEMU virtual time relative to machine reset (0..86400).
+Legacy duration is 0.016..60 seconds. The model emits state1 (path start),
+state3 (down), `max(1,floor(duration*60))` state4 moves including the endpoint,
+then state7 (up), with the same separate start/down/up intervals as before.
+Contact ID is always 1 and identity is 2 (finger).
+
+For holds, variable speed, taps, or repeated gestures use the segment form:
+
+```sh
+VPHONE_TOUCH_SCRIPT='at=125;down 100,1018;hold 0.15;move 560,1018 dur=0.8 steps=48;hold 0.1;up'
+VPHONE_TOUCH_SCRIPT='at=125;tap 320,568|at=128;down 60,1018;move 600,1018 dur=1;up'
+```
+
+Each gesture begins with `at=seconds;`, then exactly one `down x,y` and a final
+`up`, or a single `tap x,y`. Commands are separated by `;`; gestures by `|`.
+Do not add a trailing separator. Gestures must be ordered, with each `at=`
+strictly after the previous up's scheduled time. Whitespace around numbers
+and separators is accepted; command names are lowercase as shown.
+
+- `down x,y` emits start immediately, then down one 60 Hz tick later.
+- `move x,y dur=seconds [steps=N]` linearly interpolates from the current point.
+  The first move occurs one interval after the preceding frame, and the final
+  move reaches the requested endpoint exactly at `dur` after that frame.
+  Default steps are `max(1,floor(dur*60))`; explicit steps are integers 1..3600
+  and can override the usual cadence for diagnostic probes.
+- `hold seconds` emits stationary state4 frames at approximately 60 Hz,
+  including the exact duration endpoint. Move and hold durations are 0.001..60
+  seconds. Holds do not lift or restart the contact.
+- `up` emits state7 at the current point one 60 Hz tick after the prior frame.
+- `tap x,y` expands to down, a 0.1-second hold (six frames), then up.
+
+The entire script is validated before scheduling; errors identify the gesture,
+command, nearby input and reason through `VPHONE_TOUCH_SCRIPT: ...; injection disabled` (one log line). Invalid scripts inject nothing. The bounded timeline
+supports up to 16384 frames; exceeding it is an error. Unset the variable to
+disable injection. There is no interactive monitor command.
+
+Cadence uses QEMU virtual time, not wall time. If userland has not enabled
+reporting yet, injection waits. A bounded FIFO preserves transitions when SPI
+reads lag. Reporting waits and full-queue backpressure stretch the remaining
+timeline, including subsequent gestures, rather than dropping or bursting frames.
+A reset cancels the previous timeline and parses the environment again.
 
 Report 0x70 is UI lock control (`MTDeviceSetUILocked`): 1 enters UI lock,
 2 exits it. The firmware model queues reset-complete `60 02` at final execute

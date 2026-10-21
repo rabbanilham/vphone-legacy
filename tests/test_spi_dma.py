@@ -83,6 +83,7 @@ static void stq_le_p(void *v, uint64_t n) {
     stl_le_p(v,n); stl_le_p((uint8_t *)v+4,n>>32);
 }
 '''
+        harness += extract('/* Bounded, host-testable script compiler.', 'typedef struct A7Bridge')
         harness += extract('#define SPI_FIFO_SIZE', 'typedef struct A7Peripheral')
         harness += r'''
 typedef struct A7Peripheral {
@@ -94,10 +95,10 @@ typedef struct A7Peripheral {
 struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
     A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
-    int64_t touch_start_ns, touch_duration_ns;
+    TouchScript touch_script;
+    int64_t touch_epoch_ns;
     bool touch_force;
-    unsigned touch_step, touch_steps;
-    int touch_x0, touch_y0, touch_x1, touch_y1;
+    unsigned touch_step;
 };
 static void aic_update(A7State *s) { (void)s; }
 static uint8_t ram[MiB];
@@ -266,8 +267,8 @@ int main(void) {
      * Queries must leave the FIFO intact, including the initial duplicate. */
     setenv("VPHONE_TOUCH_SCRIPT","70,60,1018,600,1018,0.3",1);
     touch_script_reset(&state);
-    assert(timer_deadline==70000000000LL && state.touch_steps==18);
-    assert(state.touch_x0==60 && state.touch_y1==1018);
+    assert(timer_deadline==70000000000LL && state.touch_script.count==21);
+    assert(state.touch_script.frames[0].x==60 && state.touch_script.frames[20].y==1018);
     setenv("VPHONE_TOUCH_SCRIPT","nan,60,1018,600,1018,0.3",1);
     touch_script_reset(&state); assert(timer_deadline==0);
     unsetenv("VPHONE_TOUCH_SCRIPT"); touch_script_reset(&state);
@@ -317,8 +318,8 @@ int main(void) {
     assert(!memcmp(reply+3,surface,16));
     assert(lduw_le_p(reply+19)==touch_sum(reply,19));
     virtual_ns=70000000000LL;
-    state.touch_steps=18;state.touch_duration_ns=300000000;
-    state.touch_x0=60;state.touch_y0=1018;state.touch_x1=600;state.touch_y1=1018;
+    setenv("VPHONE_TOUCH_SCRIPT","0,60,1018,600,1018,0.3",1);
+    touch_script_reset(&state);
     touch_timer_cb(&state);
     assert(timer_deadline==virtual_ns+300000000/18);
     pio(p,query,16,reply);assert(lduw_le_p(reply+1)==58);
@@ -356,6 +357,49 @@ int main(void) {
         assert(lduw_le_p(reply+49)==(i==20?0:256));
     }
     assert(p->spi.touch.frame_count==0 && !state.touch_irq_low);
+    /* Execute rich timelines through the real timer/contact producer.
+     * Blocked policy and FIFO must preserve start/down/up and all gaps. */
+    setenv("VPHONE_TOUCH_SCRIPT",
+           "at=0;down 100,1018;hold .05;move 560,900 dur=.1 steps=6;up|at=2;tap 320,568",1);
+    touch_script_reset(&state);
+    int64_t epoch=state.touch_epoch_ns;
+    p->spi.touch.input_control[0]=0;
+    touch_timer_cb(&state);assert(state.touch_step==0);
+    virtual_ns=timer_deadline;
+    p->spi.touch.input_control[0]=4;
+    p->spi.touch.frame_count=64;
+    touch_timer_cb(&state);assert(state.touch_step==0);
+    virtual_ns=timer_deadline;p->spi.touch.frame_count=0;
+    int64_t delay=virtual_ns-epoch;
+    unsigned count=state.touch_script.count;
+    for (unsigned i=0;i<count;i++) {
+        TouchScriptFrame *want=&state.touch_script.frames[i];
+        touch_timer_cb(&state);
+        assert(state.touch_step==i+1 && p->spi.touch.frame_count==1);
+        assert(virtual_ns==epoch+delay+want->ns);
+        unsigned slot=p->spi.touch.frame_head;
+        const uint8_t *wire=p->spi.touch.frames[slot];
+        assert(wire[27]==want->state && wire[26]==1 && wire[28]==2);
+        assert(lduw_le_p(wire+30)==want->x && lduw_le_p(wire+32)==1136-want->y);
+        assert(ldl_le_p(wire+4)==(uint32_t)(virtual_ns/1000));
+        for (unsigned off=44;off<=52;off+=2)
+            assert(lduw_le_p(wire+off)==(want->state==7?0:256));
+        p->spi.touch.frame_count=0;touch_gpio_level(&state,false);
+        if (i+1<count) {
+            virtual_ns=timer_deadline;
+            if (i==3) {
+                p->spi.touch.frame_count=64;
+                touch_timer_cb(&state);assert(state.touch_step==i+1);
+                virtual_ns=timer_deadline;delay+=TOUCH_TICK_NS;
+                p->spi.touch.frame_count=0;
+            }
+        }
+    }
+    touch_timer_cb(&state);assert(p->spi.touch.frame_count==0);
+    /* Reset cancels a pending script; an invalid replacement runs nothing. */
+    setenv("VPHONE_TOUCH_SCRIPT","at=1;tap 1,2|at=0;tap 3,4",1);
+    touch_script_reset(&state);
+    assert(timer_deadline==0 && state.touch_script.count==0 && state.touch_step==0);
     /* Reproduce the probe84 stop -> BF metadata/read/modify/write path. */
     pio(p,stop,16,reply);
     stw_le_p(fetch+7,touch_sum(fetch,3));pio(p,fetch,9,reply); /* drain fresh unlock notification */
@@ -395,6 +439,7 @@ int main(void) {
     const uint8_t *regions=touch_report(&p->spi.touch,0xd0,&report_len);
     assert(report_len==1 && regions[0]==0); /* valid empty region list */
     /* Opt-in force bypasses policy only; never rewrites report70 or BF. */
+    setenv("VPHONE_TOUCH_SCRIPT","0,60,1018,600,1018,0.3",1);
     setenv("VPHONE_TOUCH_FORCE","true",1);touch_script_reset(&state);
     assert(!state.touch_force);
     setenv("VPHONE_TOUCH_FORCE","1",1);touch_script_reset(&state);

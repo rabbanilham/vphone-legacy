@@ -46,6 +46,188 @@ OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define NUM_BRIDGES 15
 #define NUM_PERIPHERALS 28
 
+/* Bounded, host-testable script compiler. Times are relative to reset. */
+#define TOUCH_SCRIPT_MAX_FRAMES 16384
+#define TOUCH_TICK_NS INT64_C(16666667)
+typedef struct TouchScriptFrame {
+    int64_t ns;
+    int x, y;
+    unsigned state;
+} TouchScriptFrame;
+typedef struct TouchScript {
+    TouchScriptFrame frames[TOUCH_SCRIPT_MAX_FRAMES];
+    unsigned count;
+} TouchScript;
+
+static void touch_skip_space(const char **p)
+{
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') { (*p)++; }
+}
+
+static bool touch_number(const char **p, double *value, double lo, double hi)
+{
+    char *end;
+    touch_skip_space(p);
+    *value = strtod(*p, &end);
+    if (end == *p || !isfinite(*value) || *value < lo || *value > hi) {
+        return false;
+    }
+    *p = end;
+    touch_skip_space(p);
+    return true;
+}
+
+static bool touch_separator(const char **p, char separator)
+{
+    if (**p != separator) { return false; }
+    (*p)++;
+    return true;
+}
+
+static bool touch_xy(const char **p, int *x, int *y)
+{
+    double a, b;
+    if (!touch_number(p, &a, 0, 640) || !touch_separator(p, ',') ||
+        !touch_number(p, &b, 0, 1136) || a != (int)a || b != (int)b) {
+        return false;
+    }
+    *x = a; *y = b;
+    return true;
+}
+
+static bool touch_script_frame(TouchScript *out, int64_t ns, unsigned state,
+                               int x, int y)
+{
+    if (out->count == TOUCH_SCRIPT_MAX_FRAMES) { return false; }
+    out->frames[out->count++] = (TouchScriptFrame) { ns, x, y, state };
+    return true;
+}
+
+static bool touch_script_segment(TouchScript *out, int64_t *ns, int *x, int *y,
+                                 int to_x, int to_y, double duration, unsigned n)
+{
+    int64_t span = duration * 1000000000;
+    for (unsigned i = 1; i <= n; i++) {
+        if (!touch_script_frame(out, *ns + span * i / n, 4,
+                                *x + (to_x - *x) * (int)i / (int)n,
+                                *y + (to_y - *y) * (int)i / (int)n)) {
+            return false;
+        }
+    }
+    *ns += span; *x = to_x; *y = to_y;
+    return true;
+}
+
+/* On any error count is zero: no prefix of an invalid script can run. */
+static bool touch_script_parse(const char *script, TouchScript *out,
+                               char *error, size_t error_size)
+{
+    const char *p = script, *why = "invalid command";
+    unsigned gesture = 1, command = 0;
+    int x = 0, y = 0;
+    int64_t ns = 0;
+    double start, duration;
+    out->count = 0;
+    touch_skip_space(&p);
+    if (strncmp(p, "at=", 3)) {
+        /* Historical six-field form, including its floor(duration*60). */
+        int x1, y1;
+        int64_t interval, first;
+        why = "expected start_s,x0,y0,x1,y1,duration_s or at=seconds;down x,y;...;up";
+        if (!touch_number(&p, &start, 0, 86400) || !touch_separator(&p, ',') ||
+            !touch_xy(&p, &x, &y) || !touch_separator(&p, ',') ||
+            !touch_xy(&p, &x1, &y1) || !touch_separator(&p, ',') ||
+            !touch_number(&p, &duration, 0.016, 60) || *p) { goto fail; }
+        unsigned n = MAX(1, (unsigned)(duration * 60));
+        ns = start * 1000000000;
+        first = ns;
+        interval = (int64_t)(duration * 1000000000) / n;
+        touch_script_frame(out, ns, 1, x, y);
+        ns += interval;
+        touch_script_frame(out, ns, 3, x, y);
+        touch_script_segment(out, &ns, &x, &y, x1, y1, duration, n);
+        touch_script_frame(out, ns + interval, 7, x, y);
+        /* Preserve the legacy timer's integer interval truncation exactly. */
+        for (unsigned i = 1; i < out->count; i++) {
+            out->frames[i].ns = first + i * interval;
+        }
+        return true;
+    }
+    for (;;) {
+        bool active = false, completed = false;
+        command = 0;
+        why = "each gesture needs at=seconds (0..86400), after the previous up";
+        if (strncmp(p, "at=", 3)) { goto fail; }
+        p += 3;
+        if (!touch_number(&p, &start, 0, 86400)) { goto fail; }
+        ns = start * 1000000000;
+        if (out->count && ns <= out->frames[out->count - 1].ns) { goto fail; }
+        if (!touch_separator(&p, ';')) { goto fail; }
+        for (;;) {
+            touch_skip_space(&p);
+            command++;
+            why = "expected down x,y, move x,y dur=seconds [steps=N], hold seconds, up, or tap x,y";
+            bool tap = !strncmp(p, "tap ", 4);
+            if (tap || !strncmp(p, "down ", 5)) {
+                if (active || completed) { why = "only one down/tap per gesture"; goto fail; }
+                p += tap ? 4 : 5;
+                if (!touch_xy(&p, &x, &y)) { why = "coordinates must be integer pixels x=0..640,y=0..1136"; goto fail; }
+                if (!touch_script_frame(out, ns, 1, x, y) ||
+                    !touch_script_frame(out, ns += TOUCH_TICK_NS, 3, x, y)) { goto full; }
+                active = true;
+                if (tap) {
+                    if (!touch_script_segment(out, &ns, &x, &y, x, y, 0.1, 6) ||
+                        !touch_script_frame(out, ns += TOUCH_TICK_NS, 7, x, y)) { goto full; }
+                    active = false; completed = true;
+                }
+            } else if (!strncmp(p, "move ", 5) || !strncmp(p, "hold ", 5)) {
+                bool move = !strncmp(p, "move ", 5);
+                int to_x = x, to_y = y;
+                p += 5;
+                if (!active) { why = "move/hold requires an active down"; goto fail; }
+                if (move) {
+                    if (!touch_xy(&p, &to_x, &to_y) || strncmp(p, "dur=", 4)) {
+                        why = "move requires x,y dur=seconds [steps=N]"; goto fail;
+                    }
+                    p += 4;
+                }
+                if (!touch_number(&p, &duration, 0.001, 60)) {
+                    why = "duration must be finite seconds in 0.001..60"; goto fail;
+                }
+                unsigned n = MAX(1, (unsigned)(duration * 60));
+                if (move && !strncmp(p, "steps=", 6)) {
+                    double steps;
+                    p += 6;
+                    if (!touch_number(&p, &steps, 1, 3600) || steps != (unsigned)steps) {
+                        why = "steps must be an integer in 1..3600"; goto fail;
+                    }
+                    n = steps;
+                }
+                if (!touch_script_segment(out, &ns, &x, &y, to_x, to_y, duration, n)) { goto full; }
+            } else if (!strncmp(p, "up", 2)) {
+                p += 2;
+                if (!active) { why = "up requires an active down"; goto fail; }
+                if (!touch_script_frame(out, ns += TOUCH_TICK_NS, 7, x, y)) { goto full; }
+                active = false; completed = true;
+            } else { goto fail; }
+            touch_skip_space(&p);
+            if (*p == ';') { p++; continue; }
+            if (*p && *p != '|') { why = "unexpected trailing text; commands use ';', gestures use '|'"; goto fail; }
+            if (active || !completed) { why = "gesture must end with up (tap supplies up)"; goto fail; }
+            break;
+        }
+        if (!*p) { return true; }
+        p++; touch_skip_space(&p); gesture++;
+    }
+full:
+    why = "script exceeds 16384 frames";
+fail:
+    snprintf(error, error_size, "gesture %u command %u near '%.48s': %s",
+             gesture, command, p, why);
+    out->count = 0;
+    return false;
+}
+
 typedef struct A7Bridge {
     hwaddr base;
     uint32_t size;
@@ -247,10 +429,10 @@ struct A7State {
     uint8_t *gpio_regs;
     bool touch_irq_low;
     QEMUTimer *touch_timer;
-    int64_t touch_start_ns, touch_duration_ns;
+    TouchScript touch_script;
+    int64_t touch_epoch_ns;
     bool touch_force;
-    unsigned touch_step, touch_steps;
-    int touch_x0, touch_y0, touch_x1, touch_y1;
+    unsigned touch_step;
     uint8_t rx[256];
     unsigned rx_count;
     uint32_t ipi[2], ipi_mask[2];
@@ -1056,26 +1238,25 @@ static void touch_timer_cb(void *opaque)
     A7State *s = opaque;
     A7Touch *t = touch_device(s);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->touch_step >= s->touch_script.count) { return; }
     if (!t || (!s->touch_force && !touch_reporting_enabled(t)) ||
         t->frame_count == 64) {
-        timer_mod(s->touch_timer, now + 16666667);
+        timer_mod(s->touch_timer, now + TOUCH_TICK_NS);
         return;
     }
-    unsigned step = s->touch_step;
-    unsigned n = s->touch_steps;
-    if (!step) { s->touch_start_ns = now; }
-    unsigned move = step ? MIN(step - 1, n) : 0;
-    int x = s->touch_x0 + (s->touch_x1 - s->touch_x0) * move / n;
-    int y = s->touch_y0 + (s->touch_y1 - s->touch_y0) * move / n;
-    /* 187cd2028 resets per-ID history on state1; 187cd1d34 copies the
-     * raw state. HID 4e70..7c treats states3/4 as touching, not 6/16. */
-    touch_contact(t, step == 0 ? 1 : step == 1 ? 3 : step > n + 1 ? 7 : 4, x, y);
-    qemu_log_mask(LOG_UNIMP, "A7 TOUCH step=%u/%u x=%d y=%d queued=%u ns=%"
-                  PRId64 " forced=%u ui=%u detectable=%04x\n",
-                  step, n, x, y, t->frame_count, now, s->touch_force,
+    TouchScriptFrame *f = &s->touch_script.frames[s->touch_step];
+    /* Policy/FIFO waits stretch the remaining timeline, preserving every
+     * transition instead of bursting overdue frames into the guest. */
+    s->touch_epoch_ns = MAX(s->touch_epoch_ns, now - f->ns);
+    touch_contact(t, f->state, f->x, f->y);
+    qemu_log_mask(LOG_UNIMP, "A7 TOUCH step=%u/%u state=%u x=%d y=%d "
+                  "queued=%u ns=%" PRId64 " forced=%u ui=%u detectable=%04x\n",
+                  s->touch_step, s->touch_script.count, f->state, f->x, f->y,
+                  t->frame_count, now, s->touch_force,
                   t->reporting, lduw_le_p(t->input_control));
-    if (s->touch_step++ <= n + 1) {
-        timer_mod(s->touch_timer, now + s->touch_duration_ns / n);
+    if (++s->touch_step < s->touch_script.count) {
+        timer_mod(s->touch_timer, s->touch_epoch_ns +
+                  s->touch_script.frames[s->touch_step].ns);
     }
 }
 
@@ -1083,26 +1264,18 @@ static void touch_script_reset(A7State *s)
 {
     const char *script = getenv("VPHONE_TOUCH_SCRIPT");
     const char *force = getenv("VPHONE_TOUCH_FORCE");
-    double start, duration;
-    int x0, y0, x1, y1, used = 0;
+    char error[256];
     timer_del(s->touch_timer);
     s->touch_step = 0;
+    s->touch_script.count = 0;
     s->touch_force = force && !strcmp(force, "1");
+    s->touch_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (!script || !*script) { return; }
-    if (sscanf(script, "%lf,%d,%d,%d,%d,%lf%n", &start, &x0, &y0,
-               &x1, &y1, &duration, &used) != 6 || script[used] ||
-        !isfinite(start) || !isfinite(duration) || start < 0 || start > 86400 ||
-        duration < 0.016 || duration > 60 || x0 < 0 || x0 > 640 ||
-        x1 < 0 || x1 > 640 || y0 < 0 || y0 > 1136 || y1 < 0 || y1 > 1136) {
-        error_report("VPHONE_TOUCH_SCRIPT: expected start_s,x0,y0,x1,y1,duration_s (640x1136 pixels)");
+    if (!touch_script_parse(script, &s->touch_script, error, sizeof(error))) {
+        error_report("VPHONE_TOUCH_SCRIPT: %s; injection disabled", error);
         return;
     }
-    s->touch_x0 = x0; s->touch_y0 = y0;
-    s->touch_x1 = x1; s->touch_y1 = y1;
-    s->touch_duration_ns = duration * 1000000000;
-    s->touch_steps = MAX(1, (unsigned)(duration * 60));
-    timer_mod(s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              (int64_t)(start * 1000000000));
+    timer_mod(s->touch_timer, s->touch_epoch_ns + s->touch_script.frames[0].ns);
 }
 
 static uint32_t touch_word(const uint8_t *b)
