@@ -46,11 +46,15 @@ def tree_fixture(compatible=b"N53AP\0iPhone6,2\0"):
     defaults.set_prop("monitor-size", struct.pack("<I", MONITOR_SIZE))
     defaults.set_prop("sep-size", struct.pack("<I", SEP_SIZE))
     root.children.append(defaults)
-    cpus, cpu = DeviceTreeNode(), DeviceTreeNode()
+    cpus = DeviceTreeNode()
     cpus.set_prop("name", b"cpus\0")
-    cpu.set_prop("name", b"cpu0\0")
-    cpu.set_prop("timebase-frequency", bytes(8))
-    cpus.children.append(cpu)
+    for index in range(2):
+        cpu = DeviceTreeNode()
+        cpu.set_prop("name", f"cpu{index}\0".encode())
+        cpu.set_prop("reg", struct.pack("<I", index))
+        cpu.set_prop("timebase-frequency", bytes(8))
+        cpu.set_prop("function-enable_core", b"\0\0\0\x11eroC" + struct.pack("<I", 1 << index))
+        cpus.children.append(cpu)
     root.children.append(cpus)
     for name in ("pmgr", "arm-io"):
         node = DeviceTreeNode()
@@ -145,12 +149,32 @@ class LoaderTests(unittest.TestCase):
             dt_data = mem[dt_off:]
             self.assertIn(b"com.apple.System.sep.art=" + escape_nvram_data(sample_art), dt_data)
 
-    def test_single_cpu_limit_is_explicit_and_conflicts_fail(self):
+    def test_cpu_limit_is_explicit_and_conflicts_fail(self):
         self.assertEqual(single_cpu_boot_args("-v"), "-v cpus=1")
         self.assertEqual(single_cpu_boot_args("-v cpus=1"), "-v cpus=1")
-        for args in ("cpus=0", "cpus=2", "cpus=1 cpus=1"):
+        self.assertEqual(single_cpu_boot_args("-v cpus=2"), "-v cpus=2")
+        for args in ("cpus=0", "cpus=3", "cpus=1 cpus=1", "cpus=1 cpus=2"):
             with self.assertRaises(ValueError):
                 single_cpu_boot_args(args)
+
+    def test_two_cpu_image_preserves_core_ids_and_enable_functions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "kernel").write_bytes(kernel_fixture())
+            (path / "tree").write_bytes(tree_fixture())
+            (path / "monitor").write_bytes(kernel_fixture(MONITOR_VIRT_BASE))
+            plan = build_image(path / "kernel", path / "tree", path / "boot",
+                               "-v cpus=2", monitor_path=path / "monitor")
+            self.assertEqual(plan["cpu_count"], 2)
+            self.assertIn("cpus=2", plan["boot_args"])
+            root, _ = parse_node((path / "boot" / "DeviceTree.runtime").read_bytes(), 0)
+            cores = root.find_node("cpus").children
+            self.assertEqual(len(cores), 2)
+            for index, cpu in enumerate(cores):
+                self.assertEqual(cpu.get_prop("reg"), struct.pack("<I", index))
+                self.assertEqual(cpu.get_prop("state"), b"off\0" if index else b"running\0")
+                self.assertEqual(cpu.get_prop("function-enable_core"),
+                                 b"\0\0\0\x11eroC" + struct.pack("<I", 1 << index))
 
     def test_segment_mapping_bss_and_bootargs(self):
         kernel = kernel_fixture()

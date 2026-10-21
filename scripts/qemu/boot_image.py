@@ -132,10 +132,10 @@ def build_nvram_proxy_data(cmdline: str = "", nvram_vars: dict = None) -> bytes:
 
 
 def single_cpu_boot_args(cmdline):
-    """AppleARMPE discovers both DT cores; this backend realizes only one."""
+    """Validate the A7 core limit (legacy helper name kept for callers)."""
     cpu_limits = [arg for arg in cmdline.split() if arg.startswith("cpus=")]
-    if cpu_limits and cpu_limits != ["cpus=1"]:
-        raise ValueError("The experimental A7 backend requires exactly cpus=1")
+    if cpu_limits and cpu_limits not in (["cpus=1"], ["cpus=2"]):
+        raise ValueError("The experimental A7 backend supports cpus=1 or cpus=2")
     return cmdline if cpu_limits else cmdline + " cpus=1"
 
 
@@ -176,6 +176,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     if monitor_path is None:
         raise ValueError("Native secure monitor is required; rebuild firmware bundle")
     cmdline = single_cpu_boot_args(cmdline)
+    cpu_count = int(next(arg[5:] for arg in cmdline.split() if arg.startswith("cpus=")))
     kernel = Path(kernel_path).read_bytes()
     info = inspect_macho(kernel)
     monitor = Path(monitor_path).read_bytes()
@@ -423,7 +424,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
                                   execution_verified=False),
                 auxiliary_images=[ans_region] if ans_region else [],
                 framebuffer=dict(width=640, height=1136, stride=2560, depth=32),
-                segments=segments, boot_args=cmdline,
+                segments=segments, boot_args=cmdline, cpu_count=cpu_count,
                 validation="prepared; guest execution not yet verified")
     (output / "boot_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     return plan

@@ -224,10 +224,13 @@ typedef struct SepMailbox {
 
 struct A7State {
     MachineState parent_obj;
-    ARMCPU *cpu;
+    ARMCPU *cpu; /* cpu0 alias for boot setup */
+    ARMCPU *ap_cpu[2];
     ARMCPU *iop_cpu;
     MemoryRegion iop_memory, iop_boot_ram, iop_dram, iop_tables, iop_unknown;
     MemoryRegion uart, aic, pmgr, pmgr_ext, gpio;
+    MemoryRegion cpu_mmio[2];
+    uint8_t cpu_regs[2][0x1000];
     A7Bridge bridges[NUM_BRIDGES];
     A7Peripheral peripherals[NUM_PERIPHERALS];
     CharFrontend chr;
@@ -235,9 +238,9 @@ struct A7State {
     uint64_t boot_entry, boot_args, framebuffer, boot_el, iop_diagnostic, system_writable, display_trace;
     uint64_t disp_mmu_table;          /* DPU0MMUPGADDR0 << 4, 0 = linear scanout */
     uint32_t disp_stride, disp_offset;
-    bool iop_started;
+    bool iop_started, secondary_started;
     unsigned iop_unknown_count;
-    uint64_t apple_c15[8][16][8]; /* Storage only: hardware effects are NOT emulated. */
+    uint64_t apple_c15[2][8][16][8]; /* Storage only: hardware effects are NOT emulated. */
     uint32_t uart_reg[16], mask[32], soft[32], device_irq[32], targets[NIRQ];
     uint32_t pmgr_reg[PMGR_SIZE / 4];
     uint32_t pmgr_ext_reg[PMGR_EXT_SIZE / 4];
@@ -250,8 +253,8 @@ struct A7State {
     int touch_x0, touch_y0, touch_x1, touch_y1;
     uint8_t rx[256];
     unsigned rx_count;
-    uint32_t ipi, ipi_mask;
-    bool timer_level[2];
+    uint32_t ipi[2], ipi_mask[2];
+    bool timer_level[2][2];
     QEMUTimer *vblank_timer;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
@@ -360,7 +363,7 @@ static void iop_try_start(A7Peripheral *p)
         qemu_log_mask(LOG_GUEST_ERROR, "ANS IOP diagnostic rejects missing/incompatible native runtime region\n");
         return;
     }
-    int result = arm_set_cpu_on(1, 0, 0, 1, false);
+    int result = arm_set_cpu_on(0x100, 0, 0, 1, false);
     if (result == QEMU_ARM_POWERCTL_RET_SUCCESS) {
         s->iop_started = true;
         qemu_log_mask(LOG_UNIMP, "ANS IOP native ARM32 firmware executing on experimental Cortex-A7; no handshake emulation\n");
@@ -369,18 +372,43 @@ static void iop_try_start(A7Peripheral *p)
     }
 }
 
+/* AIC's 0x2000 window follows the executing application processor. */
+static unsigned a7_current_cpu(A7State *s)
+{
+    return s->ap_cpu[1] && current_cpu == CPU(s->ap_cpu[1]) ? 1 : 0;
+}
+
+static bool aic_target(A7State *s, unsigned irq, unsigned cpu)
+{
+    /* Retain the original uniprocessor routing, including target=0. */
+    if (MACHINE(s)->smp.cpus == 1) {
+        return cpu == 0;
+    }
+    return ((s->targets[irq] ? s->targets[irq] : 1) & (1U << cpu)) != 0;
+}
+
+static uint32_t aic_level(A7State *s, unsigned word)
+{
+    uint32_t level = s->soft[word] | s->device_irq[word];
+    if (word == 140 / 32 && s->rx_count && (s->uart_reg[1] & 3) == 1) {
+        level |= 1U << (140 % 32);
+    }
+    return level;
+}
+
 static void aic_update(A7State *s)
 {
-    bool pending = !!(s->ipi & ~s->ipi_mask);
-    for (int i = 0; i < NIRQ / 32; i++) {
-        uint32_t level = s->soft[i] | s->device_irq[i];
-        if (i == 140 / 32 && s->rx_count &&
-            (s->uart_reg[1] & 3) == 1) {
-            level |= 1U << (140 % 32);
+    for (unsigned c = 0; c < MACHINE(s)->smp.cpus; c++) {
+        bool pending = !!(s->ipi[c] & ~s->ipi_mask[c]);
+        for (unsigned i = 0; i < NIRQ; i++) {
+            if ((aic_level(s, i / 32) & ~s->mask[i / 32] &
+                 (1U << (i % 32))) && aic_target(s, i, c)) {
+                pending = true;
+                break;
+            }
         }
-        pending |= !!(level & ~s->mask[i]);
+        qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ap_cpu[c]), ARM_CPU_IRQ), pending);
     }
-    qemu_set_irq(qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_IRQ), pending);
 }
 
 static int uart_can_read(void *opaque)
@@ -438,31 +466,50 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     }
 }
 
+static bool aic_cpu_window(A7State *s, hwaddr *off, unsigned *cpu)
+{
+    *cpu = a7_current_cpu(s);
+    if (*off >= 0x2000 && *off < 0x2080) {
+        *off -= 0x2000;
+        return true;
+    }
+    if (*off >= 0x5000 && *off < 0x5100) {
+        *cpu = (*off - 0x5000) / 0x80;
+        *off &= 0x7f;
+        return true;
+    }
+    return false;
+}
+
 static uint64_t aic_read(void *opaque, hwaddr off, unsigned size)
 {
     A7State *s = opaque;
-    if (off == 4) { return 192; }
-    if (off == 0x2000) { return 0; }
-    if (off == 0x2004) {
-        for (int i = 0; i < NIRQ; i++) {
-            bool level = ((s->soft[i / 32] | s->device_irq[i / 32]) >> (i % 32)) & 1;
-            if (i == 140 && s->rx_count && (s->uart_reg[1] & 3) == 1) {
-                level = true;
+    unsigned c;
+    if (aic_cpu_window(s, &off, &c)) {
+        if (off == 0) { return c; }
+        if (off == 0x24 || off == 0x28) { return s->ipi_mask[c]; }
+        if (off == 4 && c < MACHINE(s)->smp.cpus) {
+            for (unsigned i = 0; i < NIRQ; i++) {
+                uint32_t bit = 1U << (i % 32);
+                if ((aic_level(s, i / 32) & ~s->mask[i / 32] & bit) &&
+                    aic_target(s, i, c)) {
+                    /* Acknowledge atomically masks the shared source. */
+                    s->mask[i / 32] |= bit;
+                    aic_update(s);
+                    return 0x10000 | i;
+                }
             }
-            if (level && !(s->mask[i / 32] & (1U << (i % 32)))) {
-                s->mask[i / 32] |= 1U << (i % 32);
+            uint32_t pending = s->ipi[c] & ~s->ipi_mask[c];
+            if (pending) {
+                unsigned num = (pending & 1) ? 1 : 2;
+                s->ipi_mask[c] |= num == 1 ? 1 : 0x80000000;
                 aic_update(s);
-                return 0x10000 | i;
+                return 0x40000 | num;
             }
-        }
-        if (s->ipi & ~s->ipi_mask) {
-            unsigned num = (s->ipi & ~s->ipi_mask & 1) ? 1 : 2;
-            s->ipi_mask |= num == 1 ? 1 : 0x80000000;
-            aic_update(s);
-            return 0x40000 | num;
         }
         return 0;
     }
+    if (off == 4) { return 192; }
     if (off >= 0x3000 && off < 0x4000) { return s->targets[(off - 0x3000) / 4]; }
     if (off >= 0x4100 && off < 0x4180) { return s->mask[(off - 0x4100) / 4]; }
     if (off >= 0x4200 && off < 0x4280) {
@@ -471,11 +518,6 @@ static uint64_t aic_read(void *opaque, hwaddr off, unsigned size)
         if (word == 140 / 32 && s->rx_count) { level |= 1U << (140 % 32); }
         return level;
     }
-    if (off >= 0x5000 && off < 0x5100) {
-        unsigned reg = off & 0x7f;
-        if (reg == 0x00) { return (off - 0x5000) / 0x80; }
-        if (reg == 0x24 || reg == 0x28) { return s->ipi_mask; }
-    }
     qemu_log_mask(LOG_UNIMP, "A7 AIC unimplemented read 0x%" HWADDR_PRIx "\n", off);
     return 0;
 }
@@ -483,7 +525,22 @@ static uint64_t aic_read(void *opaque, hwaddr off, unsigned size)
 static void aic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     A7State *s = opaque;
-    if (off >= 0x3000 && off < 0x4000) { s->targets[(off - 0x3000) / 4] = val; }
+    unsigned c;
+    if (aic_cpu_window(s, &off, &c)) {
+        switch (off) {
+        case 8:
+            /* Low bits select destinations; bit 31 requests a self IPI. */
+            for (unsigned target = 0; target < MACHINE(s)->smp.cpus; target++) {
+                if (val & (1U << target)) { s->ipi[target] |= 1; }
+            }
+            if (val & 0x80000000) { s->ipi[c] |= 0x80000000; }
+            break;
+        case 0xc: s->ipi[c] &= ~val; break;
+        case 0x24: s->ipi_mask[c] |= val; break;
+        case 0x28: s->ipi_mask[c] &= ~val; break;
+        default: break;
+        }
+    } else if (off >= 0x3000 && off < 0x4000) { s->targets[(off - 0x3000) / 4] = val; }
     else if (off >= 0x4000 && off < 0x4080) { s->soft[(off - 0x4000) / 4] |= val; }
     else if (off >= 0x4080 && off < 0x4100) {
         unsigned word = (off - 0x4080) / 4;
@@ -500,10 +557,6 @@ static void aic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         }
         s->mask[word] &= ~val;
     }
-    else if (off == 0x2008 || off == 0x5008) { s->ipi |= val & 0x80000001; }
-    else if (off == 0x200c || off == 0x500c) { s->ipi &= ~val; }
-    else if (off == 0x2024 || off == 0x5024) { s->ipi_mask |= val; }
-    else if (off == 0x2028 || off == 0x5028) { s->ipi_mask &= ~val; }
     else { qemu_log_mask(LOG_UNIMP, "A7 AIC unimplemented write 0x%" HWADDR_PRIx "\n", off); }
     aic_update(s);
 }
@@ -534,10 +587,33 @@ static uint64_t pmgr_read(void *opaque, hwaddr off, unsigned size)
     return 0;
 }
 
+/* Native enable_core (0xffffff8000eccad8/0xffffff8000eccaf4) writes
+ * a core bitmask to PMGR+0x30004 and +0x30008. The secure monitor installs
+ * its warm-reset trampoline at the start of its 2-MiB-aligned allocation
+ * (0x410000c194..0x410000c1b8); x0=0 selects the secondary path at c1d4.
+ * Direct EL1 contract images instead enter the same reset code as cpu0 and
+ * dispatch on MPIDR. The native firmware owns the eventual kernel entry.
+ */
+static void a7_release_cpus(A7State *s, uint32_t cores)
+{
+    if ((cores & 2) && s->ap_cpu[1] && !s->secondary_started) {
+        uint64_t entry = s->boot_el == 3 ? s->boot_entry & ~UINT64_C(0x1fffff)
+                                        : s->boot_entry;
+        int result = arm_set_cpu_on(1, entry, 0, s->boot_el, true);
+        s->secondary_started = result == QEMU_ARM_POWERCTL_RET_SUCCESS;
+        if (!s->secondary_started) {
+            qemu_log_mask(LOG_GUEST_ERROR, "A7 CPU1 release rejected: %d\n", result);
+        }
+    }
+}
+
 static void pmgr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     A7State *s = opaque;
     if (off + size <= PMGR_SIZE) {
+        if (size == 4 && off == 0x30008) {
+            a7_release_cpus(s, val);
+        }
         if (off >= 0x20000 && off < 0x24000 && (off & 7) == 0) {
             /* In Apple S5L8960X PMGR, device power state registers are at 0x20000 + dev_id * 8.
              * Bits 0..3: PS_TARGET (requested power state)
@@ -5404,24 +5480,52 @@ static const MemoryRegionOps peripheral_ops = {
     .valid.min_access_size = 1, .valid.max_access_size = 8,
 };
 
+/* /arm-io reg[1:2], selected by the cpus' function-error_handler core
+ * index. Error control/syndrome storage only; no fabricated fault status. */
+static uint64_t cpu_mmio_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint8_t *regs = opaque;
+    return size == 8 ? ldq_le_p(regs + off) : ldl_le_p(regs + off);
+}
+
+static void cpu_mmio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    uint8_t *regs = opaque;
+    if (size == 8) {
+        stq_le_p(regs + off, val);
+    } else {
+        stl_le_p(regs + off, val);
+    }
+}
+
+static const MemoryRegionOps cpu_mmio_ops = {
+    .read = cpu_mmio_read, .write = cpu_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4, .valid.max_access_size = 8,
+    .impl.min_access_size = 4, .impl.max_access_size = 8,
+};
+
 static void timer_irq(void *opaque, int n, int level)
 {
     A7State *s = opaque;
-    s->timer_level[n] = level;
-    qemu_set_irq(qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_FIQ),
-                 s->timer_level[0] || s->timer_level[1]);
+    unsigned c = n / 2;
+    s->timer_level[c][n % 2] = level;
+    qemu_set_irq(qdev_get_gpio_in(DEVICE(s->ap_cpu[c]), ARM_CPU_FIQ),
+                 s->timer_level[c][0] || s->timer_level[c][1]);
 }
 
 static uint64_t apple_c15_read(CPUARMState *env, const ARMCPRegInfo *ri)
 {
     A7State *s = A7(qdev_get_machine());
-    return s->apple_c15[ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7];
+    unsigned c = arm_env_get_cpu(env)->mp_affinity & 1;
+    return s->apple_c15[c][ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7];
 }
 
 static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t val)
 {
     A7State *s = A7(qdev_get_machine());
-    s->apple_c15[ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7] = val;
+    unsigned c = arm_env_get_cpu(env)->mp_affinity & 1;
+    s->apple_c15[c][ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7] = val;
     qemu_log_mask(LOG_UNIMP, "A7 c15 reg opc1=%d crm=%d opc2=%d stored 0x%" PRIx64 "; hardware effects unimplemented\n",
                   ri->opc1, ri->crm, ri->opc2, val);
 }
@@ -5477,16 +5581,20 @@ static void a7_reset(void *opaque)
         s->iop_started = false;
         s->iop_unknown_count = 0;
     }
-    cpu_reset(CPU(s->cpu));
+    for (unsigned c = 0; c < MACHINE(s)->smp.cpus; c++) {
+        cpu_reset(CPU(s->ap_cpu[c]));
+    }
     pstate_write(&s->cpu->env,
                  (s->boot_el == 3 ? PSTATE_MODE_EL3h : PSTATE_MODE_EL1h) |
                  PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F);
     s->cpu->env.pc = s->boot_entry;
     s->cpu->env.xregs[0] = s->boot_args;
+    s->secondary_started = false;
     memset(s->mask, 0xff, sizeof(s->mask));
     memset(s->soft, 0, sizeof(s->soft));
     memset(s->device_irq, 0, sizeof(s->device_irq));
     memset(s->apple_c15, 0, sizeof(s->apple_c15));
+    memset(s->cpu_regs, 0, sizeof(s->cpu_regs));
     memset(s->uart_reg, 0, sizeof(s->uart_reg));
     memset(s->pmgr_reg, 0, sizeof(s->pmgr_reg));
     memset(s->pmgr_ext_reg, 0, sizeof(s->pmgr_ext_reg));
@@ -5588,8 +5696,12 @@ static void a7_reset(void *opaque)
             *(uint32_t *)(regs + 0x18) = 0x00000000;
         }
     }
-    s->ipi = 0; s->ipi_mask = UINT32_MAX; s->rx_count = 0;
-    s->timer_level[0] = s->timer_level[1] = false;
+    memset(s->ipi, 0, sizeof(s->ipi));
+    memset(s->ipi_mask, 0xff, sizeof(s->ipi_mask));
+    memset(s->timer_level, 0, sizeof(s->timer_level));
+    memset(s->targets, 0, sizeof(s->targets));
+    s->rx_count = 0;
+    aic_update(s);
 }
 
 static bool display_update(void *opaque)
@@ -5646,20 +5758,28 @@ static void a7_init(MachineState *ms)
         error_report("s5l8960x requires -kernel raw DRAM image and boot-entry/boot-args machine properties"); exit(1);
     }
     if ((s->boot_el != 1 && s->boot_el != 3) ||
-        ms->ram_size != GiB || ms->smp.cpus != 1 ||
+        ms->ram_size != GiB || (ms->smp.cpus < 1 || ms->smp.cpus > 2) ||
         s->boot_entry < RAM_BASE || s->boot_entry >= RAM_BASE + GiB ||
         s->boot_args < RAM_BASE || s->boot_args >= RAM_BASE + GiB ||
         s->framebuffer < RAM_BASE || s->framebuffer + 2560 * 1136 > RAM_BASE + GiB) {
-        error_report("experimental s5l8960x supports one CPU, 1 GiB and in-RAM boot/display addresses"); exit(1);
+        error_report("experimental s5l8960x supports one or two CPUs, 1 GiB and in-RAM boot/display addresses"); exit(1);
     }
-    s->cpu = ARM_CPU(object_new(ms->cpu_type));
-    /* Native monitor firmware initializes both EL2 and EL3 before entering
-     * the kernel. Direct EL1 mode remains for explicitly synthetic fixtures.
-     */
-    object_property_set_bool(OBJECT(s->cpu), "has_el2", s->boot_el == 3, &error_fatal);
-    object_property_set_bool(OBJECT(s->cpu), "has_el3", s->boot_el == 3, &error_fatal);
-    object_property_set_int(OBJECT(s->cpu), "cntfrq", 24000000, &error_fatal);
-    qdev_realize(DEVICE(s->cpu), NULL, &error_fatal);
+    for (unsigned c = 0; c < ms->smp.cpus; c++) {
+        ARMCPU *cpu = ARM_CPU(object_new(ms->cpu_type));
+        s->ap_cpu[c] = cpu;
+        object_property_set_int(OBJECT(cpu), "mp-affinity", c, &error_fatal);
+        if (c) {
+            object_property_set_int(OBJECT(cpu), "rvbar",
+                                    s->boot_el == 3 ? s->boot_entry & ~UINT64_C(0x1fffff)
+                                                    : s->boot_entry, &error_fatal);
+        }
+        object_property_set_bool(OBJECT(cpu), "start-powered-off", c != 0, &error_fatal);
+        object_property_set_bool(OBJECT(cpu), "has_el2", s->boot_el == 3, &error_fatal);
+        object_property_set_bool(OBJECT(cpu), "has_el3", s->boot_el == 3, &error_fatal);
+        object_property_set_int(OBJECT(cpu), "cntfrq", 24000000, &error_fatal);
+        qdev_realize(DEVICE(cpu), NULL, &error_fatal);
+    }
+    s->cpu = s->ap_cpu[0];
     /* Apple A7 Cyclone / S5L8960X implementation-defined CP15 registers.
      * Includes HID registers, Performance Monitor Counters (PMC), Cyclone config
      * (CYC_CFG), and AppleS5L8960XIO PIO/AF error control/syndrome registers.
@@ -5712,7 +5832,9 @@ static void a7_init(MachineState *ms)
             .readfn = apple_c15_read,
             .writefn = apple_c15_write
         };
-        define_one_arm_cp_reg(s->cpu, &reg);
+        for (unsigned c = 0; c < ms->smp.cpus; c++) {
+            define_one_arm_cp_reg(s->ap_cpu[c], &reg);
+        }
     }
     memory_region_add_subregion(get_system_memory(), RAM_BASE, ms->ram);
     if (load_image_targphys(ms->kernel_filename, RAM_BASE, GiB, &error_fatal) <= 0) {
@@ -5741,13 +5863,20 @@ static void a7_init(MachineState *ms)
         object_property_set_bool(OBJECT(s->iop_cpu), "start-powered-off", true, &error_fatal);
         object_property_set_bool(OBJECT(s->iop_cpu), "has_el2", false, &error_fatal);
         object_property_set_bool(OBJECT(s->iop_cpu), "has_el3", false, &error_fatal);
-        object_property_set_int(OBJECT(s->iop_cpu), "mp-affinity", 1, &error_fatal);
+        object_property_set_int(OBJECT(s->iop_cpu), "mp-affinity", 0x100, &error_fatal);
         object_property_set_int(OBJECT(s->iop_cpu), "cntfrq", 24000000, &error_fatal);
         qdev_realize(DEVICE(s->iop_cpu), NULL, &error_fatal);
         warn_report("ANS IOP diagnostic: Cortex-A7 and bootstrap scratch are provisional; peripheral accesses fail");
     }
     memory_region_init_io(&s->uart, OBJECT(s), &uart_ops, s, "a7.uart0", 0x4000);
     memory_region_add_subregion(get_system_memory(), UART_BASE, &s->uart);
+    for (unsigned c = 0; c < 2; c++) {
+        memory_region_init_io(&s->cpu_mmio[c], OBJECT(s), &cpu_mmio_ops,
+                              s->cpu_regs[c], c ? "a7.cpu1-regs" : "a7.cpu0-regs", 0x1000);
+        memory_region_add_subregion(get_system_memory(),
+                                    UINT64_C(0x202050000) + c * 0x100000,
+                                    &s->cpu_mmio[c]);
+    }
     memory_region_init_io(&s->aic, OBJECT(s), &aic_ops, s, "a7.aic", 0x100000);
     memory_region_add_subregion(get_system_memory(), AIC_BASE, &s->aic);
     memory_region_init_io(&s->pmgr, OBJECT(s), &pmgr_ops, s, "a7.pmgr", PMGR_SIZE);
@@ -5840,8 +5969,12 @@ static void a7_init(MachineState *ms)
     }
     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
     qemu_chr_fe_set_handlers(&s->chr, uart_can_read, uart_receive, NULL, NULL, s, NULL, true);
-    qdev_connect_gpio_out(DEVICE(s->cpu), GTIMER_PHYS, qemu_allocate_irq(timer_irq, s, 0));
-    qdev_connect_gpio_out(DEVICE(s->cpu), GTIMER_VIRT, qemu_allocate_irq(timer_irq, s, 1));
+    for (unsigned c = 0; c < ms->smp.cpus; c++) {
+        qdev_connect_gpio_out(DEVICE(s->ap_cpu[c]), GTIMER_PHYS,
+                              qemu_allocate_irq(timer_irq, s, c * 2));
+        qdev_connect_gpio_out(DEVICE(s->ap_cpu[c]), GTIMER_VIRT,
+                              qemu_allocate_irq(timer_irq, s, c * 2 + 1));
+    }
     s->con = qemu_graphic_console_create(NULL, 0, &display_ops, s);
     qemu_console_resize(s->con, 640, 1136);
     s->sio.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sio_irq_timer_cb, s);
@@ -5933,7 +6066,7 @@ static void a7_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
     mc->desc = "Experimental Apple A7 bring-up (Cortex-A57 prototype; no iOS compatibility claim)";
     mc->init = a7_init; mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a57");
-    mc->default_ram_size = GiB; mc->default_ram_id = "a7.ram"; mc->max_cpus = 1;
+    mc->default_ram_size = GiB; mc->default_ram_id = "a7.ram"; mc->max_cpus = 2;
     mc->no_cdrom = true; mc->no_floppy = true;
 }
 

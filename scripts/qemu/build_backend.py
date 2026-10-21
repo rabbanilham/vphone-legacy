@@ -119,7 +119,8 @@ def main():
         },
         'experimental': True, 'capabilities': {
             'raw_kernel_loader': True, 'guest_framebuffer_scanout': True,
-            'uart_polled': True, 'aic_v1_single_cpu': True, 'architected_timer': True,
+            'uart_polled': True, 'aic_v1_single_cpu': True, 'aic_v1_smp': True,
+            'max_application_cpus': 2, 'architected_timer': True,
             'cyclone_cpu': False, 'hid_hardware_effects': False, 'storage': False,
             'touch': False, 'buttons': False, 'agx': False, 'ios_boot': False,
             'springboard': False, 'guest_shutdown': False,

@@ -71,7 +71,7 @@ def main():
             assert proc.wait(timeout=5) == 0
         finally:
             if proc.poll() is None: proc.kill(); proc.wait(timeout=5)
-        for extra, message in [(['-smp', '2'], 'CPUs'), (['-m', '512'], 'one CPU'),
+        for extra, message in [(['-smp', '3'], 'CPUs'), (['-m', '512'], '1 GiB'),
                                (['-kernel', str(tmp / 'missing')], 'Could not open')]:
             result = subprocess.run(common + extra, capture_output=True, timeout=5)
             assert result.returncode != 0, extra
