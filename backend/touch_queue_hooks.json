@@ -94,9 +94,9 @@
         "description": "Checks IOHIDEventGetChildren non-NULL and count > 0"
       },
       "bb_destinations_gate": {
-        "address": "0x1000165a8",
-        "expected": "080200b41f0300f141200054a00240f9",
-        "description": "Checks unique client count w24; drops to 0x1000169bc if 0"
+        "address": "0x1000168f0",
+        "expected": "68060034e8020090007145f9c80200d0",
+        "description": "Checks resolved destinations count > 0; drops to exit if 0"
       },
       "bb_forward_task": {
         "address": "0x100013540",
