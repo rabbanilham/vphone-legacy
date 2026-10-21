@@ -53,6 +53,45 @@ typedef struct A7Bridge {
     MemoryRegion mr;
 } A7Bridge;
 
+/* Samsung SPI v1 PIO contract, KernelMemory.bin (11D257):
+ * start b65e48..94 selects v1: FIFO capacity 16 (NOT C9's 32 words).
+ * All addresses below have prefix 0xffffff8000. readRegister b66d94 /
+ * writeRegister b66da0 are ordinary 32-bit accesses. CH_CFG +00 enables
+ * channel; +04 is mode/IRQ enable (PIO bit5, DMA bit6); +08 is status/W1C,
+ * NOT configuration RAM. +10 pushes ONE byte even for a 32-bit store;
+ * +20 pops ONE byte. +34 is max(txlen,rxlen), +4c the v1 RX count
+ * (b666c0..b66794). +30/+38 are clock/CS timing; +0c controls CS bit1.
+ * transferInterrupt b66ab0 snapshots +08: TX occupancy [10:6] (b66d14),
+ * TX free=16-occupancy (b66d2c), RX occupancy [15:11] (b66d54).
+ * It drains RX, refills TX (0xff padding for rxlen>txlen), writes the
+ * snapshot back to +08 (b66bdc), and repeats until software TX/RX/discard
+ * counts reach zero (b66bf4..c08). There is NO done-bit completion test.
+ * It then disables TX IRQ, retaining bit21 in v1 (b66c0c..40); the action
+ * b66c58 masks IRQs, clears +08 with 0x40000f, and wakes the waiter.
+ * IRQ mapping below is the minimal v1 hardware interpretation: RX-ready
+ * +04 bit7, TX-ready bit8, RX-count-done bit21 / status bit22. The driver
+ * doesn't decode these cause bits, so the mapping beyond FIFO fields is
+ * an emulation assumption, not proof from a hardware manual.
+ * Shifting is synchronous with backpressure, not timed; DMA is excluded.
+ */
+#define SPI_FIFO_SIZE 16
+#define SPI_PACKET_SIZE 512
+
+typedef struct A7Touch {
+    uint8_t tx[SPI_PACKET_SIZE], reply[SPI_PACKET_SIZE];
+    uint32_t read_value, address[32], value[32];
+    unsigned memory_count;
+    bool read_pending;
+    uint8_t mode, ack_status;
+} A7Touch;
+
+typedef struct A7SPI {
+    uint8_t tx[SPI_FIFO_SIZE], rx[SPI_FIFO_SIZE];
+    unsigned tx_head, tx_count, rx_head, rx_count;
+    uint32_t shifted, total, causes;
+    A7Touch touch;
+} A7SPI;
+
 typedef struct A7Peripheral {
     A7State *owner;
     const char *name;
@@ -60,6 +99,7 @@ typedef struct A7Peripheral {
     uint32_t size;
     uint8_t *regs;
     MemoryRegion mr;
+    A7SPI spi;
     bool i2c_active, i2c_read;
     uint8_t i2c_address;
     uint8_t chestnut_pointer, i2c_rx_byte;
@@ -665,6 +705,272 @@ static const MemoryRegionOps bridge_ops = {
     .read = bridge_read, .write = bridge_write, .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1, .valid.max_access_size = 8,
 };
+
+static int spi_index(A7Peripheral *p)
+{
+    if (p->base == UINT64_C(0x20a084000)) { return 0; }
+    if (p->base == UINT64_C(0x20a088000)) { return 1; }
+    if (p->base == UINT64_C(0x20a08c000)) { return 2; }
+    return -1;
+}
+
+/* Chosen device identity, not a dump of an actual N53 controller.
+ * Report consumers: f88b7c (D0, BE max packet), f88c60 (D1 family),
+ * f88d0c..9c (D3 endian/rows/cols/BE bcd), f88fc0 (D9 two LE u32).
+ * Firmware caveat: deviceHasFirmware f8a05c reads guest object+c1;
+ * f86d10..20 sets it after loader success. There is no SPI firmware-query
+ * opcode, and C9's claimed upload bypass is unverified. Returning the
+ * accepted 4ad1 token does not itself set that cached flag.
+ * N1 uses E2 for interface info (f9065c: version RX[2], LE max RX[3:5]),
+ * E3 for metadata (f908c8: error RX[2], LE length RX[3:5]), E6/E7 for
+ * data (f90de4/f9106c: payload RX[3..], excluding report ID).
+ */
+static const struct {
+    uint8_t id, len, data[16];
+} touch_reports[] = {
+    { 0xd0, 3, { 0x11, 0x05, 0x00 } },
+    { 0xd1, 1, { 0x01 } },
+    { 0xd3, 5, { 0x00, 0x10, 0x1b, 0x02, 0x66 } },
+    { 0xd9, 8, { 0x80, 0x02, 0, 0, 0x70, 0x04, 0, 0 } },
+    { 0xd7, 1, { 0 } },
+    { 0xab, 1, { 0 } },
+};
+
+static const uint8_t *touch_report(A7Touch *t, uint8_t id, unsigned *len)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(touch_reports); i++) {
+        if (touch_reports[i].id == id) {
+            *len = touch_reports[i].len;
+            return id == 0xab ? &t->mode : touch_reports[i].data;
+        }
+    }
+    *len = 0;
+    return NULL;
+}
+
+/* f93578: sum bytes mod 65536; byte order belongs to each protocol. */
+static uint16_t touch_sum(const uint8_t *buf, unsigned len)
+{
+    uint16_t sum = 0;
+    for (unsigned i = 0; i < len; i++) { sum += buf[i]; }
+    return sum;
+}
+
+static uint32_t touch_word(const uint8_t *b)
+{
+    /* f90098..c4 / f901d8..230: BE halfwords, LOW halfword first. */
+    return ((uint32_t)b[2] << 24) | ((uint32_t)b[3] << 16) |
+           ((uint32_t)b[0] << 8) | b[1];
+}
+
+static uint32_t touch_memory_read(A7Touch *t, uint32_t address)
+{
+    for (unsigned i = 0; i < t->memory_count; i++) {
+        if (t->address[i] == address) { return t->value[i]; }
+    }
+    /* f93f88 checks CM/revision; APU_EN default follows C9 hypothesis. */
+    if (address == 0x10008ffc) { return 0x434d11a0; }
+    if (address == 0x10003800) { return 1; }
+    return 0;
+}
+
+static void touch_finish(A7Touch *t, unsigned len)
+{
+    uint8_t *b = t->tx;
+    if (len == 8 && b[0] == 0x1c && b[1] == 0x73 &&
+        touch_sum(b + 2, 4) == lduw_be_p(b + 6)) {
+        t->read_value = touch_memory_read(t, touch_word(b + 2));
+        t->read_pending = true;
+    } else if (len == 16 && b[0] == 0x1e && b[1] == 0x33 &&
+               touch_sum(b + 2, 12) == lduw_be_p(b + 14)) {
+        uint32_t address = touch_word(b + 2);
+        uint32_t mask = touch_word(b + 6), value = touch_word(b + 10);
+        unsigned i;
+        for (i = 0; i < t->memory_count; i++) {
+            if (t->address[i] == address) { break; }
+        }
+        if (i < ARRAY_SIZE(t->address)) {
+            uint32_t old = touch_memory_read(t, address);
+            if (i == t->memory_count) { t->memory_count++; }
+            t->address[i] = address;
+            t->value[i] = (old & ~mask) | (value & mask);
+        }
+    } else if (len == 16 && b[0] == 0xe4) {
+        t->ack_status = b[2] > 11 ||
+                        touch_sum(b, 14) != lduw_le_p(b + 14);
+        /* f91588..dc: opcode,id,length,data; E1 RX[8]==0 acknowledges
+         * SetReport (f9167c..a8 / f91a48). */
+        if (!t->ack_status && b[1] == 0xab && b[2] == 1) {
+            t->mode = b[3];
+        }
+    } else if (len >= 6 && b[0] == 0x92 &&
+               (uint16_t)(b[1] + touch_sum(b + 4, len - 6)) ==
+               lduw_be_p(b + len - 2)) {
+        if (b[1] == 0xab && len == 7) { t->mode = b[4]; }
+    }
+}
+
+static uint8_t touch_shift(A7Touch *t, unsigned pos, unsigned total, uint8_t tx)
+{
+    uint8_t *r = t->reply, *b = t->tx;
+    unsigned len;
+    const uint8_t *data;
+    if (pos >= SPI_PACKET_SIZE || total > SPI_PACKET_SIZE) { return 0xff; }
+    b[pos] = tx;
+    if (pos == 0) {
+        memset(r, 0, sizeof(t->reply));
+        /* f8fcd4..fdd4 requires TWO valid BE tokens, at RX[0:2]
+         * AND RX[2:4]. 4ad1 is an accepted HBPP token;
+         * deviceHasFirmware f8a05c reads cached +c1 (not this reply). */
+        if (tx == 0x1a) {
+            static const uint8_t sync[] = { 0x4a, 0xd1, 0x4a, 0xd1 };
+            memcpy(r, sync, sizeof(sync));
+            if (t->read_pending && total == 8) {
+                uint32_t v = t->read_value;
+                r[2] = v >> 8; r[3] = v;
+                r[4] = v >> 24; r[5] = v >> 16;
+                t->read_pending = false; /* f90018..34 decodes RX[2..5] */
+            }
+        } else if (tx >= 0xe1 && tx <= 0xe7) {
+            r[0] = tx;
+            if (tx == 0xe1) { r[8] = t->ack_status; }
+            if (tx == 0xe2) {
+                r[2] = 0x11; r[3] = 0; r[4] = 5;
+            }
+        } else if (tx == 0xd0) {
+            r[0] = 0xaa; r[1] = 0x11; r[2] = 5;
+        } else if (tx == 0x8f || tx == 0x82 || tx == 0x92) {
+            r[0] = 0xaa;
+        } else {
+            memset(r, 0xff, sizeof(t->reply));
+        }
+    }
+    if (pos == 1) {
+        data = touch_report(t, b[1], &len);
+        if (b[0] == 0xe3) {
+            r[2] = data ? 0 : 1; r[3] = len; r[4] = len >> 8;
+        } else if (b[0] == 0xe6 || b[0] == 0xe7) {
+            r[1] = b[1];
+            if (data) { memcpy(r + 3, data, len); }
+        } else if (b[0] == 0x8f) {
+            /* f87eb0..ec: BE checksum=id+RX[4]+RX[5], length 12b. */
+            r[4] = len >> 8; r[5] = len;
+            stw_be_p(r + 6, b[1] + r[4] + r[5]);
+        } else if (b[0] == 0x82) {
+            /* Base deviceGetReport f881d8..250: AA, payload at 4,
+             * BE checksum=sum(payload)+id at payload_end. */
+            if (data) { memcpy(r + 4, data, len); }
+            stw_be_p(r + 4 + len, b[1] + touch_sum(r + 4, len));
+        }
+    }
+    if (pos == 2 && (b[0] == 0xe6 || b[0] == 0xe7)) {
+        /* Request phase 0 and result phase 1; checksum is over response
+         * bytes, not request. E6 f90dc8..dc; E7 f91050..68. */
+        r[2] = b[2];
+    }
+    if (b[0] >= 0xe1 && b[0] <= 0xe7 && total >= 5) {
+        unsigned end = total - 2;
+        if (pos == end) { stw_le_p(r + end, touch_sum(r, end)); }
+    }
+    if (b[0] == 0x92 && total >= 6 && pos == total - 2) {
+        /* f8877c..a4 verifies the checksum of host report id+payload. */
+        stw_be_p(r + pos, b[1] + touch_sum(b + 4, total - 6));
+    }
+    uint8_t result = r[pos];
+    if (pos + 1 == total) { touch_finish(t, total); }
+    return result;
+}
+
+static uint32_t spi_status(A7SPI *spi)
+{
+    return spi->causes | (spi->tx_count << 6) | (spi->rx_count << 11);
+}
+
+static void spi_update(A7Peripheral *p)
+{
+    A7SPI *spi = &p->spi;
+    uint32_t mode = ldl_le_p(p->regs + 4);
+    unsigned irq = 137 + spi_index(p);
+    bool level = ((mode & 0x80) && spi->rx_count) ||
+                 ((mode & 0x100) && spi->total &&
+                  spi->shifted < spi->total && spi->tx_count < SPI_FIFO_SIZE) ||
+                 ((mode & 0x200000) && (spi->causes & 0x400000));
+    if (level) {
+        p->owner->device_irq[irq / 32] |= 1U << (irq % 32);
+    } else {
+        p->owner->device_irq[irq / 32] &= ~(1U << (irq % 32));
+    }
+    aic_update(p->owner);
+}
+
+static void spi_run(A7Peripheral *p)
+{
+    A7SPI *spi = &p->spi;
+    /* PIO enable + channel enable. SPI2/3 have an unconnected MISO line.
+     * GPIO CS0 selection is performed by the guest; no GPIO IRQ modeled. */
+    if (!(ldl_le_p(p->regs) & 1) ||
+        !(ldl_le_p(p->regs + 4) & 0x20) ||
+        (ldl_le_p(p->regs + 4) & 0x40)) {
+        spi_update(p);
+        return;
+    }
+    while (spi->tx_count && spi->rx_count < SPI_FIFO_SIZE &&
+           spi->shifted < spi->total) {
+        uint8_t tx = spi->tx[spi->tx_head];
+        uint8_t rx = spi_index(p) == 0 ?
+            touch_shift(&spi->touch, spi->shifted, spi->total, tx) : 0xff;
+        spi->tx_head = (spi->tx_head + 1) % SPI_FIFO_SIZE;
+        spi->tx_count--;
+        spi->rx[(spi->rx_head + spi->rx_count) % SPI_FIFO_SIZE] = rx;
+        spi->rx_count++;
+        spi->shifted++;
+        if (spi->shifted == ldl_le_p(p->regs + 0x4c)) {
+            spi->causes |= 0x400000;
+        }
+    }
+    spi_update(p);
+}
+
+static uint32_t spi_read(A7Peripheral *p, hwaddr off)
+{
+    A7SPI *spi = &p->spi;
+    if (off == 8) { return spi_status(spi); }
+    if (off == 0x20) {
+        uint8_t value = 0;
+        if (spi->rx_count) {
+            value = spi->rx[spi->rx_head];
+            spi->rx_head = (spi->rx_head + 1) % SPI_FIFO_SIZE;
+            spi->rx_count--;
+        }
+        spi_run(p);
+        return value;
+    }
+    return ldl_le_p(p->regs + off);
+}
+
+static void spi_write(A7Peripheral *p, hwaddr off, uint32_t value)
+{
+    A7SPI *spi = &p->spi;
+    if (off == 8) {
+        spi->causes &= ~(value & 0x40000f); /* counts are read-only */
+    } else if (off == 0x10) {
+        if (spi->tx_count < SPI_FIFO_SIZE) {
+            spi->tx[(spi->tx_head + spi->tx_count) % SPI_FIFO_SIZE] = value;
+            spi->tx_count++;
+        }
+    } else {
+        stl_le_p(p->regs + off, value);
+        if (off == 0x34) {
+            spi->total = value;
+            spi->shifted = spi->causes = 0;
+            spi->tx_head = spi->tx_count = spi->rx_head = spi->rx_count = 0;
+        } else if (off == 0 && !value) {
+            spi->total = spi->shifted = spi->causes = 0;
+            spi->tx_head = spi->tx_count = spi->rx_head = spi->rx_count = 0;
+        }
+    }
+    spi_run(p);
+}
 
 static int i2c_index(A7Peripheral *p)
 {
@@ -2165,6 +2471,9 @@ static uint64_t peripheral_read_impl(void *opaque, hwaddr off, unsigned size)
 {
     A7Peripheral *p = opaque;
     if (off + size <= p->size) {
+        if (spi_index(p) >= 0 && size == 4) {
+            return spi_read(p, off);
+        }
         if (i2c_index(p) >= 0 && size == 4) {
             if (off == 4) {
                 if (p->i2c_rx_valid) {
@@ -2382,6 +2691,10 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
 {
     A7Peripheral *p = opaque;
     if (off + size <= p->size) {
+        if (spi_index(p) >= 0 && size == 4) {
+            spi_write(p, off, val);
+            return;
+        }
         if (i2c_index(p) >= 0 && size == 4) {
             i2c_write(p, off, val);
             return;
@@ -4313,6 +4626,7 @@ static void a7_reset(void *opaque)
     }
     for (int i = 0; i < NUM_PERIPHERALS; i++) {
         s->peripherals[i].i2c_active = false;
+        memset(&s->peripherals[i].spi, 0, sizeof(s->peripherals[i].spi));
         s->peripherals[i].i2c_rx_valid = false;
         s->peripherals[i].chestnut_pointer_valid = false;
         s->peripherals[i].chestnut_prefix = false;
