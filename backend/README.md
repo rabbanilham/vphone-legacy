@@ -240,3 +240,31 @@ restored bag input and native import/lifecycle contract remain unavailable;
 loaded/unlocked state and the first CA application frame remain unverified.
 See [findings and reproduction](evidence/keybag-contract-20261015/FINDINGS.md).
 The optional `--keybagd-loader-hooks` mode stops on directly observed open failure.
+
+## Scripted n53 touch input
+
+After rebuilding the backend, set `VPHONE_TOUCH_SCRIPT=start_s,x0,y0,x1,y1,duration_s`
+on the QEMU process. For example, `VPHONE_TOUCH_SCRIPT='70,60,1018,600,1018,0.3'`
+drags across the setup slider at 70 seconds of QEMU virtual time. Coordinates
+are framebuffer pixels with a top-left origin (640×1136). The model emits a
+path start, down, interpolated moves at approximately 60 Hz including the endpoint, then
+an up one interval later, all with contact ID 1. If userland has not enabled
+reporting yet, the gesture waits. A bounded FIFO preserves transitions when
+SPI reads lag; full-queue backpressure stretches the gesture. Unset the variable
+to disable injection. One swipe per machine reset is supported; there is no
+interactive monitor command.
+
+Report 0x70 controls reporting (1 starts, 2 stops). Start queues a reset-complete
+report; touch data uses HBPP EB phase-0 length / phase-1 data exchanges, LE
+checksums, and GPIO22 through GPIOIC group0 / AIC108. The chosen contact
+personality is report 0x74 with a 26-byte header and a 30-byte contact. D3's
+endian byte is 1 (LE); its rows/columns and D9 dimensions retain the existing
+16×27 and 640×1136 personality. These are modeled values, not captured sensor
+firmware output. End-to-end iOS behavior requires integrator validation.
+
+Run `python3 backend/touch_input_contract_test.py` against the rebuilt QEMU
+for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
+actual source with host stubs and exercises a complete gesture under ASan/UBSan.
+For a live screen probe, use `backend/display_probe.py --stop-condition duration`
+with `--seconds 90` so it continues through the scheduled gesture; this mode
+still captures the final framebuffer and stops on a kernel panic.

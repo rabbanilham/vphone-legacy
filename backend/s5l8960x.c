@@ -89,6 +89,10 @@ typedef struct A7Touch {
     uint8_t firmware[SPI_PACKET_SIZE];
     uint32_t firmware_length; /* latest accepted image/block, bounded */
     bool booted;
+    A7State *owner;
+    uint8_t reporting, sequence;
+    uint8_t frames[64][56], frame_len[64];
+    unsigned frame_head, frame_count;
 } A7Touch;
 
 typedef struct A7SPI {
@@ -220,6 +224,11 @@ struct A7State {
     uint32_t pmgr_reg[PMGR_SIZE / 4];
     uint32_t pmgr_ext_reg[PMGR_EXT_SIZE / 4];
     uint8_t *gpio_regs;
+    bool touch_irq_low;
+    QEMUTimer *touch_timer;
+    int64_t touch_start_ns, touch_duration_ns;
+    unsigned touch_step, touch_steps;
+    int touch_x0, touch_y0, touch_x1, touch_y1;
     uint8_t rx[256];
     unsigned rx_count;
     uint32_t ipi, ipi_mask;
@@ -598,6 +607,46 @@ static void mmio_trace(const char *name, const char *op, hwaddr off, unsigned si
     }
 }
 
+/* GPIOIC ec99ec/ec9a0c: seven IRQ groups, each with seven 32-pin
+ * status words. Group is config[23:16], NOT pin / 32 (DT #gpio-gcbs=7).
+ * ec9c58 disables with type 0xe; ec9d60 enables with type 0xa for n53.
+ * Bit zero is the sampled line, not an interrupt enable bit. */
+static void touch_gpio_update(A7State *s)
+{
+    uint32_t config = ldl_le_p(s->gpio_regs + 22 * 4);
+    unsigned group = (config >> 16) & 0xff;
+    unsigned type = config & 0xe;
+    if (group < 7 && ((type == 0xa && s->touch_irq_low) ||
+                      (type == 8 && !s->touch_irq_low))) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 22));
+    }
+    for (unsigned g = 0; g < 7; g++) {
+        uint32_t pending = 0;
+        for (unsigned w = 0; w < 7; w++) {
+            pending |= ldl_le_p(s->gpio_regs + 0x800 + g * 0x40 + w * 4);
+        }
+        unsigned irq = 108 + g;
+        if (pending) { s->device_irq[irq / 32] |= 1u << (irq % 32); }
+        else { s->device_irq[irq / 32] &= ~(1u << (irq % 32)); }
+    }
+    aic_update(s);
+}
+
+static void touch_gpio_level(A7State *s, bool low)
+{
+    uint32_t config = ldl_le_p(s->gpio_regs + 22 * 4);
+    unsigned group = (config >> 16) & 0xff, type = config & 0xe;
+    bool edge = s->touch_irq_low != low &&
+                (type == 0xc || (type == 6 && low) || (type == 4 && !low));
+    if (group < 7 && edge) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 22));
+    }
+    s->touch_irq_low = low;
+    touch_gpio_update(s);
+}
+
 static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
 {
     A7State *s = opaque;
@@ -605,6 +654,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
         uint64_t val = 0;
         for (unsigned i = 0; i < size; i++) {
             uint8_t byte = s->gpio_regs[off + i];
+            if (off + i == 22 * 4) {
+                byte = (byte & ~1) | !s->touch_irq_low;
+            }
             if (((off + i) & 3) == 0) {
                 unsigned pin = (off + i) / 4;
                 /* Board-model pull-ups:
@@ -642,8 +694,15 @@ static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     mmio_trace("a7.gpio", "write", off, size, val);
     if (off + size <= GPIO_SIZE) {
         for (unsigned i = 0; i < size; i++) {
-            s->gpio_regs[off + i] = (val >> (i * 8)) & 0xff;
+            hwaddr a = off + i;
+            uint8_t byte = val >> (i * 8);
+            if (a >= 0x800 && a < 0x9c0 && (a & 0x3f) < 28) {
+                s->gpio_regs[a] &= ~byte; /* ec9ae8: W1C */
+            } else {
+                s->gpio_regs[a] = byte;
+            }
         }
+        touch_gpio_update(s);
         for (unsigned pin = 80; pin <= 83; pin++) {
             hwaddr reg = pin * 4;
             if (off < reg + 4 && off + size > reg) {
@@ -743,10 +802,11 @@ static const struct {
 } touch_reports[] = {
     { 0xd0, 3, { 0x11, 0x05, 0x00 } },
     { 0xd1, 1, { 0x01 } },
-    { 0xd3, 5, { 0x00, 0x10, 0x1b, 0x02, 0x66 } },
+    { 0xd3, 5, { 0x01, 0x10, 0x1b, 0x02, 0x66 } },
     { 0xd9, 8, { 0x80, 0x02, 0, 0, 0x70, 0x04, 0, 0 } },
     { 0xd7, 1, { 0 } },
     { 0xab, 1, { 0 } },
+    { 0x70, 1, { 0 } },
     /* f88ee8..f88f2c copies A1 to Sensor Region Param; no decode here. */
     { 0xa1, 1, { 0 } },
 };
@@ -756,7 +816,8 @@ static const uint8_t *touch_report(A7Touch *t, uint8_t id, unsigned *len)
     for (unsigned i = 0; i < ARRAY_SIZE(touch_reports); i++) {
         if (touch_reports[i].id == id) {
             *len = touch_reports[i].len;
-            return id == 0xab ? &t->mode : touch_reports[i].data;
+            return id == 0xab ? &t->mode :
+                   id == 0x70 ? &t->reporting : touch_reports[i].data;
         }
     }
     *len = 0;
@@ -769,6 +830,99 @@ static uint16_t touch_sum(const uint8_t *buf, unsigned len)
     uint16_t sum = 0;
     for (unsigned i = 0; i < len; i++) { sum += buf[i]; }
     return sum;
+}
+
+static void touch_enqueue(A7Touch *t, const uint8_t *frame, unsigned len)
+{
+    if (t->frame_count == ARRAY_SIZE(t->frames)) {
+        error_report("A7 touch queue full; gesture paused");
+        return;
+    }
+    unsigned tail = (t->frame_head + t->frame_count) % ARRAY_SIZE(t->frames);
+    memcpy(t->frames[tail], frame, len);
+    t->frame_len[tail] = len;
+    t->frame_count++;
+    touch_gpio_level(t->owner, true);
+}
+
+/* MultitouchSupport 187ccdfb0 -> 187ccf8e0: report 74, variable header
+ * and contact stride; D3 endian=1 selects LE at 187ccf9a0. Full 30-byte
+ * contact avoids the derived-force fallback used for 20-byte records. */
+static void touch_contact(A7Touch *t, unsigned state, int x, int y)
+{
+    uint8_t f[56] = { 0x74, t->sequence++, 26, 4 };
+    stl_le_p(f + 4, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    f[10] = 4; /* contact frame, flags[1:0]=0 -> type 6 */
+    stw_le_p(f + 12, 30);
+    f[14] = 1;
+    f[26] = 1; f[27] = state; f[29] = 1;
+    stw_le_p(f + 30, x);
+    stw_le_p(f + 32, 1136 - y); /* user syntax is top-left pixels */
+    stw_le_p(f + 38, state == 7 ? 0 : 32); /* tool axes */
+    stw_le_p(f + 40, state == 7 ? 0 : 32);
+    stw_le_p(f + 44, state == 7 ? 0 : 256); /* force */
+    stw_le_p(f + 46, state == 7 ? 0 : 32); /* touch axes */
+    stw_le_p(f + 48, state == 7 ? 0 : 32);
+    touch_enqueue(t, f, sizeof(f));
+}
+
+static A7Touch *touch_device(A7State *s)
+{
+    for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
+        if (s->peripherals[i].base == UINT64_C(0x20a084000)) {
+            return &s->peripherals[i].spi.touch;
+        }
+    }
+    return NULL;
+}
+
+static void touch_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    A7Touch *t = touch_device(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!t || t->reporting != 1 || t->frame_count == 64) {
+        timer_mod(s->touch_timer, now + 16666667);
+        return;
+    }
+    unsigned step = s->touch_step;
+    unsigned n = s->touch_steps;
+    if (!step) { s->touch_start_ns = now; }
+    unsigned move = step ? MIN(step - 1, n) : 0;
+    int x = s->touch_x0 + (s->touch_x1 - s->touch_x0) * move / n;
+    int y = s->touch_y0 + (s->touch_y1 - s->touch_y0) * move / n;
+    /* 187cd2028 resets per-ID history on state1; 187cd1d34 copies the
+     * raw state. HID 4e70..7c treats states3/4 as touching, not 6/16. */
+    touch_contact(t, step == 0 ? 1 : step == 1 ? 3 : step > n + 1 ? 7 : 4, x, y);
+    qemu_log_mask(LOG_UNIMP, "A7 TOUCH step=%u/%u x=%d y=%d queued=%u ns=%" PRId64 "\n",
+                  step, n, x, y, t->frame_count, now);
+    if (s->touch_step++ <= n + 1) {
+        timer_mod(s->touch_timer, now + s->touch_duration_ns / n);
+    }
+}
+
+static void touch_script_reset(A7State *s)
+{
+    const char *script = getenv("VPHONE_TOUCH_SCRIPT");
+    double start, duration;
+    int x0, y0, x1, y1, used = 0;
+    timer_del(s->touch_timer);
+    s->touch_step = 0;
+    if (!script || !*script) { return; }
+    if (sscanf(script, "%lf,%d,%d,%d,%d,%lf%n", &start, &x0, &y0,
+               &x1, &y1, &duration, &used) != 6 || script[used] ||
+        !isfinite(start) || !isfinite(duration) || start < 0 || start > 86400 ||
+        duration < 0.016 || duration > 60 || x0 < 0 || x0 > 640 ||
+        x1 < 0 || x1 > 640 || y0 < 0 || y0 > 1136 || y1 < 0 || y1 > 1136) {
+        error_report("VPHONE_TOUCH_SCRIPT: expected start_s,x0,y0,x1,y1,duration_s (640x1136 pixels)");
+        return;
+    }
+    s->touch_x0 = x0; s->touch_y0 = y0;
+    s->touch_x1 = x1; s->touch_y1 = y1;
+    s->touch_duration_ns = duration * 1000000000;
+    s->touch_steps = MAX(1, (unsigned)(duration * 60));
+    timer_mod(s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)(start * 1000000000));
 }
 
 static uint32_t touch_word(const uint8_t *b)
@@ -797,6 +951,16 @@ static void touch_finish(A7Touch *t, unsigned len)
      * Frame: 18 e1, 30 01, length/4 BE, address in BE low half first,
      * header sum BE, word-swapped data, u32 sum in the same half order.
      */
+    if (len >= 3 && (b[0] == 0xea || b[0] == 0xeb)) {
+        if (b[2] == 1 && t->frame_count &&
+            len == t->frame_len[t->frame_head] + 7u &&
+            lduw_le_p(b + len - 2) == touch_sum(b, 3)) {
+            t->frame_head = (t->frame_head + 1) % ARRAY_SIZE(t->frames);
+            t->frame_count--;
+            touch_gpio_level(t->owner, t->frame_count != 0);
+        }
+        return;
+    }
     if (len > 512 || (len >= 16 && b[0] == 0x18 &&
                       b[1] == 0xe1 && b[2] == 0x30 && b[3] == 1)) {
         bool framed = b[0] == 0x18 && b[1] == 0xe1 &&
@@ -864,6 +1028,17 @@ static void touch_finish(A7Touch *t, unsigned len)
         if (!t->ack_status && b[1] == 0xab && b[2] == 1) {
             t->mode = b[3];
         }
+        if (!t->ack_status && b[1] == 0x70 && b[2] == 1) {
+            t->reporting = b[3];
+            if (t->reporting == 1) {
+                /* 187cce0e8..210: reset-complete report initializes parser. */
+                const uint8_t ready[] = { 0x60, 2 };
+                touch_enqueue(t, ready, sizeof(ready));
+            } else {
+                t->frame_count = 0;
+                touch_gpio_level(t->owner, false);
+            }
+        }
     } else if (len >= 6 && b[0] == 0x92 &&
                (uint16_t)(b[1] + touch_sum(b + 4, len - 6)) ==
                lduw_be_p(b + len - 2)) {
@@ -896,6 +1071,14 @@ static uint8_t touch_shift(A7Touch *t, unsigned pos, unsigned total, uint8_t tx)
                 r[4] = v >> 24; r[5] = v >> 16;
                 t->read_pending = false; /* f90018..34 decodes RX[2..5] */
             }
+        } else if (tx == 0xea || tx == 0xeb) {
+            /* f8f884..c4: 16-byte length reply, LE sum at14. */
+            unsigned n = t->frame_count ? t->frame_len[t->frame_head] + 2 : 0;
+            r[0] = tx; stw_le_p(r + 1, n);
+            stw_le_p(r + 14, touch_sum(r, 14));
+        } else if (tx == 0xee) {
+            /* f93a3c wakes controller, discards all RX bytes. */
+            r[0] = tx; stw_le_p(r + 14, tx);
         } else if (tx >= 0xe1 && tx <= 0xe7) {
             r[0] = tx;
             if (tx == 0xe1) { r[8] = t->ack_status; }
@@ -932,6 +1115,17 @@ static uint8_t touch_shift(A7Touch *t, unsigned pos, unsigned total, uint8_t tx)
         /* Request phase 0 and result phase 1; checksum is over response
          * bytes, not request. E6 f90dc8..dc; E7 f91050..68. */
         r[2] = b[2];
+    }
+    if (pos == 2 && (b[0] == 0xea || b[0] == 0xeb) && tx == 1) {
+        /* f8fabc/f8fb28: five-byte zero-sum header, payload at5,
+         * LE payload sum in the last2. Query length includes checksum. */
+        unsigned n = t->frame_count ? t->frame_len[t->frame_head] : 0;
+        if (total == n + 7) {
+            stw_le_p(r + 2, n + 2);
+            r[4] = -(r[0] + r[1] + r[2] + r[3]);
+            if (n) { memcpy(r + 5, t->frames[t->frame_head], n); }
+            stw_le_p(r + 5 + n, touch_sum(r + 5, n));
+        }
     }
     if (b[0] >= 0xe1 && b[0] <= 0xe7 && total >= 5) {
         unsigned end = total - 2;
@@ -4845,6 +5039,7 @@ static void a7_reset(void *opaque)
     if (s->gpio_regs) {
         memset(s->gpio_regs, 0, GPIO_SIZE);
     }
+    s->touch_irq_low = false;
     for (int i = 0; i < NUM_BRIDGES; i++) {
         if (s->bridges[i].regs) {
             memset(s->bridges[i].regs, 0, s->bridges[i].size);
@@ -4853,6 +5048,7 @@ static void a7_reset(void *opaque)
     for (int i = 0; i < NUM_PERIPHERALS; i++) {
         s->peripherals[i].i2c_active = false;
         memset(&s->peripherals[i].spi, 0, sizeof(s->peripherals[i].spi));
+        s->peripherals[i].spi.touch.owner = s;
         s->peripherals[i].i2c_rx_valid = false;
         s->peripherals[i].chestnut_pointer_valid = false;
         s->peripherals[i].chestnut_prefix = false;
@@ -4860,6 +5056,7 @@ static void a7_reset(void *opaque)
             memset(s->peripherals[i].regs, 0, s->peripherals[i].size);
         }
     }
+    touch_script_reset(s);
     s->chestnut_control = 0;
     s->disp_token = 0;
     s->disp_pending_token = 0;
@@ -5147,6 +5344,7 @@ static void a7_init(MachineState *ms)
     s->sep.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sep_irq_timer_cb, s);
     s->sep.os_active_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          sep_os_active_timer_cb, s);
+    s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
     s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);
     s->agx_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_kick_cb, s);

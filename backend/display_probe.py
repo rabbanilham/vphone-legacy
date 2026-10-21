@@ -143,7 +143,7 @@ def main():
     p.add_argument('--breakpoint', action='append', default=[], help='name=0xVA')
     p.add_argument('--returns', action='store_true')
     p.add_argument('--user-hooks', type=Path, help='Static shared-cache hook addresses, installed after verified runtime slide')
-    p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout'), default='first-pixel')
+    p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout','duration'), default='first-pixel')
     p.add_argument('--step-count', type=int, default=1, help='Bounded instruction steps after each hook')
     p.add_argument('--diagnostic-system', type=Path, help='Alternative diagnostic system image')
     p.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
@@ -282,6 +282,7 @@ def main():
                         command(fp,'stop');clock.pause()
                     def pixel_stop():
                         analysis=json.loads((out/'framebuffer_analysis.json').read_text())
+                        if args.stop_condition == 'duration': return False
                         if not pixel_present(analysis,args.stop_condition):return False
                         # Preserve transient console fallback even when continuing
                         # to seek an application CA scanout.
