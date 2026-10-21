@@ -169,6 +169,73 @@ def blend_vibrancy(d, s):
 
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
 
+# CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
+# Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore.
+BLUR_PROGRAMS = {
+    0x115ac3fe908dec8a,
+    0x90d330877114e752,
+    0xb443c1f6a714b429,
+    0x21377cafd3277883,
+    0x95631b61e7c1be31,
+}
+
+BLUR_TAPS = [
+    (0.6575, 0.1666),
+    (2.4492, 0.1759),
+    (4.4092, 0.1005),
+    (6.3704, 0.0417),
+    (8.3332, 0.0126),
+    (10.2979, 0.0027),
+]
+
+
+def sample_bilinear(buf, w, h, u, v):
+    fu = max(0.0, min(float(w - 1), u - 0.5))
+    fv = max(0.0, min(float(h - 1), v - 0.5))
+    x0 = int(fu)
+    y0 = int(fv)
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+    fx = fu - x0
+    fy = fv - y0
+
+    c00 = buf[y0 * w + x0]
+    c10 = buf[y0 * w + x1]
+    c01 = buf[y1 * w + x0]
+    c11 = buf[y1 * w + x1]
+
+    out = []
+    for c in range(4):
+        val = ((c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
+               (c01[c] * (1.0 - fx) + c11[c] * fx) * fy)
+        out.append(max(0, min(255, int(round(val)))))
+    return tuple(out)
+
+
+def gaussian_blur_texture(buf, w, h, taps=BLUR_TAPS):
+    tmp_buf = [None] * (w * h)
+    for y in range(h):
+        for x in range(w):
+            acc = [0.0, 0.0, 0.0, 0.0]
+            for off, weight in taps:
+                sp = sample_bilinear(buf, w, h, x + 0.5 + off, y + 0.5)
+                sn = sample_bilinear(buf, w, h, x + 0.5 - off, y + 0.5)
+                for c in range(4):
+                    acc[c] += (sp[c] + sn[c]) * weight
+            tmp_buf[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
+
+    out_buf = [None] * (w * h)
+    for y in range(h):
+        for x in range(w):
+            acc = [0.0, 0.0, 0.0, 0.0]
+            for off, weight in taps:
+                sp = sample_bilinear(tmp_buf, w, h, x + 0.5, y + 0.5 + off)
+                sn = sample_bilinear(tmp_buf, w, h, x + 0.5, y + 0.5 - off)
+                for c in range(4):
+                    acc[c] += (sp[c] + sn[c]) * weight
+            out_buf[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
+    return out_buf
+
 
 def program(f, ppp):
     """FNV-1a of the first 64 bytes of the draw's USC fragment code."""
@@ -196,13 +263,14 @@ def texel(f, tex, x, y):
 
 def main():
     f = Frame(sys.argv[1])
-    fb = bytearray(W * H * 4)
     pw = (struct.unpack_from('<I', f.type1_command, 0x74)[0] & 0xffff) + 1
     ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
+    target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
+    fb = bytearray(target_w * target_h * 4)
     for vs_data, ppp, draw, viewport in walk(f):
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
-        m = find_matrix(f, vs_data)
+        m = find_matrix(f, vs_data) if stride != 12 else None
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         if m:   # screen-space position -> NDC -> pass pixels
             xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs]
@@ -210,15 +278,25 @@ def main():
         else:
             xs = [v[0] for v in vs]
             ys = [v[1] for v in vs]
-        x0, x1 = max(0, int(round(min(xs)))), min(W, pw, int(round(max(xs))))
-        y0, y1 = max(0, int(round(min(ys)))), min(H, ph, int(round(max(ys))))
+        x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
+        y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
         tex = texture(f, ppp)
         print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
               (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
                                                          for k, v in tex.items() if k != 'tsw'})))
         if x0 >= x1 or y0 >= y1:
             continue
+        prog = program(f, ppp)
         if tex:
+            is_blur = prog in BLUR_PROGRAMS
+            blurred_tex = None
+            if is_blur and tex['w'] > 0 and tex['h'] > 0:
+                raw_pixels = []
+                for ty in range(tex['h']):
+                    for tx in range(tex['w']):
+                        raw_pixels.append(texel(f, tex, tx, ty))
+                blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
+
             # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
             # then u,v in texels at +20.
             uv_off = 4 if stride == 28 else 0
@@ -228,16 +306,21 @@ def main():
             v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
             su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
             tint = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 28 else 0xffffffff
-            mask = program(f, ppp) == DEST_IN
+            mask = prog == DEST_IN
             for y in range(y0, y1):
-                ty = min(tex['h'] - 1, int((v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv))
+                fv = (v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv
+                ty = min(tex['h'] - 1, int(fv))
                 for x in range(x0, x1):
-                    tx = min(tex['w'] - 1, int((u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su))
-                    b, g, r, a = texel(f, tex, tx, ty)
+                    fu = (u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su
+                    if blurred_tex:
+                        b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, fv)
+                    else:
+                        tx = min(tex['w'] - 1, int(fu))
+                        b, g, r, a = texel(f, tex, tx, ty)
                     if tint != 0xffffffff:
                         tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                         b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
-                    d = (y * W + x) * 4
+                    d = (y * target_w + x) * 4
                     if mask:
                         fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                         continue
@@ -251,8 +334,9 @@ def main():
             colour = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 20 else 0xff000000
             r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
             for y in range(y0, y1):
-                fb[(y * W + x0) * 4:(y * W + x1) * 4] = bytes((r, g, b, a)) * (x1 - x0)
-    png(sys.argv[2], W, H, bytes(fb))
+                fb[(y * target_w + x0) * 4:(y * target_w + x1) * 4] = bytes((r, g, b, a)) * (x1 - x0)
+    png(sys.argv[2], target_w, target_h, bytes(fb))
 
 
-main()
+if __name__ == '__main__':
+    main()
