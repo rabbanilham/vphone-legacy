@@ -371,3 +371,27 @@ df -h .
 - Open question: five sparse grey glyph clusters appear around y ≈ 355 in the rtfill screendump (colours 9d9d9d/636363), which were not written by the fill. They may be CPU-written content in a tiled/twiddled layout. Not yet explained.
 - Remaining for genuine CA pixels: execute what the fragment pass does. That means at least the clear (load action) and the textured blits/composites CA issues, i.e. a USC/PDS interpreter subset or a high-level "CA composite" replay from the TA/3D streams. This is the large remaining piece; scope it before starting.
 - Clear (agy report C5, 2026-10-21): every CA 3D pass uses load action Clear (`+0x1d0 = 2`) through the ISP background object (`+0x178` = background PDS data `0x6_8000_4020`, `+0x180/+0x184` flags, depth 1.0 at `+0x1c8`, stencil `+0x1cc`). The colour clear is **transparent black**, so executing it changes nothing visible. All visible CA content comes from textured quads drawn in the TA/3D streams (VDM control stream at `0x1019c000`, vertex PDS/USC state, texture state words). Explicit `glClear` with a colour or scissor goes through a TA clear quad, whose RGBA floats are in fragment PDS data (`AGXHalClearFragmentShader::emitConstants` `0x18029751c`).
+
+---
+
+## 16. First CoreAnimation frames on screen via high-level AGX replay (Claude, 2026-10-21)
+
+### Result
+- With `VPHONE_AGX_REPLAY=1`, the emulator shows backboardd's real boot UI: a black background, the Apple logo, and later the boot progress bar (`probe-60-replay/r1`: 2,030 replayed frames, no panic, `screen.png`). Every pixel comes from backboardd's own GPU submissions (vertex buffers, texture IOSurface, PBE target), executed by the backend's HLE and scanned out through the DPU MMU table. There are no guest patches and no pokes.
+- `probe-59-replay` hit the intermittent CommCenter kernel data abort (`pc 0xf100f8`, `far 0x88`, baseband; first seen in probe 38, §10). Two follow-up runs (probe 60 r1/r2) had no panic. It is unrelated to replay but still needs its own fix.
+- r2 replayed only 2 frames. Run-to-run variance in how long the boot UI keeps animating is not yet understood.
+
+### Recovered model (verified against `probe-57-frames/dumps/frame-1.bin`)
+- **VDM block type = bits [31:29]**: 0 PPP state (`count<<8 | gva_hi`, then gva_lo), 1 PDS state (3 words), 2 VDM state (word 0, plus 1 word if bit 28, 2 if bit 27 (vertex PDS data/code, PDS heap relative), 2 if bit 26), 3 index list / draw (`0x6a000600`: count, first), 4 link, 6 terminate. agy report C6 missed type 2.
+- **Vertex data**: VDM-state vertex PDS data at `0x6_0000_0000 | word`: `+0` stride, `+8` buffer GVA. CA quads are 6 vertices of `float x,y,z,w` in pixels, followed by `u,v` (stride 24, textured) or a BGRA colour (stride 20, solid).
+- **Texture**: a PPP word `0x8xxxxxxx` → PDS heap → u64 pointer → TSW `{w0 format, w1 = (h-1)<<16 | (w-1)<<2, w2/w3: addr = ((q>>16) & 0x3ffffffff) << 2}`. The texture is linear BGRA, stride `align16(w) * 4`. The Apple logo is at `0x101d8000`, 129×158.
+- **Colour target**: the display surface is physically linear (stride 2560, the `/vram` carveout). The GPU maps it in 64 KiB strips of 16 rows: `gva = base + (y>>4)*0x10000 + (y&15)*2560 + x*4`. DPU scanout therefore uses a 2560-byte pitch; `0x4040 = 0x1000` is not the pitch.
+
+### Code
+- `backend/s5l8960x.c`: `agx_replay_frame` / `agx_replay_texture` / `agx_surface_gva` (axis-aligned quads, nearest sampling, premultiplied src-over). It is called from `agx_trace_rt` for context-slot commands with a PBE target. TA commands are retained per context when replay or frame dump is enabled.
+- `backend/agx_replay_offline.py` renders a frame dump to PNG; `backend/agx_vdm_walk.py` prints the VDM stream.
+
+### Next
+1. Make replay the default (drop the env gate) once its scope limits are documented, and add a synthetic contract test (VDM + vertex + TSW fixture → expected pixels).
+2. Generalise beyond axis-aligned quads: transforms, texcoord sub-rects, A8 glyph textures, per-draw opacity, twiddled textures. Use frame dumps from later in boot (SpringBoard UI) to find what is missing.
+3. Fix the intermittent CommCenter baseband data abort (`0xf100f8`).

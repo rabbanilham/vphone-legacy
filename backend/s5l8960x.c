@@ -3107,6 +3107,202 @@ done:
                   number, path, (unsigned long long)pages);
 }
 
+static bool agx_replay_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("VPHONE_AGX_REPLAY");
+        enabled = v && *v && strcmp(v, "0");
+    }
+    return enabled;
+}
+
+#define AGX_PDS_HEAP UINT64_C(0x600000000)
+
+static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n)
+{
+    uint8_t *out = buf;
+    while (n) {
+        hwaddr pa;
+        size_t chunk = MIN(n, 0x1000 - (gva & 0xfff));
+        if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+            address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                               out, chunk) != MEMTX_OK) {
+            return false;
+        }
+        out += chunk;
+        gva += chunk;
+        n -= chunk;
+    }
+    return true;
+}
+
+/* Display surfaces are linear 2560-byte rows in physical memory; the GPU
+ * maps each 16-row strip (40 KiB) at a 64 KiB-aligned GVA. */
+static uint64_t agx_surface_gva(uint64_t base, unsigned x, unsigned y)
+{
+    return base + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * 2560 + x * 4;
+}
+
+typedef struct AGXTexture {
+    uint64_t addr;
+    uint32_t w, h, stride;
+} AGXTexture;
+
+/* PPP words that point into the PDS heap reference fragment PDS data whose
+ * first u64 points at the texture state words (TSW). */
+static bool agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
+                               unsigned n, AGXTexture *tex)
+{
+    for (unsigned i = 0; i < n; i++) {
+        uint64_t ptr;
+        uint32_t tsw[4];
+        if ((ppp[i] & 0xc0000000) != 0x80000000 ||
+            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], &ptr, 8) ||
+            !agx_ctx_read(s, cat, ptr, tsw, sizeof(tsw))) {
+            continue;
+        }
+        uint64_t q = tsw[2] | ((uint64_t)tsw[3] << 32);
+        hwaddr pa;
+        tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
+        tex->h = (tsw[1] >> 16) + 1;
+        tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
+        tex->stride = ((tex->w + 15) & ~15u) * 4;
+        if (tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
+                           unsigned x, unsigned y, uint32_t bgra)
+{
+    hwaddr pa;
+    if (agx_gpu_translate_ctx(s, cat, agx_surface_gva(target, x, y), &pa)) {
+        address_space_stl_le(&address_space_memory, pa, bgra, MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+/* High-level replay of a CoreAnimation frame: walk the TA VDM stream and
+ * draw each axis-aligned quad (solid vertex colour or one BGRA texture,
+ * premultiplied src-over) into the 640x1136 colour target. */
+static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
+                             uint64_t target, uint32_t width, uint32_t height)
+{
+    static uint32_t row[640 * 4], texrow[0x4000];
+    uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
+    uint32_t ppp[64];
+    unsigned ppp_count = 0, draws = 0;
+
+    width = MIN(width, 640u);
+    height = MIN(height, 1136u);
+    for (unsigned guard = 0; guard < 4096; guard++) {
+        uint32_t w[5];
+        if (!agx_ctx_read(s, cat, pc, w, 4)) {
+            break;
+        }
+        unsigned kind = w[0] >> 29;
+        if (kind == 6) {
+            break;
+        } else if (kind == 4) {
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 4)) {
+                break;
+            }
+            pc = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u);
+        } else if (kind == 2) {
+            unsigned extra = !!(w[0] & (1u << 28)) + 2 * !!(w[0] & (1u << 27)) +
+                             2 * !!(w[0] & (1u << 26));
+            if ((w[0] & (1u << 27)) &&
+                agx_ctx_read(s, cat, pc + 4 + ((w[0] & (1u << 28)) ? 4 : 0), w + 1, 4)) {
+                vs_data = AGX_PDS_HEAP | w[1];
+            }
+            pc += 4 * (1 + extra);
+        } else if (kind == 1) {
+            pc += 12;
+        } else if (kind == 0) {
+            uint64_t gva;
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 4)) {
+                break;
+            }
+            gva = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u);
+            ppp_count = MIN((w[0] >> 8) & 0xfffff, ARRAY_SIZE(ppp));
+            if (!agx_ctx_read(s, cat, gva, ppp, ppp_count * 4)) {
+                ppp_count = 0;
+            }
+            pc += 8;
+        } else if (kind == 3) {
+            uint32_t stride, count;
+            uint64_t buf;
+            float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+            uint32_t colour = 0xff000000;
+            AGXTexture tex;
+
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 8)) {
+                break;
+            }
+            pc += 12;
+            count = MIN(w[1], 64u);
+            if (!vs_data || !agx_ctx_read(s, cat, vs_data, &stride, 4) ||
+                !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 16 || stride > 64) {
+                continue;
+            }
+            for (unsigned i = 0; i < count; i++) {
+                float xy[2];
+                if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                    break;
+                }
+                minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
+                miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
+            }
+            if (stride == 20) {
+                agx_ctx_read(s, cat, buf + 16, &colour, 4);
+            }
+            int x0 = MAX(0, (int)minx), y0 = MAX(0, (int)miny);
+            int x1 = MIN((int)width, (int)maxx), y1 = MIN((int)height, (int)maxy);
+            if (x0 >= x1 || y0 >= y1) {
+                continue;
+            }
+            bool textured = agx_replay_texture(s, cat, ppp, ppp_count, &tex) &&
+                            tex.stride <= sizeof(texrow);
+            draws++;
+            for (int y = y0; y < y1; y++) {
+                if (!textured) {
+                    for (int x = x0; x < x1; x++) {
+                        agx_replay_put(s, cat, target, x, y, colour);
+                    }
+                    continue;
+                }
+                uint32_t ty = MIN(tex.h - 1, (uint32_t)((y - y0) * tex.h / (y1 - y0)));
+                if (!agx_ctx_read(s, cat, tex.addr + (uint64_t)ty * tex.stride, texrow,
+                                  tex.w * 4) ||
+                    !agx_ctx_read(s, cat, agx_surface_gva(target, x0, y), row,
+                                  (x1 - x0) * 4)) {
+                    continue;
+                }
+                for (int x = x0; x < x1; x++) {
+                    uint32_t tx = MIN(tex.w - 1, (uint32_t)((x - x0) * tex.w / (x1 - x0)));
+                    uint32_t src = texrow[tx], dst = row[x - x0], a = src >> 24, out = 0;
+                    for (unsigned c = 0; c < 24; c += 8) {
+                        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
+                        out |= MIN(v, 255u) << c;
+                    }
+                    row[x - x0] = out | 0xff000000u;
+                }
+                for (int x = x0; x < x1; x++) {
+                    agx_replay_put(s, cat, target, x, y, row[x - x0]);
+                }
+            }
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "AGX replay: unknown VDM block 0x%x at 0x%llx\n",
+                          w[0], (unsigned long long)pc);
+            break;
+        }
+    }
+    qemu_log_mask(LOG_UNIMP, "AGX replay target 0x%llx draws %u\n",
+                  (unsigned long long)target, draws);
+}
+
 /* Diagnostic only: RT0 is a GPU VA, not a META pointer (B1 sections 2/5). */
 static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
 {
@@ -3223,6 +3419,34 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
     }
     if (context_id == 1 && context_cat && pbe_target && s->disp_mmu_table) {
         agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
+    }
+    if (pbe_target) {
+        static bool raw_logged;
+        MemTxResult r;
+        uint32_t pce = address_space_ldl_le(&address_space_memory,
+                                            cat_base + ((pbe_target >> 30) & 0x3ff) * 4,
+                                            MEMTXATTRS_UNSPECIFIED, &r);
+        uint64_t pd = (uint64_t)(pce >> 4) << 12;
+        uint64_t pde = address_space_ldq_le(&address_space_memory,
+                                            pd + ((pbe_target >> 21) & 0x1ff) * 8,
+                                            MEMTXATTRS_UNSPECIFIED, &r);
+        if (!raw_logged) {
+            char line[20 * 19 + 1] = "";
+            raw_logged = true;
+            for (unsigned i = 0; i < 20; i++) {
+                uint64_t pte = address_space_ldq_le(&address_space_memory,
+                                                    (pde & UINT64_C(0xfffffff000)) + i * 8,
+                                                    MEMTXATTRS_UNSPECIFIED, &r);
+                snprintf(line + i * 19, 20, " %018llx", (unsigned long long)pte);
+            }
+            qemu_log_mask(LOG_UNIMP, "AGX RT raw target 0x%llx pce 0x%x pde 0x%llx pte%s\n",
+                          (unsigned long long)pbe_target, pce, (unsigned long long)pde, line);
+        }
+    }
+    if (pbe_target && context_cat && agx_replay_enabled() &&
+        context_id < ARRAY_SIZE(s->agx_last_ta) && s->agx_last_ta_queue[context_id]) {
+        agx_replay_frame(s, cat_base, s->agx_last_ta[context_id], pbe_target,
+                         (uint32_t)ldl_le_p(raw + 0x74) + 1, (uint32_t)ldl_le_p(raw + 0x70) + 1);
     }
     /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
      * colour target comes from the end-of-tile PBE state when available. */
@@ -3393,7 +3617,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
             qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
                           block, command[1], command[2], command[3]);
         } else if (command[0] != 4) {
-            if (command[0] == 0 && getenv("VPHONE_AGX_FRAME_DUMP") &&
+            if (command[0] == 0 && (getenv("VPHONE_AGX_FRAME_DUMP") || agx_replay_enabled()) &&
                 command[1] < ARRAY_SIZE(s->agx_last_ta)) {
                 uint32_t context = command[1];
                 uint8_t ta[0x280];
@@ -3759,7 +3983,9 @@ static bool display_update(void *opaque)
     uint8_t *src = ram + s->framebuffer - RAM_BASE;
     if (s->disp_mmu_table) {
         /* Gather the plane through the display MMU page table. */
-        uint32_t stride = s->disp_stride ? s->disp_stride : 2560;
+        /* Display surfaces are linear 640 * 4-byte rows (the /vram carveout
+         * is exactly 2560 * 1136); 0x4040 (0x1000) is not the row pitch. */
+        uint32_t stride = 2560;
         for (unsigned y = 0; y < 1136; y++) {
             uint8_t *dst = surface_data(surface) + y * surface_stride(surface);
             uint64_t o = s->disp_offset + (uint64_t)y * stride;
