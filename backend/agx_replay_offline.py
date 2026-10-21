@@ -162,6 +162,22 @@ def blend_vibrancy(d, s):
     return tuple(min(255, sc + dc * (255 - sa) // 255) for sc, dc in ((sr, dr), (sg, dg), (sb, db)))
 
 
+DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
+
+
+def program(f, ppp):
+    """FNV-1a of the first 64 bytes of the draw's USC fragment code."""
+    try:
+        off = f.u32(0x600000000 | ppp[7])
+        code = f.read(0x700000000 | off, 64)
+    except (KeyError, ValueError, IndexError):
+        return 0
+    h = 0xcbf29ce484222325
+    for b in code:
+        h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+
 def texel(f, tex, x, y):
     if tex['strip']:
         gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * 4
@@ -207,6 +223,7 @@ def main():
             v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
             su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
             tint = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 28 else 0xffffffff
+            mask = program(f, ppp) == DEST_IN
             for y in range(y0, y1):
                 ty = min(tex['h'] - 1, int((v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv))
                 for x in range(x0, x1):
@@ -216,6 +233,9 @@ def main():
                         tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                         b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                     d = (y * W + x) * 4
+                    if mask:
+                        fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
+                        continue
                     if tex.get('vibrancy'):
                         fb[d:d + 3] = bytes(blend_vibrancy(tuple(fb[d:d + 3]), (r, g, b, a)))
                     else:

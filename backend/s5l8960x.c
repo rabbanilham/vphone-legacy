@@ -3322,11 +3322,44 @@ static uint32_t agx_blend_vibrancy(uint32_t dst, uint32_t src)
     uint32_t out = 0;
 
     sb = sb * f / 255; sg = sg * f / 255; sr = sr * f / 255; sa = sa * f / 255;
-    const uint32_t s3[3] = { sb, sg, sr }, d3[3] = { db, dg, dr };
-    for (unsigned c = 0; c < 3; c++) {
-        out |= MIN(s3[c] + d3[c] * (255 - sa) / 255, 255u) << (c * 8);
+    const uint32_t s4[4] = { sb, sg, sr, sa }, d4[4] = { db, dg, dr, dst >> 24 };
+    for (unsigned c = 0; c < 4; c++) {
+        out |= MIN(s4[c] + d4[c] * (255 - sa) / 255, 255u) << (c * 8);
     }
-    return out | 0xff000000u;
+    return out;
+}
+
+/* Premultiplied BGRA src-over, alpha included (offscreen layers keep it). */
+static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
+{
+    uint32_t a = src >> 24, out = 0;
+    for (unsigned c = 0; c < 32; c += 8) {
+        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
+        out |= MIN(v, 255u) << c;
+    }
+    return out;
+}
+
+/* CA fragment shaders recognised by an FNV-1a hash of the first 64 bytes of
+ * their USC code (PPP word 7 -> state at 0x6_0000_0000 -> USC offset in the
+ * 0x7_0000_0000 heap). The compiled code is identical across boots of this
+ * iOS build. */
+#define AGX_USC_DEST_IN UINT64_C(0x4ee01acc47551344)  /* mask: D *= texel alpha */
+
+static uint64_t agx_replay_program(A7State *s, uint64_t cat, const uint32_t *ppp, unsigned n)
+{
+    uint32_t off;
+    uint8_t code[64];
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    if (n < 8 || !ppp[7] ||
+        !agx_ctx_read(s, cat, UINT64_C(0x600000000) | ppp[7], &off, 4) ||
+        !agx_ctx_read(s, cat, UINT64_C(0x700000000) | off, code, sizeof(code))) {
+        return 0;
+    }
+    for (unsigned i = 0; i < sizeof(code); i++) {
+        h = (h ^ code[i]) * UINT64_C(0x100000001b3);
+    }
+    return h;
 }
 
 static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
@@ -3500,14 +3533,21 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             bool textured = found != AGX_TEX_NONE;
             bool vibrancy = found == AGX_TEX_VIBRANCY;
+            bool dest_in = textured &&
+                           agx_replay_program(s, cat, ppp, ppp_count) == AGX_USC_DEST_IN;
             /* Texel-unit coordinates (rectangle textures) exceed 1. */
             float su = textured && MAX(u1, v1) <= 1.0001f ? tex.w : 1;
             float sv = textured && MAX(u1, v1) <= 1.0001f ? tex.h : 1;
             draws++;
             for (int y = y0; y < y1; y++) {
                 if (!textured) {
+                    if (!agx_ctx_read(s, cat, agx_surface_gva(target, x0, y), row,
+                                      (x1 - x0) * 4)) {
+                        continue;
+                    }
                     for (int x = x0; x < x1; x++) {
-                        agx_replay_put(s, cat, target, x, y, colour);
+                        agx_replay_put(s, cat, target, x, y,
+                                       agx_blend_over(row[x - x0], colour));
                     }
                     continue;
                 }
@@ -3529,16 +3569,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                         src = m;
                     }
-                    if (vibrancy) {
+                    if (dest_in) {
+                        uint32_t a = src >> 24;
+                        for (unsigned c = 0; c < 32; c += 8) {
+                            out |= (((dst >> c) & 0xff) * a / 255) << c;
+                        }
+                        row[x - x0] = out;
+                    } else if (vibrancy) {
                         row[x - x0] = agx_blend_vibrancy(dst, src);
-                        continue;
+                    } else {
+                        row[x - x0] = agx_blend_over(dst, src);
                     }
-                    uint32_t a = src >> 24;
-                    for (unsigned c = 0; c < 24; c += 8) {
-                        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
-                        out |= MIN(v, 255u) << c;
-                    }
-                    row[x - x0] = out | 0xff000000u;
                 }
                 for (int x = x0; x < x1; x++) {
                     agx_replay_put(s, cat, target, x, y, row[x - x0]);
