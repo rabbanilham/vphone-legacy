@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Synthetic native GPIOIC + HBPP EB input contract; requires rebuilt QEMU.
 
-No iOS/disk. Starts the reporting interface, drains reset-complete, waits
+No iOS/disk. Completes firmware boot, sends deferred unlock 70=2, drains
+reset-complete, enables BF detection (or uses --force diagnostically), waits
 for a virtual-clock scripted start and fetches it through SPI1 PIO.
 """
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,7 +21,7 @@ from gpio_contract_test import move64
 SPI, GPIO, AIC, RESULT = 0x20a084000, 0x20e300000, 0x20e100000, 0x800020000
 
 
-def fixture():
+def fixture(force=False):
     code = move64(4, RESULT)
     expected, packets = [], []
 
@@ -50,11 +52,18 @@ def fixture():
 
     write(SPI, 0xd)
     write(AIC + 0x418c, 1 << 12)  # mask-clear word3, IRQ108
-    start = bytearray([0xe4, 0x70, 1, 1]) + bytearray(12)
-    struct.pack_into('<H', start, 14, sum(start[:14]))
-    # E4 response echoes opcode, zero status and LE checksum.
+    # Minimal valid framed image plus final execute exercises the modeled
+    # firmware lifecycle; no iOS or guest disk is used by this fixture.
+    image = bytearray([0x18, 0xe1, 0x30, 1, 0, 1, 0, 0, 0x10, 0, 0, 0]) + bytearray(8)
+    struct.pack_into('>H', image, 10, sum(image[4:10]))
+    transfer(image, [None] * len(image))
+    execute = bytearray([0x1d, 0x53, 0x34, 0, 0x10, 0, 0, 1, 0, 0, 0, 0])
+    struct.pack_into('>H', execute, 10, sum(execute[2:10]))
+    transfer(execute, [None] * len(execute))
+    stop = bytearray([0xe4, 0x70, 1, 2]) + bytearray(12)
+    struct.pack_into('<H', stop, 14, sum(stop[:14]))
     r = bytearray(16); r[0] = 0xe4; r[14] = 0xe4
-    transfer(start, r)
+    transfer(stop, r)  # deferred unlock must preserve boot notification
     record(GPIO + 88, 0)  # active low sample, no config yet
     record(AIC + 0x2004, 0)  # no interrupt while disabled
     write(GPIO + 88, 0x20a)
@@ -71,6 +80,16 @@ def fixture():
     record(GPIO + 88, 0x20f)  # line released after consume
     write(GPIO + 88, 0x20a)
     write(AIC + 0x418c, 1 << 12)
+    if not force:
+        r = bytearray(16); r[0] = 0xe3; r[3] = 4; r[14] = 0xe7
+        transfer(bytes([0xe3, 0xbf]) + bytes(14), r)
+        r = bytearray(16); r[:3] = bytes([0xe6, 0xbf, 1])
+        struct.pack_into('<H', r, 14, sum(r[:14]))
+        transfer(bytes([0xe6, 0xbf, 1, 4]) + bytes(12), r)
+        control = bytearray([0xe4, 0xbf, 4, 0x9d, 1, 9, 0]) + bytearray(9)
+        struct.pack_into('<H', control, 14, sum(control[:14]))
+        r = bytearray(16); r[0] = 0xe4; r[14] = 0xe4
+        transfer(control, r)
     # Wait for timer to produce down, without injecting a guest-owned IRQ.
     code.extend(move64(2, GPIO + 0x800))
     code.extend([0xb9400043, 0x34ffffe3])  # ldr w3,[x2]; cbz w3,-4
@@ -92,14 +111,18 @@ def fixture():
 
 
 def main():
-    payload, expected, packets = fixture()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--force', action='store_true', help='diagnostic injection after 70=2 without BF enable')
+    args = parser.parse_args()
+    payload, expected, packets = fixture(args.force)
     with tempfile.TemporaryDirectory(prefix='a7touch-', dir='/tmp') as directory:
         root = Path(directory); (root / 'fixture.bin').write_bytes(payload)
         proc = subprocess.Popen([
             str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
             '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
             '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off'],
-            env={**os.environ, 'VPHONE_TOUCH_SCRIPT': '0.05,60,1018,600,1018,0.3'},
+            env={**os.environ, 'VPHONE_TOUCH_SCRIPT': '0.05,60,1018,600,1018,0.3',
+                 'VPHONE_TOUCH_FORCE': '1' if args.force else '0'},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 15
