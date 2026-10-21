@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import select
 import re
@@ -403,7 +404,7 @@ def main():
                    f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},display-trace=1,"
                    f"system-image={images}/system.raw,data-image={images}/data.raw,"
                    f"utility-image={images}/utility.raw,system-writable=1")
-        cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=single',
+        cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'single'),
                '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M', '-kernel', plan['image'], '-display', 'none',
                '-serial', f'file:{out}/serial.log', '-S', '-qmp', f'unix:{qmp},server=on,wait=off',
                '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')] + args.qemu_arg

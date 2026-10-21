@@ -60,7 +60,7 @@ def main():
                f"system-image={images}/system.raw,data-image={images}/data.raw,"
                f"utility-image={images}/utility.raw,system-writable=1")
     cmd = [str(ROOT / 'backend/bin/qemu-system-aarch64'), '-machine', machine,
-           '-accel', 'tcg,thread=single', '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
+           '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'single'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
            '-kernel', plan['image'], '-display', 'cocoa',
            '-serial', f'file:{work}/serial.log',
            '-qmp', f'unix:{work}/qmp,server=on,wait=off'] + args.qemu_arg
