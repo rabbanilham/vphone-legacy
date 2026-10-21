@@ -82,6 +82,15 @@ def fixture(force=False):
     record(GPIO + 88, 0x20f)  # line released after consume
     write(GPIO + 88, 0x20a)
     write(AIC + 0x418c, 1 << 12)
+    # D9 extended surface bounds must be available over the same SPI path
+    # used at startup, before the normalized MTContact can reach HID.
+    r = bytearray(16); r[0] = 0xe3; r[3] = 16
+    struct.pack_into('<H', r, 14, sum(r[:14]))
+    transfer(bytes([0xe3, 0xd9]) + bytes(14), r)
+    surface = struct.pack('<IIHHHH', 5100, 9100, 0, 0, 640, 1136)
+    r = bytearray(21); r[:3] = bytes([0xe6, 0xd9, 1]); r[3:19] = surface
+    struct.pack_into('<H', r, 19, sum(r[:19]))
+    transfer(bytes([0xe6, 0xd9, 1, 16]) + bytes(17), r)
     if not force:
         r = bytearray(16); r[0] = 0xe3; r[3] = 4; r[14] = 0xe7
         transfer(bytes([0xe3, 0xbf]) + bytes(14), r)
@@ -153,9 +162,10 @@ def main():
                     assert int.from_bytes(r[-2:], 'little') == sum(f), r.hex()
                     assert f[:4] == bytes([0x74, 0, 26, 4])
                     assert f[14] == 1 and int.from_bytes(f[12:14], 'little') == 30
-                    assert f[26:30] == bytes([1, 1, 0, 1])
+                    assert f[26:30] == bytes([1, 1, 2, 1])
                     assert struct.unpack_from('<HH', f, 30) == (60, 118)
-                    assert int.from_bytes(f[44:46], 'little') == 256
+                    assert struct.unpack_from('<HH', f, 38) == (400, 300)
+                    assert struct.unpack_from('<HHHHH', f, 44) == (256,) * 5
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
         finally:

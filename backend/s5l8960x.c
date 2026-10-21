@@ -814,7 +814,13 @@ static const struct {
     { 0xd0, 1, { 0 } },
     { 0xd1, 1, { 0x01 } },
     { 0xd3, 5, { 0x01, 0x10, 0x1b, 0x02, 0x66 } },
-    { 0xd9, 8, { 0x80, 0x02, 0, 0, 0x70, 0x04, 0, 0 } },
+    /* D9 physical size is in hundredths of mm (HID 8d04..24), NOT
+     * framebuffer pixels. The 16-byte form also publishes raw bounds
+     * xmin,ymin,xmax,ymax; MTParseSensorSurfaceDescriptor (187cd08d0)
+     * and mt_InitProcessing (187cd40a0..4124) override the family grid.
+     * This chosen 51x91 mm surface uses pixel-valued raw coordinates. */
+    { 0xd9, 16, { 0xec, 0x13, 0, 0, 0x8c, 0x23, 0, 0,
+                  0, 0, 0, 0, 0x80, 0x02, 0x70, 0x04 } },
     { 0xd7, 1, { 0 } },
     { 0xab, 1, { 0 } },
     { 0x70, 1, { 0 } },
@@ -873,14 +879,21 @@ static void touch_contact(A7Touch *t, unsigned state, int x, int y)
     f[10] = 4; /* contact frame, flags[1:0]=0 -> type 6 */
     stw_le_p(f + 12, 30);
     f[14] = 1;
-    f[26] = 1; f[27] = state; f[29] = 1;
+    /* Binary+2 -> MTContact+18 is identity, not flags. Zero is
+     * unidentified and fails MTParserPath::isFingerContact (HID a134).
+     * Identity2 is a finger (1..5); path ID1 stays stable across frames. */
+    f[26] = 1; f[27] = state; f[28] = 2; f[29] = 1;
     stw_le_p(f + 30, x);
     stw_le_p(f + 32, 1136 - y); /* user syntax is top-left pixels */
-    stw_le_p(f + 38, state == 7 ? 0 : 32); /* tool axes */
-    stw_le_p(f + 40, state == 7 ? 0 : 32);
+    stw_le_p(f + 38, state == 7 ? 0 : 400); /* ellipse radii, 1/100 mm */
+    stw_le_p(f + 40, state == 7 ? 0 : 300);
     stw_le_p(f + 44, state == 7 ? 0 : 256); /* force */
-    stw_le_p(f + 46, state == 7 ? 0 : 32); /* touch axes */
-    stw_le_p(f + 48, state == 7 ? 0 : 32);
+    /* Full-stride extensions are density and quality, NOT radii:
+     * 187cd1da0..1dbc/1d78..1d8c scale these by 1/256. */
+    stw_le_p(f + 46, state == 7 ? 0 : 256); /* density */
+    stw_le_p(f + 48, state == 7 ? 0 : 256); /* related density */
+    stw_le_p(f + 50, state == 7 ? 0 : 256); /* quality */
+    stw_le_p(f + 52, state == 7 ? 0 : 256); /* signal */
     touch_enqueue(t, f, sizeof(f));
 }
 
