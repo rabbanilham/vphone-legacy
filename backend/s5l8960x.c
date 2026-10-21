@@ -3234,7 +3234,7 @@ typedef struct AGXTexture {
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
 } AGXTexture;
 
-enum { AGX_TEX_NONE, AGX_TEX_FOUND, AGX_TEX_SKIP };
+enum { AGX_TEX_NONE, AGX_TEX_FOUND, AGX_TEX_VIBRANCY };
 
 static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
                                   AGXTexture *tex)
@@ -3265,15 +3265,16 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
  * pointers to blocks holding sampler state, texture state words (TSW) and
- * shader constants. Draws whose constants are the Rec.709 luma weights are
- * CA vibrancy/desaturation passes, which the replay cannot express; skip
- * them rather than painting an opaque quad. */
+ * shader constants. Draws whose constants are the Rec.709 luma weights use
+ * CA's darkenSourceOver / lightenSourceOver legibility shaders (agy report
+ * C8): the source is attenuated by the destination luminance before src-over. */
 static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                               unsigned n, AGXTexture *tex)
 {
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
     uint32_t blocks[4][12];
     unsigned count = 0;
+    bool vibrancy = false;
 
     for (unsigned i = 0; i < n; i++) {
         uint32_t data[8];
@@ -3285,9 +3286,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
             uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
             if (ptr >= 0x1000 && ptr < (UINT64_C(1) << 40) &&
                 agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
-                if (!memcmp(blocks[count], luma, sizeof(luma))) {
-                    return AGX_TEX_SKIP;
-                }
+                vibrancy |= !memcmp(blocks[count], luma, sizeof(luma));
                 count++;
             }
         }
@@ -3295,7 +3294,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
     for (unsigned b = 0; b < count; b++) {
         for (unsigned k = 0; k + 4 <= 12; k++) {
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
-                return AGX_TEX_FOUND;
+                return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
     }
@@ -3308,6 +3307,26 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
         return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * 4;
     }
     return tex->addr + (uint64_t)y * tex->stride + x * 4;
+}
+
+/* darkenSourceOver / lightenSourceOver: scale the (premultiplied) source by
+ * Y^4 of the destination luminance (dark shadows) or (1-Y)^4 (light halos),
+ * then src-over. Light sources are recognised by their colour. */
+static uint32_t agx_blend_vibrancy(uint32_t dst, uint32_t src)
+{
+    uint32_t db = dst & 0xff, dg = (dst >> 8) & 0xff, dr = (dst >> 16) & 0xff;
+    uint32_t sb = src & 0xff, sg = (src >> 8) & 0xff, sr = (src >> 16) & 0xff, sa = src >> 24;
+    uint32_t y = (54 * dr + 183 * dg + 19 * db) >> 8;
+    uint32_t y1 = sr + sg + sb > 384 ? 255 - y : y;
+    uint32_t y2 = y1 * y1 / 255, f = y2 * y2 / 255;
+    uint32_t out = 0;
+
+    sb = sb * f / 255; sg = sg * f / 255; sr = sr * f / 255; sa = sa * f / 255;
+    const uint32_t s3[3] = { sb, sg, sr }, d3[3] = { db, dg, dr };
+    for (unsigned c = 0; c < 3; c++) {
+        out |= MIN(s3[c] + d3[c] * (255 - sa) / 255, 255u) << (c * 8);
+    }
+    return out | 0xff000000u;
 }
 
 static void agx_replay_put(A7State *s, uint64_t cat, uint64_t target,
@@ -3475,11 +3494,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 continue;
             }
             int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
-            if (found == AGX_TEX_SKIP || (found == AGX_TEX_NONE && stride != 20) ||
-                (found == AGX_TEX_FOUND && tex.w * 4 > sizeof(texrow))) {
+            if ((found == AGX_TEX_NONE && stride != 20) ||
+                (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 continue;
             }
-            bool textured = found == AGX_TEX_FOUND;
+            bool textured = found != AGX_TEX_NONE;
+            bool vibrancy = found == AGX_TEX_VIBRANCY;
             /* Texel-unit coordinates (rectangle textures) exceed 1. */
             float su = textured && MAX(u1, v1) <= 1.0001f ? tex.w : 1;
             float sv = textured && MAX(u1, v1) <= 1.0001f ? tex.h : 1;
@@ -3508,6 +3528,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
                         }
                         src = m;
+                    }
+                    if (vibrancy) {
+                        row[x - x0] = agx_blend_vibrancy(dst, src);
+                        continue;
                     }
                     uint32_t a = src >> 24;
                     for (unsigned c = 0; c < 24; c += 8) {

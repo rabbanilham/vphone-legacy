@@ -141,14 +141,25 @@ def decode_tsw(f, tsw):
 def texture(f, ppp):
     """First texture state word block among the fragment data; None for vibrancy."""
     words = fragment_words(f, ppp)
-    if any(tuple(ws[:3]) == LUMA for _, ws in words):
-        return 'skip'
+    vibrancy = any(tuple(ws[:3]) == LUMA for _, ws in words)
     for _, ws in words:
         for k in range(0, 9):
             tex = decode_tsw(f, ws[k:k + 4])
             if tex:
+                tex['vibrancy'] = vibrancy
                 return tex
     return None
+
+
+def blend_vibrancy(d, s):
+    """darkenSourceOver/lightenSourceOver (agy C8): scale S by Y^4 or (1-Y)^4 of D, src-over."""
+    dr, dg, db = d
+    sr, sg, sb, sa = s
+    y = (54 * dr + 183 * dg + 19 * db) >> 8
+    y1 = 255 - y if sr + sg + sb > 384 else y
+    f = (y1 * y1 // 255) ** 2 // 255
+    sr, sg, sb, sa = (c * f // 255 for c in (sr, sg, sb, sa))
+    return tuple(min(255, sc + dc * (255 - sa) // 255) for sc, dc in ((sr, dr), (sg, dg), (sb, db)))
 
 
 def texel(f, tex, x, y):
@@ -184,7 +195,7 @@ def main():
         print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
               (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
                                                          for k, v in tex.items() if k != 'tsw'})))
-        if tex == 'skip' or x0 >= x1 or y0 >= y1:
+        if x0 >= x1 or y0 >= y1:
             continue
         if tex:
             # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
@@ -205,8 +216,11 @@ def main():
                         tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                         b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                     d = (y * W + x) * 4
-                    for c, src in enumerate((r, g, b)):
-                        fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
+                    if tex.get('vibrancy'):
+                        fb[d:d + 3] = bytes(blend_vibrancy(tuple(fb[d:d + 3]), (r, g, b, a)))
+                    else:
+                        for c, src in enumerate((r, g, b)):
+                            fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
                     fb[d + 3] = 255
         else:
             colour = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 20 else 0xff000000
