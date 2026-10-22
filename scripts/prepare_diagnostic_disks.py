@@ -160,15 +160,18 @@ def prepare_data():
 
 
 def seed_setup_done(data_mount, build_version="11D257"):
-    """Seed the preferences a device has after finishing Setup Assistant.
+    """Seed Setup Assistant UI completion preferences for iOS 7.1.2.
 
     Verified in 11D257 (agy A1 report, strings checked in the cache/lockdownd):
     - Preferences.framework PSSetupAssistantNeedsToRun (0x189522298) returns
       NO for ForceNoBuddy, and also checks SetupDone / SetupVersion (>= 5) /
-      AssistantPresented; SpringBoard _SBUpdateBuddyMode (0x1000ded5c) then
-      leaves buddy mode, so the lock screen unlocks to the home screen.
+      AssistantPresented. SpringBoard _SBUpdateBuddyMode (0x1000ded5c)
+      independently checks SBLockdownManager.brickedDevice; completion
+      preferences alone do not guarantee that buddy mode is disabled.
     Activation state is deliberately left to the guest; this only records
-    that the Setup Assistant UI has been completed.
+    that the Setup Assistant UI has been completed. A guest reporting
+    BrickState=true can still present Setup.app (see
+    research/reports/setup-done-validation-20261023.md).
     """
     bplist = lambda value: plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
     purplebuddy = bplist({

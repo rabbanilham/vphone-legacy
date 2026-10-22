@@ -576,3 +576,23 @@ df -h .
   - The 20–65 s critical path to the first Setup frame (agy D6).
   - One Setup crash at about 45 s in probe-149 (cause unknown; use `--collect-crashlogs`).
   - Intermittent logo-only boots from before these fixes (probes 135/144/146; agy D1b).
+
+## 22. Faster greeting, AIC CPU count, rendering throughput (Claude + agy, 2026-10-23)
+
+- **AIC:** `AIC_INFO` (reg 4) now reports the CPU count minus one in bits 20:16, and the per-CPU IPID send at `0x501c + cpu*0x80` is delivered (b3d1652, `smp_contract_test`).
+  - Before, `AppleInterruptController` believed one CPU and dropped every IPI to CPU1 (agy D1b).
+- **Camera ISP left out of the DT** (989059c, `boot_image.omit_unpopulated_devices`; local plan `boot-plan-smp-noisp`).
+  - Before, mediaserverd crashed every time it opened the ISP, which has no firmware model.
+  - SpringBoard then spent three 9 s `com.apple.coremedia.recorder` timeouts on its main thread (agy D8).
+  - **The greeting now renders at about 35 s instead of about 64 s.**
+  - The `a7.isp` shortcut in `s5l8960x.c` is only reached with older plans.
+- **Status bar:** the TSW search covers words 0 and 4, plus word 7 only behind the luma weights (D7 + d4a9168).
+- **The Apple c15 PMC registers are logged once per register** (031270f). They were about 50k trace lines per probe.
+- **Replay throughput** (49a8514): rows are written with `agx_ctx_write`, one page walk per page instead of a walk plus a store per pixel. The probe-162 → 163 host `sample` while scrolling Setup:
+  - replay samples: 1662 → 167;
+  - CPU0 BQL waits: 3242 → 284;
+  - frames rendered: 2.3× more.
+  - The replay runs in `agx_kick_cb` under the BQL. Exception entry, interrupts and ERET (through the ARM PMU EL-change hook) all take the BQL, so replay time used to stall both vCPUs.
+- **The warm data disk** (`build/diagnostic/data-diagnostic-warm.raw`, icon caches built by one boot) gained only 1–3 s, so it's not the default.
+- **Wi-Fi HSIC:** about 22 s of kernel-thread retries are faithful absent-hardware behaviour (agy D5). There is no early exit.
+- **Taps work through Setup:** language → country → the next steps (probes 161–163). Setup currently ends at its iTunes connection step, where it needs activation; that step is out of scope for this project.
