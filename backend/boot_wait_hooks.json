@@ -1,0 +1,24 @@
+{
+  "cache_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "boot_wait_interfaces_begin": "0x18461e028",
+    "boot_wait_interfaces_done": "0x1846198cc"
+  },
+  "exe_headers": {
+    "backboardd": "cffaedfe0c0000010000000002000000"
+  },
+  "exe_hooks": {
+    "backboardd": {
+      "boot_wait_sb_checkin": {
+        "address": "0x10003a1c4",
+        "expected": "7051ff1716020090c87a88b9686a68f8",
+        "description": "systemAppCheckIn receives checkin from system app and triggers overlay dismiss"
+      }
+    }
+  },
+  "notes": {
+    "purpose": "T19: measure InterfaceNamer initialization and received system-app check-in. Filter interface events by identity.process == CommCenter. Check-in is observed in backboardd, not proof of Setup Assistant greeting.",
+    "limits": "Use --max-hits boot_wait_=32 and --max-hits userclient_start=0; require all hooks mapped and unsaturated. elapsed is host running time excluding debugger pauses, not the ARM virtual counter."
+  }
+}

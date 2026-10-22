@@ -172,6 +172,30 @@ def add_node(parent, name):
     return child
 
 
+def omit_unpopulated_devices(root):
+    """Describe the emulator's absent modem and motion CPU, not firmware nubs.
+
+    AppleBaseband can wait indefinitely for the unimplemented HSIC service;
+    InterfaceNamer waits up to 60 seconds for IOKit to settle. Oscar's UART ROM
+    likewise cannot answer (one-second ready waits, retried on power changes).
+    Remove both modem nubs together: removing HSIC alone strands AppleBaseband.
+    Keep controllers and their other children, GPIO/PMU wiring and audio intact.
+    This edits only the loader's in-memory DT, never the firmware input or disk.
+    """
+    for path in (("baseband",),
+                 ("arm-io", "usb-complex", "usb-ehci0", "hsic-baseband"),
+                 ("arm-io", "uart2", "oscar")):
+        parent = root
+        for name in path[:-1]:
+            parent = next((c for c in parent.children
+                           if c.get_prop("name") == name.encode() + b"\0"), None)
+            if parent is None:
+                break
+        if parent is not None:
+            parent.children = [c for c in parent.children
+                               if c.get_prop("name") != path[-1].encode() + b"\0"]
+
+
 def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 cpus=1", *, monitor_path=None, ans_path=None, nvram_vars=None):
     if monitor_path is None:
         raise ValueError("Native secure monitor is required; rebuild firmware bundle")
@@ -229,9 +253,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     lcd = root.find_node("lcd")
     if lcd:
         lcd.set_prop("lcd-panel-id", struct.pack("<I", 0xa6970dc8))
-    oscar = root.find_node("oscar")
-    if oscar:
-        oscar.children = [c for c in oscar.children if c.get_prop("name") != b"compass\0"]
+    omit_unpopulated_devices(root)
     memory = add_node(root, "memory")
     memory.set_prop("reg", struct.pack("<QQ", DRAM_BASE, RAM_SIZE))
     # Firmware DT is a bootloader template: original pram/reg is all zeros.

@@ -6247,6 +6247,8 @@ static void a7_init(MachineState *ms)
         { "a7.i2s_switch",  UINT64_C(0x20a003000), 0x1000 },
         { "a7.mca_ctl",     UINT64_C(0x20a002000), 0x1000 },
         { "a7.mca",         UINT64_C(0x20a0c0000), 0x14000 },
+        /* Register storage only, no Oscar ROM/firmware on UART2. The loader
+         * omits its oscar nub, as it omits the absent modem/HSIC endpoint. */
         { "a7.uart_other",  UINT64_C(0x20a0a4000), 0x18000 },
         { "a7.pmgr_sochot", UINT64_C(0x202230000), 0x1000 },
         { "a7.jpeg",        UINT64_C(0x207b00000), 0x4000 },
