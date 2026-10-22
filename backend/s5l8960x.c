@@ -1966,7 +1966,15 @@ static void chestnut_command(A7Peripheral *p, uint32_t value)
  * baseband start waits for function-bb_usb_mux at f0da34. */
 static bool i2c_is_tristar(A7Peripheral *p)
 {
-    return i2c_index(p) == 0 && p->i2c_address == 0x1a;
+    /* Opt-in until the system-ID exchange is complete: answering REV but
+     * failing getSystemID panics AppleTriStar2 (probe-138/139), which is
+     * worse than the old NACK (start fails, dock provider never appears). */
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("VPHONE_TRISTAR");
+        enabled = env && !strcmp(env, "1");
+    }
+    return enabled && i2c_index(p) == 0 && p->i2c_address == 0x1a;
 }
 
 static bool i2c_is_lm3534(A7Peripheral *p)

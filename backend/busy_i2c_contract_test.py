@@ -3,7 +3,11 @@
 
 Compiles actual board C with the existing PMU/I2C harness. No QEMU/iOS run.
 """
+import os
 from pmu_contract_test import host_check
+
+# The TriStar model is opt-in on the board (VPHONE_TRISTAR=1).
+os.environ.setdefault('VPHONE_TRISTAR', '1')
 
 BASEBAND = r'''
  /* TriStar REV and baseband USB/UART mux control, repeated START and STOP. */
