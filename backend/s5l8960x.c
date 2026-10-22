@@ -16,7 +16,9 @@
 #include "hw/core/loader.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/usb/hcd-ehci.h"
+#include "hw/usb/hcd-ohci.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "target/arm/cpu.h"
@@ -482,6 +484,9 @@ struct A7State {
     A7Bridge bridges[NUM_BRIDGES];
     MemoryRegion usb_dma_memory, usb_dma_ram;
     AddressSpace usb_dma_as;
+    MemoryRegion usb_otg;
+    uint32_t usb_regs[0x10000 / 4];
+    A7Bridge usb_aux[4];
     A7Peripheral peripherals[NUM_PERIPHERALS];
     CharFrontend chr;
     QemuConsole *con;
@@ -1088,6 +1093,140 @@ static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 static const MemoryRegionOps gpio_ops = {
     .read = gpio_read, .write = gpio_write, .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1, .valid.max_access_size = 8,
+};
+
+/* Detached DWC OTG device core. Exact n53 DT reservation; no USB host or
+ * packet engine. Native e703cc/e6e688 polls GRSTCTL, e70974 polls GOUTNAKEFF,
+ * e70a84 polls EPDISBLD. Commands complete synchronously on an idle bus.
+ * Capability values describe the modeled 14-endpoint, 2080-word FIFO core;
+ * they are not a claimed readback of A7 silicon. */
+static void a7_otg_reset(A7State *s)
+{
+    uint32_t *r = s->usb_regs;
+    memset(r, 0, 0x10000);
+    r[0x000 / 4] = 1u << 16; /* CONIDSTS=B device, no A/B session valid */
+    r[0x00c / 4] = 0x1400;
+    r[0x010 / 4] = 1u << 31; /* AHBIdle */
+    r[0x024 / 4] = 0x400;
+    r[0x028 / 4] = 0x01000400;
+    r[0x02c / 4] = 0x00080100; /* empty nonperiodic FIFO/queue */
+    r[0x040 / 4] = 0x4f54280a; /* Synopsys OTG 2.80a */
+    r[0x044 / 4] = 0x264; /* DT eps-dir-bitmap */
+    r[0x048 / 4] = (1u << 19) | (7u << 10) | (1u << 6) | (2u << 3);
+    r[0x04c / 4] = (0x820u << 16) | (4u << 4) | 4;
+    r[0x050 / 4] = (7u << 26) | (1u << 25) | 7u;
+    r[0x100 / 4] = 0x01000500;
+    for (unsigned i = 0; i < 15; i++) {
+        r[(0x104 + 4 * i) / 4] = (0x20u << 16) | (0x600 + 0x20 * i);
+    }
+    r[0x804 / 4] = 2; /* soft disconnect */
+    r[0x808 / 4] = 1; /* suspended, no enumeration */
+    for (unsigned ep = 0; ep < 16; ep++) {
+        r[(0x900 + 0x20 * ep) / 4] = 1u << 17; /* NAKSTS */
+        r[(0xb00 + 0x20 * ep) / 4] = 1u << 17;
+        r[(0x918 + 0x20 * ep) / 4] = ep ? 0x20 : 0x100; /* TX FIFO space */
+    }
+}
+
+static uint32_t a7_otg_daint(A7State *s)
+{
+    uint32_t *r = s->usb_regs, pending = 0;
+    for (unsigned ep = 0; ep < 16; ep++) {
+        if (r[(0x908 + 32 * ep) / 4] & r[0x810 / 4]) { pending |= 1u << ep; }
+        if (r[(0xb08 + 32 * ep) / 4] & r[0x814 / 4]) { pending |= 1u << (16 + ep); }
+    }
+    return pending;
+}
+
+static uint32_t a7_otg_word(A7State *s, unsigned off)
+{
+    uint32_t *r = s->usb_regs;
+    if (off == 0x818) { return a7_otg_daint(s); }
+    if (off == 0x14) {
+        uint32_t pending = a7_otg_daint(s) & r[0x81c / 4];
+        /* Device mode, empty TX FIFO, no RX/session/reset/enumeration event.
+         * NAK effective levels track DCTL requests, including when W1C'd. */
+        return 0x20 | ((pending & 0xffff) ? (1u << 18) : 0) |
+               ((pending >> 16) ? (1u << 19) : 0) |
+               ((r[0x804 / 4] & 4) ? 0x40 : 0) |
+               ((r[0x804 / 4] & 8) ? 0x80 : 0);
+    }
+    return r[off / 4];
+}
+
+static uint64_t a7_otg_read(void *opaque, hwaddr off, unsigned size)
+{
+    A7State *s = opaque;
+    uint64_t value = 0;
+    for (unsigned i = 0; i < size; i++) {
+        value |= (uint64_t)((a7_otg_word(s, (off + i) & ~3u) >>
+                             (8 * ((off + i) & 3))) & 0xff) << (8 * i);
+    }
+    return value;
+}
+
+static void a7_otg_store(A7State *s, unsigned off, uint32_t v, uint32_t mask)
+{
+    uint32_t *r = s->usb_regs;
+    uint32_t old = r[off / 4];
+    uint32_t next = (old & ~mask) | (v & mask);
+    if (off == 0x10) {
+        if (v & mask & 1) {
+            a7_otg_reset(s);
+        }
+        r[off / 4] = 1u << 31; /* soft reset / RX+TX flush complete */
+    } else if (off == 0x804) {
+        uint32_t nak = old & 0xc;
+        if (v & mask & (1u << 7)) { nak |= 4; }
+        if (v & mask & (1u << 8)) { nak &= ~4u; }
+        if (v & mask & (1u << 9)) { nak |= 8; }
+        if (v & mask & (1u << 10)) { nak &= ~8u; }
+        r[off / 4] = (next & ~0x78du) | nak; /* command pulses + RO status */
+    } else if ((off >= 0x900 && off < 0xd00) && !(off & 0x1f)) {
+        /* Endpoint CNAK/SNAK and disable are commands. No cable means no
+         * transfer completion, even when software arms EP0 receive DMA. */
+        uint32_t nak = old & (1u << 17);
+        if (v & mask & (1u << 26)) { nak &= ~(1u << 17); }
+        if (v & mask & (1u << 27)) { nak |= 1u << 17; }
+        if (v & mask & (1u << 30)) {
+            next &= ~(3u << 30);
+            r[(off + 8) / 4] |= 2; /* EPDISBLD */
+        }
+        r[off / 4] = (next & ~((3u << 26) | (1u << 17))) | nak;
+    } else if (off == 4 || off == 0x14 ||
+               (off >= 0x900 && off < 0xd00 && (off & 0x1f) == 8)) {
+        r[off / 4] &= ~(v & mask); /* W1C */
+    } else if (off == 0 || off == 0x2c || (off >= 0x40 && off <= 0x50) ||
+               off == 0x808 || off == 0x818 || off == 0x20 || off == 0x1c ||
+               (off >= 0x900 && off < 0xb00 && (off & 0x1f) == 0x18)) {
+        /* RO identity, cable, empty RX, interrupt summary and FIFO space. */
+    } else {
+        r[off / 4] = next; /* full DT aperture, including vendor holes */
+    }
+}
+
+static void a7_usb_irq(void *opaque, int irq, int level);
+
+static void a7_otg_write(void *opaque, hwaddr off, uint64_t value, unsigned size)
+{
+    A7State *s = opaque;
+    /* Merge lanes once per word so a partial W1C/command cannot replay RO
+     * or adjacent bits. QEMU splits unaligned accesses for this region. */
+    while (size) {
+        unsigned lane = off & 3, n = MIN(size, 4 - lane);
+        uint32_t mask = (UINT32_MAX >> (8 * (4 - n))) << (8 * lane);
+        a7_otg_store(s, off & ~3u, (uint32_t)value << (8 * lane), mask);
+        off += n; size -= n; value >>= 8 * n;
+    }
+    a7_usb_irq(s, 162, (s->usb_regs[8 / 4] & 1) &&
+                (a7_otg_word(s, 0x14) & s->usb_regs[0x18 / 4]));
+}
+
+static const MemoryRegionOps a7_otg_ops = {
+    .read = a7_otg_read, .write = a7_otg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 static uint64_t bridge_read(void *opaque, hwaddr off, unsigned size)
@@ -1794,6 +1933,7 @@ static unsigned d2045_adc_sample(unsigned channel)
     case 0: case 4: return 2130; /* VCC_MAIN / VBAT: about 3.8 V */
     case 2: case 7: return 2048; /* thermistor / divider: about 1.25 V */
     case 11: case 12: case 13: case 14: return 432; /* tdev: about 25 C */
+    case 9: return 0; /* VBUS: detached, 1053d90..da8 / 105462c..648 */
     default: return 2048;
     }
 }
@@ -6120,6 +6260,10 @@ static void a7_reset(void *opaque)
     memset(&s->mouse_touch, 0, sizeof(s->mouse_touch));
     touch_script_reset(s);
     s->chestnut_control = 0;
+    a7_otg_reset(s);
+    for (unsigned i = 0; i < ARRAY_SIZE(s->usb_aux); i++) {
+        memset(s->usb_aux[i].regs, 0, s->usb_aux[i].size);
+    }
     d2045_reset(s);
     s->disp_token = 0;
     s->disp_pending_token = 0;
@@ -6435,6 +6579,33 @@ static void a7_init(MachineState *ms)
         }
     }
     a7_usb_init(s);
+    /* All remaining USB reg resources; no complex-wide catch-all. */
+    memory_region_init_io(&s->usb_otg, OBJECT(s), &a7_otg_ops, s,
+                          "a7.usb-device", 0x10000);
+    memory_region_add_subregion(get_system_memory(), UINT64_C(0x20c100000),
+                                &s->usb_otg);
+    static const struct { hwaddr base; uint32_t size; } usb_aux_defs[] = {
+        { UINT64_C(0x20c000010), 0x10 }, /* usb-device reg[1] */
+        { UINT64_C(0x20c000050), 0x10 }, /* hsic-baseband */
+        { UINT64_C(0x20c000060), 0x10 }, /* wlan HSIC: probe148 fault */
+        { UINT64_C(0x20c300000), 0x10000 }, /* OHCI reservation */
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(usb_aux_defs); i++) {
+        A7Bridge *b = &s->usb_aux[i];
+        b->base = usb_aux_defs[i].base; b->size = usb_aux_defs[i].size;
+        b->regs = g_malloc0(b->size);
+        memory_region_init_io(&b->mr, OBJECT(s), &bridge_ops, b,
+                              "a7.usb-aux", b->size);
+        memory_region_add_subregion_overlap(get_system_memory(), b->base,
+                                            &b->mr, -1);
+    }
+    DeviceState *ohci = qdev_new("sysbus-ohci");
+    qdev_prop_set_uint32(ohci, "num-ports", 1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ohci), &error_fatal);
+    SYSBUS_OHCI(ohci)->ohci.as = &s->usb_dma_as;
+    sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, UINT64_C(0x20c300000));
+    sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0,
+                       qemu_allocate_irq(a7_usb_irq, s, 164));
     static const struct {
         const char *name;
         hwaddr base;
