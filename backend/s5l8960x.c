@@ -5058,6 +5058,7 @@ typedef struct AGXRenderJob {
     uint64_t target;
     uint32_t width;
     uint32_t height;
+    bool is_clear;
 
     /* Stamp to store upon rasterisation completion */
     bool has_stamp;
@@ -5472,7 +5473,8 @@ static bool agx_replay_viewport(const uint32_t *ppp, unsigned n, float vp[4])
 }
 
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
-                             uint64_t target, uint32_t width, uint32_t height)
+                             uint64_t target, uint32_t width, uint32_t height,
+                             bool is_clear)
 {
     /* Thread-safety: row and texrow are thread-local (__thread) buffers,
      * ensuring safe re-entrancy between the dedicated off-BQL render thread
@@ -5487,6 +5489,15 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     height = MIN(height, 1136u);
     AGXSurface sf;
     agx_surface_layout(s, cat, target, width, &sf);
+
+    if (is_clear) {
+        uint32_t zero_row[640];
+        memset(zero_row, 0, sizeof(zero_row));
+        for (uint32_t y = 0; y < height; y++) {
+            agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, y), zero_row, width * 4);
+        }
+    }
+
     /* Default viewport covers the pass; PPP state updates it. */
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
     for (unsigned guard = 0; guard < 4096; guard++) {
@@ -5861,7 +5872,7 @@ static void *agx_render_thread_fn(void *opaque)
         if (job->target != 0) {
             rcu_read_lock();
             agx_replay_frame(job->s, job->cat_base, job->ta, job->target,
-                             job->width, job->height);
+                             job->width, job->height, job->is_clear);
             rcu_read_unlock();
         }
 
@@ -6068,13 +6079,14 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     /* +0x70/+0x74 carry flags above the max x/y in bits [15:0]. */
     uint32_t pass_w = (ldl_le_p(raw + 0x74) & 0xffff) + 1;
     uint32_t pass_h = (ldl_le_p(raw + 0x70) & 0xffff) + 1;
+    bool is_clear = ldl_le_p(raw + 0x178) != 0 && !(ldl_le_p(raw + 0x23c) & 1);
     /* Each 3D pass replays the TA that shares its parameter buffer; vertex
      * positions go through the pass's own matrix and viewport, so offscreen
      * passes (e.g. 608x64 backdrops) land in their own coordinate space. */
     const uint8_t *pass_ta = agx_find_ta(s, context_id, raw);
     if (pbe_target && context_cat && agx_replay_enabled() && pass_ta) {
         if (!agx_replay_thread_enabled()) {
-            agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h);
+            agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h, is_clear);
         } else if (out_job) {
             AGXRenderJob *job = g_new0(AGXRenderJob, 1);
             job->s = s;
@@ -6082,6 +6094,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
             job->target = pbe_target;
             job->width = pass_w;
             job->height = pass_h;
+            job->is_clear = is_clear;
             memcpy(job->ta, pass_ta, sizeof(job->ta));
             *out_job = job;
         }

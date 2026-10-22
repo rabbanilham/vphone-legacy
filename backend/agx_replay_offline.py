@@ -176,6 +176,20 @@ def blend_vibrancy(d, s):
 
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
 
+
+def is_clear_pass(type1_command):
+    """Determine if a pass background is a clear (True) or load (False).
+
+    A 3D pass is a clear if it carries a background object (+0x178 != 0)
+    and the driver's load flag at +0x23c is 0. Display passes set +0x23c = 1
+    (load-op) and offscreen backdrops set +0x23c = 0 (clear-op).
+    Synthetic commands without a background object (+0x178 == 0) leave
+    canvas memory untouched.
+    """
+    w178 = struct.unpack_from('<I', type1_command, 0x178)[0]
+    w23c = struct.unpack_from('<I', type1_command, 0x23c)[0]
+    return (w178 != 0) and ((w23c & 1) == 0)
+
 # CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
 # Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore.
 BLUR_PROGRAMS = {
@@ -398,7 +412,7 @@ def main():
     target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
     fb = bytearray(target_w * target_h * 4)
     target = f.header.get('pbe_target')
-    if target and target in f.pages:
+    if not is_clear_pass(f.type1_command) and target and target in f.pages:
         strip = ((target + 0x9000) // 4096 * 4096 in f.pages and
                  (target + 0xa000) // 4096 * 4096 not in f.pages)
         stride = 2560 if strip else ((target_w + 15) & ~15) * 4
