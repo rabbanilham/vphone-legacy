@@ -46,7 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define GPIO_BASE UINT64_C(0x20e300000)
 #define GPIO_SIZE UINT64_C(0x100000)
 #define NIRQ 1024
-#define NUM_BRIDGES 16
+#define NUM_BRIDGES 18
 #define NUM_PERIPHERALS 28
 
 /* Bounded, host-testable script compiler. Times are relative to reset. */
@@ -480,6 +480,8 @@ struct A7State {
     MemoryRegion cpu_mmio[2];
     uint8_t cpu_regs[2][0x1000];
     A7Bridge bridges[NUM_BRIDGES];
+    MemoryRegion usb_dma_memory, usb_dma_ram;
+    AddressSpace usb_dma_as;
     A7Peripheral peripherals[NUM_PERIPHERALS];
     CharFrontend chr;
     QemuConsole *con;
@@ -6221,11 +6223,21 @@ static void a7_usb_irq(void *opaque, int irq, int level)
 
 static void a7_usb_init(A7State *s)
 {
+    /* The native schedule pointers are 32-bit DRAM bus offsets, whereas AP
+     * RAM starts at 0x800000000. Keep this wiring private to USB: adding a
+     * low alias to system memory would also change CPU and other DMA views.
+     * No USB iommu-parent/DART exists in the N53 DT. */
+    memory_region_init(&s->usb_dma_memory, OBJECT(s), "a7.usb-dma", UINT64_C(0x100000000));
+    memory_region_init_alias(&s->usb_dma_ram, OBJECT(s), "a7.usb-dram",
+                             MACHINE(s)->ram, 0, GiB);
+    memory_region_add_subregion(&s->usb_dma_memory, 0, &s->usb_dma_ram);
+    address_space_init(&s->usb_dma_as, &s->usb_dma_memory, "a7.usb-dma");
     static const char *const types[] = { "a7.ehci0", "a7.ehci1" };
     for (unsigned i = 0; i < ARRAY_SIZE(types); i++) {
         DeviceState *dev = qdev_new(types[i]);
         SysBusDevice *bus = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(bus, &error_fatal);
+        SYS_BUS_EHCI(dev)->ehci.as = &s->usb_dma_as;
         sysbus_mmio_map(bus, 0, UINT64_C(0x20c200000) + i * 0x200000);
         sysbus_connect_irq(bus, 0, qemu_allocate_irq(a7_usb_irq, s, 163 + i * 2));
     }
@@ -6398,6 +6410,13 @@ static void a7_init(MachineState *ms)
          * here (111193c..1968, 1111bcc..1c20). No busy bits or cable events.
          */
         { UINT64_C(0x20c000000), 0x10 },
+        /* Full DT reg[0] reservations. QEMU's EHCI container has holes even
+         * inside its 0x1000 bytes: Synopsys writes the HSIC port mask at
+         * +0x2c0 (110c7e4). Retain vendor configuration in those holes and
+         * the reserved tail; standard EHCI registers always take precedence.
+         * No vendor busy/command poll was found in the native init paths. */
+        { UINT64_C(0x20c200000), 0x10000 },
+        { UINT64_C(0x20c400000), 0x10000 },
     };
     for (int i = 0; i < NUM_BRIDGES; i++) {
         char name[32];
@@ -6407,8 +6426,13 @@ static void a7_init(MachineState *ms)
         s->bridges[i].regs = g_malloc0(bridge_defs[i].size);
         memory_region_init_io(&s->bridges[i].mr, OBJECT(s), &bridge_ops,
                               &s->bridges[i], name, bridge_defs[i].size);
-        memory_region_add_subregion(get_system_memory(), bridge_defs[i].base,
-                                    &s->bridges[i].mr);
+        if (i >= NUM_BRIDGES - 2) {
+            memory_region_add_subregion_overlap(get_system_memory(), bridge_defs[i].base,
+                                                &s->bridges[i].mr, -1);
+        } else {
+            memory_region_add_subregion(get_system_memory(), bridge_defs[i].base,
+                                        &s->bridges[i].mr);
+        }
     }
     a7_usb_init(s);
     static const struct {
