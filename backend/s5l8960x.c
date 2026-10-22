@@ -16,6 +16,7 @@
 #include "hw/core/loader.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/usb/hcd-ehci.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "target/arm/cpu.h"
@@ -45,7 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define GPIO_BASE UINT64_C(0x20e300000)
 #define GPIO_SIZE UINT64_C(0x100000)
 #define NIRQ 1024
-#define NUM_BRIDGES 15
+#define NUM_BRIDGES 16
 #define NUM_PERIPHERALS 28
 
 /* Bounded, host-testable script compiler. Times are relative to reset. */
@@ -6191,6 +6192,45 @@ static bool display_update(void *opaque)
 }
 static const GraphicHwOps display_ops = { .gfx_update = display_update };
 
+/* USB complex DT ranges: arm-io +0xc000000, EHCI +0x200000/+0x400000.
+ * Use the EHCI engine, including real reset/run/halt, frame clock, W1C,
+ * schedule and IRQ semantics. No USB device is attached by this board.
+ * The root-port counts cover the DT's EHCI0 ports 1/3 and EHCI1 port 1;
+ * these are a modeled topology, not recovered capability/OTP dumps.
+ */
+static void a7_ehci_class_init(ObjectClass *oc, const void *data)
+{
+    SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(oc);
+    sec->capsbase = 0;
+    sec->opregbase = 0x10;
+    sec->portscbase = 0x44;
+    sec->portnr = *(const unsigned *)data;
+}
+
+static void a7_usb_irq(void *opaque, int irq, int level)
+{
+    A7State *s = opaque;
+    uint32_t bit = 1U << (irq % 32);
+    if (level) {
+        s->device_irq[irq / 32] |= bit;
+    } else {
+        s->device_irq[irq / 32] &= ~bit;
+    }
+    aic_update(s);
+}
+
+static void a7_usb_init(A7State *s)
+{
+    static const char *const types[] = { "a7.ehci0", "a7.ehci1" };
+    for (unsigned i = 0; i < ARRAY_SIZE(types); i++) {
+        DeviceState *dev = qdev_new(types[i]);
+        SysBusDevice *bus = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(bus, &error_fatal);
+        sysbus_mmio_map(bus, 0, UINT64_C(0x20c200000) + i * 0x200000);
+        sysbus_connect_irq(bus, 0, qemu_allocate_irq(a7_usb_irq, s, 163 + i * 2));
+    }
+}
+
 static void a7_init(MachineState *ms)
 {
     A7State *s = A7(ms);
@@ -6353,6 +6393,11 @@ static void a7_init(MachineState *ms)
         { UINT64_C(0x201f80000), 0x1000 },
         { UINT64_C(0x20caff000), 0x200000 },
         { UINT64_C(0x200000000), 0x10000 },
+        /* EHCI provider reg[1]: USB control/config, distinct from PHY at
+         * +0x20. Native AppleS5L8960XUSBEHCI gates clocks and stores cfg-incr
+         * here (111193c..1968, 1111bcc..1c20). No busy bits or cable events.
+         */
+        { UINT64_C(0x20c000000), 0x10 },
     };
     for (int i = 0; i < NUM_BRIDGES; i++) {
         char name[32];
@@ -6365,6 +6410,7 @@ static void a7_init(MachineState *ms)
         memory_region_add_subregion(get_system_memory(), bridge_defs[i].base,
                                     &s->bridges[i].mr);
     }
+    a7_usb_init(s);
     static const struct {
         const char *name;
         hwaddr base;
@@ -6546,6 +6592,16 @@ static const TypeInfo a7_touch_display_type = {
 };
 static void a7_register(void)
 {
+    static const unsigned ports[] = { 3, 1 };
+    static const TypeInfo ehci_types[] = {
+        { .name = "a7.ehci0", .parent = TYPE_SYS_BUS_EHCI,
+          .class_init = a7_ehci_class_init, .class_data = &ports[0] },
+        { .name = "a7.ehci1", .parent = TYPE_SYS_BUS_EHCI,
+          .class_init = a7_ehci_class_init, .class_data = &ports[1] },
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(ehci_types); i++) {
+        type_register_static(&ehci_types[i]);
+    }
     type_register_static(&a7_touch_display_type);
     type_register_static(&a7_type);
 }
