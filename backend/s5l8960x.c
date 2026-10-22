@@ -4122,6 +4122,14 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
             /* SGX power/reset register bit 4 self-clears upon reset completion */
             val &= ~UINT64_C(0x10);
         }
+        if (p->base == UINT64_C(0x20e200000) && size == 4 &&
+            (off == 0x10 || off == 0x20 || off == 0x40)) {
+            /* DWI channel control: bit 0 (GO, written as 0x41/0x71) clears
+             * once the backlight word at +4 has been shifted out, which
+             * AppleS5L8940DWI::_waitTransaction (10ea5a4) polls for. Nothing
+             * is attached to the wire, so the transfer completes at once. */
+            val &= ~UINT64_C(1);
+        }
         if (p->base == UINT64_C(0x208040000) && !p->owner->iop_diagnostic && p->owner->sys_fd >= 0) {
             A7State *s = p->owner;
             qemu_log_mask(LOG_UNIMP, "ANS MMIO WRITE off=0x%" HWADDR_PRIx " val=0x%" PRIx64 " size=%u\n",
