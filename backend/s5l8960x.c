@@ -1983,8 +1983,12 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
     A7RegisterI2C *d = tristar ? &p->tristar : &p->lm3534;
     /* CBTL system-ID response e9ea10..68 is a separate read window:
      * marker 0x74, packed 10-bit board ID. Use synthetic ID 0 (no OTP
-     * supplied); it is not an accessory serial/identity or modem IMEI. */
-    unsigned limit = tristar ? (d->pointer >= 0x20 ? 0x23 : 16) : 4;
+     * supplied); it is not an accessory serial/identity or modem IMEI.
+     * The driver asks for logical register 0x20, which its bus helper
+     * (vtable+0x650) sends as hardware register 0x5d (probe-138 trace:
+     * W134 W25d W135 W603); keep 0x20 for the synthetic fixtures. */
+    unsigned id_base = tristar && d->pointer >= 0x5d ? 0x5d : 0x20;
+    unsigned limit = tristar ? (d->pointer >= 0x20 ? id_base + 3 : 16) : 4;
     if (value & 0x100) {
         if (!p->i2c_read) {
             d->prefix = true;
@@ -2004,8 +2008,8 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
             p->pmu_rx[i] = tristar && reg == 0xf ? 0x20 :
                            tristar && reg == 0xc ? 4 :
                            tristar && reg == 0xd ? 0 :
-                           tristar && reg == 0x20 ? 0x74 :
-                           tristar && reg >= 0x21 ? 0 : d->regs[reg];
+                           tristar && reg == id_base ? 0x74 :
+                           tristar && reg > id_base ? 0 : d->regs[reg];
         }
         p->pmu_rx_head = 0;
         p->pmu_rx_count = count;
@@ -2014,7 +2018,8 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
         if (d->prefix) {
             d->pointer = value & 0xff;
             d->pointer_valid = d->pointer < (tristar ? 16u : 4u) ||
-                               (tristar && d->pointer >= 0x20 && d->pointer <= 0x22);
+                               (tristar && ((d->pointer >= 0x20 && d->pointer <= 0x22) ||
+                                            (d->pointer >= 0x5d && d->pointer <= 0x5f)));
             d->prefix = false;
             if (!d->pointer_valid) {
                 i2c_nack(p);
