@@ -37,7 +37,7 @@ class SPIDMAContractTests(unittest.TestCase):
 #define MiB (1024U * 1024U)
 #define GiB (1024ULL * MiB)
 #define RAM_BASE UINT64_C(0x800000000)
-#define NUM_PERIPHERALS 1
+#define NUM_PERIPHERALS 2
 #define SIO_OUTBOX_CAPACITY 64
 #define GPIO_SIZE 0x100000
 #define QEMU_CLOCK_VIRTUAL 0
@@ -94,7 +94,7 @@ typedef struct A7Peripheral {
         harness += extract('typedef struct SioDMA', '#define SEP_OUTBOX_CAPACITY')
         harness += r'''
 struct A7State {
-    uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
+    uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
     A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
@@ -191,6 +191,54 @@ int main(void) {
     assert(p->spi.touch.firmware_bytes==0xfb58);
     pio(p,probe,2,reply); assert(reply[0]==0x4b && reply[1]==0xc1);
     pio(p,probe,2,reply); assert(reply[0]==0x4a && reply[1]==0xd1);
+
+    /* SPI2 Mesa uses DT endpoints 24/25, independently of SPI1's HBPP.
+     * Its native start sends 7 bytes and clocks at least 23 response bytes.
+     * No sensor firmware is emulated: idle MISO must reject identification,
+     * while both real DMA channels finish with their own tags/counts. */
+    static uint8_t regs2[0x100];
+    A7Peripheral *mesa=&state.peripherals[1];
+    mesa->owner=&state;mesa->base=UINT64_C(0x20a088000);mesa->regs=regs2;
+    assert(gpio_read(&state,79*4,4)==1 && gpio_read(&state,146*4,4)==1);
+    descriptor(12,1);segment(12,0,RAM_BASE+0x30000,7);
+    descriptor(16,1);segment(16,0,RAM_BASE+0x31000,23);
+    memset(ram+0x31000,0,23);drain();
+    inbox(24,150,5,0,0);inbox(25,151,5,0,0);
+    inbox(24,152,6,0,12);inbox(25,153,6,0,16);
+    expect(2,24,152,0x65,0,0);expect(3,25,153,0x65,0,0);
+    assert(state.sio.spi_dma[2].active && state.sio.spi_dma[3].active);
+    assert(state.sio.outbox_count==4); /* no premature completion */
+    unsigned touch_bytes=p->spi.touch.firmware_bytes;
+    spi_write(mesa,0,0xd);spi_write(mesa,0x34,23);spi_write(mesa,0x4c,23);
+    spi_write(mesa,4,0x204058);
+    expect(4,24,152,0x68,0xc0,7);expect(5,25,153,0x68,0xc0,23);
+    assert(!state.sio.spi_dma[2].active && !state.sio.spi_dma[3].active);
+    for(unsigned i=0;i<23;i++) assert(ram[0x31000+i]==0xff);
+    assert(p->spi.touch.firmware_bytes==touch_bytes);
+    assert(state.device_irq[4]&(1u<<10));
+    spi_write(mesa,8,0x40000f);assert(!(state.device_irq[4]&(1u<<10)));
+    spi_write(mesa,4,0x4018);drain();
+    /* A second request may arrive after DMA mode is enabled (kick path). */
+    spi_write(mesa,0x34,23);spi_write(mesa,0x4c,23);spi_write(mesa,4,0x4058);
+    inbox(25,154,6,0,16);
+    expect(0,25,154,0x65,0,0);expect(1,25,154,0x68,0xc0,23);
+    spi_write(mesa,4,0x4018);drain();
+    inbox(24,155,6,0,12);inbox(24,156,8,0,0);
+    expect(0,24,155,0x65,0,0);expect(1,24,156,0x65,0,0);
+    expect(2,24,155,0x68,0xc0,0);
+    segment(12,0,mesa->base,7);inbox(24,157,6,0,12);
+    expect(3,24,157,0x66,0,0);assert(mmio_attempts==0);
+
+    /* Concurrent channel banks: SPI2 RX completion must leave SPI1 TX armed. */
+    descriptor(20,1);segment(20,0,RAM_BASE+0x32000,5);drain();
+    inbox(22,158,6,0,20);
+    spi_write(mesa,0x34,23);spi_write(mesa,0x4c,23);spi_write(mesa,4,0x4058);
+    inbox(25,159,6,0,16);
+    expect(0,22,158,0x65,0,0);expect(1,25,159,0x65,0,0);
+    expect(2,25,159,0x68,0xc0,23);
+    assert(state.sio.spi_dma[0].active && !state.sio.spi_dma[3].active);
+    inbox(22,160,8,0,0);expect(3,22,160,0x65,0,0);
+    expect(4,22,158,0x68,0xc0,0);spi_write(mesa,4,0x4018);
     /* Valid small framed firmware upload, then bad checksum. */
     uint8_t frame[20]={0x18,0xe1,0x30,1,0,1};
     stw_be_p(frame+10,touch_sum(frame+4,6));

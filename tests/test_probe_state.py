@@ -8,6 +8,19 @@ from probe_state import RunClock,ReturnRegistry,ScanoutTracker,pixel_present,ins
 from display_probe import memory_state, parse_hook_dumps, capture_hook_dumps, derive_exe_slide, install_exe_hooks
 
 class ProbeStateTests(unittest.TestCase):
+
+    def test_va_global_instruction_mismatch_skips_only_this_hit(self):
+        expected = bytes(range(16))
+        mismatches = []
+        record = lambda: mismatches.append('skip-hit')
+        self.assertFalse(instruction_mapped(b'', expected, on_mismatch=record))
+        self.assertEqual(mismatches, [])
+        self.assertFalse(instruction_mapped(bytes(16), expected, on_mismatch=record))
+        self.assertEqual(mismatches, ['skip-hit'])
+        # The intended process subsequently reaches the same breakpoint VA.
+        self.assertTrue(instruction_mapped(expected, expected, on_mismatch=record))
+        self.assertEqual(mismatches, ['skip-hit'])
+
     def test_opt_in_hook_dumps_bound_reads_and_preserve_failures(self):
         self.assertEqual(parse_hook_dumps([]), {})
         specs = parse_hook_dumps(['frame=x25:96', 'frame=x1:0x10'])

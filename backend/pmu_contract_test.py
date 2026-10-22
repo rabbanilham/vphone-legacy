@@ -64,7 +64,7 @@ def fixture():
     return struct.pack('<' + 'I' * len(code), *code), expected
 
 
-def host_check():
+def host_check(extra_checks=""):
     """Compile real device/controller functions against bounded clock/IRQ stubs."""
     compiler = shutil.which('cc')
     if not compiler:
@@ -108,7 +108,7 @@ typedef struct { A7State *owner; hwaddr base; uint8_t regs[0x1000];
  uint8_t chestnut_pointer, i2c_rx_byte;
  bool chestnut_prefix, chestnut_pointer_valid, i2c_rx_valid;
  uint16_t pmu_pointer; unsigned pmu_prefix_count, pmu_rx_head, pmu_rx_count;
- bool pmu_pointer_valid; uint8_t pmu_rx[255]; } A7Peripheral;
+ bool pmu_pointer_valid; uint8_t pmu_rx[255]; A7RegisterI2C tristar, lm3534; } A7Peripheral;
 static void aic_update(A7State *s) { (void)s; }
 '''
     # Also use the real GPIO group aggregation/level assertion helper.
@@ -191,6 +191,7 @@ int main(void) {
  return 0;
 }
 '''
+    main = main.replace(' return 0;\n}', extra_checks + '\n return 0;\n}')
     with tempfile.TemporaryDirectory(prefix='d2045-host-') as temp:
         root = Path(temp)
         (root / 'test.c').write_text(prelude + device + types + gpio + functions + main)

@@ -675,11 +675,22 @@ def main():
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if pc in user_expected:
                                 actual=memory(gs,pc,16)
-                                try:mapped=instruction_mapped(actual,user_expected[pc])
-                                except ValueError:
-                                    save_json(out/'user-hook-mismatch.json',dict(name=name,pc=hex(pc),actual=actual.hex(),expected=user_expected[pc].hex(),identity=caller_identity))
-                                    raise
+                                def log_mismatch():
+                                    # Breakpoints are VA-global: another process can
+                                    # execute unrelated code at an executable hook VA.
+                                    # Keep the verified hook for its intended mapping,
+                                    # and never count or interpret this hit as evidence.
+                                    mismatch = dict(name=name, pc=hex(pc), actual=actual.hex(),
+                                                    expected=user_expected[pc].hex(),
+                                                    identity=caller_identity,
+                                                    elapsed=clock.elapsed(), action='skip-hit')
+                                    save_json(out/'user-hook-mismatch.json', mismatch)
+                                    with (out/'user-hook-mismatches.jsonl').open('a') as log:
+                                        log.write(json.dumps(mismatch) + '\n')
+                                mapped = instruction_mapped(actual, user_expected[pc],
+                                                            on_mismatch=log_mismatch)
                                 if not mapped:
+                                    # Skip unrelated mappings and unresolved pages.
                                     # TCG may stop at a virtual breakpoint before
                                     # the guest resolves its instruction-page fault.
                                     # Let the fault execute, retaining the hook;

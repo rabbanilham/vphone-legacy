@@ -4,9 +4,13 @@ import time
 def pixel_present(analysis,condition):
     return bool(analysis['non_zero_bytes'] if condition=='first-pixel' else analysis['non_zero_rgb_bytes'])
 
-def instruction_mapped(actual,expected):
+def instruction_mapped(actual,expected, *, on_mismatch=None):
     if not actual:return False
-    if actual!=expected:raise ValueError('Executed instruction bytes differ from the verified image')
+    if actual!=expected:
+        if on_mismatch is None:
+            raise ValueError('Executed instruction bytes differ from the verified image')
+        on_mismatch()
+        return False
     return True
 
 class RunClock:
