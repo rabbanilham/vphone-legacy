@@ -313,11 +313,14 @@ def main():
     p.add_argument('--diagnostic-system', type=Path, help='Alternative diagnostic system image')
     p.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
     p.add_argument('--plan', type=Path, help='Alternative boot_plan.json path')
+    p.add_argument('--qemu-binary', type=Path, help='Explicit QEMU binary for reproducible diagnostic runs')
     p.add_argument('--keybagd-loader-hooks', action='store_true', help='Trace native systembag file loading and stop on a proven open error')
     p.add_argument('--diagnostic-poke', action='append', default=[], choices=('meta_alive','stamps','device_status','drain'),
                    help='Diagnostic-only guest writes used to map later blockers; never acceptance evidence')
     p.add_argument('--meta-dump', action='store_true', help='On the first meta_wait, save AGXMetaFirmware state, pointer translations and guest RAM')
     p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
+    p.add_argument('--framebuffer-at', type=float, action='append', default=[],
+                   help='Save a QMP framebuffer at these guest-running seconds (repeatable)')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
@@ -328,6 +331,8 @@ def main():
     except ValueError as exc:
         p.error(str(exc))
     assert 0 < args.seconds <= 180
+    if any(not 0 < at < args.seconds for at in args.framebuffer_at):
+        p.error('--framebuffer-at must be positive and less than --seconds')
     assert 1 <= args.step_count <= 64
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -362,7 +367,8 @@ def main():
         assert digest(target) == sha
         provenance['inputs'][kind] = dict(source=str(source), copy=str(target), sha256=sha)
     plan = json.loads(plan_path.read_text())
-    binary = ROOT / 'backend/bin/qemu-system-aarch64'
+    binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
+    provenance['binary'] = str(binary)
     provenance.update(binary_sha256=digest(binary), source_sha256=digest(ROOT / 'backend/s5l8960x.c'))
     assert digest(plan['image']) == plan['image_sha256']
     provenance['boot_image_sha256'] = plan['image_sha256']
@@ -446,6 +452,8 @@ def main():
                     temporary = ReturnRegistry()
                     hook_counts={}
                     snapshot_at=sorted(args.snapshot_at)
+                    framebuffer_at=sorted(set(args.framebuffer_at))
+                    framebuffer_captures=[]
                     serial_offset=0; serial_tail=b''; panicked=False
                     def freeze():
                         if gs and clock.resumed is not None:
@@ -473,6 +481,13 @@ def main():
                         if eligible:save_json(out/'ca-scanout-candidate.json',dict(needs_surface_commit_attribution=True,registers=views))
                         return eligible
                     while clock.elapsed() < args.seconds:
+                        if framebuffer_at and clock.elapsed() >= framebuffer_at[0]:
+                            requested=framebuffer_at.pop(0)
+                            path=out/f'framebuffer-at-{requested:g}s.ppm'
+                            command(fp,'screendump',{'filename':str(path)})
+                            framebuffer_captures.append(dict(requested_seconds=requested,
+                                                            elapsed_seconds=clock.elapsed(),path=str(path)))
+                            save_json(out/'framebuffer-captures.json',framebuffer_captures)
                         with (out/'serial.log').open('rb') as serial:
                             serial.seek(serial_offset); update=serial.read()
                             serial_offset=serial.tell()

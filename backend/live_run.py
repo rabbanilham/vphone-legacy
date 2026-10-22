@@ -38,6 +38,7 @@ def main():
     p.add_argument('--plan', type=Path, default=EVIDENCE / 'boot-plan-vram/boot_plan.json')
     p.add_argument('--system', type=Path, default=ROOT / 'build/diagnostic/system-diagnostic-sep.raw')
     p.add_argument('--data', type=Path, default=ROOT / 'build/diagnostic/data-diagnostic-systembag.raw')
+    p.add_argument('--qemu-binary', type=Path, help='Explicit QEMU binary for a reproducible diagnostic run')
     p.add_argument('--keep-images', action='store_true')
     p.add_argument('--collect-crashlogs', action='store_true',
                    help='Collect guest crash reports from data clone before cleanup')
@@ -61,7 +62,8 @@ def main():
                f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},"
                f"system-image={images}/system.raw,data-image={images}/data.raw,"
                f"utility-image={images}/utility.raw,system-writable=1")
-    cmd = [str(ROOT / 'backend/bin/qemu-system-aarch64'), '-machine', machine,
+    binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
+    cmd = [str(binary), '-machine', machine,
            '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'single'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
            '-kernel', plan['image'], '-display', 'cocoa',
            '-serial', f'file:{work}/serial.log',
