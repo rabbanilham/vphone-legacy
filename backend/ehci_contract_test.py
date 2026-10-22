@@ -103,8 +103,8 @@ def fixture():
     return struct.pack('<' + 'I' * len(code), *code), expected
 
 
-def main():
-    payload, expected = fixture()
+def main(make_fixture=fixture, success_message=None):
+    payload, expected = make_fixture()
     with tempfile.TemporaryDirectory(prefix='a7ehci-', dir='/tmp') as directory:
         root = Path(directory)
         image = root / 'fixture.bin'; image.write_bytes(payload)
@@ -134,7 +134,7 @@ def main():
             assert proc.wait(timeout=5) == 0
         finally:
             if proc.poll() is None: proc.kill(); proc.wait(timeout=5)
-    print('PASS: EHCI capability header, reset, run/halt, disconnected ports, W1C, control isolation, vendor holes/tail, schedules running over the private USB bus view')
+    print(success_message or 'PASS: EHCI capability header, reset, run/halt, disconnected ports, W1C, control isolation, vendor holes/tail, schedules running over the private USB bus view')
     print('Synthetic MMIO contract only; no iOS or modem startup claim.')
 
 

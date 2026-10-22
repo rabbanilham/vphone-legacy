@@ -40,7 +40,7 @@ def main():
     shutil.copyfile(BACKEND / 's5l8960x.c', source / 'hw/arm/s5l8960x.c')
     additions = {
         'hw/arm/meson.build': "\narm_common_ss.add(when: 'CONFIG_S5L8960X', if_true: files('s5l8960x.c'))\n",
-        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n',
+        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
     }
     for relative, addition in additions.items():
         path = source / relative
