@@ -352,6 +352,12 @@ typedef struct A7D2045 {
     bool irq_low;
 } A7D2045;
 
+/* Byte-addressed board peripherals on I2C0 (CBTL1610 and LM3534). */
+typedef struct A7RegisterI2C {
+    uint8_t regs[16], pointer;
+    bool prefix, pointer_valid;
+} A7RegisterI2C;
+
 typedef struct A7Peripheral {
     A7State *owner;
     const char *name;
@@ -365,6 +371,7 @@ typedef struct A7Peripheral {
     unsigned pmu_prefix_count, pmu_rx_head, pmu_rx_count;
     bool pmu_pointer_valid;
     uint8_t pmu_rx[255];
+    A7RegisterI2C tristar, lm3534;
     uint8_t i2c_address;
     uint8_t chestnut_pointer, i2c_rx_byte;
     bool chestnut_prefix, chestnut_pointer_valid, i2c_rx_valid;
@@ -411,7 +418,7 @@ typedef struct SioMailbox {
     uint32_t params[256];
     uint64_t dma_seg_phys;
     uint32_t dma_seg_count;
-    SioDMA spi_dma[2]; /* DeviceTree SPI1 endpoints 22 TX / 23 RX */
+    SioDMA spi_dma[4]; /* DT SPI1 22/23, SPI2 24/25 (TX/RX). */
     /* Other AppleSmartIODMA endpoints (e.g. UART2_RX 65): submissions that
      * have no modelled data source stay armed until a stop. */
     uint8_t dma_pending[0x50][8];
@@ -1017,7 +1024,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                 /* Board-model pull-ups:
                  * 1) Native I2C lines: pins 80-83 (0x140..0x14c).
                  *    See research/native-i2c-gpio-contract.md.
-                 * 2) Physical push buttons: pins 2 (menu), 3 (hold), 4 (volup),
+                 * 2) Idle active-low peripheral IRQs: TriStar GPIO146 and
+                 *    the unresponsive Mesa SPI2 slave GPIO79.
+                 * 3) Physical push buttons: pins 2 (menu), 3 (hold), 4 (volup),
                  *    5 (voldown), 16 (ringerab).
                  *    On hardware, buttons are active-low (pulled high to VDD when
                  *    idle/unpressed, grounded to 0 when pressed).
@@ -1026,7 +1035,7 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                  *    all buttons appear held down, triggering IOHIDEventDriver's
                  *    hold+volume sysdiagnose watchdog and NMI panic after 2.5s.
                  */
-                if ((pin >= 80 && pin <= 83) ||
+                if ((pin >= 80 && pin <= 83) || pin == 79 || pin == 146 ||
                     pin == 2 || pin == 3 || pin == 4 || pin == 5 || pin == 16) {
                     uint32_t config = ldl_le_p(s->gpio_regs + off + i);
                     bool driven = !(config & 0x200) && (config & 0xe) == 2;
@@ -1673,7 +1682,8 @@ static void sio_spi_dma_run(A7Peripheral *p);
 static void spi_run(A7Peripheral *p)
 {
     A7SPI *spi = &p->spi;
-    if (spi_index(p) == 0 && (ldl_le_p(p->regs + 4) & 0x40)) {
+    if ((spi_index(p) == 0 || spi_index(p) == 1) &&
+        (ldl_le_p(p->regs + 4) & 0x40)) {
         sio_spi_dma_run(p);
         spi_update(p);
         return;
@@ -1946,6 +1956,91 @@ static void chestnut_command(A7Peripheral *p, uint32_t value)
     }
 }
 
+/* Native AppleCBTL1610: REV 0x0f (e9e8c8), muxes 1/2
+ * (e9eff8/e9f1b0), status 0x0c and read-clear events 0x0d
+ * (e9eb70/e9f2ac), mask 0x0e (e9e98c). The connector is empty:
+ * status bit2=1 means no cable; bit7=0 means no accessory identity.
+ * Revision 0x20 is a synthetic supported revision, not an OTP identity.
+ * No events are fabricated, so GPIO IRQ remains deasserted. This lets
+ * TriStar publish the dock's native IOFunctionParent mux functions;
+ * baseband start waits for function-bb_usb_mux at f0da34. */
+static bool i2c_is_tristar(A7Peripheral *p)
+{
+    return i2c_index(p) == 0 && p->i2c_address == 0x1a;
+}
+
+static bool i2c_is_lm3534(A7Peripheral *p)
+{
+    return i2c_index(p) == 0 && p->i2c_address == 0x63;
+}
+
+/* AppleLMBacklight start f2095c..98 reads four bytes at 0; enable
+ * f20b08..94 writes the same block with bit0 toggled. Byte-addressed
+ * control storage is sufficient for the native function provider to start. */
+static void board_i2c_command(A7Peripheral *p, uint32_t value)
+{
+    bool tristar = i2c_is_tristar(p);
+    A7RegisterI2C *d = tristar ? &p->tristar : &p->lm3534;
+    /* CBTL system-ID response e9ea10..68 is a separate read window:
+     * marker 0x74, packed 10-bit board ID. Use synthetic ID 0 (no OTP
+     * supplied); it is not an accessory serial/identity or modem IMEI. */
+    unsigned limit = tristar ? (d->pointer >= 0x20 ? 0x23 : 16) : 4;
+    if (value & 0x100) {
+        if (!p->i2c_read) {
+            d->prefix = true;
+            d->pointer_valid = false;
+        }
+    } else if (!p->i2c_active) {
+        return;
+    } else if (value & 0x400) {
+        unsigned count = value & 0xff;
+        if (!p->i2c_read || !d->pointer_valid || !count ||
+            d->pointer >= limit || count > limit - d->pointer || p->pmu_rx_count) {
+            i2c_nack(p);
+            return;
+        }
+        for (unsigned i = 0; i < count; i++) {
+            unsigned reg = d->pointer++;
+            p->pmu_rx[i] = tristar && reg == 0xf ? 0x20 :
+                           tristar && reg == 0xc ? 4 :
+                           tristar && reg == 0xd ? 0 :
+                           tristar && reg == 0x20 ? 0x74 :
+                           tristar && reg >= 0x21 ? 0 : d->regs[reg];
+        }
+        p->pmu_rx_head = 0;
+        p->pmu_rx_count = count;
+        stl_le_p(p->regs + 0x14, ldl_le_p(p->regs + 0x14) | (1u << 20));
+    } else if (!p->i2c_read) {
+        if (d->prefix) {
+            d->pointer = value & 0xff;
+            d->pointer_valid = d->pointer < (tristar ? 16u : 4u) ||
+                               (tristar && d->pointer >= 0x20 && d->pointer <= 0x22);
+            d->prefix = false;
+            if (!d->pointer_valid) {
+                i2c_nack(p);
+                return;
+            }
+        } else if (d->pointer_valid && d->pointer < limit) {
+            unsigned reg = d->pointer++;
+            if (!tristar || (reg < 0xc || reg == 0xe)) {
+                d->regs[reg] = value;
+            }
+        } else {
+            i2c_nack(p);
+            return;
+        }
+    } else {
+        i2c_nack(p);
+        return;
+    }
+    if (value & 0x200) {
+        p->i2c_active = false;
+        if (!p->i2c_read) {
+            stl_le_p(p->regs + 0x14, ldl_le_p(p->regs + 0x14) | (1u << 27));
+        }
+    }
+}
+
 static bool i2c_is_d2045(A7Peripheral *p)
 {
     return i2c_index(p) == 0 && p->i2c_address == 0x74;
@@ -2023,7 +2118,8 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
             p->i2c_active = true;
             p->i2c_rx_valid = false;
             p->pmu_rx_head = p->pmu_rx_count = 0;
-            if (!i2c_is_chestnut(p) && !i2c_is_d2045(p)) {
+            if (!i2c_is_chestnut(p) && !i2c_is_d2045(p) &&
+                !i2c_is_tristar(p) && !i2c_is_lm3534(p)) {
                 /* Other slave addresses retain the native NACK boundary. */
                 i2c_nack(p);
                 qemu_log_mask(LOG_UNIMP,
@@ -2033,6 +2129,8 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
         }
         if (i2c_is_chestnut(p)) {
             chestnut_command(p, value);
+        } else if (i2c_is_tristar(p) || i2c_is_lm3534(p)) {
+            board_i2c_command(p, value);
         } else if (i2c_is_d2045(p)) {
             d2045_command(p, value);
         } else if (value & 0x200) {
@@ -2044,6 +2142,8 @@ static void i2c_write(A7Peripheral *p, hwaddr off, uint32_t value)
             p->i2c_active = false;
             p->i2c_rx_valid = false;
             p->chestnut_prefix = false;
+            p->tristar.prefix = p->tristar.pointer_valid = false;
+            p->lm3534.prefix = p->lm3534.pointer_valid = false;
             p->pmu_rx_head = p->pmu_rx_count = p->pmu_prefix_count = 0;
             p->pmu_pointer_valid = false;
             stl_le_p(p->regs + 0x14, 0);
@@ -2778,8 +2878,8 @@ static void sio_spi_dma_complete(A7State *s, unsigned channel, bool ok)
      * Short count is reported as IOReturn underrun by the native client.
      */
     qemu_log_mask(LOG_UNIMP,
-                  "SPI1 DMA EP=%u tag=%u bytes=%u complete=%s\n",
-                  22 + channel, dma->tag, dma->length, ok ? "ok" : "short");
+                  "SPI%u DMA EP=%u tag=%u bytes=%u complete=%s\n",
+                  1 + channel / 2, 22 + channel, dma->tag, dma->length, ok ? "ok" : "short");
     dma->active = false;
     sio_outbox_push(s, sio_pack_msg(22 + channel, dma->tag, 0x68,
                                    0xc0, ok ? dma->length : 0));
@@ -2789,7 +2889,8 @@ static void sio_spi_dma_run(A7Peripheral *p)
 {
     A7State *s = p->owner;
     A7SPI *spi = &p->spi;
-    SioDMA *tx = &s->sio.spi_dma[0], *rx = &s->sio.spi_dma[1];
+    unsigned channel = 2 * spi_index(p);
+    SioDMA *tx = &s->sio.spi_dma[channel], *rx = &s->sio.spi_dma[channel + 1];
     uint32_t clocks = MAX(ldl_le_p(p->regs + 0x34),
                           ldl_le_p(p->regs + 0x4c));
     unsigned completions = tx->active + rx->active;
@@ -2812,7 +2913,11 @@ static void sio_spi_dma_run(A7Peripheral *p)
         spi->total = clocks;
         for (uint32_t i = 0; i < clocks; i++) {
             uint8_t byte = output && i < tx->length ? output[i] : 0xff;
-            uint8_t reply = touch_shift(&spi->touch, i, clocks, byte);
+            /* SPI2 has no enrolled sensor/biometric firmware. Complete
+             * real clocks on its idle-high MISO wire, as in PIO; let
+             * the native Mesa driver reject the invalid response. */
+            uint8_t reply = spi_index(p) == 0 ?
+                touch_shift(&spi->touch, i, clocks, byte) : 0xff;
             if (input && i < rx->length) { input[i] = reply; }
         }
         spi->shifted = clocks;
@@ -2823,16 +2928,16 @@ static void sio_spi_dma_run(A7Peripheral *p)
     }
     g_free(input);
     g_free(output);
-    if (tx->active) { sio_spi_dma_complete(s, 0, ok); }
-    if (rx->active) { sio_spi_dma_complete(s, 1, ok); }
+    if (tx->active) { sio_spi_dma_complete(s, channel, ok); }
+    if (rx->active) { sio_spi_dma_complete(s, channel + 1, ok); }
 }
 
 static void sio_spi_dma_kick(A7State *s)
 {
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
-        if (spi_index(&s->peripherals[i]) == 0) {
+        if (spi_index(&s->peripherals[i]) >= 0 &&
+            spi_index(&s->peripherals[i]) <= 1) {
             spi_run(&s->peripherals[i]);
-            return;
         }
     }
 }
@@ -3041,7 +3146,7 @@ static void sio_handle_inbox_msg(A7State *s, uint64_t msg)
         } else {
             sio_outbox_push(s, sio_pack_msg(1, tag, 0x66, param, 0));
         }
-    } else if (ep == 22 || ep == 23) {
+    } else if (ep >= 22 && ep <= 25) {
         SioDMA *dma = &s->sio.spi_dma[ep - 22];
         if (op == 5) {
             uint8_t config[20];
@@ -5958,6 +6063,8 @@ static void a7_reset(void *opaque)
         }
     }
     for (int i = 0; i < NUM_PERIPHERALS; i++) {
+        memset(&s->peripherals[i].tristar, 0, sizeof(s->peripherals[i].tristar));
+        memset(&s->peripherals[i].lm3534, 0, sizeof(s->peripherals[i].lm3534));
         s->peripherals[i].i2c_active = false;
         s->peripherals[i].pmu_rx_head = s->peripherals[i].pmu_rx_count = 0;
         s->peripherals[i].pmu_prefix_count = 0;
