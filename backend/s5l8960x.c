@@ -5079,7 +5079,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                               unsigned n, AGXTexture *tex)
 {
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
-    uint32_t blocks[4][8];
+    uint32_t blocks[4][12];
     unsigned count = 0;
     bool vibrancy = false;
 
@@ -5099,7 +5099,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 break;
             }
             if (agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
-                for (unsigned j = 0; j + 3 <= ARRAY_SIZE(blocks[count]); j++) {
+                for (unsigned j = 0; j + 3 <= 8; j++) {
                     if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
                         vibrancy = true;
                         break;
@@ -5114,8 +5114,16 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
          * TSW is located strictly at offset 0 (stand-alone TSW) or offset 4
          * (preceded by a 4-word header or sampler). Arbitrary offsets like
          * k = 6 overran into adjacent allocations and caused the status-bar
-         * blur backdrop to borrow "Searching..." (agy B4/D7). */
-        for (unsigned k = 0; k <= 4; k += 4) {
+         * blur backdrop to borrow "Searching..." (agy B4/D7). The one
+         * exception is the vibrancy block: luma weights, four sampler words,
+         * then the TSW at word 7 (handover section 16), only accepted when
+         * the block really starts with the luma weights. */
+        static const unsigned offsets[] = { 0, 4, 7 };
+        for (unsigned o = 0; o < ARRAY_SIZE(offsets); o++) {
+            unsigned k = offsets[o];
+            if (k == 7 && memcmp(blocks[b], luma, sizeof(luma))) {
+                continue;
+            }
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
                 return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }

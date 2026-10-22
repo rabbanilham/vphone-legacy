@@ -116,7 +116,7 @@ def fragment_words(f, ppp):
             if not 0x1000 <= ptr < (1 << 40):
                 break  # contiguous pointer list; the rest may be the next draw's
             try:
-                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(8)]))
+                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
             except (KeyError, ValueError):
                 pass
     return found
@@ -147,9 +147,13 @@ def decode_tsw(f, tsw):
 def texture(f, ppp):
     """First texture state word block among the fragment data; None for vibrancy."""
     words = fragment_words(f, ppp)
-    vibrancy = any(tuple(ws[i:i + 3]) == LUMA for _, ws in words for i in range(len(ws) - 2))
+    vibrancy = any(tuple(ws[i:i + 3]) == LUMA for _, ws in words for i in range(6))
     for _, ws in words:
-        for k in (0, 4):  # TSW starts at valid 16-byte aligned offset (0 or 4)
+        # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
+        # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
+        for k in (0, 4, 7):
+            if k == 7 and tuple(ws[:3]) != LUMA:
+                continue
             if len(ws) >= k + 4:
                 tex = decode_tsw(f, ws[k:k + 4])
                 if tex:
