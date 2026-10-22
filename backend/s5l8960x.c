@@ -6472,6 +6472,8 @@ static void a7_init(MachineState *ms)
         s->framebuffer < RAM_BASE || s->framebuffer + 2560 * 1136 > RAM_BASE + GiB) {
         error_report("experimental s5l8960x supports one or two CPUs, 1 GiB and in-RAM boot/display addresses"); exit(1);
     }
+    const char *pmu_env = getenv("VPHONE_PMU");
+    bool enable_pmu = pmu_env && !strcmp(pmu_env, "1");
     for (unsigned c = 0; c < ms->smp.cpus; c++) {
         ARMCPU *cpu = ARM_CPU(object_new(ms->cpu_type));
         s->ap_cpu[c] = cpu;
@@ -6485,6 +6487,7 @@ static void a7_init(MachineState *ms)
         object_property_set_bool(OBJECT(cpu), "has_el2", s->boot_el == 3, &error_fatal);
         object_property_set_bool(OBJECT(cpu), "has_el3", s->boot_el == 3, &error_fatal);
         object_property_set_int(OBJECT(cpu), "cntfrq", 24000000, &error_fatal);
+        object_property_set_bool(OBJECT(cpu), "pmu", enable_pmu, &error_fatal);
         qdev_realize(DEVICE(cpu), NULL, &error_fatal);
     }
     s->cpu = s->ap_cpu[0];
@@ -6573,6 +6576,7 @@ static void a7_init(MachineState *ms)
         object_property_set_bool(OBJECT(s->iop_cpu), "has_el3", false, &error_fatal);
         object_property_set_int(OBJECT(s->iop_cpu), "mp-affinity", 0x100, &error_fatal);
         object_property_set_int(OBJECT(s->iop_cpu), "cntfrq", 24000000, &error_fatal);
+        object_property_set_bool(OBJECT(s->iop_cpu), "pmu", enable_pmu, &error_fatal);
         qdev_realize(DEVICE(s->iop_cpu), NULL, &error_fatal);
         warn_report("ANS IOP diagnostic: Cortex-A7 and bootstrap scratch are provisional; peripheral accesses fail");
     }
