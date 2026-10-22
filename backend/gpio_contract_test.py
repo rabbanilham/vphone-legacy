@@ -29,7 +29,7 @@ def fixture():
             code += [0xb9400003 | pin << 10 | 2 << 5,
                      0xb9000003 | len(expected) << 10 | 4 << 5]
             expected.append(result)
-    code += move64(5, 0x20e30013c)
+    code += move64(5, 0x20e300138)
     code += [0xb94000a3, 0xb9000003 | len(expected) << 10 | 4 << 5]
     expected.append(0)  # Adjacent unrelated pin is not forced high.
     code += [0x52800000 | 0xface << 5,

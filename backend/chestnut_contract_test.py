@@ -39,8 +39,13 @@ def fixture():
     write(bus,0x14e);write(bus,0x206);read(bus+0x14,0x08200000);read(bus+4,0x100)
     prefix();clear();write(bus,0x14f);write(bus,0x602)
     read(bus+0x14,0x08200000);read(bus+4,0x100)
+    # Native setLDO values (probe-151): 0x17 rails on, 0x10 rails off.
+    clear();write(bus,0x14e);write(bus,5);write(bus,0x217)
+    read(bus+0x14,0x08000000);receive(0x17)
+    clear();write(bus,0x14e);write(bus,5);write(bus,0x210)
+    read(bus+0x14,0x08000000);receive(0x10)
     clear();write(bus,0x14e);write(bus,5);write(bus,0x280)
-    read(bus+0x14,0x08200000);receive(0x0f)  # Unsupported control bits do not mutate state.
+    read(bus+0x14,0x08200000);receive(0x10)  # Unsupported control bits do not mutate state.
     clear();write(bus,0x14c);read(bus+0x14,0x08200000)
     # Identical address on I2C1 remains unmatched.
     write(bus+0x1014,0xffffffff);write(bus+0x1000,0x14e)

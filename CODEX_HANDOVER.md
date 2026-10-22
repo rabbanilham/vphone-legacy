@@ -1,5 +1,127 @@
 # vphone-legacy continuation (Codex Handover)
 
+## GPU Hang Eliminated via TA Queue Draining (Probe 44); Full CoreAnimation Display Rendering Pipeline & DataMigration Gate Isolated — 2026-10-20
+
+**GPU hang bug in AppleH6GPU eliminated via all-ring queue draining in AGX META HLE; backboardd renders continuous CoreAnimation frames (`ca_render_display`, `ca_finish_update`, `swap_submit` with active layer mask 3); SpringBoard check-in blocked at `DataMigration.framework` semaphore wait.**
+
+### 1. Verification & Current Progress
+- **Reproducible Diagnostic Disks Built**: `scripts/prepare_diagnostic_disks.py` generates permanent, hash-verified disk images:
+  * `build/diagnostic/system-diagnostic-sep.raw` (SHA256: `8918b9b0c4fcbfee47f52b26f9a0de2103b8a1b6e6feefb662ec8687241bdae1`): 22MB reclaimed from unused update ramdisk, `/usr/standalone/firmware/sep-firmware.img4` populated with `research/firmware-artifacts/sep-firmware.n53.RELEASE.im4p`.
+  * `build/diagnostic/data-diagnostic-systembag.raw` (SHA256: `a8df5e090c8a172bdaeb79b11c56c1c71794a295aa6561b727cac306cfa7d1d3`): `/private/var` template from `system.raw` populated with `/var/db/` and unencrypted binary plist `/keybags/systembag.kb` for `no-effaceable-storage`.
+  * Stale absolute paths to `/Users/bagas/Documents/Projects/vphone/vphone-legacy` migrated to `/Users/bagas/Downloads/vphone-legacy` in all boot plans.
+- **Root Cause & Fix for Probe 41 GPU Hang**:
+  * Guest previously logged: `GPU hang: Trying restart GPU ... LastSubmittedStamp[4]=8 stampsPtr[4]=4`. Channel 4 is Tile Acceleration (TA) queue `0xc0488000`, kicked on Host Ring 0 (doorbell `0x10`).
+  * `backend/s5l8960x.c` line 2840 updated from `if (ring == 1)` to `if (entry[2])` to register and drain queues across all host rings (Ring 0 TA channel queue `0xc0488000`, Ring 1 3D channel queue `0xc0474000`, Ring 2 compute queue).
+- **Clean 180s Execution (Probe 44)**:
+  * Zero GPU hangs, zero GPU restarts in `serial.log`.
+  * Host Ring 0 and Host Ring 1 queues both drained commands and updated stamps (`consumed 3 commands, 1 stamps` on both rings).
+  * Disposable probe images in `images/` immediately purged with `backend/probe_cleanup.py`.
+
+### 2. CoreAnimation Display Pipeline & Swap Submissions (Probe 44)
+- **Breakpoint Execution Ladder**:
+  * `ca_renderer`: 7 hits
+  * `ca_render_display`: 6 hits (`0x1843a504c`)
+  * `ca_eagl_render_update`: 7 hits (`0x1843a592c`)
+  * `ca_finish_update`: 16 hits (`0x1843a9d7c`)
+  * `swap_submit`: 16 hits (`0xffffff8000c5d810`)
+  * `program_hardware`: 16 hits (`0xffffff8000f29094`)
+- **Application Frame Swap Payloads Captured**:
+  * Hits 683, 699, 715 in `swap_submit` passed 312-byte swap payloads with active layer mask `0x03` (both layer 0 and layer 1 active!), dimensions `0x280` x `0x470` (640 x 1136 Retina display for iPhone 5s), advancing swap tokens `0xb`, `0xc`, `0xd`.
+
+### 3. Disassembly of Display MMIO Hardware Programming (`AppleMobileADBE0::program_hardware`)
+- Disassembly of `0xffffff8000f29094`:
+  * At lines `0xffffff8000f29608` - `0xffffff8000f29734`: Checks active layer bit `x24` in `[x12, #0x1c8]`.
+  * If layer 0 is inactive: branches to `0xffffff8000f29728` which writes `0` to MMIO `0x206204044` (`layer0 base`). This explains why `layer0 base off=0x4044 val=0x0` was written during early boot frames.
+  * When layer 0 IS active: calls `[surface, vtable + 0xd8]` to retrieve the physical buffer base address and writes it to `0x206204044` at `0xffffff8000f29e9c`!
+
+### 4. Live Multi-Process Thread State (`ca-thread-state-150s.json`) & Current Blocker
+- All primary daemons running: `installd` (PID 32), `lsd` (PID 26), `backboardd` (PID 98), `SpringBoard` (PID 31).
+- `backboardd` has `CA::Render::Server::server_thread` (TID 860) listening for mach messages.
+- `SpringBoard` (TID 507) is waiting on `_BKSSystemAppCheckIn+0xb8` (waiting for backboardd system app check-in acknowledgment).
+- `backboardd` worker thread (TID 869) is trapped in `DataMigration.framework` (`0x1869110c8` in `-[DMConnection ...]`, `dispatch_semaphore_wait`), waiting for migration status check before completing system app check-in.
+
+### 5. Next Steps
+1. Trace `DataMigration.framework` in `backboardd` / `data_migrator` daemon to unblock system app checkin completion.
+2. Hook the render target surface to scanout at `0x8018e0000`.
+
+---
+
+## AGX Rogue graphics submission blocker solved: AGXMetaFirmware wait gate isolated — 2026-10-16
+
+**Physical non-zero RGB bytes rendered to `0x8018e0000` (1,086 bytes in Probe 28); SpringBoard frame render blocker isolated down to single byte flag `[AGXMetaFirmware + 0x539]` in Probe 29.**
+
+### 1. Verification & Current Progress
+- **Non-Zero Physical Framebuffer Pixels**: Probe 28 achieved genuine non-zero RGB pixels (1,086 bytes) written to physical framebuffer `0x8018e0000` (`framebuffer.ppm` generated, SHA-256 `c004fe66c1ef52b73148c2eb34f0cf3365e2491fcc10cbbe125e1632aca64c17`).
+- **Full Clean 75-Second Boots**: Both Probe 28 (618 wall seconds) and Probe 29 (585 wall seconds) ran for 75.0 guest seconds with exit code 0, zero panics, zero guest errors.
+- **Hardware Swap Advancer & Display Pipeline**: `AppleMobileADBE0::program_hardware` (`0xffffff8000f29094`) fired 25 times; `swap_advancer` (`0xffffff8001181c1c`) fired 3,771 times; display MMIO configured for 640x1136 resolution (`0x206204070 = 0x02800470`).
+- **Host Disk Quota Protected**: All disposable probe images (`images/`) purged immediately post-execution; 13 GiB free space maintained.
+
+### 2. Live Kernel Call Stack Uncovered (Probe 29)
+In Probe 29, `ca_probe_state.py` was extended to introspect the kernel PCB (`[thread + 0x680]`), `wait_event` (`[thread + 0x20]`), `continuation` (`[thread + 0x58]`), and walk the 16-frame kernel call stack.
+SpringBoard's main render thread (TID 550) was caught live in `_IOAccelContextSubmitDataBuffers`:
+```
+  #15: lr=0xffffff80002cff84 fp=0xffffff80a66944b0 -> is_io_connect_method
+  #14: lr=0xffffff8001143540 fp=0xffffff80a6694420 -> _IOAccelContextSubmitDataBuffers (waiting for +0x620)
+  #13: lr=0xffffff800114fbfc fp=0xffffff80a66943f0 -> AGXGLContext::submitDataBuffers (waiting for +0x630)
+  #12: lr=0xffffff80011450dc fp=0xffffff80a66943b0 -> IOAccelGLContext2 (waiting for channel submit)
+  #11: lr=0xffffff8001144e0c fp=0xffffff80a6694370
+  #10: lr=0xffffff800117b8d8 fp=0xffffff80a6693ce0
+  #9:  lr=0xffffff8001141ea4 fp=0xffffff80a6693cc0
+  #8:  lr=0xffffff800117e1b0 fp=0xffffff80a6693c30
+  #7:  lr=0xffffff80002b88e0 fp=0xffffff80a6693bd0 -> IOCommandGate::runAction
+  #6:  lr=0xffffff8001174ee4 fp=0xffffff80a6693bb0
+  #5:  lr=0xffffff8001185068 fp=0xffffff80a6693b80
+  #4:  lr=0xffffff8001184804 fp=0xffffff80a6693b40 -> AGXMetaFirmware::waitForMetaAlive
+  #3:  lr=0xffffff80002b8ae0 fp=0xffffff80a6693b10 -> IOCommandGate::commandSleep
+  #2:  lr=0xffffff80002b7604 fp=0xffffff80a6693ae0 -> IOWorkLoop::sleepGate
+  #1:  lr=0xffffff8000207200 fp=0xffffff80a6693a90 -> lck_mtx_sleep
+  #0:  lr=0xffffff80002f7168 fp=0xffffff80a6693a50 -> thread_block (k_lr=0xffffff80002f7d60 machine_switch_context)
+```
+
+### 3. Root Cause Analysis: AGXMetaFirmware Heartbeat Gate
+Disassembly of `0xffffff800118479c` (`AGXMetaFirmware::waitForMetaAlive`):
+```asm
+0xffffff80011847b0: mov   x19, x0                 ; x19 = AGXMetaFirmware instance
+0xffffff80011847b8: add   x20, x19, #0x539        ; x20 = &fMetaAlive (0xffffff808216d539)
+0xffffff80011847c0: ldrb  w8, [x20]               ; load fMetaAlive
+0xffffff80011847c4: mov   w0, #1
+0xffffff80011847c8: cbnz  w8, #0xffffff8001184884 ; IF fMetaAlive != 0 -> RETURN 1 (SUCCESS)!
+0xffffff80011847e4: ldr   x8, [x19, #0x58]
+0xffffff80011847e8: ldr   x0, [x8, #0x520]        ; command gate
+0xffffff80011847f0: ldr   x8, [x8, #0x108]        ; IOCommandGate::commandSleep
+0xffffff80011847fc: mov   x1, x20                 ; event = x19 + 0x539
+0xffffff8001184800: blr   x8                      ; commandSleep(event, deadline, 0)
+0xffffff8001184804: mov   x8, x0
+0xffffff8001184808: cbz   w8, #0xffffff80011847c0 ; retry loop
+...
+0xffffff8001184844: adrp  x0, "METADEBUG: Timedout waiting for META alive!"
+```
+The exact wait event captured in `ca-thread-state.json` is `k_ev = 0xffffff808216d539` (`x19 + 0x539`).
+The driver's own wake path at `0xffffff8001185224`:
+```asm
+0xffffff8001185224: mov   w8, #1
+0xffffff8001185228: strb  w8, [x19, #0x538]
+0xffffff800118522c: strb  w8, [x19, #0x539]        ; sets fMetaAlive = 1
+0xffffff8001185234: ldr   x0, [x8, #0x520]         ; command gate
+0xffffff800118523c: ldr   x3, [x8, #0x100]         ; IOCommandGate::commandWakeup
+0xffffff8001185240: mov   x1, x20                  ; event = x19 + 0x539
+0xffffff8001185254: br    x3                       ; commandWakeup(event, false)
+```
+
+### 4. Resolution Plan for Next Probe
+1. **Dynamic Assertion**:
+   In `display_probe.py`, hook `meta_wait=0xffffff80011847c0`. When hit:
+   - Read `x20` (event pointer `x19 + 0x539`).
+   - If `[x20] == 0`: write byte `1` to `[x20]` and `[x20 - 1]`.
+   - Result: `ldrb w8, [x20]` reads 1, `cbnz w8, #0xffffff8001184884` branches directly to return 1 (success) without calling `commandSleep`!
+2. **Execute Probe 30**:
+   - `waitForMetaAlive` returns 1 immediately.
+   - SpringBoard's render transaction completes and commits to CoreAnimation RenderServer (`backboardd`).
+   - ADBE writes `layer_base = 0x18e0000` to `0x206204044`.
+   - Framebuffer candidate verifies attributed CoreAnimation physical scanout!
+
+---
+
 ## Systembag generation, companion metadata, and SEP import/unlock contract recovered — 2026-10-15
 
 **The first CA-rendered application frame remains unmet.** The native restore/first-boot creation and persistence path for `systembag.kb`, its companion metadata (`AppleEffaceableStorage`), and the complete SEP import/export/unlock lifecycle have been recovered via static Capstone disassembly and Mach-O analysis of `keybagd`, `mobile_obliterator`, `MobileKeyBag.framework` (`dyld_shared_cache_arm64`), and `kernel.macho`. See `backend/evidence/keybag-contract-20261015/FINDINGS.md`.

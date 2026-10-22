@@ -1,0 +1,263 @@
+{
+  "cache_path": "backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "mt_ui_locked": "0x187ccc828",
+    "mt_get_report": "0x187cccfcc",
+    "mt_set_report": "0x187cccfec",
+    "mt_detection_mode": "0x187cd39b8",
+    "mt_report_dispatch": "0x187ccde24",
+    "mt_unpack_contacts": "0x187ccf8e0",
+    "mt_process_contacts": "0x187cd4150",
+    "mt_input_detection_state": "0x187cd36c0",
+    "mt_forward_binary": "0x187cd1f80",
+    "mt_contact_filled": "0x187cd20ac",
+    "mt_contact_callback": "0x187cd214c",
+    "hid_digitizer_collection": "0x1825b47cc",
+    "hid_digitizer_finger": "0x1825b4adc",
+    "hid_append_event": "0x1825b4440",
+    "hid_system_dispatch": "0x1825ba9f8",
+    "hid_connection_dispatch": "0x1825e1c90",
+    "hid_connection_enqueue_result": "0x1825e1ccc",
+    "hid_queue_enqueue": "0x1825c486c",
+    "hid_data_queue_enqueue": "0x18259de20",
+    "hid_data_queue_enqueue_tail": "0x18259df50",
+    "hid_data_queue_notify": "0x18259e0c4",
+    "hid_data_queue_notify_msg": "0x18259e114",
+    "hid_data_queue_notify_ret": "0x18259e118",
+    "hid_queue_set_notify_port": "0x1825c47e0",
+    "hid_data_queue_set_port": "0x18259e08c",
+    "hid_server_create_queue": "0x1825e41d4",
+    "hid_server_start_queue": "0x1825e4294",
+    "hid_server_stop_queue": "0x1825e42ec",
+    "bks_register_callback": "0x185cdd7e8",
+    "bks_digitizer_info": "0x185cddee8",
+    "bks_event_info_result": "0x185cddd8c",
+    "hid_client_create_type": "0x1825bbdf4",
+    "hid_client_schedule_runloop": "0x1825bbafc",
+    "hid_client_unschedule_runloop": "0x1825bc490",
+    "hid_client_register_callback": "0x1825bc904",
+    "hid_client_queue_created": "0x1825bc47c",
+    "cf_mach_port_create_source": "0x1815da548",
+    "cf_mach_port_perform": "0x18164c9d0",
+    "hid_client_queue_callback": "0x1825bc654",
+    "hid_client_dequeued": "0x1825bc68c",
+    "hid_client_callback_call": "0x1825bc72c",
+    "ui_install_event_source": "0x1846d0d18",
+    "ui_hid_callback": "0x184660ac0",
+    "ui_queue_consume": "0x184660b0c",
+    "ca_hit_test": "0x1843895dc",
+    "ca_hit_context_result": "0x18438961c",
+    "ca_context_client": "0x18438968c",
+    "ca_context_task": "0x1843896dc",
+    "ca_context_task_result": "0x184389738"
+  },
+  "known_return_sites": {
+    "backboardd": {
+      "bks_digitizer_info": "0x100016ef0",
+      "ca_context_task_result": "0x100016790",
+      "ca_hit_test": "0x10001765c"
+    },
+    "SpringBoard": {
+      "sb_hid_monitor_create": "0x100068594"
+    }
+  },
+  "exe_headers": {
+    "backboardd": "cffaedfe0c0000010000000002000000",
+    "SpringBoard": "cffaedfe0c0000010000000002000000"
+  },
+  "exe_hooks": {
+    "backboardd": {
+      "bb_handle_collection": {
+        "address": "0x1000163b0",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_queue_BKDigitizerHandlePathCollectionEventOnDisplay entry"
+      },
+      "bb_display_integrated_gate": {
+        "address": "0x100016408",
+        "expected": "c00300b4d9f2ff9780000034e00315aa",
+        "description": "Checks kIOHIDEventFieldDigitizerDisplayIntegrated (0xb0019)"
+      },
+      "bb_pocket_touches_gate": {
+        "address": "0x100016410",
+        "expected": "80000034e00315aa60deff97603c0037",
+        "description": "Checks _pocketTouchesExpected on main display"
+      },
+      "bb_cancel_gate": {
+        "address": "0x10001646c",
+        "expected": "20053836e1030032e00315aadd050094",
+        "description": "Checks cancel bit (bit 7) of event flags 0xb0007"
+      },
+      "bb_children_gate": {
+        "address": "0x100016518",
+        "expected": "803400b4ffd10094f40300aa343400b4",
+        "description": "Checks IOHIDEventGetChildren non-NULL and count > 0"
+      },
+      "bb_destinations_gate": {
+        "address": "0x1000168f0",
+        "expected": "68060034e8020090007145f9c80200d0",
+        "description": "Checks resolved destinations count > 0; drops to exit if 0"
+      },
+      "bb_forward_task": {
+        "address": "0x100013540",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "_forwardEventToClientWithTaskPort entry: x0=event, x1=taskPort"
+      },
+      "bb_forward_task_lookup": {
+        "address": "0x1000135ac",
+        "expected": "f40300f9010300b021c03c91c4e8ff97",
+        "description": "Calls clientForTaskPort: result in x0"
+      },
+      "bb_client_for_task": {
+        "address": "0x100046ad4",
+        "expected": "fd7bbfa9fd030091f44fbfa9ff8301d1",
+        "description": "-[BKHIDClientConnectionManager clientForTaskPort:] entry"
+      },
+      "bb_client_for_task_cfport": {
+        "address": "0x100046bac",
+        "expected": "940100b4681240f9a9010090294989b9",
+        "description": "Checks CFMachPortCreateWithPort result; returns NULL if 0"
+      },
+      "bb_client_for_task_dict": {
+        "address": "0x100046bc4",
+        "expected": "8e100094681640f9080540f9000d00f9",
+        "description": "CFDictionaryGetValue on _taskPortToConnectionMap"
+      },
+      "bb_forward_task_conn_gate": {
+        "address": "0x100013628",
+        "expected": "94822c91800600f9e80200b008413891",
+        "description": "Checks client connection x20; drops to exit if NULL"
+      },
+      "bb_forward_task_dispatch": {
+        "address": "0x100013688",
+        "expected": "800a40f9e80200d008a10c91010140f9",
+        "description": "Calls _IOHIDEventSystemConnectionDispatchEvent"
+      },
+      "bb_client_conn_added": {
+        "address": "0x100046dd0",
+        "expected": "fd7bbfa9fd030091f44fbfa9ffc300d1",
+        "description": "-[BKHIDClientConnectionManager clientConnectionAdded:] entry"
+      },
+      "bb_client_conn_added_worker": {
+        "address": "0x100046e48",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "clientConnectionAdded worker: extracts task and bundleID"
+      },
+      "bb_client_conn_added_cfport": {
+        "address": "0x100046ebc",
+        "expected": "360200b4b40100b4a8010090084989b9",
+        "description": "Checks CFMachPortCreateWithPort result when adding connection"
+      },
+      "bb_client_conn_removed": {
+        "address": "0x100046f48",
+        "expected": "fd7bbfa9fd030091f44fbfa9ffc300d1",
+        "description": "-[BKHIDClientConnectionManager clientConnectionRemoved:] entry"
+      },
+      "bb_system_gesture_stealing_gate": {
+        "address": "0x100018f28",
+        "expected": "f44fbfa9f657bfa9f30300aa681240f9",
+        "description": "Checks systemGestureIsStealingEvents [x8, #0x31]; drops if set"
+      },
+      "bb_create_task_block": {
+        "address": "0x100013670",
+        "expected": "00241c911adc0094801200f945010094",
+        "description": "Creates forward-task dispatch block"
+      },
+      "bb_thread_dispatch_gate": {
+        "address": "0x100013778",
+        "expected": "39832c91760200f0d6820d91e0031baa",
+        "description": "Checks router thread dispatch condition"
+      },
+      "bb_task_block_invoke": {
+        "address": "0x1000137f4",
+        "expected": "08c10291010140f9e11700f9e0031baa",
+        "description": "Dispatch block invoke performing the client event dispatch"
+      },
+      "bb_context_select": {
+        "address": "0x1000167c0",
+        "expected": "2a1d00125f01386bc20000548b09298b",
+        "description": "Evaluates candidate CA context ID against frontmost window"
+      },
+      "bb_digitizer_info_return": {
+        "address": "0x100016f4c",
+        "expected": "8bcc00943a0300905ac32d91181e00b4",
+        "description": "Extracts context ID, display ID, and task port from digitizer info"
+      }
+    },
+    "SpringBoard": {
+      "sb_hid_monitor_create": {
+        "address": "0x100068590",
+        "expected": "fad20994f30300aa932600f993580494",
+        "description": "Creates SpringBoard monitor HID client and registers sb_hid_monitor_callback"
+      },
+      "sb_hid_monitor_callback": {
+        "address": "0x100068cac",
+        "expected": "fd7bbfa9fd030091f44fbfa9f657bfa9",
+        "description": "SpringBoard monitor HID event callback"
+      }
+    }
+  },
+  "suggested_hook_dumps": {
+    "hid_connection_dispatch": [
+      "x0:184",
+      "x1:256"
+    ],
+    "hid_queue_enqueue": [
+      "x0:144",
+      "x1:256"
+    ],
+    "hid_data_queue_enqueue": [
+      "x0:32"
+    ],
+    "hid_data_queue_enqueue_tail": [
+      "x19:32"
+    ],
+    "hid_data_queue_notify": [
+      "x0:32"
+    ],
+    "hid_data_queue_notify_msg": [
+      "sp:24"
+    ],
+    "hid_client_queue_created": [
+      "x19:288"
+    ],
+    "cf_mach_port_perform": [
+      "x1:24",
+      "x3:288"
+    ],
+    "hid_client_queue_callback": [
+      "x3:288"
+    ],
+    "hid_client_dequeued": [
+      "x20:32"
+    ],
+    "bb_forward_task": [
+      "x0:184",
+      "x1:8"
+    ],
+    "bb_forward_task_conn_gate": [
+      "x20:184"
+    ],
+    "bb_client_for_task_cfport": [
+      "x20:64"
+    ],
+    "bb_client_conn_added_worker": [
+      "x21:8",
+      "x20:64"
+    ]
+  },
+  "notes": {
+    "architecture": "Full IOHIDEventQueue and IOHIDEventSystem client IPC diagnosis pipeline.",
+    "diagnostics": {
+      "hid_data_queue_enqueue": "x0:32 dumps queueMemory size (+0x00), head (+0x04), and tail (+0x08) before enqueue",
+      "hid_data_queue_enqueue_tail": "x19:32 dumps queueMemory before 'notify only on empty->non-empty' comparison (cmp w24, w23)",
+      "hid_data_queue_notify": "x0:32 entered ONLY when queue transitions from empty to non-empty; if skipped, queue was not empty!",
+      "hid_data_queue_notify_msg": "sp:24 dumps Mach message header: msgh_bits, msgh_size, msgh_remote_port",
+      "hid_client_queue_created": "x19:288 dumps client object at queue creation (+0x78 callback, +0xc0 queue, +0xc8 cfMachPort, +0xd0 source, +0xe0 runloop, +0xe8 mode)",
+      "cf_mach_port_perform": "x1:24 dumps Mach message header received by SpringBoard CFMachPort, x3:288 dumps client object",
+      "hid_client_queue_callback": "x3:288 dumps client object during queue callback perform",
+      "hid_client_dequeued": "x20:32 dumps queueMemory in SpringBoard address space; x0 is dequeued event"
+    },
+    "caps": "Use --max-hits bb_=0 --max-hits hid_=0 --max-hits cf_=0 --max-hits ui_=0 --max-hits ca_=0 for unlimited coverage of touch routing and queue events."
+  }
+}

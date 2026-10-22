@@ -1,0 +1,10 @@
+{
+  "cache_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "symbols": {
+    "sb_dispatch_release_unaligned": "0x18e17cd94"
+  },
+  "notes": {
+    "purpose": "T13: SpringBoard only; aligned calls are skipped without consuming cap. Captures candidate block invoke and descriptor on an unaligned dispatch_release argument. High-rate breakpoint: use one diagnostic run only."
+  }
+}

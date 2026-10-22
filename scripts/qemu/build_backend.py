@@ -40,12 +40,19 @@ def main():
     shutil.copyfile(BACKEND / 's5l8960x.c', source / 'hw/arm/s5l8960x.c')
     additions = {
         'hw/arm/meson.build': "\narm_common_ss.add(when: 'CONFIG_S5L8960X', if_true: files('s5l8960x.c'))\n",
-        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n',
+        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
     }
     for relative, addition in additions.items():
         path = source / relative
         original = subprocess.check_output(['git', '-C', str(source), 'show', f'HEAD:{relative}'])
         path.write_bytes(original + addition.encode())
+    # Upstream fixes kept in the repo: restore each touched file to the
+    # pinned commit, then apply, so rebuilds stay idempotent.
+    for patch in sorted((BACKEND / 'patches').glob('*.patch')):
+        touched = [line[6:].strip() for line in patch.read_text().splitlines()
+                   if line.startswith('+++ b/')]
+        run(['git', '-C', source, 'checkout', '--', *touched])
+        run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
     pcs = [Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2')]
@@ -53,7 +60,7 @@ def main():
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
         '--disable-user', '--disable-tools', '--disable-werror', '--disable-slirp',
         '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--disable-vnc',
-        '--disable-hvf', '--enable-tcg', '--disable-plugins']
+        '--disable-hvf', '--enable-tcg', '--disable-plugins', '--disable-pvg']
     sdk = args.sdk or (BACKEND / 'macos-sdk' if (BACKEND / 'macos-sdk').exists() else None)
     if sdk:
         if not sdk.is_dir():
@@ -112,7 +119,8 @@ def main():
         },
         'experimental': True, 'capabilities': {
             'raw_kernel_loader': True, 'guest_framebuffer_scanout': True,
-            'uart_polled': True, 'aic_v1_single_cpu': True, 'architected_timer': True,
+            'uart_polled': True, 'aic_v1_single_cpu': True, 'aic_v1_smp': True,
+            'max_application_cpus': 2, 'architected_timer': True,
             'cyclone_cpu': False, 'hid_hardware_effects': False, 'storage': False,
             'touch': False, 'buttons': False, 'agx': False, 'ios_boot': False,
             'springboard': False, 'guest_shutdown': False,

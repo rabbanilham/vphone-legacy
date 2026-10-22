@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import select
 import re
@@ -45,6 +46,38 @@ def memory(gs, addr, size):
     return bytes.fromhex(reply) if not reply.startswith('E') else b''
 
 
+def parse_hook_dumps(items):
+    """Bounded opt-in reads; multiple registers may be selected per hook."""
+    result = {}
+    for item in items:
+        name, spec = item.split('=', 1)
+        address, length = spec.split(':', 1)
+        match = re.fullmatch(r'(x(?:[0-9]|[12][0-9]|30)|sp)([+-](?:0x[0-9a-fA-F]+|[0-9]+))?', address)
+        if not name or not match:
+            raise ValueError('hook dump requires name=x0..x30|sp[+/-offset]:length')
+        reg, displacement = match.groups()
+        offset = int(displacement, 0) if displacement else 0
+        if abs(offset) > 4096:
+            raise ValueError('hook dump offset must be -4096..4096')
+        length = int(length, 0)
+        if not 1 <= length <= 4096:
+            raise ValueError('hook dump length must be 1..4096')
+        result.setdefault(name, []).append((31 if reg == 'sp' else int(reg[1:]), length, offset))
+    return result
+
+
+def capture_hook_dumps(gs, registers, specs):
+    result = []
+    for reg, length, offset in specs:
+        base = registers[reg]
+        addr = base + offset
+        data = memory(gs, addr, length) if base and 0 < addr < (1 << 64) and addr + length <= (1 << 64) else b''
+        result.append(dict(register='sp' if reg == 31 else f'x{reg}', offset=offset, address=hex(addr),
+                           requested=length, readable=len(data) == length,
+                           bytes=data.hex()))
+    return result
+
+
 def u64(gs, addr):
     data = memory(gs, addr, 8)
     return int.from_bytes(data, 'little') if len(data) == 8 else 0
@@ -53,6 +86,137 @@ def u64(gs, addr):
 def memory_state(gs,addr,size=8):
     data=memory(gs,addr,size)
     return dict(readable=len(data)==size, value=hex(int.from_bytes(data,'little')) if len(data)==size else None, bytes=data.hex())
+
+
+def dispatch_release_evidence(gs, registers):
+    """Read the caller's surviving block/continuation; do not infer their types.
+
+    At call_block_and_release's BLR, x19 saves the block. A tail-called
+    dispatch_release preserves that register, but other callers need not.
+    """
+    result = {}
+    for label, reg in (('object', 0), ('block_candidate', 19),
+                       ('continuation_candidate', 27), ('stack', 31)):
+        addr = registers[reg]
+        data = memory(gs, addr, 128) if 0 < addr < (1 << 64) - 128 else b''
+        result[label] = dict(address=hex(addr), bytes=data.hex(), readable=len(data) == 128)
+        if label == 'block_candidate' and len(data) >= 32:
+            invoke, descriptor = struct.unpack_from('<QQ', data, 16)
+            result[label].update(invoke=hex(invoke), descriptor=hex(descriptor))
+            for key, ptr in (('invoke_bytes', invoke), ('descriptor_bytes', descriptor)):
+                result[label][key] = memory(gs, ptr, 64).hex() if 0 < ptr < (1 << 64) - 64 else ''
+            for offset in (0x20, 0x28):
+                if len(data) < offset + 8:
+                    continue
+                ptr = struct.unpack_from('<Q', data, offset)[0]
+                captured = memory(gs, ptr, 128) if 0 < ptr < (1 << 64) - 128 else b''
+                result[label][f'capture_{offset:x}_candidate'] = dict(
+                    address=hex(ptr), bytes=captured.hex(), readable=len(captured) == 128)
+    # The observed drain keeps the pthread/TLS base in x24. Its current
+    # queue slot is +0xa0; verify the captured header before interpreting it.
+    tls = registers[24]
+    slot = memory(gs, tls + 0xa0, 8) if 0 < tls < (1 << 64) - 0xa8 else b''
+    if len(slot) == 8:
+        queue = int.from_bytes(slot, 'little')
+        head = memory(gs, queue, 128) if 0 < queue < (1 << 64) - 128 else b''
+        result['queue_candidate'] = dict(address=hex(queue), bytes=head.hex(), readable=len(head) == 128)
+        if len(head) >= 0x68:
+            label = int.from_bytes(head[0x60:0x68], 'little')
+            result['queue_candidate']['label_bytes'] = memory(gs, label, 128).hex() if 0 < label < (1 << 64) - 128 else ''
+    return result
+
+
+def compiler_connection_evidence(gs, registers, name):
+    """T15 exact-PC layouts, before executing the hooked instruction.
+
+    These hooks belong to AGXCompilerConnection's XPC implementation and
+    AGXGLDriver. Keep raw bytes: a freed C++ object may now be a CFString.
+    No type is inferred from the address or from the contents of freed RAM.
+    """
+    def read_at(addr, size):
+        data = memory(gs, addr, size) if 0 < addr <= (1 << 64) - size else b''
+        return dict(address=hex(addr), bytes=data.hex(), readable=len(data) == size)
+
+    result = {}
+    if name == 'sb_compiler_reply_invoke':
+        block = read_at(registers[0], 0x30)
+        result['block'] = block
+        data = bytes.fromhex(block['bytes'])
+        obj = struct.unpack_from('<Q', data, 0x20)[0] if len(data) == 0x30 else 0
+        if len(data) == 0x30:
+            result['captured_reply'] = read_at(struct.unpack_from('<Q', data, 0x28)[0], 96)
+    elif name in ('sb_compiler_ctor_ready', 'sb_compiler_reply_after_xpc_release',
+                  'sb_compiler_delete'):
+        obj = registers[19]
+    elif name == 'sb_compiler_reply_enqueue':
+        obj = registers[20]
+        result['stack_block'] = read_at(registers[31], 0x30)
+    elif name == 'sb_compiler_request_reply':
+        obj = registers[24]
+        result['reply_status'] = hex(registers[22])
+    elif name in ('sb_compiler_owner_created', 'sb_compiler_owner_destroy'):
+        owner = registers[19] if name == 'sb_compiler_owner_created' else registers[0]
+        result['owner'] = read_at(owner, 0x290)
+        slot = read_at(owner + 0x280, 8) if owner else read_at(0, 8)
+        result['owner_connection_slot'] = slot
+        obj = int.from_bytes(bytes.fromhex(slot['bytes']), 'little') if slot['readable'] else 0
+    else:
+        obj = registers[0]
+    result['connection_candidate'] = read_at(obj, 128)
+    data = bytes.fromhex(result['connection_candidate']['bytes'])
+    if len(data) >= 0x28:
+        result['words'] = [hex(v) for v in struct.unpack_from('<5Q', data)]
+        for key, offset in (('queue_candidate', 8), ('xpc_candidate', 0x18),
+                            ('last_reply_candidate', 0x20)):
+            result[key] = read_at(struct.unpack_from('<Q', data, offset)[0], 96)
+    return result
+
+
+def derive_exe_slide(gs, mem_fn, proc, expected_header, known_sites=None, lr=None, hook_name=None, max_scan_bytes=0x400000, preferred_base=0x100000000):
+    """Derive executable ASLR slide from verified LR at a known return site or by scanning text pages."""
+    if known_sites and hook_name and hook_name in known_sites and lr:
+        preferred = int(known_sites[hook_name], 0)
+        cand = lr - preferred
+        if cand >= 0 and (cand & 0xfff) == 0:
+            hdr = mem_fn(gs, preferred_base + cand, len(expected_header))
+            if len(hdr) == len(expected_header) and hdr == expected_header:
+                return cand
+    for step in (0x4000, 0x1000):
+        for s in range(0, max_scan_bytes, step):
+            hdr = mem_fn(gs, preferred_base + s, len(expected_header))
+            if len(hdr) == len(expected_header) and hdr == expected_header:
+                return s
+    return None
+
+
+def install_exe_hooks(gs, mem_fn, rsp_fn, proc, slide, hooks_dict, expected_dict, bps, user_expected, exe_path=None, preferred_base=0x100000000):
+    """Verify instruction bytes against expected and install Z0 breakpoints for executable hooks."""
+    disk_data = Path(exe_path).read_bytes() if exe_path and Path(exe_path).exists() else None
+    verified = []
+    for uname, spec in hooks_dict.items():
+        if isinstance(spec, dict):
+            static = int(spec.get('address') or spec.get('static'), 0)
+            exp_hex = spec.get('expected')
+        else:
+            static = int(spec, 0)
+            exp_hex = expected_dict.get(uname)
+        if exp_hex:
+            expected = bytes.fromhex(exp_hex)
+        elif disk_data:
+            off = static - preferred_base
+            expected = disk_data[off:off+16] if 0 <= off <= len(disk_data) - 16 else b''
+        else:
+            expected = b''
+        runtime = static + slide
+        actual = mem_fn(gs, runtime, len(expected)) if expected else b''
+        assert expected and (not actual or actual == expected), (uname, actual.hex(), expected.hex())
+        assert rsp_fn(gs, f'Z0,{runtime:x},4') == 'OK'
+        bps[runtime] = uname
+        user_expected[runtime] = expected
+        verified.append(dict(name=uname, static=hex(static), runtime=hex(runtime),
+                             bytes=actual.hex(), expected=expected.hex(),
+                             mapped_at_install=bool(actual), exe=True, process=proc))
+    return verified
 
 
 def sysreg_numbers(gs):
@@ -142,15 +306,33 @@ def main():
     p.add_argument('--seconds', type=float, default=45)
     p.add_argument('--breakpoint', action='append', default=[], help='name=0xVA')
     p.add_argument('--returns', action='store_true')
+    p.add_argument('--hook-dump', action='append', default=[], help='name=xN|sp[+/-offset]:length, bounded read-only register-relative dump (repeatable; offset +/-4096, length 1..4096)')
     p.add_argument('--user-hooks', type=Path, help='Static shared-cache hook addresses, installed after verified runtime slide')
-    p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout'), default='first-pixel')
+    p.add_argument('--stop-condition', choices=('first-pixel','ca-scanout','duration'), default='first-pixel')
     p.add_argument('--step-count', type=int, default=1, help='Bounded instruction steps after each hook')
     p.add_argument('--diagnostic-system', type=Path, help='Alternative diagnostic system image')
     p.add_argument('--diagnostic-data', type=Path, help='Alternative diagnostic data image')
     p.add_argument('--plan', type=Path, help='Alternative boot_plan.json path')
+    p.add_argument('--qemu-binary', type=Path, help='Explicit QEMU binary for reproducible diagnostic runs')
     p.add_argument('--keybagd-loader-hooks', action='store_true', help='Trace native systembag file loading and stop on a proven open error')
+    p.add_argument('--diagnostic-poke', action='append', default=[], choices=('meta_alive','stamps','device_status','drain'),
+                   help='Diagnostic-only guest writes used to map later blockers; never acceptance evidence')
+    p.add_argument('--meta-dump', action='store_true', help='On the first meta_wait, save AGXMetaFirmware state, pointer translations and guest RAM')
+    p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
+    p.add_argument('--framebuffer-at', type=float, action='append', default=[],
+                   help='Save a QMP framebuffer at these guest-running seconds (repeatable)')
+    p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
+    p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
+    p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
+    p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     args = p.parse_args()
+    try:
+        hook_dumps = parse_hook_dumps(args.hook_dump)
+    except ValueError as exc:
+        p.error(str(exc))
     assert 0 < args.seconds <= 180
+    if any(not 0 < at < args.seconds for at in args.framebuffer_at):
+        p.error('--framebuffer-at must be positive and less than --seconds')
     assert 1 <= args.step_count <= 64
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -185,7 +367,8 @@ def main():
         assert digest(target) == sha
         provenance['inputs'][kind] = dict(source=str(source), copy=str(target), sha256=sha)
     plan = json.loads(plan_path.read_text())
-    binary = ROOT / 'backend/bin/qemu-system-aarch64'
+    binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
+    provenance['binary'] = str(binary)
     provenance.update(binary_sha256=digest(binary), source_sha256=digest(ROOT / 'backend/s5l8960x.c'))
     assert digest(plan['image']) == plan['image_sha256']
     provenance['boot_image_sha256'] = plan['image_sha256']
@@ -196,9 +379,20 @@ def main():
         provenance['auxiliary_images'].append(image)
     save_json(out / 'provenance.json', provenance)
     bps = {int(item.split('=', 1)[1], 0): item.split('=', 1)[0] for item in args.breakpoint}
+    # Every GDB stop costs a host round trip; high-rate hooks such as
+    # swap_advancer turned 75 guest seconds into ~600 wall seconds.
+    poke = set(args.diagnostic_poke)
+    max_hits = {'accel_': 0, 'meta_': 0}
+    max_hits.update({k: int(v, 0) for k, v in (item.split('=', 1) for item in args.max_hits)})
+    def hit_cap(name, pc):
+        for prefix in sorted(max_hits, key=len, reverse=True):
+            if name.startswith(prefix):return max_hits[prefix]
+        return 24 if pc in user_expected else 8
     user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
     user_installed = False
     user_expected = {}
+    exe_installed = {}
+    exe_slides = {}
     keybagd_installed = False
     ready_providers = set()
     wake_providers = set()
@@ -217,10 +411,10 @@ def main():
                    f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},display-trace=1,"
                    f"system-image={images}/system.raw,data-image={images}/data.raw,"
                    f"utility-image={images}/utility.raw,system-writable=1")
-        cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=single',
-               '-smp', '1', '-m', '1024M', '-kernel', plan['image'], '-display', 'none',
+        cmd = [str(binary), '-machine', machine, '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'single'),
+               '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M', '-kernel', plan['image'], '-display', os.environ.get('VPHONE_DISPLAY', 'none'),
                '-serial', f'file:{out}/serial.log', '-S', '-qmp', f'unix:{qmp},server=on,wait=off',
-               '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')]
+               '-d', 'unimp,guest_errors', '-D', str(out / 'qemu-trace.log')] + args.qemu_arg
         if bps:
             cmd += ['-gdb', f'unix:{gdb},server=on,wait=off']
         for image in plan.get('auxiliary_images', []):
@@ -257,6 +451,9 @@ def main():
                     started = time.monotonic(); next_sample = started + 1
                     temporary = ReturnRegistry()
                     hook_counts={}
+                    snapshot_at=sorted(args.snapshot_at)
+                    framebuffer_at=sorted(set(args.framebuffer_at))
+                    framebuffer_captures=[]
                     serial_offset=0; serial_tail=b''; panicked=False
                     def freeze():
                         if gs and clock.resumed is not None:
@@ -265,6 +462,7 @@ def main():
                         command(fp,'stop');clock.pause()
                     def pixel_stop():
                         analysis=json.loads((out/'framebuffer_analysis.json').read_text())
+                        if args.stop_condition == 'duration': return False
                         if not pixel_present(analysis,args.stop_condition):return False
                         # Preserve transient console fallback even when continuing
                         # to seek an application CA scanout.
@@ -283,6 +481,13 @@ def main():
                         if eligible:save_json(out/'ca-scanout-candidate.json',dict(needs_surface_commit_attribution=True,registers=views))
                         return eligible
                     while clock.elapsed() < args.seconds:
+                        if framebuffer_at and clock.elapsed() >= framebuffer_at[0]:
+                            requested=framebuffer_at.pop(0)
+                            path=out/f'framebuffer-at-{requested:g}s.ppm'
+                            command(fp,'screendump',{'filename':str(path)})
+                            framebuffer_captures.append(dict(requested_seconds=requested,
+                                                            elapsed_seconds=clock.elapsed(),path=str(path)))
+                            save_json(out/'framebuffer-captures.json',framebuffer_captures)
                         with (out/'serial.log').open('rb') as serial:
                             serial.seek(serial_offset); update=serial.read()
                             serial_offset=serial.tell()
@@ -297,6 +502,11 @@ def main():
                                 if capture(fp,out,clock.elapsed()):
                                     freeze();capture(fp,out,clock.elapsed())
                                     if pixel_stop():break
+                                    cont()
+                                if snapshot_at and clock.elapsed()>=snapshot_at[0] and user_hooks and (out/'user-hook-mapping.json').exists():
+                                    at=snapshot_at.pop(0);freeze()
+                                    from ca_probe_state import snapshot
+                                    snapshot(gs,memory,u64,out,out/'user-hook-mapping.json',Path(user_hooks['index_path']),f'ca-thread-state-{int(at):03d}s.json')
                                     cont()
                                 next_sample=time.monotonic()+1
                             if not select.select([gs], [], [], max(0, min(.1, args.seconds - clock.elapsed())))[0]:
@@ -418,7 +628,7 @@ def main():
                                     if slide<0 or slide&0xfff: continue
                                     if memory(gs,0x180000000+slide,16)!=cache[:16]: continue
                                     verified=[]
-                                    for uname, static in user_hooks['symbols'].items():
+                                    for uname, static in user_hooks.get('symbols', {}).items():
                                         static=int(static,0); expected=b''
                                         for va,size,off,*_ in index['mappings']:
                                             if va<=static<va+size:
@@ -429,22 +639,84 @@ def main():
                                         bps[static+slide]=uname
                                         user_expected[static+slide]=expected
                                         verified.append(dict(name=uname,static=hex(static),runtime=hex(static+slide),bytes=actual.hex(),expected=expected.hex(),mapped_at_install=bool(actual)))
-                                    save_json(out/'user-hook-mapping.json',dict(slide=hex(slide),hooks=verified))
+                                    for item in args.user_va_hook:
+                                        uname, va = item.split('=', 1); va = int(va, 0)
+                                        assert rsp(gs,f'Z0,{va:x},4')=='OK'
+                                        bps[va]=uname
+                                        verified.append(dict(name=uname,runtime=hex(va),absolute=True))
+                                    mapping_dict = dict(slide=hex(slide),hooks=verified)
+                                    if 'exe_hooks' in user_hooks and 'backboardd' in user_hooks['exe_hooks']:
+                                        exe_proc = 'backboardd'
+                                        hdr_hex = user_hooks.get('exe_headers', {}).get(exe_proc, 'cffaedfe0c0000010000000002000000')
+                                        hdr = bytes.fromhex(hdr_hex)
+                                        known = user_hooks.get('known_return_sites', {}).get(exe_proc, {})
+                                        exe_slide = derive_exe_slide(gs, memory, exe_proc, hdr, known)
+                                        if exe_slide is not None:
+                                            exe_exp = user_hooks.get('exe_expected', {}).get(exe_proc, {})
+                                            exe_path = user_hooks.get('exe_paths', {}).get(exe_proc)
+                                            exe_v = install_exe_hooks(gs, memory, rsp, exe_proc, exe_slide, user_hooks['exe_hooks'][exe_proc], exe_exp, bps, user_expected, exe_path=exe_path)
+                                            verified.extend(exe_v)
+                                            exe_slides[exe_proc] = exe_slide
+                                            exe_installed[exe_proc] = True
+                                            mapping_dict['exe_slide'] = hex(exe_slide)
+                                            mapping_dict['exe_slides'] = {exe_proc: hex(exe_slide)}
+                                    save_json(out/'user-hook-mapping.json',mapping_dict)
                                     user_installed=True;break
+                            if user_hooks and 'exe_hooks' in user_hooks:
+                                cur_proc = caller_identity.get('process')
+                                if cur_proc in user_hooks['exe_hooks'] and cur_proc not in exe_installed:
+                                    hdr_hex = user_hooks.get('exe_headers', {}).get(cur_proc, 'cffaedfe0c0000010000000002000000')
+                                    hdr = bytes.fromhex(hdr_hex)
+                                    known = user_hooks.get('known_return_sites', {}).get(cur_proc, {})
+                                    lr_val = x[30] if len(x) > 30 else None
+                                    exe_slide = derive_exe_slide(gs, memory, cur_proc, hdr, known, lr=lr_val, hook_name=name)
+                                    if exe_slide is not None:
+                                        exe_exp = user_hooks.get('exe_expected', {}).get(cur_proc, {})
+                                        exe_path = user_hooks.get('exe_paths', {}).get(cur_proc)
+                                        exe_v = install_exe_hooks(gs, memory, rsp, cur_proc, exe_slide, user_hooks['exe_hooks'][cur_proc], exe_exp, bps, user_expected, exe_path=exe_path)
+                                        exe_slides[cur_proc] = exe_slide
+                                        exe_installed[cur_proc] = True
+                                        mapping_path = out / 'user-hook-mapping.json'
+                                        if mapping_path.exists():
+                                            m_dict = json.loads(mapping_path.read_text())
+                                            m_dict['exe_slide'] = hex(exe_slide)
+                                            m_dict.setdefault('exe_slides', {})[cur_proc] = hex(exe_slide)
+                                            m_dict.setdefault('hooks', []).extend(exe_v)
+                                            save_json(mapping_path, m_dict)
+                            if name.startswith('bb_') and caller_identity.get('process') != 'backboardd':
+                                assert rsp(gs,'s').startswith('T');cont();continue
+                            if name.startswith('sb_') and caller_identity.get('process') != 'SpringBoard':
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if name.startswith('keybagd_') and caller_identity.get('process') != 'keybagd':
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if pc in user_expected:
                                 actual=memory(gs,pc,16)
-                                try:mapped=instruction_mapped(actual,user_expected[pc])
-                                except ValueError:
-                                    save_json(out/'user-hook-mismatch.json',dict(name=name,pc=hex(pc),actual=actual.hex(),expected=user_expected[pc].hex(),identity=caller_identity))
-                                    raise
+                                def log_mismatch():
+                                    # Breakpoints are VA-global: another process can
+                                    # execute unrelated code at an executable hook VA.
+                                    # Keep the verified hook for its intended mapping,
+                                    # and never count or interpret this hit as evidence.
+                                    mismatch = dict(name=name, pc=hex(pc), actual=actual.hex(),
+                                                    expected=user_expected[pc].hex(),
+                                                    identity=caller_identity,
+                                                    elapsed=clock.elapsed(), action='skip-hit')
+                                    save_json(out/'user-hook-mismatch.json', mismatch)
+                                    with (out/'user-hook-mismatches.jsonl').open('a') as log:
+                                        log.write(json.dumps(mismatch) + '\n')
+                                mapped = instruction_mapped(actual, user_expected[pc],
+                                                            on_mismatch=log_mismatch)
                                 if not mapped:
+                                    # Skip unrelated mappings and unresolved pages.
                                     # TCG may stop at a virtual breakpoint before
                                     # the guest resolves its instruction-page fault.
                                     # Let the fault execute, retaining the hook;
                                     # this is not evidence of function execution.
                                     assert rsp(gs,'s').startswith('T');cont();continue
+                            if name == 'sb_dispatch_release_unaligned' and not (x[0] & 7):
+                                # This diagnostic targets the T13 failure (x0 ends
+                                # in 0x78c). Keep the hook until a suspicious call;
+                                # ordinary aligned releases must not consume its cap.
+                                assert rsp(gs,'s').startswith('T');cont();continue
                             if name.startswith(('io_','surface_','accel_','ca_')) and caller_identity.get('process') not in ('backboardd','SpringBoard'):
                                 assert rsp(gs,'s').startswith('T');cont();continue
                             if name == 'display_irq_register':
@@ -480,12 +752,40 @@ def main():
                                     assert rsp(gs,'s').startswith('T'); cont(); continue
                             event = dict(name=name, elapsed=clock.elapsed(), wall_elapsed=clock.wall(),
                                          pc=hex(pc), registers=[hex(v) for v in x], reply=payload)
+                            if name in hook_dumps:
+                                event['memory_dumps'] = capture_hook_dumps(gs, x, hook_dumps[name])
                             event['identity'] = caller_identity
+                            if name == 'sb_dispatch_release_unaligned':
+                                event['dispatch_release'] = dispatch_release_evidence(gs, x)
+                            if name.startswith('sb_compiler_'):
+                                event['compiler_connection'] = compiler_connection_evidence(gs, x, name)
                             if caller_identity.get('exec_fname'):
                                 event['exec_fname'] = caller_identity['exec_fname']
                             if caller_identity.get('vnode_path'):
                                 event['vnode_path'] = caller_identity['vnode_path']
                             event['instruction_bytes'] = memory(gs, pc, 16).hex()
+                            if name.startswith('hidf_'):
+                                # IOHIDServiceFilter (x0) -> plugin interfaces at +0x10/+0x18.
+                                # For CompassPlugIn, vtable - 0x4108 is the image base;
+                                # record its lazy pointers, stubs and stub helper.
+                                obs = dict(filter=hex(x[0]), filter_bytes=memory(gs, x[0], 0x30).hex())
+                                for slot in (0x10, 0x18):
+                                    inst = u64(gs, x[0] + slot) if len(memory(gs, x[0] + slot, 8)) == 8 else 0
+                                    if not inst:
+                                        continue
+                                    head = memory(gs, inst, 0x40)
+                                    entry = dict(instance=hex(inst), bytes=head.hex())
+                                    if len(head) >= 8:
+                                        vt = int.from_bytes(head[:8], 'little')
+                                        base = vt - 0x4108
+                                        entry['vtable'] = hex(vt)
+                                        if base & 0xfff == 0 and memory(gs, base, 4) == bytes.fromhex('cffaedfe'):
+                                            entry['compass_base'] = hex(base)
+                                            entry['la_symbol_ptr'] = memory(gs, base + 0x4030, 0xc0).hex()
+                                            entry['stubs'] = memory(gs, base + 0x3c3c, 0x120).hex()
+                                            entry['stub_helper'] = memory(gs, base + 0x3d5c, 0x138).hex()
+                                    obs[hex(slot)] = entry
+                                event['hidf'] = obs
                             if name == 'keybagd_systembag_load_before':
                                 event['contract_observation']=dict(verified_user_mapping=keybagd_installed)
                             if name in ('keybagd_read_plist','keybagd_open_result_before','keybagd_errno_before') and not pending:
@@ -634,6 +934,85 @@ def main():
                                     if name=='ca_add_context':event['ca_context']=memory(gs,x[1],512).hex()
                                 if name.startswith('surface_') and pc in temporary and 0x100000000<=x[0]<0x200000000:
                                     event['surface_head']=memory(gs,x[0],256).hex()
+                                if name.startswith('accel_') and pc in bps:
+                                    dev = x[0] if x[0] >> 56 == 0xff else 0
+                                    dev_status = memory(gs, dev + 0x490, 1) if dev else b''
+                                    if not dev_status and dev:
+                                        alt_dev = u64(gs, dev + 0x118)
+                                        if alt_dev >> 56 == 0xff:
+                                            dev = alt_dev
+                                            dev_status = memory(gs, dev + 0x490, 1)
+                                    if dev_status:
+                                        event['device_status_before'] = dev_status.hex()
+                                        if 'device_status' in poke and not (dev_status[0] & 2):
+                                            new_byte = dev_status[0] | 2
+                                            rsp(gs, f'M{dev + 0x490:x},1:{new_byte:02x}')
+                                            event['device_status_after'] = hex(new_byte)
+                                if name.startswith('accel_wait_stamp') and pc in bps:
+                                    channel_obj = x[0]
+                                    ring_idx = x[1] & 0x1f
+                                    target_stamp = x[2] & 0xffffffff
+                                    stamps_table = u64(gs, channel_obj + 0x28) if channel_obj >> 56 == 0xff else 0
+                                    stamp_ptr = u64(gs, stamps_table + ring_idx * 8) if stamps_table >> 56 == 0xff else 0
+                                    if stamp_ptr >> 56 == 0xff:
+                                        cur_stamp = int.from_bytes(memory(gs, stamp_ptr, 4), 'little')
+                                        event['stamp_before'] = cur_stamp
+                                        event['target_stamp'] = target_stamp
+                                        event['stamp_ptr'] = hex(stamp_ptr)
+                                        if 'stamps' in poke and cur_stamp < target_stamp:
+                                            rsp(gs, f'M{stamp_ptr:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                            event['stamp_after'] = target_stamp
+                                        if 'stamps' in poke and x[3] >> 56 == 0xff:
+                                            rsp(gs, f'M{x[3]:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                if name.startswith('accel_stamp_') and pc in bps:
+                                    stamp_ptr = x[23] if x[23] >> 56 == 0xff else x[0]
+                                    if stamp_ptr >> 56 == 0xff:
+                                        cur_stamp = int.from_bytes(memory(gs, stamp_ptr, 4), 'little')
+                                        target_stamp = x[21] & 0xffffffff
+                                        event['stamp_before'] = cur_stamp
+                                        event['target_stamp'] = target_stamp
+                                        event['stamp_ptr'] = hex(stamp_ptr)
+                                        if 'stamps' in poke and cur_stamp < target_stamp:
+                                            rsp(gs, f'M{stamp_ptr:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                            event['stamp_after'] = target_stamp
+                                        if 'stamps' in poke and x[22] >> 56 == 0xff:
+                                            rsp(gs, f'M{x[22]:x},4:{target_stamp.to_bytes(4, "little").hex()}')
+                                if name == 'accel_drain_sleep' and pc in bps and 'drain' in poke:
+                                    event['drain_iteration'] = x[23]
+                                    event['drain_event_obj'] = hex(x[21])
+                                    regs_mod = list(x)
+                                    regs_mod[24] = 1
+                                    rsp(gs, 'G' + struct.pack('<33Q', *regs_mod).hex())
+                                    event['drain_x24_set'] = 1
+                            if name.startswith('meta_') and pc in bps:
+                                meta=x[19] if x[19]>>56==0xff else (x[0] if x[0]>>56==0xff else 0)
+                                if meta:
+                                    event['meta_object']=hex(meta)
+                                    event['meta_state_538']=memory(gs,meta+0x530,16).hex()
+                                    owner=u64(gs,meta+0x58)
+                                    if owner>>56==0xff:
+                                        doorbell=u64(gs,owner+0x518)
+                                        event['meta_owner']=hex(owner);event['meta_doorbell_va']=hex(doorbell)
+                                        if doorbell>>56==0xff:
+                                            event['meta_doorbell_pa']=command(fp,'human-monitor-command',{'command-line':f'gva2gpa {doorbell:#x}'}).strip()
+                                if name=='meta_wait' and args.meta_dump and meta and not (out/'meta-dump.json').exists():
+                                    def gpa(va):
+                                        raw=command(fp,'human-monitor-command',{'command-line':f'gva2gpa {va:#x}'})
+                                        found=re.findall(r'gpa: 0x([0-9a-fA-F]+)',raw);return hex(int(found[0],16)) if found else None
+                                    owner=u64(gs,meta+0x58);dump=dict(meta=hex(meta),owner=hex(owner),meta_bytes=memory(gs,meta,0x600).hex(),pointers={})
+                                    for base,size in ((meta,0x600),(owner,0x3f00)):
+                                        for o in range(0,size,8):
+                                            v=u64(gs,base+o)
+                                            if v>>40==0xffffff and v&7==0:dump['pointers'][f'{base:#x}+{o:#x}']=dict(va=hex(v),pa=gpa(v))
+                                    dump['owner_bytes']=memory(gs,owner,0x3f00).hex()
+                                    dump['sgx1_sequencer']=command(fp,'human-monitor-command',{'command-line':'xp /20xw 0x201e10000'})
+                                    command(fp,'pmemsave',{'val':plan['dram_base'],'size':plan['memory_size'],'filename':str(out/'ram.bin')})
+                                    save_json(out/'meta-dump.json',dump)
+                                if name=='meta_msg':
+                                    event['meta_message']=memory(gs,x[1],64).hex() if x[1]>>56==0xff else None
+                                if name=='meta_wait' and 'meta_alive' in poke and meta and memory(gs,meta+0x539,1)==b'\0':
+                                    assert rsp(gs,f'M{meta+0x538:x},2:0101')=='OK'
+                                    event['diagnostic_poke']='meta_alive'
                             if name=='swap_submit' and pc in bps:
                                 event['swap_payload']=memory(gs,x[1],min(x[2],0x138)).hex()
                             if name in ('swap_begin','program_hardware','irq_filter'):
@@ -698,7 +1077,8 @@ def main():
                                 break
                             if pc in bps:
                                 hook_counts[pc]=hook_counts.get(pc,0)+1
-                                if hook_counts[pc]>=(24 if pc in user_expected else 8):
+                                cap=hit_cap(name,pc)
+                                if cap and hook_counts[pc]>=cap:
                                     if pc not in temporary:assert rsp(gs,f'z0,{pc:x},4')=='OK'
                                     del bps[pc]
                             steps = []
@@ -707,7 +1087,8 @@ def main():
                                 if args.step_count > 1:
                                     sr = struct.unpack_from('<33Q', bytes.fromhex(rsp(gs,'g')))
                                     steps.append(dict(pc=hex(sr[32]),x0=hex(sr[0]),x1=hex(sr[1]),x8=hex(sr[8]),
-                                                      bytes=memory(gs,sr[32],4).hex()))
+                                                      x16=hex(sr[16]),x19=hex(sr[19]),x20=hex(sr[20]),x21=hex(sr[21]),
+                                                      lr=hex(sr[30]),bytes=memory(gs,sr[32],4).hex()))
                             if steps:
                                 event['steps'] = steps
                                 save_json(out / 'breakpoints.json', events)
@@ -732,7 +1113,7 @@ def main():
                     save_json(out/'observations.json',dict(kernel_panic=panicked,guest_running_seconds=clock.elapsed(),wall_seconds=clock.wall(),stop_condition=args.stop_condition))
                     (out / 'registers.txt').write_text(command(fp, 'human-monitor-command', {'command-line':'info registers'}))
                     views = {}
-                    for addr, count in [(0x206200000,4),(0x206300000,4),(0x206201020,24),(0x206204040,16),(0x206400000,32)]:
+                    for addr, count in [(0x206200000,4),(0x206300000,4),(0x206201020,24),(0x206204040,16),(0x206400000,32),(0x201000000,16),(0x201e00000,16)]:
                         views[hex(addr)] = command(fp, 'human-monitor-command', {'command-line': f'xp /{count}xw {addr:#x}'})
                     save_json(out / 'mmio_registers.json', views)
                     command(fp, 'screendump', {'filename': str(out / 'qmp-framebuffer.ppm')})
@@ -748,6 +1129,11 @@ def main():
                 except subprocess.TimeoutExpired:
                     proc.kill(); proc.wait(timeout=5)
                 save_json(out / 'process-exit.json', dict(exit_code=proc.returncode, reaped=True))
+                if args.collect_crashlogs:
+                    data_raw = images / 'data.raw'
+                    if data_raw.exists():
+                        from crashlogs import collect_crashlogs
+                        collect_crashlogs(data_raw, out / 'crashlogs')
     print(out, flush=True)
 
 

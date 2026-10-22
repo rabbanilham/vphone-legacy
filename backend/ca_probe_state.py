@@ -1,10 +1,17 @@
 """Read-only task-specific CA thread snapshots; unmapped data remains unknown."""
 import bisect
 import json
+import os
 import struct
 from pathlib import Path
 
-def snapshot(gs, memory, u64, out, mapping_path, index_path):
+# p_comm is truncated to 16 bytes ('com.apple.datami' is the DataMigration
+# XPC service). VPHONE_SNAPSHOT_PROCS adds comma-separated names.
+SNAPSHOT_PROCESSES = {'backboardd', 'SpringBoard', 'lsd', 'installd', 'com.apple.datami',
+                      *filter(None, os.environ.get('VPHONE_SNAPSHOT_PROCS', '').split(','))}
+
+
+def snapshot(gs, memory, u64, out, mapping_path, index_path, output_name='ca-thread-state.json'):
     phys=u64(gs,0xffffff8000694020);virt=u64(gs,0xffffff8000694018)
     def direct(pa): return pa-phys+virt
     def read_user(pmap,va,size):
@@ -41,7 +48,7 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path):
         while proc and proc not in seen and len(seen)<256:
             seen.add(proc);name=memory(gs,proc+0x254,16).split(b'\0')[0].decode(errors='replace')
             inventory.append(dict(name=name,pid=int.from_bytes(memory(gs,proc+0x10,4),'little'),proc=hex(proc)))
-            if name in ('backboardd','SpringBoard','lsd','installd'):
+            if name in SNAPSHOT_PROCESSES:
                 task=u64(gs,proc+0x18);vmap=u64(gs,task+0x28);pmap=u64(gs,vmap+0x58)
                 record=dict(process=name,pid=int.from_bytes(memory(gs,proc+0x10,4),'little'),task=hex(task),pmap=hex(pmap),threads=[])
                 head=task+0x48;thread=u64(gs,head);threads_seen=set()
@@ -55,8 +62,28 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path):
                             if not data:break
                             fp,lr=struct.unpack('<QQ',data);frames.append(dict(lr=hex(lr),symbol=symbol(lr)))
                         message=read_user(pmap,x[0],256)
-                        record['threads'].append(dict(thread=hex(thread),tid=u64(gs,thread+0x740),pc=hex(x[32]),pc_symbol=symbol(x[32]),lr=hex(x[30]),lr_symbol=symbol(x[30]),registers=[hex(v) for v in x],frames=frames,message_head=message.hex() if message else None))
+                        pcb=u64(gs,thread+0x680);k_event=u64(gs,thread+0x20);k_cont=u64(gs,thread+0x58)
+                        k_fp=u64(gs,pcb+0xf0) if pcb>>56==0xff else 0
+                        k_lr=u64(gs,pcb+0xf8) if pcb>>56==0xff else 0
+                        k_sp=u64(gs,pcb+0x100) if pcb>>56==0xff else 0
+                        k_frames=[];curr_fp=k_fp
+                        for _ in range(16):
+                            if not (curr_fp>>56==0xff):break
+                            fdata=memory(gs,curr_fp,16)
+                            if len(fdata)!=16:break
+                            prev_fp,ret_lr=struct.unpack('<QQ',fdata)
+                            k_frames.append(dict(fp=hex(curr_fp),lr=hex(ret_lr)))
+                            if prev_fp<=curr_fp:break
+                            curr_fp=prev_fp
+                        record['threads'].append(dict(thread=hex(thread),tid=u64(gs,thread+0x740),pc=hex(x[32]),pc_symbol=symbol(x[32]),lr=hex(x[30]),lr_symbol=symbol(x[30]),registers=[hex(v) for v in x],frames=frames,message_head=message.hex() if message else None,kernel_state=dict(pcb=hex(pcb),wait_event=hex(k_event),continuation=hex(k_cont),lr=hex(k_lr),fp=hex(k_fp),sp=hex(k_sp),frames=k_frames)))
                     thread=u64(gs,thread+0x308)
                 result.append(record)
             proc=u64(gs,proc+0xb0)
-    (out/'ca-thread-state.json').write_text(json.dumps(dict(cache_slide=hex(slide),tasks=result,process_inventory=inventory),indent=2)+'\n')
+    (out/output_name).write_text(json.dumps(dict(cache_slide=hex(slide),tasks=result,process_inventory=inventory),indent=2)+'\n')
+    from iokit_probe_state import capture_iokit, capture_kernel_threads
+    read_kernel = lambda address, size: memory(gs, address, size)
+    iokit = capture_iokit(read_kernel)
+    iokit['kernel_task'] = capture_kernel_threads(read_kernel)
+    iokit['source_snapshot'] = output_name
+    suffix = output_name.removeprefix('ca-thread-state')
+    (out/('iokit-state' + suffix)).write_text(json.dumps(iokit, indent=2)+'\n')

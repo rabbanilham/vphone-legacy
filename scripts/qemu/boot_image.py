@@ -132,10 +132,10 @@ def build_nvram_proxy_data(cmdline: str = "", nvram_vars: dict = None) -> bytes:
 
 
 def single_cpu_boot_args(cmdline):
-    """AppleARMPE discovers both DT cores; this backend realizes only one."""
+    """Validate the A7 core limit (legacy helper name kept for callers)."""
     cpu_limits = [arg for arg in cmdline.split() if arg.startswith("cpus=")]
-    if cpu_limits and cpu_limits != ["cpus=1"]:
-        raise ValueError("The experimental A7 backend requires exactly cpus=1")
+    if cpu_limits and cpu_limits not in (["cpus=1"], ["cpus=2"]):
+        raise ValueError("The experimental A7 backend supports cpus=1 or cpus=2")
     return cmdline if cpu_limits else cmdline + " cpus=1"
 
 
@@ -172,10 +172,39 @@ def add_node(parent, name):
     return child
 
 
+def omit_unpopulated_devices(root):
+    """Describe the emulator's absent motion coprocessor (Oscar/M7).
+
+    AppleOscarProcessor waits one second per baud-rate attempt for a UART
+    boot-ROM 'ready' message that nothing can send (16 timeouts per boot).
+    Removing the oscar subtree (with its sensors) removes those waits; UART2
+    itself and all PMU/GPIO wiring stay. The baseband nodes are kept on
+    purpose: without them CommCenter restarts and SpringBoard, which waits on
+    CoreTelephony, never reaches the setup greeting (probe-132 vs probe-133).
+    The camera ISP is omitted too: the board has no ISP firmware, so
+    AppleH6CamIn's power-on failed and mediaserverd crashed each time its
+    camera bundle opened it, leaving SpringBoard in 9 s coremedia.recorder
+    timeouts; without the node mediaserverd reports no H6ISP capture device
+    and the greeting renders at ~35 s instead of ~64 s (probe-159 vs probe-160).
+    This edits only the loader's in-memory DT, never the firmware input or disk.
+    """
+    for path in (("arm-io", "uart2", "oscar"), ("arm-io", "isp")):
+        parent = root
+        for name in path[:-1]:
+            parent = next((c for c in parent.children
+                           if c.get_prop("name") == name.encode() + b"\0"), None)
+            if parent is None:
+                break
+        if parent is not None:
+            parent.children = [c for c in parent.children
+                               if c.get_prop("name") != path[-1].encode() + b"\0"]
+
+
 def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 cpus=1", *, monitor_path=None, ans_path=None, nvram_vars=None):
     if monitor_path is None:
         raise ValueError("Native secure monitor is required; rebuild firmware bundle")
     cmdline = single_cpu_boot_args(cmdline)
+    cpu_count = int(next(arg[5:] for arg in cmdline.split() if arg.startswith("cpus=")))
     kernel = Path(kernel_path).read_bytes()
     info = inspect_macho(kernel)
     monitor = Path(monitor_path).read_bytes()
@@ -228,9 +257,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     lcd = root.find_node("lcd")
     if lcd:
         lcd.set_prop("lcd-panel-id", struct.pack("<I", 0xa6970dc8))
-    oscar = root.find_node("oscar")
-    if oscar:
-        oscar.children = [c for c in oscar.children if c.get_prop("name") != b"compass\0"]
+    omit_unpopulated_devices(root)
     memory = add_node(root, "memory")
     memory.set_prop("reg", struct.pack("<QQ", DRAM_BASE, RAM_SIZE))
     # Firmware DT is a bootloader template: original pram/reg is all zeros.
@@ -353,6 +380,13 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     framebuffer_offset = align(dt_offset + len(raw_tree))
     framebuffer = DRAM_BASE + framebuffer_offset
     memory_map.set_prop("DiagnosticFramebuffer", struct.pack("<QQ", framebuffer, FRAMEBUFFER_SIZE))
+    # iBoot fills the /vram placeholder with the display carveout.
+    # IOSurfaceRoot::installMemoryRegions waits for this region (vram ->
+    # PurpleGfxMem) before any IOSurfaceRoot client can open; a zero reg
+    # blocks backboardd's render server. Same 16-byte size: offsets stay put.
+    vram = root.find_node("vram")
+    if vram is not None:
+        vram.set_prop("reg", struct.pack("<QQ", framebuffer, FRAMEBUFFER_SIZE))
     raw_tree = serialize_node(root)
     top = DRAM_BASE + align(framebuffer_offset + FRAMEBUFFER_SIZE)
     total = top - DRAM_BASE + 0x10000
@@ -416,7 +450,7 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
                                   execution_verified=False),
                 auxiliary_images=[ans_region] if ans_region else [],
                 framebuffer=dict(width=640, height=1136, stride=2560, depth=32),
-                segments=segments, boot_args=cmdline,
+                segments=segments, boot_args=cmdline, cpu_count=cpu_count,
                 validation="prepared; guest execution not yet verified")
     (output / "boot_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     return plan

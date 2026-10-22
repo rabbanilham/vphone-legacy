@@ -69,7 +69,7 @@ echo "  dylib built OK"
 # --- Verify ---
 echo ""
 echo "=== Verifying imports ==="
-python3 -c "
+"${VENV_DIR}/bin/python" -c "
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 from keystone import Ks, KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN
 from pyimg4 import IM4P

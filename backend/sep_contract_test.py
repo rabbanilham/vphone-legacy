@@ -350,6 +350,16 @@ def service_fixture():
     read(SEP + 0x1038, 7 | (0x19 << 8) | (1 << 15) | (0x70 << 16) | (8 << 48), True)
     read(BASE + 0x500000, 0, True)
     read(BASE + 0x500008, 0x55aa55aa33cc33cc, True)
+    # 11b. Cmd24 (24-byte request) replies with two zero u64 (no lock-state
+    # action), preserving the following sentinel.
+    write64(BASE + 0x500000, 0xfacefeedbaadf00d)
+    write64(BASE + 0x500008, 0xfacefeedbaadf00d)
+    write64(BASE + 0x500010, 0x55aa55aa33cc33cc)
+    write64(SEP + 0x1010, 7 | (0x18 << 8) | (0x7e << 16) | (0x18 << 48))
+    read(SEP + 0x1038, 7 | (0x18 << 8) | (1 << 15) | (0x7e << 16) | (0x10 << 48), True)
+    read(BASE + 0x500000, 0, True)
+    read(BASE + 0x500008, 0, True)
+    read(BASE + 0x500010, 0x55aa55aa33cc33cc, True)
     # 12. EP7 keybag create (cmd 0x02, tag 0x71, len 16) -> reply len 0
     write64(SEP + 0x1010, 7 | (0x02 << 8) | (0x71 << 16) | (16 << 48))
     read(SEP + 0x1038, 7 | (0x02 << 8) | (1 << 15) | (0x71 << 16), True)
@@ -473,7 +483,7 @@ def run_service_fixture():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
-    print('PASS: SEP post-boot service endpoints: EP0 (OOL/params/keepalive), EP2 (ART_LOAD), EP7 (Cmd2/4/13/17/18/22/25/26/30, reject unsupported)')
+    print('PASS: SEP post-boot service endpoints: EP0 (OOL/params/keepalive), EP2 (ART_LOAD), EP7 (Cmd2/4/13/17/18/22/24/25/26/30, reject unsupported)')
 
 
 def main():

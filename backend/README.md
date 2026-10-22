@@ -43,7 +43,7 @@ entry in EL3h, with interrupts masked and MMU off. `x0` points to the monitor's
 six-u64 boot arguments; the actual firmware performs the kernel handoff.
 The default `boot-el=1` direct EL1h entry is used by synthetic fixtures.
 It exposes 1 GiB RAM
-and exactly one CPU. A nonexistent/empty image or invalid boot addresses fail.
+and one or two application CPUs (`-smp 1` or `-smp 2`, default one). A nonexistent/empty image or invalid boot addresses fail.
 
 The fixed scanout reads 640×1136 BGRX32 pixels at physical `0x83fc00000`, stride
 2560; `framebuffer=0xADDRESS` may override the in-RAM address. A black display
@@ -52,6 +52,19 @@ AppleH6PDisplayPipe register emulation or compositor compatibility is claimed.
 Input, graceful guest shutdown and iOS boot remain unverified. The experimental
 ASP software model below supports checked raw block I/O; successful native
 filesystem mount remains unverified.
+
+For dual-core experiments, put `cpus=2` in the loader boot arguments and use
+`-smp 2 -accel tcg,thread=single`. The runtime launcher reads the core count
+from the generated boot plan. CPU1 stays powered off until the guest writes
+its bit to PMGR `0x20e030008`. Native EL3 release enters the secure monitor's
+warm-reset trampoline at `0x800600000` with x0=0; direct EL1 fixtures enter
+`boot-entry` and distinguish cores through MPIDR. The monitor retains control
+of the kernel handoff. CPU error MMIO blocks at `0x202050000` and `0x202150000`
+provide storage, without emulating hardware error injection.
+
+After rebuilding, run `python3 backend/smp_contract_test.py` for the synthetic
+two-core startup and bidirectional/self IPI contract. Native iOS SMP execution
+remains unverified. Evidence and limitations are in [T16-smp.md](../research/T16-smp.md).
 
 ## Implemented contracts and limits
 
@@ -70,7 +83,7 @@ filesystem mount remains unverified.
 - UART0 at `0x20a0a0000`: S5L polled RX/TX status and FIFO, serial0 chardev;
   received bytes can assert IRQ 140. DMA/modem support is unimplemented.
 - AIC v1 at `0x20e100000`: 1024 IRQ mask/software-pending slots, prioritized
-  event/auto-mask behavior, one CPU, basic self-IPI and timer outputs to FIQ.
+  event/auto-mask behavior, per-core self/cross IPIs and timer outputs to each core's FIQ. IRQ target masks select the receiving core; source masks remain shared.
   Only UART is a hardware IRQ source; other peripherals are unimplemented.
 - PMGR, GPIO, 15 bridge ranges and 28 peripheral ranges now have experimental
   register storage/readback. PMGR power-state writes mirror target into actual
@@ -240,3 +253,126 @@ restored bag input and native import/lifecycle contract remain unavailable;
 loaded/unlocked state and the first CA application frame remain unverified.
 See [findings and reproduction](evidence/keybag-contract-20261015/FINDINGS.md).
 The optional `--keybagd-loader-hooks` mode stops on directly observed open failure.
+
+## Scripted n53 touch input
+
+After rebuilding the backend, set `VPHONE_TOUCH_SCRIPT` on the QEMU process.
+The existing six-field swipe form remains supported:
+
+```sh
+VPHONE_TOUCH_SCRIPT='125,60,1018,600,1018,0.3'
+```
+
+Fields are `start_s,x0,y0,x1,y1,duration_s`. Coordinates are integer framebuffer
+pixels with a top-left origin (X 0..640, Y 0..1136), not UIKit points.
+Start is seconds of QEMU virtual time relative to machine reset (0..86400).
+Legacy duration is 0.016..60 seconds. The model emits state1 (path start),
+state3 (down), `max(1,floor(duration*60))` state4 moves including the endpoint,
+then state7 (up), with the same separate start/down/up intervals as before.
+Contact ID is always 1 and identity is 2 (finger).
+
+For holds, variable speed, taps, or repeated gestures use the segment form:
+
+```sh
+VPHONE_TOUCH_SCRIPT='at=125;down 100,1018;hold 0.15;move 560,1018 dur=0.8 steps=48;hold 0.1;up'
+VPHONE_TOUCH_SCRIPT='at=125;tap 320,568|at=128;down 60,1018;move 600,1018 dur=1;up'
+```
+
+Each gesture begins with `at=seconds;`, then exactly one `down x,y` and a final
+`up`, or a single `tap x,y`. Commands are separated by `;`; gestures by `|`.
+Do not add a trailing separator. Gestures must be ordered, with each `at=`
+strictly after the previous up's scheduled time. Whitespace around numbers
+and separators is accepted; command names are lowercase as shown.
+
+- `down x,y` emits start immediately, then down one 60 Hz tick later.
+- `move x,y dur=seconds [steps=N]` linearly interpolates from the current point.
+  The first move occurs one interval after the preceding frame, and the final
+  move reaches the requested endpoint exactly at `dur` after that frame.
+  Default steps are `max(1,floor(dur*60))`; explicit steps are integers 1..3600
+  and can override the usual cadence for diagnostic probes.
+- `hold seconds` emits stationary state4 frames at approximately 60 Hz,
+  including the exact duration endpoint. Move and hold durations are 0.001..60
+  seconds. Holds do not lift or restart the contact.
+- `up` emits state7 at the current point one 60 Hz tick after the prior frame.
+- `tap x,y` expands to down, a 0.1-second hold (six frames), then up.
+
+The entire script is validated before scheduling; errors identify the gesture,
+command, nearby input and reason through `VPHONE_TOUCH_SCRIPT: ...; injection disabled` (one log line). Invalid scripts inject nothing. The bounded timeline
+supports up to 16384 frames; exceeding it is an error. Unset the variable to
+disable injection. There is no interactive monitor command.
+
+Cadence uses QEMU virtual time, not wall time. If userland has not enabled
+reporting yet, injection waits. A bounded FIFO preserves transitions when SPI
+reads lag. Reporting waits and full-queue backpressure stretch the remaining
+timeline, including subsequent gestures, rather than dropping or bursting frames.
+A reset cancels the previous timeline and parses the environment again.
+
+Report 0x70 is UI lock control (`MTDeviceSetUILocked`): 1 enters UI lock,
+2 exits it. The firmware model queues reset-complete `60 02` at final execute
+and on unlock; it preserves a pending notification across policy changes.
+MultitouchHID uses that notification to restore its deferred InputDetectionMode.
+Report 0xbf contains two LE 16-bit masks (detectable inputs, inputs suppressing
+fingers); the injector waits for detectable bit2 with UI lock inactive. Reports
+0xaf and 0xc8 retain the face-detection and input-report controls used by that path.
+The earlier requirement for 0x70=1 was incorrect.
+
+For diagnostics only, `VPHONE_TOUCH_FORCE=1` bypasses the reporting gate while
+retaining the same script timing, FIFO and IRQ protocol. It defaults off and
+does not change the values returned by reports 0x70 or 0xbf. A forced gesture
+alone does not demonstrate that native startup policy works.
+
+Touch data uses HBPP EB phase-0 length / phase-1 data exchanges, LE
+checksums, and GPIO22 through GPIOIC group0 / AIC108. The chosen contact
+personality is report 0x74 with a 26-byte header and a 30-byte contact. D3's
+endian byte is 1 (LE); its rows/columns and D9 dimensions retain the existing
+16×27 and 640×1136 personality. These are modeled values, not captured sensor
+firmware output. End-to-end iOS behavior requires integrator validation.
+
+### Mouse input in the Cocoa window
+
+Host mouse touch input is enabled by default. Set `VPHONE_MOUSE_TOUCH=0` on
+the QEMU process to disable registration of the mouse handler. The board's
+640×1136 graphic console belongs to the named `a7-touch-display` sysbus device;
+its bound QEMU absolute-pointer handler scales X/Y from `0..INPUT_EVENT_ABS_MAX`
+to `0..640` / `0..1136` top-left pixels. Cocoa supplies the position without
+relative-pointer acceleration. Input is committed at QEMU's sync boundary,
+after Cocoa's button event and both coordinate events have arrived.
+
+Left press emits start1 followed by down3 at the press position. Dragging emits
+move4 at most once per 16,666,667 ns of QEMU virtual time (about 60 Hz), coalescing
+intermediate positions to the latest point. A stationary hold queues no extra
+frames. Release emits a final move4 at the release position, then up7, even for
+a quick click. Transitions are spaced by one tick; a full touch FIFO delays
+delivery without losing transitions or bursting overdue motion. Both mouse and
+script use the same report 0x74 builder, identity 2, raw `(x,1136-y)`, FIFO and
+GPIO22 falling-edge IRQ path.
+
+Mouse presses are ignored while **any scripted frames remain**, including the
+wait before a scheduled script and gaps between its gestures. They are also
+ignored while a previous mouse release is draining or the reporting gate is
+closed. Release and press again after the script finishes/reporting resumes;
+a held ignored press never starts later. `VPHONE_TOUCH_FORCE=1` bypasses the
+same BF detectable/UI-lock reporting gate for mouse input, but does not bypass
+script ownership. Controller stop/UI-lock or disabling BF contact detection
+cancels the current mouse session along with queued contacts; a fresh click is
+required. Machine reset clears the mouse state and pending timer.
+
+SpringBoard processes touches slowly under emulation. For the lock-screen
+slide, drag slowly rightward near y=1036, from about x=40 to x=600 over roughly
+3 guest seconds, then **pause for about 1 guest second before releasing**.
+A fast swipe may bounce back because UIKit has not processed enough movement
+before the release. Guest seconds can take substantially longer than wall time.
+
+`tests/test_mouse_touch.py` compiles the actual sequencer, QEMU callbacks and
+frame builder with host stubs under ASan/UBSan. It checks coordinate scaling,
+Cocoa event ordering, contact states/identity/raw coordinates, motion coalescing,
+quick clicks, FIFO/gate waits, final release coordinates, ignored buttons/consoles,
+and script/force/disable policies. The SPI harness also checks controller-stop
+cancellation. These tests do not replace a rebuilt QEMU/Cocoa/iOS run.
+
+Run `python3 backend/touch_input_contract_test.py` and its diagnostic `--force`
+variant against the rebuilt QEMU for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
+actual source with host stubs and exercises a complete gesture under ASan/UBSan.
+For a live screen probe, use `backend/display_probe.py --stop-condition duration`
+with `--seconds 90` so it continues through the scheduled gesture; this mode
+still captures the final framebuffer and stops on a kernel panic.
