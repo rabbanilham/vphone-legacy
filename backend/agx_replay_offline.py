@@ -115,11 +115,10 @@ def fragment_words(f, ppp):
             ptr = data[k] | (data[k + 1] << 32)
             if not 0x1000 <= ptr < (1 << 40):
                 break  # contiguous pointer list; the rest may be the next draw's
-            if True:
-                try:
-                    found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
-                except (KeyError, ValueError):
-                    pass
+            try:
+                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(8)]))
+            except (KeyError, ValueError):
+                pass
     return found
 
 
@@ -148,13 +147,14 @@ def decode_tsw(f, tsw):
 def texture(f, ppp):
     """First texture state word block among the fragment data; None for vibrancy."""
     words = fragment_words(f, ppp)
-    vibrancy = any(tuple(ws[:3]) == LUMA for _, ws in words)
+    vibrancy = any(tuple(ws[i:i + 3]) == LUMA for _, ws in words for i in range(len(ws) - 2))
     for _, ws in words:
-        for k in range(0, 8):  # TSW starts within words 0..7 (word 7 for vibrancy)
-            tex = decode_tsw(f, ws[k:k + 4])
-            if tex:
-                tex['vibrancy'] = vibrancy
-                return tex
+        for k in (0, 4):  # TSW starts at valid 16-byte aligned offset (0 or 4)
+            if len(ws) >= k + 4:
+                tex = decode_tsw(f, ws[k:k + 4])
+                if tex:
+                    tex['vibrancy'] = vibrancy
+                    return tex
     return None
 
 
@@ -269,6 +269,21 @@ def main():
     ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
     target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
     fb = bytearray(target_w * target_h * 4)
+    target = f.header.get('pbe_target')
+    if target and target in f.pages:
+        strip = ((target + 0x9000) // 4096 * 4096 in f.pages and
+                 (target + 0xa000) // 4096 * 4096 not in f.pages)
+        stride = 2560 if strip else ((target_w + 15) & ~15) * 4
+        for y in range(target_h):
+            for x in range(target_w):
+                gva = (target + (y >> 4) * 0x10000 + (y & 15) * stride + x * 4 if strip
+                       else target + y * stride + x * 4)
+                try:
+                    b, g, r, a = f.read(gva, 4)
+                    off = (y * target_w + x) * 4
+                    fb[off:off + 4] = bytes((r, g, b, a))
+                except KeyError:
+                    pass
     for vs_data, ppp, draw, viewport in walk(f):
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
@@ -328,15 +343,18 @@ def main():
                         continue
                     if tex.get('vibrancy'):
                         fb[d:d + 3] = bytes(blend_vibrancy(tuple(fb[d:d + 3]), (r, g, b, a)))
+                        fb[d + 3] = min(255, a + fb[d + 3] * (255 - a) // 255) if fb[d + 3] else a
                     else:
-                        for c, src in enumerate((r, g, b)):
+                        for c, src in enumerate((r, g, b, a)):
                             fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
-                    fb[d + 3] = 255
-        else:
-            colour = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 20 else 0xff000000
+        elif stride == 20:
+            colour = struct.unpack_from('<I', vs[0][2], 0)[0]
             r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
             for y in range(y0, y1):
-                fb[(y * target_w + x0) * 4:(y * target_w + x1) * 4] = bytes((r, g, b, a)) * (x1 - x0)
+                for x in range(x0, x1):
+                    d = (y * target_w + x) * 4
+                    for c, src in enumerate((r, g, b, a)):
+                        fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
     png(sys.argv[2], target_w, target_h, bytes(fb))
 
 
