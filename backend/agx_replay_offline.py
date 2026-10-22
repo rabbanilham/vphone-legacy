@@ -333,15 +333,6 @@ def main():
             tint = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 28 else 0xffffffff
             mask = prog == DEST_IN
 
-            if mask and (target_w < 640 or target_h < 1136):
-                # CA layer mask (DEST_IN) on offscreen passes: pixels outside the mask quad
-                # have mask alpha = 0 (D * 0 = 0). Clear canvas outside to transparent.
-                for cy in range(target_h):
-                    for cx in range(target_w):
-                        if not (x0 <= cx < x1 and y0 <= cy < y1):
-                            cd = (cy * target_w + cx) * 4
-                            fb[cd:cd + 4] = b'\x00\x00\x00\x00'
-
             sub_w = (u1 - u0) * su
             sub_h = (v1 - v0) * sv
             is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1

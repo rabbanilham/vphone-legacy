@@ -25,7 +25,7 @@ class AGXReplayThreadTests(unittest.TestCase):
     def test_thread_safety_invariants(self):
         source = SOURCE.read_text()
         # Verify thread-local re-entrant buffers in replay
-        self.assertIn('static __thread uint32_t row[640 * 4], texrow[0x4000];', source)
+        self.assertRegex(source, r'static __thread uint32_t row\[640 \* 4\], texrow\[0x4000\]')
         # Verify RCU registration and locking in worker thread
         self.assertIn('rcu_register_thread();', source)
         self.assertIn('rcu_unregister_thread();', source)

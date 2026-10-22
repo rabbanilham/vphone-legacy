@@ -5620,28 +5620,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                           fabsf((float)(y1 - y0) - sub_h) > 0.1f);
             int cached_y0 = -1, cached_y1 = -1;
 
-            if (dest_in && (sf.base < UINT64_C(0x400000000) || width < 640 || height < 1136)) {
-                /* CA layer mask (DEST_IN) on offscreen passes: outside the mask quad,
-                 * mask alpha is 0 (D * 0 = 0). Clear canvas outside to transparent. */
-                uint32_t zero_row[1024];
-                memset(zero_row, 0, sizeof(zero_row));
-                for (uint32_t cy = 0; cy < height; cy++) {
-                    if (cy < (uint32_t)y0 || cy >= (uint32_t)y1) {
-                        for (uint32_t cx = 0; cx < width; cx += 1024) {
-                            uint32_t chunk = MIN(width - cx, 1024u);
-                            agx_ctx_write(s, cat, agx_surface_gva(&sf, cx, cy), zero_row, chunk * 4);
-                        }
-                    } else {
-                        if (x0 > 0) {
-                            agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, cy), zero_row, (uint32_t)x0 * 4);
-                        }
-                        if ((uint32_t)x1 < width) {
-                            agx_ctx_write(s, cat, agx_surface_gva(&sf, x1, cy), zero_row, (width - (uint32_t)x1) * 4);
-                        }
-                    }
-                }
-            }
-
             draws++;
             for (int y = y0; y < y1; y++) {
                 if (!textured) {

@@ -2,7 +2,7 @@
 - USC blur program fingerprint table (9 programs)
 - PDS pointer list traversal termination on unmapped/invalid word
 - Row-cached bilinear interpolation for scaled textures
-- Porter-Duff DEST_IN padding zeroing on offscreen passes
+- (offscreen DEST_IN padding is left to the pass load action; see handover)
 - 4-channel vibrancy blending with alpha attenuation
 """
 import importlib.util
