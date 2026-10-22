@@ -4927,15 +4927,25 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
         }
         for (unsigned k = 0; k < 8 && count < ARRAY_SIZE(blocks); k += 2) {
             uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
-            if (ptr >= 0x1000 && ptr < (UINT64_C(1) << 40) &&
-                agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
+            /* The pointer list is contiguous from offset 0. Stop at the first
+             * non-pointer: the rest of the 8-word read can be the NEXT draw's
+             * PDS data (status-bar blur backdrop borrowing the "Searching"
+             * texture, agy B4). */
+            if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) {
+                break;
+            }
+            if (agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
                 vibrancy |= !memcmp(blocks[count], luma, sizeof(luma));
                 count++;
             }
         }
     }
     for (unsigned b = 0; b < count; b++) {
-        for (unsigned k = 0; k + 4 <= 12; k++) {
+        /* A TSW starts within the block's first 8 words (word 7 behind the
+         * vibrancy luma constants, handover section 16). Word 8 onwards is the
+         * next allocation: the status-bar blur backdrop otherwise picked up
+         * the following draw's TSW (agy B4). */
+        for (unsigned k = 0; k <= 7; k++) {
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
                 return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }

@@ -113,7 +113,9 @@ def fragment_words(f, ppp):
             continue
         for k in range(0, 8, 2):
             ptr = data[k] | (data[k + 1] << 32)
-            if 0x1000 <= ptr < (1 << 40):
+            if not 0x1000 <= ptr < (1 << 40):
+                break  # contiguous pointer list; the rest may be the next draw's
+            if True:
                 try:
                     found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
                 except (KeyError, ValueError):
@@ -148,7 +150,7 @@ def texture(f, ppp):
     words = fragment_words(f, ppp)
     vibrancy = any(tuple(ws[:3]) == LUMA for _, ws in words)
     for _, ws in words:
-        for k in range(0, 9):
+        for k in range(0, 8):  # TSW starts within words 0..7 (word 7 for vibrancy)
             tex = decode_tsw(f, ws[k:k + 4])
             if tex:
                 tex['vibrancy'] = vibrancy
