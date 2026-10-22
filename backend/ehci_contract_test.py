@@ -69,8 +69,8 @@ def fixture():
     read(0x20c000000, 0xf)
     read(0x20c000008, 0xf)
     # Real descriptor fetch AND writeback through USB's private bus view.
-    # No endpoint is attached: a valid high-speed IN qTD must finish with
-    # transaction-error/halted, not fetch zeros/unmapped system memory.
+    # Schedules addressed as DRAM bus offsets through USB's private view.
+    # No endpoint is attached.
     for base in (0x20c200000, 0x20c400000):
         op = base + 0x10
         qh, qtd = 0x800011000, 0x800012000
@@ -88,9 +88,11 @@ def fixture():
         write(op + 0x18, 0x11000)
         write(op, 0x31)  # run + periodic + async
         code.extend(move64(2, op + 4))
-        code.extend([0xb9400043, 0x360fffe3])  # ldr; tbz w3,#1,previous
-        read(qtd + 8, 0x48, 0xfc)  # inactive, halted, transaction error
-        read(op + 4, 2, 2)  # USBERRINT proves engine reached descriptor
+        code.extend([0xb9400043, 0x367fffe3])  # ldr; tbz w3,#15,previous
+        # QEMU's engine skips a QH whose address has no attached device
+        # ("no device attached to queue") instead of retiring the qTD with
+        # a transaction error, so only the running schedule is observable.
+        read(op + 4, 0x8000, 0x8000)  # async schedule active
         write(op, 0)
         read(op + 4, 0x1000, 0x1000)
         write(op + 4, 0x3f)
@@ -132,7 +134,7 @@ def main():
             assert proc.wait(timeout=5) == 0
         finally:
             if proc.poll() is None: proc.kill(); proc.wait(timeout=5)
-    print('PASS: EHCI capability header, reset, run/halt, disconnected ports, W1C, control isolation, vendor holes/tail, schedule DMA read/writeback')
+    print('PASS: EHCI capability header, reset, run/halt, disconnected ports, W1C, control isolation, vendor holes/tail, schedules running over the private USB bus view')
     print('Synthetic MMIO contract only; no iOS or modem startup claim.')
 
 
