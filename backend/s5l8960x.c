@@ -4817,6 +4817,29 @@ static unsigned agx_vdm_draw_count(A7State *s, uint64_t cat, const uint8_t *ta)
     return draws;
 }
 
+/* Row-wise counterpart of agx_ctx_read: one page walk and one memory-API
+ * write per page instead of a walk plus a store per pixel, which made the
+ * replay hold the BQL for most of each frame (probe-162 host profile). */
+static bool agx_ctx_write(A7State *s, uint64_t cat, uint64_t gva, const void *buf, size_t n)
+{
+    const uint8_t *in = buf;
+    bool ok = true;
+    while (n) {
+        hwaddr pa;
+        size_t chunk = MIN(n, 0x1000 - (gva & 0xfff));
+        /* Like the old per-pixel stores, skip only the unmapped pages. */
+        if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+            address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                in, chunk) != MEMTX_OK) {
+            ok = false;
+        }
+        in += chunk;
+        gva += chunk;
+        n -= chunk;
+    }
+    return ok;
+}
+
 static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
                            uint64_t target, uint32_t queue, const uint8_t *raw)
 {
@@ -5322,15 +5345,6 @@ static uint64_t agx_replay_program(A7State *s, uint64_t cat, const uint32_t *ppp
     return h;
 }
 
-static void agx_replay_put(A7State *s, uint64_t cat, const AGXSurface *target,
-                           unsigned x, unsigned y, uint32_t bgra)
-{
-    hwaddr pa;
-    if (agx_gpu_translate_ctx(s, cat, agx_surface_gva(target, x, y), &pa)) {
-        address_space_stl_le(&address_space_memory, pa, bgra, MEMTXATTRS_UNSPECIFIED, NULL);
-    }
-}
-
 /* High-level replay of a CoreAnimation frame: walk the TA VDM stream and
  * draw each axis-aligned quad (solid vertex colour or one BGRA texture,
  * premultiplied src-over) into the 640x1136 colour target. */
@@ -5531,9 +5545,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         continue;
                     }
                     for (int x = x0; x < x1; x++) {
-                        agx_replay_put(s, cat, &sf, x, y,
-                                       agx_blend_over(row[x - x0], colour));
+                        row[x - x0] = agx_blend_over(row[x - x0], colour);
                     }
+                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                     continue;
                 }
                 float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
@@ -5576,9 +5590,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         row[x - x0] = agx_blend_over(dst, src);
                     }
                 }
-                for (int x = x0; x < x1; x++) {
-                    agx_replay_put(s, cat, &sf, x, y, row[x - x0]);
-                }
+                agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
             }
             g_free(blurred_tex);
         } else {
