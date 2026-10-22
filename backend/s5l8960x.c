@@ -767,7 +767,13 @@ static uint64_t aic_read(void *opaque, hwaddr off, unsigned size)
         }
         return 0;
     }
-    if (off == 4) { return 192; }
+    if (off == 4) {
+        /* AppleInterruptController::start (10e5fe8) takes bits 20:16 as the
+         * CPU count minus one and bits 9:0 as the external IRQ count. With 0
+         * there it believed one CPU and its IPID path (10e63d0) refused every
+         * IPI to CPU1, which then only woke on its own timer. */
+        return ((uint64_t)(MACHINE(s)->smp.cpus - 1) << 16) | 192;
+    }
     if (off >= 0x3000 && off < 0x4000) { return s->targets[(off - 0x3000) / 4]; }
     if (off >= 0x4100 && off < 0x4180) { return s->mask[(off - 0x4100) / 4]; }
     if (off >= 0x4200 && off < 0x4280) {
@@ -794,6 +800,11 @@ static void aic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             if (val & 0x80000000) { s->ipi[c] |= 0x80000000; }
             break;
         case 0xc: s->ipi[c] &= ~val; break;
+        case 0x1c:
+            /* IPID sends "other" IPIs by writing 1 to 0x501c + cpu * 0x80
+             * (10e63e4); in that window c is the target CPU. */
+            if (val & 1) { s->ipi[c] |= 1; }
+            break;
         case 0x24: s->ipi_mask[c] |= val; break;
         case 0x28: s->ipi_mask[c] &= ~val; break;
         default: break;

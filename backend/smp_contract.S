@@ -32,11 +32,13 @@ _start:
     str w0, [x7, #8]           // enable_core(cpu1)
 2:  ldr w0, [x4]
     cbz w0, 2b
-    // CPU1 consumed the IPI queued while powered off. Send another after ACK.
+    // CPU1 consumed the IPI queued while powered off. Send another after ACK,
+    // this time through CPU1's own window (IPID writes 0x501c + cpu * 0x80).
 3:  ldr w0, [x4, #8]
     cbz w0, 3b
-    mov w0, #2
-    str w0, [x5, #0x2008]
+    mov w0, #1
+    mov x9, #0x509c
+    str w0, [x5, x9]
 4:  ldr w0, [x4, #4]
     cbz w0, 4b
     mov w0, #0x80000000
@@ -48,6 +50,8 @@ _start:
     ldr w0, [x4, #8]
     cmp w0, #2
     b.ne 5b
+    ldr w0, [x5, #4]           // AIC_INFO: CPU count - 1 in bits 20:16
+    str w0, [x4, #32]
     mov w0, #0xface
     str w0, [x4, #24]
 6:  b 6b

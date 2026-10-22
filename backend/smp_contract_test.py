@@ -61,13 +61,13 @@ def run_case(root):
             command(fp, 'cont')
             while True:
                 dump = command(fp, 'human-monitor-command', {
-                    'command-line': 'xp /8wx 0x800020000'})
+                    'command-line': 'xp /9wx 0x800020000'})
                 actual = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', dump)]
-                if actual and actual[-2] == 0xface:
+                if len(actual) > 6 and actual[6] == 0xface:
                     break
                 assert time.monotonic() < deadline, dump
                 time.sleep(.01)
-            assert actual == [0x11, 1, 2, 1, 1, 0, 0xface, 0], actual
+            assert actual == [0x11, 1, 2, 1, 1, 0, 0xface, 0, 0x100c0], actual
             command(fp, 'quit')
         assert proc.wait(timeout=5) == 0
     finally:
@@ -80,7 +80,7 @@ def main():
     assert BINARY.exists(), 'Build backend first with scripts/qemu/build_backend.py'
     with tempfile.TemporaryDirectory(prefix='a7smp-', dir='/tmp') as directory:
         run_case(Path(directory))
-    print('PASS: powered-off CPU1, PMGR release, CPU1 marker, cross/self IPIs on both cores')
+    print('PASS: powered-off CPU1, PMGR release, CPU1 marker, cross/self IPIs on both cores, per-CPU IPID send, AIC_INFO CPU count')
     print('Synthetic EL1 contract only; native EL3/iOS startup still requires validation.')
 
 
