@@ -5529,8 +5529,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
         } else if (kind == 3) {
             uint32_t stride, count;
             uint64_t buf;
-            float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
-            uint32_t colour = 0xff000000;
             AGXTexture tex;
 
             if (!agx_ctx_read(s, cat, pc + 4, w + 1, 8)) {
@@ -5542,58 +5540,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 12 || stride > 64) {
                 continue;
             }
-            float m4[4];
-            bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
-            for (unsigned i = 0; i < count; i++) {
-                float xy[2];
-                if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
-                    break;
-                }
-                if (transformed) {
-                    /* screen-space position -> NDC -> pass pixels */
-                    xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
-                    xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
-                }
-                minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
-                miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
-            }
-            /* Vertex layouts seen from CA: stride 20 = position + BGRA colour;
-             * 24 = position + normalised u,v; 28 = position + BGRA tint +
-             * u,v in texels. */
-            float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
-            uint32_t tint = 0xffffffff;
-            if (stride == 20) {
-                agx_ctx_read(s, cat, buf + 16, &colour, 4);
-            } else if (stride == 24 || stride == 28) {
-                unsigned uv = stride == 28 ? 20 : 16;
-                u0 = v0 = 1e9; u1 = v1 = -1e9;
-                if (stride == 28) {
-                    agx_ctx_read(s, cat, buf + 16, &tint, 4);
-                }
-                for (unsigned i = 0; i < count; i++) {
-                    float t[2];
-                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride + uv, t, 8)) {
-                        break;
-                    }
-                    u0 = MIN(u0, t[0]); u1 = MAX(u1, t[0]);
-                    v0 = MIN(v0, t[1]); v1 = MAX(v1, t[1]);
-                }
-            }
-            int x0 = MAX(0, (int)lroundf(minx)), y0 = MAX(0, (int)lroundf(miny));
-            int x1 = MIN((int)width, (int)lroundf(maxx)), y1 = MIN((int)height, (int)lroundf(maxy));
-            if (x0 >= x1 || y0 >= y1 || !(u1 >= u0) || !(v1 >= v0)) {
-                continue;
-            }
             int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
-            if ((found == AGX_TEX_NONE && stride != 20) ||
+            uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
+            bool is_blur_prog = agx_is_blur_program(prog);
+            if ((found == AGX_TEX_NONE && stride != 20 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 continue;
             }
             bool textured = found != AGX_TEX_NONE;
             bool vibrancy = found == AGX_TEX_VIBRANCY;
-            uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
             bool dest_in = textured && prog == AGX_USC_DEST_IN;
-            bool is_blur = textured && agx_is_blur_program(prog);
+            bool is_blur = textured && is_blur_prog;
             uint32_t *blurred_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
                 uint32_t *raw_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
@@ -5616,107 +5573,191 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 g_free(raw_tex);
                 g_free(tmp_tex);
             }
-            /* Texel-unit coordinates (rectangle textures) exceed 1. */
-            float su = textured && MAX(u1, v1) <= 1.0001f ? tex.w : 1;
-            float sv = textured && MAX(u1, v1) <= 1.0001f ? tex.h : 1;
-            float sub_w = (u1 - u0) * su;
-            float sub_h = (v1 - v0) * sv;
-            bool is_scaled = textured && (fabsf((float)(x1 - x0) - sub_w) > 0.1f ||
-                                          fabsf((float)(y1 - y0) - sub_h) > 0.1f);
-            int cached_y0 = -1, cached_y1 = -1;
 
-            draws++;
-            for (int y = y0; y < y1; y++) {
+            unsigned step = (count == 4) ? 4 : 6;
+            bool any_drawn = false;
+            for (unsigned q_start = 0; q_start + step <= count; q_start += step) {
+                float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+                float m4[4];
+                bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
+                for (unsigned i = q_start; i < q_start + step; i++) {
+                    float xy[2];
+                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                        break;
+                    }
+                    if (transformed) {
+                        /* screen-space position -> NDC -> pass pixels */
+                        xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
+                        xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
+                    }
+                    minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
+                    miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
+                }
+
+                float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
+                uint32_t tint = 0xffffffff;
+                uint32_t colour = 0xff000000;
+                if (stride == 20) {
+                    agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &colour, 4);
+                } else if (stride == 24 || stride == 28) {
+                    unsigned uv = stride == 28 ? 20 : 16;
+                    u0 = v0 = 1e9; u1 = v1 = -1e9;
+                    if (stride == 28) {
+                        agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &tint, 4);
+                    }
+                    for (unsigned i = q_start; i < q_start + step; i++) {
+                        float t[2];
+                        if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride + uv, t, 8)) {
+                            break;
+                        }
+                        u0 = MIN(u0, t[0]); u1 = MAX(u1, t[0]);
+                        v0 = MIN(v0, t[1]); v1 = MAX(v1, t[1]);
+                    }
+                }
+
+                int x0 = MAX(0, (int)lroundf(minx)), y0 = MAX(0, (int)lroundf(miny));
+                int x1 = MIN((int)width, (int)lroundf(maxx)), y1 = MIN((int)height, (int)lroundf(maxy));
+                if (x0 >= x1 || y0 >= y1 || !(u1 >= u0) || !(v1 >= v0)) {
+                    continue;
+                }
+                any_drawn = true;
+
+                if (stride == 12 && is_blur_prog && !textured) {
+                    /* Untextured Gaussian blur backdrop pass on canvas */
+                    uint32_t bw = (uint32_t)(x1 - x0), bh = (uint32_t)(y1 - y0);
+                    if (bw > 0 && bh > 0 && bw <= 2048 && bh <= 2048) {
+                        uint32_t *raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        uint32_t *tmp_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        if (raw_tex && tmp_tex) {
+                            bool read_ok = true;
+                            for (uint32_t y = 0; y < bh; y++) {
+                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y0 + y),
+                                                  raw_tex + (size_t)y * bw, bw * 4)) {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                            if (read_ok) {
+                                agx_blur_texture(raw_tex, tmp_tex, bw, bh);
+                                for (uint32_t y = 0; y < bh; y++) {
+                                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y0 + y),
+                                                  raw_tex + (size_t)y * bw, bw * 4);
+                                }
+                            }
+                        }
+                        g_free(raw_tex);
+                        g_free(tmp_tex);
+                    }
+                    continue;
+                }
+
                 if (!textured) {
+                    for (int y = y0; y < y1; y++) {
+                        if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
+                                          (x1 - x0) * 4)) {
+                            continue;
+                        }
+                        for (int x = x0; x < x1; x++) {
+                            row[x - x0] = agx_blend_over(row[x - x0], colour);
+                        }
+                        agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
+                    }
+                    continue;
+                }
+
+                /* Texel-unit coordinates (rectangle textures) exceed 1. */
+                float su = MAX(u1, v1) <= 1.0001f ? tex.w : 1;
+                float sv = MAX(u1, v1) <= 1.0001f ? tex.h : 1;
+                float sub_w = (u1 - u0) * su;
+                float sub_h = (v1 - v0) * sv;
+                bool is_scaled = (fabsf((float)(x1 - x0) - sub_w) > 0.1f ||
+                                  fabsf((float)(y1 - y0) - sub_h) > 0.1f);
+                int cached_y0 = -1, cached_y1 = -1;
+
+                for (int y = y0; y < y1; y++) {
+                    float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
+                    uint32_t ty0 = 0, ty1 = 0;
+                    float fy = 0.0f;
+                    if (!blurred_tex) {
+                        if (is_scaled) {
+                            float v_sample = fv * sv - 0.5f;
+                            if (v_sample < 0.0f) v_sample = 0.0f;
+                            if (v_sample > (float)(tex.h - 1)) v_sample = (float)(tex.h - 1);
+                            ty0 = (uint32_t)v_sample;
+                            ty1 = ty0 + 1 < tex.h ? ty0 + 1 : ty0;
+                            fy = v_sample - (float)ty0;
+
+                            if ((int)ty0 != cached_y0) {
+                                if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                                    continue;
+                                }
+                                cached_y0 = (int)ty0;
+                            }
+                            if (ty1 != ty0 && (int)ty1 != cached_y1) {
+                                if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty1), texrow1, tex.w * 4)) {
+                                    continue;
+                                }
+                                cached_y1 = (int)ty1;
+                            }
+                        } else {
+                            ty0 = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                                continue;
+                            }
+                        }
+                    }
                     if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
                                       (x1 - x0) * 4)) {
                         continue;
                     }
                     for (int x = x0; x < x1; x++) {
-                        row[x - x0] = agx_blend_over(row[x - x0], colour);
+                        float fu = u0 + (u1 - u0) * (x - x0 + 0.5f) / (x1 - x0);
+                        uint32_t src;
+                        if (blurred_tex) {
+                            src = agx_sample_bilinear(blurred_tex, tex.w, tex.h, fu * su, fv * sv);
+                        } else if (is_scaled) {
+                            float u_sample = fu * su - 0.5f;
+                            if (u_sample < 0.0f) u_sample = 0.0f;
+                            if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                            uint32_t tx0 = (uint32_t)u_sample;
+                            uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                            float fx = u_sample - (float)tx0;
+                            uint32_t c00 = texrow[tx0];
+                            uint32_t c10 = texrow[tx1];
+                            uint32_t c01 = (ty1 == ty0) ? texrow[tx0] : texrow1[tx0];
+                            uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
+                            src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
+                        } else {
+                            uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                            src = texrow[tx];
+                        }
+                        uint32_t dst = row[x - x0], out = 0;
+                        if (tint != 0xffffffff) {
+                            uint32_t m = 0;
+                            for (unsigned c = 0; c < 32; c += 8) {
+                                m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
+                            }
+                            src = m;
+                        }
+                        if (dest_in) {
+                            uint32_t a = src >> 24;
+                            for (unsigned c = 0; c < 32; c += 8) {
+                                out |= (((dst >> c) & 0xff) * a / 255) << c;
+                            }
+                            row[x - x0] = out;
+                        } else if (vibrancy) {
+                            row[x - x0] = agx_blend_vibrancy(dst, src);
+                        } else {
+                            row[x - x0] = agx_blend_over(dst, src);
+                        }
                     }
                     agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
-                    continue;
                 }
-                float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
-                uint32_t ty0 = 0, ty1 = 0;
-                float fy = 0.0f;
-                if (!blurred_tex) {
-                    if (is_scaled) {
-                        float v_sample = fv * sv - 0.5f;
-                        if (v_sample < 0.0f) v_sample = 0.0f;
-                        if (v_sample > (float)(tex.h - 1)) v_sample = (float)(tex.h - 1);
-                        ty0 = (uint32_t)v_sample;
-                        ty1 = ty0 + 1 < tex.h ? ty0 + 1 : ty0;
-                        fy = v_sample - (float)ty0;
-
-                        if ((int)ty0 != cached_y0) {
-                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
-                                continue;
-                            }
-                            cached_y0 = (int)ty0;
-                        }
-                        if (ty1 != ty0 && (int)ty1 != cached_y1) {
-                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty1), texrow1, tex.w * 4)) {
-                                continue;
-                            }
-                            cached_y1 = (int)ty1;
-                        }
-                    } else {
-                        ty0 = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
-                        if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
-                            continue;
-                        }
-                    }
-                }
-                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
-                                  (x1 - x0) * 4)) {
-                    continue;
-                }
-                for (int x = x0; x < x1; x++) {
-                    float fu = u0 + (u1 - u0) * (x - x0 + 0.5f) / (x1 - x0);
-                    uint32_t src;
-                    if (blurred_tex) {
-                        src = agx_sample_bilinear(blurred_tex, tex.w, tex.h, fu * su, fv * sv);
-                    } else if (is_scaled) {
-                        float u_sample = fu * su - 0.5f;
-                        if (u_sample < 0.0f) u_sample = 0.0f;
-                        if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
-                        uint32_t tx0 = (uint32_t)u_sample;
-                        uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
-                        float fx = u_sample - (float)tx0;
-                        uint32_t c00 = texrow[tx0];
-                        uint32_t c10 = texrow[tx1];
-                        uint32_t c01 = (ty1 == ty0) ? texrow[tx0] : texrow1[tx0];
-                        uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
-                        src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
-                    } else {
-                        uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
-                        src = texrow[tx];
-                    }
-                    uint32_t dst = row[x - x0], out = 0;
-                    if (tint != 0xffffffff) {
-                        uint32_t m = 0;
-                        for (unsigned c = 0; c < 32; c += 8) {
-                            m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
-                        }
-                        src = m;
-                    }
-                    if (dest_in) {
-                        uint32_t a = src >> 24;
-                        for (unsigned c = 0; c < 32; c += 8) {
-                            out |= (((dst >> c) & 0xff) * a / 255) << c;
-                        }
-                        row[x - x0] = out;
-                    } else if (vibrancy) {
-                        row[x - x0] = agx_blend_vibrancy(dst, src);
-                    } else {
-                        row[x - x0] = agx_blend_over(dst, src);
-                    }
-                }
-                agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
             }
             g_free(blurred_tex);
+            if (any_drawn) {
+                draws++;
+            }
         } else {
             qemu_log_mask(LOG_GUEST_ERROR, "AGX replay: unknown VDM block 0x%x at 0x%llx\n",
                           w[0], (unsigned long long)pc);

@@ -4,6 +4,7 @@ Walks the VDM stream from the TA command, decodes each draw's vertices
 (vertex PDS data: stride, buffer) and texture state words (PPP -> fragment
 PDS data -> TSW), then rasterises axis-aligned quads with src-over blending.
 """
+from pathlib import Path
 import struct
 import sys
 import zlib
@@ -271,7 +272,126 @@ def texel(f, tex, x, y):
         return b'\0\0\0\0'
 
 
+def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
+    """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
+    count = draw[1]
+    w0 = draw[0]
+    kind = w0 >> 29
+    if kind != 3:
+        return 'skipped: unknown VDM block', {'kind': kind}
+
+    try:
+        stride, vs = vertices(f, vs_data, count)
+    except Exception as e:
+        return 'skipped: unmapped memory', {'error': str(e)}
+
+    if stride is None or stride < 12 or stride > 64:
+        return 'skipped: unmapped memory', {'stride': stride}
+
+    tex = texture(f, ppp)
+    prog = program(f, ppp)
+
+    if not tex and stride != 20:
+        if stride == 12 and prog in BLUR_PROGRAMS:
+            return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
+        return 'skipped: untextured with stride != 20', {'stride': stride, 'prog': hex(prog)}
+
+    if tex and tex['w'] * 4 > 0x10000:
+        return 'skipped: texture wider than texrow', {'width': tex['w']}
+
+    m = find_matrix(f, vs_data) if stride != 12 else None
+    vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
+
+    step = 4 if count == 4 else 6
+    for q_start in range(0, count, step):
+        q_vs = vs[q_start:q_start + step]
+        if len(q_vs) < step:
+            break
+        if m:
+            xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in q_vs]
+            ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in q_vs]
+        else:
+            xs = [v[0] for v in q_vs]
+            ys = [v[1] for v in q_vs]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        for x, y in zip(xs, ys):
+            if not ((abs(x - minx) < 1e-3 or abs(x - maxx) < 1e-3) and
+                    (abs(y - miny) < 1e-3 or abs(y - maxy) < 1e-3)):
+                return 'skipped: non-axis-aligned or rotated geometry', {'quad': q_start // step}
+
+    if not tex and stride == 20:
+        if count == 12:
+            return 'replayed exactly: solid multi-quad (2 quads, stride=20)', {'count': count}
+        return 'replayed exactly: solid quad (stride=20)', {'count': count}
+
+    is_blur = prog in BLUR_PROGRAMS
+    is_dest_in = prog == DEST_IN
+    is_vibrancy = tex.get('vibrancy', False)
+
+    uv_off = 4 if stride == 28 else 0
+    uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 else [(0, 0), (1, 1)])
+    u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
+    v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
+    su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+    xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
+    ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
+    x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
+    y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
+    sub_w = (u1 - u0) * su
+    sub_h = (v1 - v0) * sv
+    is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
+
+    if is_blur:
+        return 'approximated: Gaussian blur (separable 6-tap)', {'prog': hex(prog)}
+    elif is_dest_in:
+        if is_scaled:
+            return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
+        return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
+    elif is_vibrancy:
+        return 'approximated: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
+    elif is_scaled:
+        return 'approximated: textured quad (bilinear scaled)', {'prog': hex(prog)}
+    else:
+        return 'replayed exactly: textured quad (1:1 nearest)', {'prog': hex(prog)}
+
+
+def audit_frame(f):
+    """Walk frame f and return list of (draw_idx, outcome, details)."""
+    pw = (struct.unpack_from('<I', f.type1_command, 0x74)[0] & 0xffff) + 1
+    ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
+    target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
+    outcomes = []
+    did = 0
+    for vs_data, ppp, draw, viewport in walk(f):
+        res, details = classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph)
+        outcomes.append((did, res, details))
+        did += 1
+    return outcomes
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--audit':
+        dumps_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parents[1] / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'
+        from collections import Counter, defaultdict
+        total_counts = Counter()
+        category_frames = defaultdict(set)
+        for i in range(1, 151):
+            bp = dumps_dir / f'frame-{i}.bin'
+            if not bp.exists():
+                continue
+            fr = Frame(bp)
+            for did, out, _ in audit_frame(fr):
+                total_counts[out] += 1
+                category_frames[out].add(i)
+        print(f"{'Category':<60} | {'Count':<6} | {'Frames'}")
+        print("-" * 85)
+        for cat, cnt in total_counts.most_common():
+            flist = sorted(list(category_frames[cat]))
+            fstr = f"{len(flist)} frames ({flist[0]}..{flist[-1]})" if len(flist) > 10 else f"{len(flist)} frames {flist}"
+            print(f"{cat:<60} | {cnt:<6} | {fstr}")
+        return
+
     f = Frame(sys.argv[1])
     pw = (struct.unpack_from('<I', f.type1_command, 0x74)[0] & 0xffff) + 1
     ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
@@ -297,106 +417,126 @@ def main():
         stride, vs = vertices(f, vs_data, count)
         m = find_matrix(f, vs_data) if stride != 12 else None
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
-        if m:   # screen-space position -> NDC -> pass pixels
-            xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs]
-            ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs]
-        else:
-            xs = [v[0] for v in vs]
-            ys = [v[1] for v in vs]
-        x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
-        y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
         tex = texture(f, ppp)
-        print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
-              (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
-                                                         for k, v in tex.items() if k != 'tsw'})))
-        if x0 >= x1 or y0 >= y1:
-            continue
         prog = program(f, ppp)
-        if tex:
-            is_blur = prog in BLUR_PROGRAMS
-            blurred_tex = None
-            if is_blur and tex['w'] > 0 and tex['h'] > 0:
+
+        step = 4 if count == 4 else 6
+        for q_start in range(0, count, step):
+            q_vs = vs[q_start:q_start + step]
+            if len(q_vs) < step:
+                break
+            if m:   # screen-space position -> NDC -> pass pixels
+                xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in q_vs]
+                ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in q_vs]
+            else:
+                xs = [v[0] for v in q_vs]
+                ys = [v[1] for v in q_vs]
+            x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
+            y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
+            print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
+                  (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
+                                                             for k, v in tex.items() if k != 'tsw'})))
+            if x0 >= x1 or y0 >= y1:
+                continue
+            if tex:
+                is_blur = prog in BLUR_PROGRAMS
+                blurred_tex = None
+                if is_blur and tex['w'] > 0 and tex['h'] > 0:
+                    raw_pixels = []
+                    for ty in range(tex['h']):
+                        for tx in range(tex['w']):
+                            raw_pixels.append(texel(f, tex, tx, ty))
+                    blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
+
+                # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
+                # then u,v in texels at +20.
+                uv_off = 4 if stride == 28 else 0
+                uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24
+                       else [(0, 0), (1, 1)])
+                u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
+                v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
+                su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
+                mask = prog == DEST_IN
+
+                sub_w = (u1 - u0) * su
+                sub_h = (v1 - v0) * sv
+                is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
+                tex_cached_rows = {}
+                def get_tex_row(ry):
+                    if ry not in tex_cached_rows:
+                        tex_cached_rows[ry] = [texel(f, tex, rx, ry) for rx in range(tex['w'])]
+                    return tex_cached_rows[ry]
+
+                for y in range(y0, y1):
+                    fv = (v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv
+                    if is_scaled and not blurred_tex:
+                        v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
+                        ty0 = int(v_sample)
+                        ty1 = min(tex['h'] - 1, ty0 + 1)
+                        fy = v_sample - ty0
+                        row0 = get_tex_row(ty0)
+                        row1 = get_tex_row(ty1) if ty1 != ty0 else row0
+                    else:
+                        ty = min(tex['h'] - 1, int(fv))
+                        row0 = get_tex_row(ty)
+
+                    for x in range(x0, x1):
+                        fu = (u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su
+                        if blurred_tex:
+                            b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, fv)
+                        elif is_scaled:
+                            u_sample = max(0.0, min(float(tex['w'] - 1), fu - 0.5))
+                            tx0 = int(u_sample)
+                            tx1 = min(tex['w'] - 1, tx0 + 1)
+                            fx = u_sample - tx0
+                            c00 = row0[tx0]
+                            c10 = row0[tx1]
+                            c01 = row1[tx0]
+                            c11 = row1[tx1]
+                            b, g, r, a = (
+                                max(0, min(255, int(round(
+                                    (c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
+                                    (c01[c] * (1.0 - fx) + c11[c] * fx) * fy
+                                )))) for c in range(4)
+                            )
+                        else:
+                            tx = min(tex['w'] - 1, int(fu))
+                            b, g, r, a = row0[tx]
+                        if tint != 0xffffffff:
+                            tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
+                            b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
+                        d = (y * target_w + x) * 4
+                        if mask:
+                            fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
+                            continue
+                        if tex.get('vibrancy'):
+                            fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
+                        else:
+                            for c, src in enumerate((r, g, b, a)):
+                                fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
+            elif stride == 12 and prog in BLUR_PROGRAMS:
+                bw, bh = x1 - x0, y1 - y0
                 raw_pixels = []
-                for ty in range(tex['h']):
-                    for tx in range(tex['w']):
-                        raw_pixels.append(texel(f, tex, tx, ty))
-                blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
-
-            # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
-            # then u,v in texels at +20.
-            uv_off = 4 if stride == 28 else 0
-            uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24
-                   else [(0, 0), (1, 1)])
-            u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
-            v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
-            su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
-            tint = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 28 else 0xffffffff
-            mask = prog == DEST_IN
-
-            sub_w = (u1 - u0) * su
-            sub_h = (v1 - v0) * sv
-            is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
-            tex_cached_rows = {}
-            def get_tex_row(ry):
-                if ry not in tex_cached_rows:
-                    tex_cached_rows[ry] = [texel(f, tex, rx, ry) for rx in range(tex['w'])]
-                return tex_cached_rows[ry]
-
-            for y in range(y0, y1):
-                fv = (v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv
-                if is_scaled and not blurred_tex:
-                    v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
-                    ty0 = int(v_sample)
-                    ty1 = min(tex['h'] - 1, ty0 + 1)
-                    fy = v_sample - ty0
-                    row0 = get_tex_row(ty0)
-                    row1 = get_tex_row(ty1) if ty1 != ty0 else row0
-                else:
-                    ty = min(tex['h'] - 1, int(fv))
-                    row0 = get_tex_row(ty)
-
-                for x in range(x0, x1):
-                    fu = (u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su
-                    if blurred_tex:
-                        b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, fv)
-                    elif is_scaled:
-                        u_sample = max(0.0, min(float(tex['w'] - 1), fu - 0.5))
-                        tx0 = int(u_sample)
-                        tx1 = min(tex['w'] - 1, tx0 + 1)
-                        fx = u_sample - tx0
-                        c00 = row0[tx0]
-                        c10 = row0[tx1]
-                        c01 = row1[tx0]
-                        c11 = row1[tx1]
-                        b, g, r, a = (
-                            max(0, min(255, int(round(
-                                (c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
-                                (c01[c] * (1.0 - fx) + c11[c] * fx) * fy
-                            )))) for c in range(4)
-                        )
-                    else:
-                        tx = min(tex['w'] - 1, int(fu))
-                        b, g, r, a = row0[tx]
-                    if tint != 0xffffffff:
-                        tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
-                        b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
-                    d = (y * target_w + x) * 4
-                    if mask:
-                        fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
-                        continue
-                    if tex.get('vibrancy'):
-                        fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
-                    else:
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        d = (y * target_w + x) * 4
+                        r, g, b, a = fb[d:d + 4]
+                        raw_pixels.append((b, g, r, a))
+                blurred = gaussian_blur_texture(raw_pixels, bw, bh)
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
+                        d = (y * target_w + x) * 4
+                        fb[d:d + 4] = bytes((r, g, b, a))
+            elif stride == 20:
+                colour = struct.unpack_from('<I', q_vs[0][2], 0)[0]
+                r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        d = (y * target_w + x) * 4
                         for c, src in enumerate((r, g, b, a)):
                             fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
-        elif stride == 20:
-            colour = struct.unpack_from('<I', vs[0][2], 0)[0]
-            r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    d = (y * target_w + x) * 4
-                    for c, src in enumerate((r, g, b, a)):
-                        fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
     png(sys.argv[2], target_w, target_h, bytes(fb))
 
 
