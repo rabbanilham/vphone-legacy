@@ -80,3 +80,10 @@ def snapshot(gs, memory, u64, out, mapping_path, index_path, output_name='ca-thr
                 result.append(record)
             proc=u64(gs,proc+0xb0)
     (out/output_name).write_text(json.dumps(dict(cache_slide=hex(slide),tasks=result,process_inventory=inventory),indent=2)+'\n')
+    from iokit_probe_state import capture_iokit, capture_kernel_threads
+    read_kernel = lambda address, size: memory(gs, address, size)
+    iokit = capture_iokit(read_kernel)
+    iokit['kernel_task'] = capture_kernel_threads(read_kernel)
+    iokit['source_snapshot'] = output_name
+    suffix = output_name.removeprefix('ca-thread-state')
+    (out/('iokit-state' + suffix)).write_text(json.dumps(iokit, indent=2)+'\n')
