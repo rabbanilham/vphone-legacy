@@ -2075,11 +2075,13 @@ static void chestnut_command(A7Peripheral *p, uint32_t value)
                 return;
             }
         } else if (p->chestnut_pointer_valid && p->chestnut_pointer == 5) {
-            if (value & 0xf0) {
+            /* AppleChestnutDisplayPMU::setLDO writes 0x17 (rails on) and
+             * 0x10 (off): bit 4 is part of the native register (probe-151). */
+            if (value & 0xe0) {
                 i2c_nack(p);
                 return;
             }
-            p->owner->chestnut_control = value & 0x0f;
+            p->owner->chestnut_control = value & 0x1f;
             p->chestnut_pointer_valid = false; /* No invented auto-increment registers. */
             qemu_log_mask(LOG_UNIMP, "CHESTNUT WRITE reg=0x05 value=0x%02x\n",
                           p->owner->chestnut_control);
