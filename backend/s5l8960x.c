@@ -1989,12 +1989,12 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
 {
     bool tristar = i2c_is_tristar(p);
     A7RegisterI2C *d = tristar ? &p->tristar : &p->lm3534;
-    /* CBTL system-ID response e9ea10..68 is a separate read window:
-     * marker 0x74, packed 10-bit board ID. Use synthetic ID 0 (no OTP
-     * supplied); it is not an accessory serial/identity or modem IMEI.
-     * The driver asks for logical register 0x20, which its bus helper
-     * (vtable+0x650) sends as hardware register 0x5d (probe-138 trace:
-     * W134 W25d W135 W603); keep 0x20 for the synthetic fixtures. */
+    /* AppleTriStarBuiltIn::read (e9cc78) forwards the byte prefix unchanged
+     * to AppleARMIICDevice::transfer (800bbc). getSystemID (e9ea10) reads
+     * 74 00 00 at 0x20: marker followed by synthetic packed board ID 0.
+     * No translation to 0x5d exists in that path. Retain the observed
+     * probe139 alias for compatibility while the prefix/buffer discrepancy
+     * is investigated; it is not a recovered CBTL hardware mapping. */
     unsigned id_base = tristar && d->pointer >= 0x5d ? 0x5d : 0x20;
     /* LM3534's four control bytes are registers 0x10..0x13 (f20960..6c:
      * register 0x10 unless the DT says islp8559); 0..3 alias the same bytes
@@ -2020,8 +2020,12 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
             p->pmu_rx[i] = tristar && reg == 0xf ? 0x20 :
                            tristar && reg == 0xc ? 4 :
                            tristar && reg == 0xd ? 0 :
-                           tristar && reg == id_base ? 0x74 :
-                           tristar && reg > id_base ? 0 :
+                           /* 0x20 window (CBTL e9ea10): marker first. 0x5d
+                            * window (runtime variant e9daa8..b00): ID low,
+                            * ID high, then marker 0x74 in the third byte. */
+                           tristar && id_base == 0x20 && reg == 0x20 ? 0x74 :
+                           tristar && id_base == 0x5d && reg == 0x5f ? 0x74 :
+                           tristar && reg >= id_base ? 0 :
                            !tristar ? d->regs[reg & 3] : d->regs[reg];
         }
         p->pmu_rx_head = 0;

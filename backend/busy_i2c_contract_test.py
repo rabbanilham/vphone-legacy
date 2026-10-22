@@ -3,7 +3,9 @@
 
 Compiles actual board C with the existing PMU/I2C harness. No QEMU/iOS run.
 """
+import json
 import os
+from pathlib import Path
 from pmu_contract_test import host_check
 
 # The TriStar model is opt-in on the board (VPHONE_TRISTAR=1).
@@ -57,6 +59,48 @@ IAP = r'''
  assert(ldl_le_p(p.regs+0x14)==0x08200000);
 '''
 
+def tristar_startup_checks(*, observed_prefix=False):
+    """Replay every TriStar transfer in probe139, resetting as its controller does.
+
+    The captured 0x5d prefix is inconsistent with the native forwarding ABI.
+    Default replays the recovered 0x20 request; observed_prefix replays the
+    capture unchanged against the retained compatibility alias. Neither
+    host replay establishes where the native guest buffer receives bytes.
+    """
+    trace = Path(__file__).resolve().parents[1] / 'tests/fixtures/probe139_tristar.json'
+    checks = []
+    for row in json.loads(trace.read_text()):
+        tx = row['tx'][:]
+        bad_prefix = tx[1] == 0x25d
+        rx = row['rx']
+        if bad_prefix and not observed_prefix:
+            tx[1] = 0x220
+        elif bad_prefix:
+            # Runtime variant e9daa8..b00 reads 0x5d: ID low, ID high, then
+            # the 0x74 marker (probe139 captured the old marker-first reply).
+            rx = [0, 0, 0x74]
+        checks.append('i2c_write(&p,0x10,0x80000000);')
+        checks.append('i2c_write(&p,0x14,~0u);')
+        checks.extend(f'send(&p,{word:#x});' for word in tx)
+        checks.append('assert(!(ldl_le_p(p.regs+0x14)&0x00200000));')
+        checks.append(f'assert(i2c_read(&p,8)=={len(rx) << 8});')
+        for i, byte in enumerate(rx):
+            checks.append(f'assert(i2c_read(&p,8)=={(len(rx)-i) << 8});')
+            checks.append(f'assert(i2c_read(&p,4)=={byte});')
+        checks.append('assert(i2c_read(&p,4)==0x100);')
+    checks.append('assert(p.tristar.regs[0xe]==1);')
+    # Receive into an offset, as getSystemID uses sp+0xd; no framing byte
+    # is consumed by either the nub or the controller before byte zero.
+    checks.append(r'''
+      uint8_t frame[16]; memset(frame,0xa5,sizeof(frame));
+      send(&p,0x134);send(&p,0x220);send(&p,0x135);send(&p,0x603);
+      for(unsigned i=0;i<3;i++) frame[13+i]=i2c_read(&p,4);
+      assert(frame[12]==0xa5 && frame[13]==0x74);
+      assert(((frame[14]<<2)|frame[15])==0);
+    ''')
+    return '\n'.join(checks)
+
+
 BACKLIGHT = r'''
  /* Native LM3534 start reads 4 bytes at 0, enable writes 4 bytes back. */
  i2c_write(&p,0x14,~0u);send(&p,0x1c6);send(&p,0x200);
@@ -81,6 +125,7 @@ BACKLIGHT = r'''
 '''
 
 if __name__ == '__main__':
-    for checks in (BASEBAND, IAP, BACKLIGHT):
+    for checks in (BASEBAND, IAP, BACKLIGHT, tristar_startup_checks(),
+                   tristar_startup_checks(observed_prefix=True)):
         host_check(checks)
     print('PASS: baseband mux, unplugged accessory, LM3534 native register contracts')
