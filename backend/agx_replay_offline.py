@@ -118,7 +118,7 @@ def fragment_words(f, ppp):
             try:
                 found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
             except (KeyError, ValueError):
-                pass
+                break  # unmapped or invalid pointer terminates the contiguous list
     return found
 
 
@@ -164,13 +164,13 @@ def texture(f, ppp):
 
 def blend_vibrancy(d, s):
     """darkenSourceOver/lightenSourceOver (agy C8): scale S by Y^4 or (1-Y)^4 of D, src-over."""
-    dr, dg, db = d
+    dr, dg, db, da = d
     sr, sg, sb, sa = s
     y = (54 * dr + 183 * dg + 19 * db) >> 8
     y1 = 255 - y if sr + sg + sb > 384 else y
     f = (y1 * y1 // 255) ** 2 // 255
     sr, sg, sb, sa = (c * f // 255 for c in (sr, sg, sb, sa))
-    return tuple(min(255, sc + dc * (255 - sa) // 255) for sc, dc in ((sr, dr), (sg, dg), (sb, db)))
+    return tuple(min(255, sc + dc * (255 - sa) // 255) for sc, dc in ((sr, dr), (sg, dg), (sb, db), (sa, da)))
 
 
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
@@ -183,6 +183,10 @@ BLUR_PROGRAMS = {
     0xb443c1f6a714b429,
     0x21377cafd3277883,
     0x95631b61e7c1be31,
+    0x145dbc3101d94f8c,
+    0xf0c17d1e30ec2393,
+    0x69f1605719a006b2,
+    0xa4c025e0be54470a,
 }
 
 BLUR_TAPS = [
@@ -328,16 +332,60 @@ def main():
             su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
             tint = struct.unpack_from('<I', vs[0][2], 0)[0] if stride == 28 else 0xffffffff
             mask = prog == DEST_IN
+
+            if mask and (target_w < 640 or target_h < 1136):
+                # CA layer mask (DEST_IN) on offscreen passes: pixels outside the mask quad
+                # have mask alpha = 0 (D * 0 = 0). Clear canvas outside to transparent.
+                for cy in range(target_h):
+                    for cx in range(target_w):
+                        if not (x0 <= cx < x1 and y0 <= cy < y1):
+                            cd = (cy * target_w + cx) * 4
+                            fb[cd:cd + 4] = b'\x00\x00\x00\x00'
+
+            sub_w = (u1 - u0) * su
+            sub_h = (v1 - v0) * sv
+            is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
+            tex_cached_rows = {}
+            def get_tex_row(ry):
+                if ry not in tex_cached_rows:
+                    tex_cached_rows[ry] = [texel(f, tex, rx, ry) for rx in range(tex['w'])]
+                return tex_cached_rows[ry]
+
             for y in range(y0, y1):
                 fv = (v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv
-                ty = min(tex['h'] - 1, int(fv))
+                if is_scaled and not blurred_tex:
+                    v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
+                    ty0 = int(v_sample)
+                    ty1 = min(tex['h'] - 1, ty0 + 1)
+                    fy = v_sample - ty0
+                    row0 = get_tex_row(ty0)
+                    row1 = get_tex_row(ty1) if ty1 != ty0 else row0
+                else:
+                    ty = min(tex['h'] - 1, int(fv))
+                    row0 = get_tex_row(ty)
+
                 for x in range(x0, x1):
                     fu = (u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su
                     if blurred_tex:
                         b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, fv)
+                    elif is_scaled:
+                        u_sample = max(0.0, min(float(tex['w'] - 1), fu - 0.5))
+                        tx0 = int(u_sample)
+                        tx1 = min(tex['w'] - 1, tx0 + 1)
+                        fx = u_sample - tx0
+                        c00 = row0[tx0]
+                        c10 = row0[tx1]
+                        c01 = row1[tx0]
+                        c11 = row1[tx1]
+                        b, g, r, a = (
+                            max(0, min(255, int(round(
+                                (c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
+                                (c01[c] * (1.0 - fx) + c11[c] * fx) * fy
+                            )))) for c in range(4)
+                        )
                     else:
                         tx = min(tex['w'] - 1, int(fu))
-                        b, g, r, a = texel(f, tex, tx, ty)
+                        b, g, r, a = row0[tx]
                     if tint != 0xffffffff:
                         tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                         b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
@@ -346,8 +394,7 @@ def main():
                         fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                         continue
                     if tex.get('vibrancy'):
-                        fb[d:d + 3] = bytes(blend_vibrancy(tuple(fb[d:d + 3]), (r, g, b, a)))
-                        fb[d + 3] = min(255, a + fb[d + 3] * (255 - a) // 255) if fb[d + 3] else a
+                        fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
                     else:
                         for c, src in enumerate((r, g, b, a)):
                             fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
