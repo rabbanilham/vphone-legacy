@@ -5189,15 +5189,16 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
             if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) {
                 break;
             }
-            if (agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
-                for (unsigned j = 0; j + 3 <= 8; j++) {
-                    if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
-                        vibrancy = true;
-                        break;
-                    }
-                }
-                count++;
+            if (!agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
+                break;
             }
+            for (unsigned j = 0; j + 3 <= 8; j++) {
+                if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
+                    vibrancy = true;
+                    break;
+                }
+            }
+            count++;
         }
     }
     for (unsigned b = 0; b < count; b++) {
@@ -5275,12 +5276,18 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 #define AGX_USC_BLUR_3 UINT64_C(0xb443c1f6a714b429)
 #define AGX_USC_BLUR_4 UINT64_C(0x21377cafd3277883)
 #define AGX_USC_BLUR_5 UINT64_C(0x95631b61e7c1be31)
+#define AGX_USC_BLUR_6 UINT64_C(0x145dbc3101d94f8c)
+#define AGX_USC_BLUR_7 UINT64_C(0xf0c17d1e30ec2393)
+#define AGX_USC_BLUR_8 UINT64_C(0x69f1605719a006b2)
+#define AGX_USC_BLUR_9 UINT64_C(0xa4c025e0be54470a)
 
 static inline bool agx_is_blur_program(uint64_t prog)
 {
     return prog == AGX_USC_BLUR_1 || prog == AGX_USC_BLUR_2 ||
            prog == AGX_USC_BLUR_3 || prog == AGX_USC_BLUR_4 ||
-           prog == AGX_USC_BLUR_5;
+           prog == AGX_USC_BLUR_5 || prog == AGX_USC_BLUR_6 ||
+           prog == AGX_USC_BLUR_7 || prog == AGX_USC_BLUR_8 ||
+           prog == AGX_USC_BLUR_9;
 }
 
 static const struct {
@@ -5294,6 +5301,26 @@ static const struct {
     { 8.3332f, 0.0126f },
     { 10.2979f, 0.0027f },
 };
+
+static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
+                                                uint32_t c01, uint32_t c11,
+                                                float fx, float fy)
+{
+    uint32_t out = 0;
+    for (unsigned c = 0; c < 32; c += 8) {
+        float b00 = (float)((c00 >> c) & 0xff);
+        float b10 = (float)((c10 >> c) & 0xff);
+        float b01 = (float)((c01 >> c) & 0xff);
+        float b11 = (float)((c11 >> c) & 0xff);
+        float val = (b00 * (1.0f - fx) + b10 * fx) * (1.0f - fy) +
+                    (b01 * (1.0f - fx) + b11 * fx) * fy;
+        int iv = (int)lroundf(val);
+        if (iv < 0) iv = 0;
+        if (iv > 255) iv = 255;
+        out |= (uint32_t)iv << c;
+    }
+    return out;
+}
 
 static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h, float u, float v)
 {
@@ -5317,20 +5344,7 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     uint32_t c01 = buf[y1 * w + x0];
     uint32_t c11 = buf[y1 * w + x1];
 
-    uint32_t out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        float b00 = (float)((c00 >> c) & 0xff);
-        float b10 = (float)((c10 >> c) & 0xff);
-        float b01 = (float)((c01 >> c) & 0xff);
-        float b11 = (float)((c11 >> c) & 0xff);
-        float val = (b00 * (1.0f - fx) + b10 * fx) * (1.0f - fy) +
-                    (b01 * (1.0f - fx) + b11 * fx) * fy;
-        int iv = (int)lroundf(val);
-        if (iv < 0) iv = 0;
-        if (iv > 255) iv = 255;
-        out |= (uint32_t)iv << c;
-    }
-    return out;
+    return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
 static void agx_blur_texture(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h)
@@ -5459,7 +5473,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
      * ensuring safe re-entrancy between the dedicated off-BQL render thread
      * and the inline BQL fallback. Guest memory is accessed via
      * address_space_read/write on address_space_memory under RCU read lock. */
-    static __thread uint32_t row[640 * 4], texrow[0x4000];
+    static __thread uint32_t row[640 * 4], texrow[0x4000], texrow1[0x4000];
     uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
     uint32_t ppp[64];
     unsigned ppp_count = 0, draws = 0;
@@ -5600,6 +5614,34 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             /* Texel-unit coordinates (rectangle textures) exceed 1. */
             float su = textured && MAX(u1, v1) <= 1.0001f ? tex.w : 1;
             float sv = textured && MAX(u1, v1) <= 1.0001f ? tex.h : 1;
+            float sub_w = (u1 - u0) * su;
+            float sub_h = (v1 - v0) * sv;
+            bool is_scaled = textured && (fabsf((float)(x1 - x0) - sub_w) > 0.1f ||
+                                          fabsf((float)(y1 - y0) - sub_h) > 0.1f);
+            int cached_y0 = -1, cached_y1 = -1;
+
+            if (dest_in && (sf.base < UINT64_C(0x400000000) || width < 640 || height < 1136)) {
+                /* CA layer mask (DEST_IN) on offscreen passes: outside the mask quad,
+                 * mask alpha is 0 (D * 0 = 0). Clear canvas outside to transparent. */
+                uint32_t zero_row[1024];
+                memset(zero_row, 0, sizeof(zero_row));
+                for (uint32_t cy = 0; cy < height; cy++) {
+                    if (cy < (uint32_t)y0 || cy >= (uint32_t)y1) {
+                        for (uint32_t cx = 0; cx < width; cx += 1024) {
+                            uint32_t chunk = MIN(width - cx, 1024u);
+                            agx_ctx_write(s, cat, agx_surface_gva(&sf, cx, cy), zero_row, chunk * 4);
+                        }
+                    } else {
+                        if (x0 > 0) {
+                            agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, cy), zero_row, (uint32_t)x0 * 4);
+                        }
+                        if ((uint32_t)x1 < width) {
+                            agx_ctx_write(s, cat, agx_surface_gva(&sf, x1, cy), zero_row, (width - (uint32_t)x1) * 4);
+                        }
+                    }
+                }
+            }
+
             draws++;
             for (int y = y0; y < y1; y++) {
                 if (!textured) {
@@ -5614,10 +5656,34 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
                 float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
-                uint32_t ty = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                uint32_t ty0 = 0, ty1 = 0;
+                float fy = 0.0f;
                 if (!blurred_tex) {
-                    if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty), texrow, tex.w * 4)) {
-                        continue;
+                    if (is_scaled) {
+                        float v_sample = fv * sv - 0.5f;
+                        if (v_sample < 0.0f) v_sample = 0.0f;
+                        if (v_sample > (float)(tex.h - 1)) v_sample = (float)(tex.h - 1);
+                        ty0 = (uint32_t)v_sample;
+                        ty1 = ty0 + 1 < tex.h ? ty0 + 1 : ty0;
+                        fy = v_sample - (float)ty0;
+
+                        if ((int)ty0 != cached_y0) {
+                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                                continue;
+                            }
+                            cached_y0 = (int)ty0;
+                        }
+                        if (ty1 != ty0 && (int)ty1 != cached_y1) {
+                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty1), texrow1, tex.w * 4)) {
+                                continue;
+                            }
+                            cached_y1 = (int)ty1;
+                        }
+                    } else {
+                        ty0 = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                        if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                            continue;
+                        }
                     }
                 }
                 if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
@@ -5629,6 +5695,18 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     uint32_t src;
                     if (blurred_tex) {
                         src = agx_sample_bilinear(blurred_tex, tex.w, tex.h, fu * su, fv * sv);
+                    } else if (is_scaled) {
+                        float u_sample = fu * su - 0.5f;
+                        if (u_sample < 0.0f) u_sample = 0.0f;
+                        if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                        uint32_t tx0 = (uint32_t)u_sample;
+                        uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                        float fx = u_sample - (float)tx0;
+                        uint32_t c00 = texrow[tx0];
+                        uint32_t c10 = texrow[tx1];
+                        uint32_t c01 = (ty1 == ty0) ? texrow[tx0] : texrow1[tx0];
+                        uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
+                        src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
                     } else {
                         uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
                         src = texrow[tx];
