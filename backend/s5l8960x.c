@@ -1996,7 +1996,11 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
      * (vtable+0x650) sends as hardware register 0x5d (probe-138 trace:
      * W134 W25d W135 W603); keep 0x20 for the synthetic fixtures. */
     unsigned id_base = tristar && d->pointer >= 0x5d ? 0x5d : 0x20;
-    unsigned limit = tristar ? (d->pointer >= 0x20 ? id_base + 3 : 16) : 4;
+    /* LM3534's four control bytes are registers 0x10..0x13 (f20960..6c:
+     * register 0x10 unless the DT says islp8559); 0..3 alias the same bytes
+     * for the synthetic fixtures. */
+    unsigned lm_base = !tristar && d->pointer >= 0x10 ? 0x10 : 0;
+    unsigned limit = tristar ? (d->pointer >= 0x20 ? id_base + 3 : 16) : lm_base + 4;
     if (value & 0x100) {
         if (!p->i2c_read) {
             d->prefix = true;
@@ -2017,7 +2021,8 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
                            tristar && reg == 0xc ? 4 :
                            tristar && reg == 0xd ? 0 :
                            tristar && reg == id_base ? 0x74 :
-                           tristar && reg > id_base ? 0 : d->regs[reg];
+                           tristar && reg > id_base ? 0 :
+                           !tristar ? d->regs[reg & 3] : d->regs[reg];
         }
         p->pmu_rx_head = 0;
         p->pmu_rx_count = count;
@@ -2026,6 +2031,7 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
         if (d->prefix) {
             d->pointer = value & 0xff;
             d->pointer_valid = d->pointer < (tristar ? 16u : 4u) ||
+                               (!tristar && d->pointer >= 0x10 && d->pointer < 0x14) ||
                                (tristar && ((d->pointer >= 0x20 && d->pointer <= 0x22) ||
                                             (d->pointer >= 0x5d && d->pointer <= 0x5f)));
             d->prefix = false;
@@ -2035,7 +2041,9 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
             }
         } else if (d->pointer_valid && d->pointer < limit) {
             unsigned reg = d->pointer++;
-            if (!tristar || (reg < 0xc || reg == 0xe)) {
+            if (!tristar) {
+                d->regs[reg & 3] = value;
+            } else if (reg < 0xc || reg == 0xe) {
                 d->regs[reg] = value;
             }
         } else {
