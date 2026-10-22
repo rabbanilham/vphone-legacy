@@ -1053,6 +1053,15 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                  *    inverts: pressed = (sample ^ inversion ^ 1). When unmodeled/0,
                  *    all buttons appear held down, triggering IOHIDEventDriver's
                  *    hold+volume sysdiagnose watchdog and NMI panic after 2.5s.
+                 * 4) Wi-Fi HSIC: GPIO166 (0xa6, function-host_ready output) and
+                 *    GPIO167 (0xa7, function-device_ready active-high input).
+                 *    When the BCM43342 Wi-Fi module is absent or unpowered,
+                 *    pin 167 remains 0 (LOW), indicating DEVICE_READY = 0.
+                 *    EHCI1 port 0 PORTSC bit 0 (CCS) remains 0 (disconnected).
+                 *    AppleBCMWLANBusInterfaceHSIC unconditionally executes 4
+                 *    enumeration retry timeouts (~21.86s) before reporting
+                 *    bus enumeration failure; real hardware has no early exit,
+                 *    so pin 167 must faithfully remain 0 (not pulled up).
                  */
                 if ((pin >= 80 && pin <= 83) || pin == 79 || pin == 146 ||
                     pin == 2 || pin == 3 || pin == 4 || pin == 5 || pin == 16) {
@@ -6630,7 +6639,7 @@ static void a7_init(MachineState *ms)
     static const struct { hwaddr base; uint32_t size; } usb_aux_defs[] = {
         { UINT64_C(0x20c000010), 0x10 }, /* usb-device reg[1] */
         { UINT64_C(0x20c000050), 0x10 }, /* hsic-baseband */
-        { UINT64_C(0x20c000060), 0x10 }, /* wlan HSIC: probe148 fault */
+        { UINT64_C(0x20c000060), 0x10 }, /* wlan HSIC: DT /arm-io/usb-complex/usb-ehci1/wlan reg[0] */
         { UINT64_C(0x20c300000), 0x10000 }, /* OHCI reservation */
     };
     for (unsigned i = 0; i < ARRAY_SIZE(usb_aux_defs); i++) {
