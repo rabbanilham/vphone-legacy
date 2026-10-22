@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from macho import inspect_macho
 from bundle import validate_bundle, resolve_artifact
 from patchers.patch_devicetree import DeviceTreeNode, serialize_node, parse_node
-from qemu.boot_image import build_image, DRAM_BASE, RAM_SIZE, USABLE_RAM_SIZE, PRAM_BASE, PRAM_SIZE, STRAM_BASE, STRAM_SIZE, TIMEBASE_FREQUENCY, FRAMEBUFFER_SIZE, ANS_BASE, ANS_SIZE, KERNEL_BASE, MONITOR_BASE, MONITOR_SIZE, MONITOR_VIRT_BASE, SEP_SIZE, boot_args, make_chrp_partition, build_nvram_proxy_data, single_cpu_boot_args, escape_nvram_data, unescape_nvram_data
+from qemu.boot_image import build_image, omit_unpopulated_devices, add_node, DRAM_BASE, RAM_SIZE, USABLE_RAM_SIZE, PRAM_BASE, PRAM_SIZE, STRAM_BASE, STRAM_SIZE, TIMEBASE_FREQUENCY, FRAMEBUFFER_SIZE, ANS_BASE, ANS_SIZE, KERNEL_BASE, MONITOR_BASE, MONITOR_SIZE, MONITOR_VIRT_BASE, SEP_SIZE, boot_args, make_chrp_partition, build_nvram_proxy_data, single_cpu_boot_args, escape_nvram_data, unescape_nvram_data
 from qemu.runtime import QMP, stop, kernel_panic, PanicMonitor
 
 
@@ -64,6 +64,59 @@ def tree_fixture(compatible=b"N53AP\0iPhone6,2\0"):
 
 
 class LoaderTests(unittest.TestCase):
+    def test_absent_devices_in_built_dt_and_ram_leave_input_untouched(self):
+        root, _ = parse_node(tree_fixture())
+        modem = add_node(root, "baseband")
+        modem.set_prop("compatible", b"baseband,n41\0")
+        modem.set_prop("class", struct.pack("<I", 3))
+        arm = root.find_node("arm-io")
+        uart = add_node(arm, "uart2")
+        uart.set_prop("interrupts", struct.pack("<I", 142))
+        oscar = add_node(uart, "oscar")
+        oscar.set_prop("compatible", b"apple-oscar\0oscar\0")
+        for name in ("gyro", "accelerometer", "compass", "cma"):
+            add_node(oscar, name)
+        ehci = add_node(add_node(arm, "usb-complex"), "usb-ehci0")
+        add_node(ehci, "hsic-baseband")
+        # Unrelated devices and even equal names at other paths must survive.
+        add_node(ehci, "hsic-wlan")
+        pmu = add_node(add_node(arm, "i2c0"), "pmu")
+        pmu.set_prop("event_name-gpio2", b"baseband\0")
+        add_node(add_node(arm, "mca1"), "audio-baseband-voice")
+        add_node(add_node(arm, "uart1"), "bluetooth")
+        add_node(add_node(root, "unrelated"), "oscar")
+        original = serialize_node(root)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "kernel").write_bytes(kernel_fixture())
+            (path / "monitor").write_bytes(kernel_fixture(MONITOR_VIRT_BASE))
+            (path / "tree").write_bytes(original)
+            plan = build_image(path / "kernel", path / "tree", path / "boot",
+                               "-v cpus=2", monitor_path=path / "monitor")
+            raw = (path / "boot/DeviceTree.runtime").read_bytes()
+            built, _ = parse_node(raw)
+            self.assertIsNone(built.find_node("baseband"))
+            self.assertIsNone(built.find_node("hsic-baseband"))
+            self.assertEqual(built.find_node("uart2").children, [])
+            self.assertEqual(built.find_node("uart2").get_prop("interrupts"),
+                             struct.pack("<I", 142))
+            for name in ("hsic-wlan", "audio-baseband-voice", "bluetooth", "oscar"):
+                self.assertIsNotNone(built.find_node(name))
+            self.assertEqual(built.find_node("pmu").get_prop("event_name-gpio2"),
+                             b"baseband\0")
+            ram = Path(plan["image"]).read_bytes()
+            dt_off = plan["devicetree_pa"] - DRAM_BASE
+            self.assertEqual(ram[dt_off:dt_off + len(raw)], raw)
+            self.assertEqual((path / "tree").read_bytes(), original)
+            omit_unpopulated_devices(built)
+            self.assertEqual(serialize_node(built), raw)
+
+    def test_absent_device_filter_accepts_missing_parent_paths(self):
+        root, _ = parse_node(tree_fixture())
+        original = serialize_node(root)
+        omit_unpopulated_devices(root)
+        self.assertEqual(serialize_node(root), original)
+
     def test_nvram_partitions_make_forward_progress(self):
         data = build_nvram_proxy_data("-v cpus=1")
         self.assertEqual(len(data), 8192)
