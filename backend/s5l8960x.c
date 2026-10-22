@@ -1981,12 +1981,12 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
 {
     bool tristar = i2c_is_tristar(p);
     A7RegisterI2C *d = tristar ? &p->tristar : &p->lm3534;
-    /* CBTL system-ID response e9ea10..68 is a separate read window:
-     * marker 0x74, packed 10-bit board ID. Use synthetic ID 0 (no OTP
-     * supplied); it is not an accessory serial/identity or modem IMEI.
-     * The driver asks for logical register 0x20, which its bus helper
-     * (vtable+0x650) sends as hardware register 0x5d (probe-138 trace:
-     * W134 W25d W135 W603); keep 0x20 for the synthetic fixtures. */
+    /* AppleTriStarBuiltIn::read (e9cc78) forwards the byte prefix unchanged
+     * to AppleARMIICDevice::transfer (800bbc). getSystemID (e9ea10) reads
+     * 74 00 00 at 0x20: marker followed by synthetic packed board ID 0.
+     * No translation to 0x5d exists in that path. Retain the observed
+     * probe139 alias for compatibility while the prefix/buffer discrepancy
+     * is investigated; it is not a recovered CBTL hardware mapping. */
     unsigned id_base = tristar && d->pointer >= 0x5d ? 0x5d : 0x20;
     unsigned limit = tristar ? (d->pointer >= 0x20 ? id_base + 3 : 16) : 4;
     if (value & 0x100) {
