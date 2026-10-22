@@ -321,6 +321,7 @@ def main():
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
+    p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     args = p.parse_args()
     try:
         hook_dumps = parse_hook_dumps(args.hook_dump)
@@ -1113,6 +1114,11 @@ def main():
                 except subprocess.TimeoutExpired:
                     proc.kill(); proc.wait(timeout=5)
                 save_json(out / 'process-exit.json', dict(exit_code=proc.returncode, reaped=True))
+                if args.collect_crashlogs:
+                    data_raw = images / 'data.raw'
+                    if data_raw.exists():
+                        from crashlogs import collect_crashlogs
+                        collect_crashlogs(data_raw, out / 'crashlogs')
     print(out, flush=True)
 
 

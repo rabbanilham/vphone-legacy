@@ -39,6 +39,8 @@ def main():
     p.add_argument('--system', type=Path, default=ROOT / 'build/diagnostic/system-diagnostic-sep.raw')
     p.add_argument('--data', type=Path, default=ROOT / 'build/diagnostic/data-diagnostic-systembag.raw')
     p.add_argument('--keep-images', action='store_true')
+    p.add_argument('--collect-crashlogs', action='store_true',
+                   help='Collect guest crash reports from data clone before cleanup')
     p.add_argument('--qemu-arg', action='append', default=[])
     args = p.parse_args()
 
@@ -73,6 +75,16 @@ def main():
     except KeyboardInterrupt:
         return 130
     finally:
+        if args.collect_crashlogs:
+            data_raw = images / 'data.raw'
+            if data_raw.exists():
+                crashlogs_dir = work / 'crashlogs'
+                try:
+                    from crashlogs import collect_crashlogs
+                    collect_crashlogs(data_raw, crashlogs_dir)
+                    print(f'[live] collected crashlogs in {crashlogs_dir}')
+                except Exception as exc:
+                    print(f'[live] warning: crashlog collection failed: {exc}', file=sys.stderr)
         if args.keep_images:
             print(f'[live] kept images in {images}')
         else:
