@@ -542,11 +542,16 @@ struct A7State {
     QemuCond agx_render_cond;
     struct AGXRenderJob *agx_job_head;
     struct AGXRenderJob *agx_job_tail;
+    /* Finished jobs, completed in submission order by one BH: separate
+     * one-shot BHs may run in any order, which published a later stamp and
+     * the completion event before an earlier stamp (probe-167 GPU hang). */
+    struct AGXRenderJob *agx_done_head, *agx_done_tail;
+    QEMUBH *agx_done_bh;
     bool agx_render_thread_running;
     bool agx_render_thread_exit;
     unsigned agx_inflight_jobs;
     /* Queue read index already consumed on the host but not yet published to
-     * the guest (published by agx_replay_complete_bh after the pixels land).
+     * the guest (published by agx_replay_done_bh after the pixels land).
      * A drain before then must continue from here, not re-read the guest's
      * stale index, or it would replay and stamp the same commands twice. */
     struct { uint64_t control; uint32_t index; bool valid; } agx_host_read[16];
@@ -5722,14 +5727,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                   (unsigned long long)target, draws);
 }
 
-/* Bottom half scheduled on the main loop context when the off-BQL render
- * thread finishes rasterising a frame or job. */
-static void agx_replay_complete_bh(void *opaque)
+/* Publish one finished job (main loop, BQL held). */
+static void agx_replay_complete_job(AGXRenderJob *job)
 {
-    AGXRenderJob *job = opaque;
     A7State *s = job->s;
 
-    /* Thread-safety: agx_replay_complete_bh runs on the main loop context with
+    /* Thread-safety: agx_replay_done_bh runs this on the main loop context with
      * the BQL held. Stamp writes, queue control updates, and firmware completion
      * notifications occur strictly after all frame pixels have been committed to
      * guest RAM by the off-BQL render thread. */
@@ -5762,6 +5765,27 @@ static void agx_replay_complete_bh(void *opaque)
         s->agx_inflight_jobs--;
     }
     g_free(job);
+}
+
+static void agx_replay_done_bh(void *opaque)
+{
+    A7State *s = opaque;
+    for (;;) {
+        qemu_mutex_lock(&s->agx_render_mutex);
+        AGXRenderJob *job = s->agx_done_head;
+        if (job) {
+            s->agx_done_head = job->next;
+            if (!s->agx_done_head) {
+                s->agx_done_tail = NULL;
+            }
+        }
+        qemu_mutex_unlock(&s->agx_render_mutex);
+        if (!job) {
+            return;
+        }
+        job->next = NULL;
+        agx_replay_complete_job(job);
+    }
 }
 
 /* Dedicated off-BQL render thread worker loop. */
@@ -5800,11 +5824,16 @@ static void *agx_render_thread_fn(void *opaque)
             rcu_read_unlock();
         }
 
-        /* Schedule stamp and kick completion on main context with BQL. */
-        aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                                agx_replay_complete_bh, job);
-
+        /* Stamps and the kick completion are published in order by
+         * agx_replay_done_bh on the main loop with the BQL. */
         qemu_mutex_lock(&s->agx_render_mutex);
+        if (s->agx_done_tail) {
+            s->agx_done_tail->next = job;
+        } else {
+            s->agx_done_head = job;
+        }
+        s->agx_done_tail = job;
+        qemu_bh_schedule(s->agx_done_bh);
     }
     qemu_mutex_unlock(&s->agx_render_mutex);
 
@@ -6690,6 +6719,13 @@ static void a7_reset(void *opaque)
         }
         s->agx_job_head = NULL;
         s->agx_job_tail = NULL;
+        for (job = s->agx_done_head; job; ) {
+            AGXRenderJob *next = job->next;
+            g_free(job);
+            job = next;
+        }
+        s->agx_done_head = NULL;
+        s->agx_done_tail = NULL;
         qemu_mutex_unlock(&s->agx_render_mutex);
         s->agx_inflight_jobs = 0;
         memset(s->agx_host_read, 0, sizeof(s->agx_host_read));
@@ -7163,6 +7199,7 @@ static void a7_init(MachineState *ms)
     s->agx_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_kick_cb, s);
     qemu_mutex_init(&s->agx_render_mutex);
     qemu_cond_init(&s->agx_render_cond);
+    s->agx_done_bh = qemu_bh_new(agx_replay_done_bh, s);
     s->agx_job_head = NULL;
     s->agx_job_tail = NULL;
     s->agx_render_thread_running = false;

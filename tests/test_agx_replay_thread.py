@@ -19,8 +19,10 @@ class AGXReplayThreadTests(unittest.TestCase):
         self.assertIn('agx_replay_thread_enabled', source)
         self.assertIn('typedef struct AGXRenderJob', source)
         self.assertIn('qemu_thread_create(&s->agx_render_thread, "agx-render"', source)
-        self.assertIn('aio_bh_schedule_oneshot', source)
-        self.assertIn('agx_replay_complete_bh', source)
+        # One persistent BH drains finished jobs in submission order; one-shot
+        # BHs per job ran out of order and published stamps out of order.
+        self.assertIn('qemu_bh_new(agx_replay_done_bh, s)', source)
+        self.assertNotIn('aio_bh_schedule_oneshot', source)
 
     def test_thread_safety_invariants(self):
         source = SOURCE.read_text()
@@ -31,8 +33,8 @@ class AGXReplayThreadTests(unittest.TestCase):
         self.assertIn('rcu_unregister_thread();', source)
         self.assertIn('rcu_read_lock();', source)
         self.assertIn('rcu_read_unlock();', source)
-        # Verify BQL synchronization via bottom half
-        self.assertIn('aio_bh_schedule_oneshot(qemu_get_aio_context(),', source)
+        # Verify BQL synchronization via the ordered completion bottom half
+        self.assertIn('qemu_bh_schedule(s->agx_done_bh);', source)
 
     def test_replay_thread_c_harness(self):
         compiler = shutil.which('cc')
