@@ -548,3 +548,31 @@ df -h .
 - Why the earlier fast swipes failed (verified with SpringBoard exe hooks, `backend/evidence/keybag-contract-20261015/sb-scroll-hooks.json`): SBLockScreenScrollView pages 1 -> 0 (320 pt pages) and needs > 50 % travel or a flick. SpringBoard's main thread processes HID events late, UIKit coalesces them, so the pan saw Began -> one Changed (offset 278.5, only 41 pt) -> Ended with velocity 0 and bounced back. A slow 3 s drag with a 1 s hold lets a Changed with offset 63 (percent 0.8) arrive before release -> page 0 -> lockScreenView:didScrollToPage:0 -> unlock -> Setup.app.
 - y=1036 compensates MultitouchHID's fingertip offset (~16 px up). Leftward drags never start the pan.
 - Remaining artefact: an oversized, distorted "Searching" status-bar text drawn across the top (replay bug).
+
+## 21. IOKit quiet, USB complex, display power; greeting at ~65 s (Claude + Codex + agy, 2026-10-22/23)
+
+- **IOKit busy leaves → 0 at 45 s.** Before: uart6/iap, spi2/mesa, baseband, backlight kept the registry busy, so configd's InterfaceNamer waited its 60 s timeout and CommCenter, SpringBoard and lockdownd waited behind it. Fixed in the board only:
+  - SPI2 SmartIO DMA (endpoints 24/25) and LM3534 control registers 0x10..0x13 (cc80e54, afccded).
+  - TriStar CBTL1610 at I2C0 0x1a with the 0x5d system-ID window, the 0x74 marker last (T21/T22).
+  - The USB complex the TriStar path reaches (T23–T25, `research/reports/T2[345]-*.md`):
+    - EHCI0/1 at 0x20c200000/0x20c400000 on QEMU's sysbus EHCI, with lower-priority storage for the Synopsys vendor holes (the HSIC port mask at +0x2c0).
+    - A private USB DMA address space: DRAM seen at bus address 0.
+    - OHCI at 0x20c300000.
+    - DWC2 OTG device core at 0x20c100000: detached, idle, with self-clearing reset/flush bits.
+    - HSIC port control words at complex +0x50/+0x60, and the reg[1] control windows.
+  - TriStar is **on by default** (7452d32); `VPHONE_TRISTAR=0` restores the old NACK.
+- **Display power.**
+  - DWI (0x20e200000) channel control registers 0x10/0x20/0x40 now self-clear GO (bit 0). `AppleS5L8940DWI::_waitTransaction` (10ea5a4) panicked when backboardd switched the backlight off.
+  - Chestnut register 0x05 accepts bit 4: setLDO writes 0x17 (on) and 0x10 (off).
+  - Contracts: `backend/dwi_contract_test.py`, `backend/chestnut_contract_test.py`.
+- **Result** (probes 149–153; plan boot-plan-smp-nooscar, data-diagnostic-systembag, MTTCG): no panic, and Setup is running by 45 s.
+  - The greeting renders at about 65–70 s guest, down from about 107–122 s.
+  - The display idles off at about 98 s.
+  - A slide at 80 s reaches the language list (probe-153).
+  - A black final framebuffer can mean the display slept; count `AGX RT queue` lines in qemu-trace.log before calling it a stall.
+- **Tooling:** `display_probe.py --collect-crashlogs` and `live_run.py --collect-crashlogs` attach the data clone read-only and copy the CrashReporter logs to `<out>/crashlogs/` (agy D4, `backend/crashlogs.py`).
+- **Open:**
+  - Wi-Fi HSIC enumeration retries cost about 22 s of kernel time (4 × 3.5 s, `AppleBCMWLANBusInterfaceHSIC`; agy D5).
+  - The 20–65 s critical path to the first Setup frame (agy D6).
+  - One Setup crash at about 45 s in probe-149 (cause unknown; use `--collect-crashlogs`).
+  - Intermittent logo-only boots from before these fixes (probes 135/144/146; agy D1b).
