@@ -46,28 +46,18 @@ def query_cpu_pmu(env_extra=None):
                 json.loads(fp.readline())
                 command(fp, "qmp_capabilities")
 
-                # Locate CPU path in QOM
-                resp = command(fp, "qom-list", {"path": "/machine/unattached"})
-                devices = resp.get("return", [])
+                # command() returns the QMP "return" payload. CPUs are the
+                # unattached children whose type is the A57 model.
                 cpu_path = None
-                for dev in devices:
-                    name = dev.get("name")
-                    if dev.get("type", "").startswith("child<"):
-                        try:
-                            t = command(fp, "qom-get", {"path": f"/machine/unattached/{name}", "property": "type"})
-                            if "cortex-a57" in str(t.get("return", "")):
-                                cpu_path = f"/machine/unattached/{name}"
-                                break
-                        except Exception:
-                            pass
-
-                if not cpu_path:
-                    # fallback to checking device[0]
-                    cpu_path = "/machine/unattached/device[0]"
-
+                for dev in command(fp, "qom-list", {"path": "/machine/unattached"}):
+                    if not dev.get("type", "").startswith("child<cortex-a57"):
+                        continue
+                    cpu_path = f"/machine/unattached/{dev['name']}"
+                    break
+                assert cpu_path, "no cortex-a57 CPU in /machine/unattached"
                 pmu_val = command(fp, "qom-get", {"path": cpu_path, "property": "pmu"})
                 command(fp, "quit")
-                return pmu_val.get("return")
+                return pmu_val
         finally:
             if proc.poll() is None:
                 proc.kill()
