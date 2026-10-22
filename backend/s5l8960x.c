@@ -5472,6 +5472,36 @@ static bool agx_replay_viewport(const uint32_t *ppp, unsigned n, float vp[4])
     return false;
 }
 
+/* Clip coverage, not the interpolation domain: an off-screen quad must keep
+ * sampling the same texels as the corresponding crop of its full raster. */
+static float agx_quad_coordinate(float pixel, float low, float high,
+                                  float uv0, float uv1)
+{
+    return uv0 + (uv1 - uv0) * (pixel + 0.5f - low) / (high - low);
+}
+
+/* Preserve the association between vertex positions and texture coordinates.
+ * CA also submits quads with U along screen Y (and even constant V). */
+static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float out[6])
+{
+    float dx1 = xy[1][0] - xy[0][0], dy1 = xy[1][1] - xy[0][1];
+    float dx2 = xy[2][0] - xy[0][0], dy2 = xy[2][1] - xy[0][1];
+    float det = dx1 * dy2 - dx2 * dy1;
+    if (!isfinite(det) || fabsf(det) < 1e-8f) {
+        return false;
+    }
+    for (unsigned c = 0; c < 2; c++) {
+        float d1 = uv[1][c] - uv[0][c], d2 = uv[2][c] - uv[0][c];
+        out[c * 3] = (d1 * dy2 - d2 * dy1) / det;
+        out[c * 3 + 1] = (dx1 * d2 - dx2 * d1) / det;
+        out[c * 3 + 2] = uv[0][c] - out[c * 3] * xy[0][0] - out[c * 3 + 1] * xy[0][1];
+        if (!isfinite(out[c * 3]) || !isfinite(out[c * 3 + 1]) || !isfinite(out[c * 3 + 2])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear)
@@ -5551,6 +5581,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 12 || stride > 64) {
                 continue;
             }
+
             int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
             uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
             bool is_blur_prog = agx_is_blur_program(prog);
@@ -5584,13 +5615,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 g_free(raw_tex);
                 g_free(tmp_tex);
             }
-
             unsigned step = (count == 4) ? 4 : 6;
             bool any_drawn = false;
             for (unsigned q_start = 0; q_start + step <= count; q_start += step) {
                 float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
                 float m4[4];
                 bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
+                float quad_xy[3][2], quad_uv[3][2], uv_map[6];
+                bool affine = false;
+                unsigned quad_vertices = 0;
+
                 for (unsigned i = q_start; i < q_start + step; i++) {
                     float xy[2];
                     if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
@@ -5603,8 +5637,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     minx = MIN(minx, xy[0]); maxx = MAX(maxx, xy[0]);
                     miny = MIN(miny, xy[1]); maxy = MAX(maxy, xy[1]);
+                    unsigned sub_idx = i - q_start;
+                    if (sub_idx < 3) {
+                        quad_xy[sub_idx][0] = xy[0];
+                        quad_xy[sub_idx][1] = xy[1];
+                    }
                 }
 
+                /* Vertex layouts seen from CA: stride 20 = position + BGRA colour;
+                 * 24 = position + normalised u,v; 28 = position + BGRA tint +
+                 * u,v in texels. */
                 float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
                 uint32_t tint = 0xffffffff;
                 uint32_t colour = 0xff000000;
@@ -5623,6 +5665,15 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                         u0 = MIN(u0, t[0]); u1 = MAX(u1, t[0]);
                         v0 = MIN(v0, t[1]); v1 = MAX(v1, t[1]);
+                        unsigned sub_idx = i - q_start;
+                        if (sub_idx < 3) {
+                            quad_vertices++;
+                            quad_uv[sub_idx][0] = t[0];
+                            quad_uv[sub_idx][1] = t[1];
+                            if (sub_idx == 2 && quad_vertices == 3) {
+                                affine = agx_quad_affine(quad_xy, quad_uv, uv_map);
+                            }
+                        }
                     }
                 }
 
@@ -5681,15 +5732,45 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 float sv = MAX(u1, v1) <= 1.0001f ? tex.h : 1;
                 float sub_w = (u1 - u0) * su;
                 float sub_h = (v1 - v0) * sv;
-                bool is_scaled = (fabsf((float)(x1 - x0) - sub_w) > 0.1f ||
-                                  fabsf((float)(y1 - y0) - sub_h) > 0.1f);
+                bool is_scaled = (fabsf((maxx - minx) - sub_w) > 0.1f ||
+                                  fabsf((maxy - miny) - sub_h) > 0.1f);
+                if (affine) {
+                    float step_x = hypotf(uv_map[0] * su, uv_map[3] * sv);
+                    float step_y = hypotf(uv_map[1] * su, uv_map[4] * sv);
+                    is_scaled = fabsf(step_x - 1.0f) > 0.1f || fabsf(step_y - 1.0f) > 0.1f;
+                }
+                /* A cross-axis V coordinate needs multiple source rows per
+                 * output row: snapshot this bounded texture for the quad (the
+                 * axis-aligned path keeps its two-row cache; blur already
+                 * owns a snapshot). */
+                uint32_t *sample_tex = blurred_tex, *quad_tex = NULL;
+                if (affine && fabsf(uv_map[3]) > 1e-8f && !sample_tex) {
+                    if ((uint64_t)tex.w * tex.h > 4096 * 4096) {
+                        continue;
+                    }
+                    quad_tex = g_malloc((size_t)tex.w * tex.h * 4);
+                    for (unsigned ty = 0; ty < tex.h; ty++) {
+                        if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty),
+                                          quad_tex + (size_t)ty * tex.w, tex.w * 4)) {
+                            g_free(quad_tex);
+                            quad_tex = NULL;
+                            break;
+                        }
+                    }
+                    if (!quad_tex) {
+                        continue;
+                    }
+                    sample_tex = quad_tex;
+                }
                 int cached_y0 = -1, cached_y1 = -1;
 
                 for (int y = y0; y < y1; y++) {
-                    float fv = v0 + (v1 - v0) * (y - y0 + 0.5f) / (y1 - y0);
+                    /* Clip coverage, not the interpolation domain. */
+                    float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :
+                                        agx_quad_coordinate(y, miny, maxy, v0, v1);
                     uint32_t ty0 = 0, ty1 = 0;
                     float fy = 0.0f;
-                    if (!blurred_tex) {
+                    if (!sample_tex) {
                         if (is_scaled) {
                             float v_sample = fv * sv - 0.5f;
                             if (v_sample < 0.0f) v_sample = 0.0f;
@@ -5722,10 +5803,19 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         continue;
                     }
                     for (int x = x0; x < x1; x++) {
-                        float fu = u0 + (u1 - u0) * (x - x0 + 0.5f) / (x1 - x0);
+                        float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                            agx_quad_coordinate(x, minx, maxx, u0, u1);
+                        float sample_v = affine ? fv + uv_map[3] * (x + 0.5f) : fv;
                         uint32_t src;
-                        if (blurred_tex) {
-                            src = agx_sample_bilinear(blurred_tex, tex.w, tex.h, fu * su, fv * sv);
+                        if (sample_tex) {
+                            if (is_blur || is_scaled) {
+                                src = agx_sample_bilinear(sample_tex, tex.w, tex.h,
+                                                          fu * su, sample_v * sv);
+                            } else {
+                                unsigned tx = MIN(tex.w - 1, (unsigned)MAX(0.0f, fu * su));
+                                unsigned ty = MIN(tex.h - 1, (unsigned)MAX(0.0f, sample_v * sv));
+                                src = sample_tex[(size_t)ty * tex.w + tx];
+                            }
                         } else if (is_scaled) {
                             float u_sample = fu * su - 0.5f;
                             if (u_sample < 0.0f) u_sample = 0.0f;
@@ -5764,6 +5854,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                 }
+                g_free(quad_tex);
             }
             g_free(blurred_tex);
             if (any_drawn) {

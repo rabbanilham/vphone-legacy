@@ -115,7 +115,7 @@ REPLAY_MASK_CODE = bytes.fromhex(
 REPLAY_BLUR_CODE = bytes.fromhex(
     '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
     '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
-REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'gauss-blur', 'vibrancy-dark', 'vibrancy-light')
+REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light')
 
 
 def blend_vibrancy(dst, src):
@@ -264,7 +264,20 @@ def replay_blob(case=True):
             for i in range(6):
                 put(state + 0x200 + i * 20 + 16, '<I', destination)
             expect_rect((0, 0, 8, 4), lambda x, y: destination)
-            if case == 'dest-in':
+            if case == 'rotate-uv':
+                # Clockwise UVs: U follows output Y; V follows reversed X.
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x300 + i * 24, '<6f', 2 + u * 2, v * 4, 0, 1, v, 1 - u)
+                expect_rect((2, 0, 4, 4), lambda x, y: REPLAY_TEXELS[(3 - x) * 4 + y])
+            elif case in ('clip-top-left', 'clip-bottom-right'):
+                # Crop a 4x2 texture without squeezing all texels into the
+                # visible 2x1 region. The rest of the pass and padding LOAD.
+                left, top = (-2, -1) if case == 'clip-top-left' else (14, 15)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x300 + i * 24, '<6f', left + u * 4, top + v * 2, 0, 1, u, v)
+                rect = (max(0, left), max(0, top), min(width, left + 4), min(height, top + 2))
+                expect_rect(rect, lambda x, y: REPLAY_TEXELS[(y - top) * 4 + x - left])
+            elif case == 'dest-in':
                 # PPP[7] -> PDS state -> USC offset -> exact 64 code bytes.
                 put(state + 15 * 4, '<I', 8 << 8)
                 put(state + 0x110 + 7 * 4, '<I', 0x1200)
