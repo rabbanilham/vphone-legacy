@@ -545,6 +545,11 @@ struct A7State {
     bool agx_render_thread_running;
     bool agx_render_thread_exit;
     unsigned agx_inflight_jobs;
+    /* Queue read index already consumed on the host but not yet published to
+     * the guest (published by agx_replay_complete_bh after the pixels land).
+     * A drain before then must continue from here, not re-read the guest's
+     * stale index, or it would replay and stamp the same commands twice. */
+    struct { uint64_t control; uint32_t index; bool valid; } agx_host_read[16];
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -5681,6 +5686,15 @@ static void agx_replay_complete_bh(void *opaque)
     if (job->has_queue_ctrl) {
         smp_wmb();
         agx_gpu_access(s, job->queue_ctrl_gva, &job->queue_read_index, 4, true);
+        /* The guest has caught up with the host once the last outstanding
+         * index for this queue is published. */
+        for (unsigned i = 0; i < ARRAY_SIZE(s->agx_host_read); i++) {
+            if (s->agx_host_read[i].valid &&
+                s->agx_host_read[i].control == job->queue_ctrl_gva &&
+                s->agx_host_read[i].index == job->queue_read_index) {
+                s->agx_host_read[i].valid = false;
+            }
+        }
     }
     if (job->post_completion) {
         qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n",
@@ -6104,6 +6118,14 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
         !size || size > 0x10000 || read_index >= size || write_index >= size) {
         return 0;
     }
+    int host_slot = -1;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->agx_host_read); i++) {
+        if (s->agx_host_read[i].valid && s->agx_host_read[i].control == control) {
+            host_slot = i;
+            read_index = s->agx_host_read[i].index;
+            break;
+        }
+    }
     unsigned done = 0;
     AGXRenderJob *pending_job = NULL;
     bool queue_has_job = false;
@@ -6232,9 +6254,40 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
         queue_has_job = true;
         pending_job = NULL;
     }
+    if (!queue_has_job && host_slot >= 0 && done) {
+        /* Older jobs of this queue are still in flight: publish this index
+         * behind them, or their completion would move the guest's read
+         * index backwards. */
+        AGXRenderJob *ctrl_job = g_new0(AGXRenderJob, 1);
+        ctrl_job->s = s;
+        ctrl_job->has_queue_ctrl = true;
+        ctrl_job->queue_ctrl_gva = control;
+        ctrl_job->queue_read_index = read_index;
+        if (!*local_head) {
+            *local_head = ctrl_job;
+        } else {
+            (*local_tail)->next = ctrl_job;
+        }
+        *local_tail = ctrl_job;
+        queue_has_job = true;
+    }
     if (!queue_has_job) {
         smp_wmb();
         agx_gpu_access(s, control, &read_index, 4, true);
+    } else {
+        if (host_slot < 0) {
+            for (unsigned i = 0; i < ARRAY_SIZE(s->agx_host_read); i++) {
+                if (!s->agx_host_read[i].valid) {
+                    host_slot = i;
+                    break;
+                }
+            }
+        }
+        if (host_slot >= 0) {
+            s->agx_host_read[host_slot].control = control;
+            s->agx_host_read[host_slot].index = read_index;
+            s->agx_host_read[host_slot].valid = true;
+        }
     }
     return done;
 }
@@ -6583,6 +6636,7 @@ static void a7_reset(void *opaque)
         s->agx_job_tail = NULL;
         qemu_mutex_unlock(&s->agx_render_mutex);
         s->agx_inflight_jobs = 0;
+        memset(s->agx_host_read, 0, sizeof(s->agx_host_read));
     }
     s->ans_clock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ans_calendar_seconds = s->utility_epoch;
