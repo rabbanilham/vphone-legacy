@@ -6134,8 +6134,16 @@ static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t v
     A7State *s = A7(qdev_get_machine());
     unsigned c = env_archcpu(env)->mp_affinity & 1;
     s->apple_c15[c][ri->opc1 & 7][ri->crm & 15][ri->opc2 & 7] = val;
-    qemu_log_mask(LOG_UNIMP, "A7 c15 reg opc1=%d crm=%d opc2=%d stored 0x%" PRIx64 "; hardware effects unimplemented\n",
-                  ri->opc1, ri->crm, ri->opc2, val);
+    /* Log each register once: PMCPerfController rewrites the PMC set at
+     * ~450 Hz, and logging every write put ~50k synchronous lines into a
+     * probe's trace (agy D6), slowing MTTCG. */
+    static uint8_t logged[8][16];
+    uint8_t bit = 1U << (ri->opc2 & 7);
+    if (!(qatomic_fetch_or(&logged[ri->opc1 & 7][ri->crm & 15], bit) & bit)) {
+        qemu_log_mask(LOG_UNIMP, "A7 c15 reg opc1=%d crm=%d opc2=%d stored 0x%" PRIx64
+                      "; hardware effects unimplemented (logged once)\n",
+                      ri->opc1, ri->crm, ri->opc2, val);
+    }
 }
 
 static void vblank_timer_cb(void *opaque)
