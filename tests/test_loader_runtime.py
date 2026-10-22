@@ -95,8 +95,9 @@ class LoaderTests(unittest.TestCase):
                                "-v cpus=2", monitor_path=path / "monitor")
             raw = (path / "boot/DeviceTree.runtime").read_bytes()
             built, _ = parse_node(raw)
-            self.assertIsNone(built.find_node("baseband"))
-            self.assertIsNone(built.find_node("hsic-baseband"))
+            # Baseband nubs stay: CommCenter needs them (probe-132 regression).
+            self.assertIsNotNone(built.find_node("baseband"))
+            self.assertIsNotNone(built.find_node("hsic-baseband"))
             self.assertEqual(built.find_node("uart2").children, [])
             self.assertEqual(built.find_node("uart2").get_prop("interrupts"),
                              struct.pack("<I", 142))

@@ -173,18 +173,17 @@ def add_node(parent, name):
 
 
 def omit_unpopulated_devices(root):
-    """Describe the emulator's absent modem and motion CPU, not firmware nubs.
+    """Describe the emulator's absent motion coprocessor (Oscar/M7).
 
-    AppleBaseband can wait indefinitely for the unimplemented HSIC service;
-    InterfaceNamer waits up to 60 seconds for IOKit to settle. Oscar's UART ROM
-    likewise cannot answer (one-second ready waits, retried on power changes).
-    Remove both modem nubs together: removing HSIC alone strands AppleBaseband.
-    Keep controllers and their other children, GPIO/PMU wiring and audio intact.
+    AppleOscarProcessor waits one second per baud-rate attempt for a UART
+    boot-ROM 'ready' message that nothing can send (16 timeouts per boot).
+    Removing the oscar subtree (with its sensors) removes those waits; UART2
+    itself and all PMU/GPIO wiring stay. The baseband nodes are kept on
+    purpose: without them CommCenter restarts and SpringBoard, which waits on
+    CoreTelephony, never reaches the setup greeting (probe-132 vs probe-133).
     This edits only the loader's in-memory DT, never the firmware input or disk.
     """
-    for path in (("baseband",),
-                 ("arm-io", "usb-complex", "usb-ehci0", "hsic-baseband"),
-                 ("arm-io", "uart2", "oscar")):
+    for path in (("arm-io", "uart2", "oscar"),):
         parent = root
         for name in path[:-1]:
             parent = next((c for c in parent.children
