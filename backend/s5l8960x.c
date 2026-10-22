@@ -15,6 +15,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "target/arm/cpu.h"
@@ -28,6 +29,7 @@
 #include "chardev/char-fe.h"
 #include "crypto/aes.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include <sys/file.h>
 #include <math.h>
 
@@ -226,6 +228,62 @@ fail:
              gesture, command, p, why);
     out->count = 0;
     return false;
+}
+
+/* Host-testable mouse contact sequencer. Input packets commit at sync. */
+typedef struct MouseTouch {
+    int host_x, host_y, x, y, start_x, start_y;
+    bool button, last_button, pressed, dirty;
+    unsigned phase; /* 0 idle, 1 start, 2 down, 3 drag/final move, 4 up */
+    int64_t due;
+} MouseTouch;
+
+static int mouse_touch_scale(int value, int maximum, int pixels)
+{
+    value = MAX(0, MIN(value, maximum));
+    return (int)((int64_t)value * pixels / maximum);
+}
+
+static void mouse_touch_sync(MouseTouch *m, bool allowed, int64_t now)
+{
+    if (m->button && !m->last_button && !m->phase && allowed) {
+        m->x = m->start_x = m->host_x;
+        m->y = m->start_y = m->host_y;
+        m->phase = 1;
+        m->pressed = true;
+        m->dirty = false;
+        m->due = now;
+    } else if (m->phase && m->pressed) {
+        m->dirty |= m->x != m->host_x || m->y != m->host_y;
+        m->x = m->host_x;
+        m->y = m->host_y;
+    }
+    if (!m->button) { m->pressed = false; }
+    /* Ignored presses require a release and a fresh press. */
+    m->last_button = m->button;
+}
+
+static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
+                             TouchScriptFrame *f)
+{
+    if (!m->phase || now < m->due || !ready ||
+        (m->phase == 3 && m->pressed && !m->dirty)) { return false; }
+    f->ns = now;
+    f->x = m->x; f->y = m->y;
+    if (m->phase <= 2) {
+        f->state = m->phase == 1 ? 1 : 3;
+        f->x = m->start_x; f->y = m->start_y;
+        m->phase++;
+    } else if (m->phase == 3) {
+        f->state = 4;
+        m->dirty = false;
+        if (!m->pressed) { m->phase = 4; }
+    } else {
+        f->state = 7;
+        m->phase = 0;
+    }
+    m->due = now + TOUCH_TICK_NS;
+    return true;
 }
 
 typedef struct A7Bridge {
@@ -429,6 +487,9 @@ struct A7State {
     uint8_t *gpio_regs;
     bool touch_irq_low;
     QEMUTimer *touch_timer;
+    QEMUTimer *mouse_touch_timer;
+    MouseTouch mouse_touch;
+    bool mouse_touch_enabled;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
     bool touch_force;
@@ -1219,6 +1280,11 @@ static void touch_boot_complete(A7Touch *t)
  * Compact in FIFO order; never discard a boot notification awaiting EB. */
 static void touch_stop_contacts(A7Touch *t)
 {
+    /* The controller discarded this contact session. Require a fresh click;
+     * keep last_button so a held mouse cannot silently restart it. */
+    t->owner->mouse_touch.phase = 0;
+    t->owner->mouse_touch.pressed = false;
+    timer_del(t->owner->mouse_touch_timer);
     unsigned kept = 0;
     for (unsigned i = 0; i < t->frame_count; i++) {
         unsigned at = (t->frame_head + i) % ARRAY_SIZE(t->frames);
@@ -1277,6 +1343,71 @@ static void touch_script_reset(A7State *s)
     }
     timer_mod(s->touch_timer, s->touch_epoch_ns + s->touch_script.frames[0].ns);
 }
+
+/* Board-owned display device gives QEMU input a real console binding. */
+#define TYPE_A7_TOUCH_DISPLAY "a7-touch-display"
+OBJECT_DECLARE_SIMPLE_TYPE(A7TouchDisplay, A7_TOUCH_DISPLAY)
+struct A7TouchDisplay {
+    SysBusDevice parent_obj;
+    A7State *board;
+};
+
+static void mouse_touch_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    MouseTouch *m = &s->mouse_touch;
+    A7Touch *t = touch_device(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    TouchScriptFrame f;
+    bool ready = t && (s->touch_force || touch_reporting_enabled(t)) &&
+                 t->frame_count < ARRAY_SIZE(t->frames);
+    if (mouse_touch_next(m, now, ready, &f)) {
+        touch_contact(t, f.state, f.x, f.y);
+    }
+    if (m->phase && (m->phase != 3 || !m->pressed || m->dirty)) {
+        timer_mod(s->mouse_touch_timer,
+                  m->due > now ? m->due : now + TOUCH_TICK_NS);
+    } else {
+        timer_del(s->mouse_touch_timer);
+    }
+}
+
+static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
+                             QemuInputEvent *evt)
+{
+    A7State *s = A7_TOUCH_DISPLAY(dev)->board;
+    MouseTouch *m = &s->mouse_touch;
+    if (src != s->con) { return; }
+    if (evt->type == INPUT_EVENT_KIND_ABS) {
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            m->host_x = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 640);
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            m->host_y = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 1136);
+        }
+    } else if (evt->type == INPUT_EVENT_KIND_BTN &&
+               evt->btn.button == INPUT_BUTTON_LEFT) {
+        m->button = evt->btn.down;
+    }
+}
+
+static void mouse_touch_input_sync(DeviceState *dev)
+{
+    A7State *s = A7_TOUCH_DISPLAY(dev)->board;
+    A7Touch *t = touch_device(s);
+    bool allowed = s->mouse_touch_enabled && t &&
+                   (s->touch_force || touch_reporting_enabled(t)) &&
+                   s->touch_step >= s->touch_script.count;
+    mouse_touch_sync(&s->mouse_touch, allowed,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    mouse_touch_timer_cb(s);
+}
+
+static const QemuInputHandler mouse_touch_handler = {
+    .name = "A7 touchscreen mouse",
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .event = mouse_touch_event,
+    .sync = mouse_touch_input_sync,
+};
 
 static uint32_t touch_word(const uint8_t *b)
 {
@@ -5840,6 +5971,8 @@ static void a7_reset(void *opaque)
             memset(s->peripherals[i].regs, 0, s->peripherals[i].size);
         }
     }
+    timer_del(s->mouse_touch_timer);
+    memset(&s->mouse_touch, 0, sizeof(s->mouse_touch));
     touch_script_reset(s);
     s->chestnut_control = 0;
     d2045_reset(s);
@@ -6148,7 +6281,11 @@ static void a7_init(MachineState *ms)
         qdev_connect_gpio_out(DEVICE(s->ap_cpu[c]), GTIMER_VIRT,
                               qemu_allocate_irq(timer_irq, s, c * 2 + 1));
     }
-    s->con = qemu_graphic_console_create(NULL, 0, &display_ops, s);
+    DeviceState *display = qdev_new(TYPE_A7_TOUCH_DISPLAY);
+    display->id = g_strdup(TYPE_A7_TOUCH_DISPLAY);
+    A7_TOUCH_DISPLAY(display)->board = s;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(display), &error_fatal);
+    s->con = qemu_graphic_console_create(display, 0, &display_ops, s);
     qemu_console_resize(s->con, 640, 1136);
     s->sio.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sio_irq_timer_cb, s);
     s->sep.irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sep_irq_timer_cb, s);
@@ -6156,6 +6293,15 @@ static void a7_init(MachineState *ms)
                                          sep_os_active_timer_cb, s);
     s->pmu.adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d2045_adc_done, s);
     s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
+    s->mouse_touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mouse_touch_timer_cb, s);
+    const char *mouse_touch = getenv("VPHONE_MOUSE_TOUCH");
+    s->mouse_touch_enabled = !mouse_touch || strcmp(mouse_touch, "0");
+    if (s->mouse_touch_enabled) {
+        QemuInputHandlerState *input =
+            qemu_input_handler_register(display, &mouse_touch_handler);
+        qemu_input_handler_bind(input, display->id, 0, &error_fatal);
+        qemu_input_handler_activate(input);
+    }
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
     s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);
     s->agx_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_kick_cb, s);
@@ -6249,5 +6395,14 @@ static const TypeInfo a7_type = {
     .class_init = a7_class_init,
     .interfaces = aarch64_machine_interfaces,
 };
-static void a7_register(void) { type_register_static(&a7_type); }
+static const TypeInfo a7_touch_display_type = {
+    .name = TYPE_A7_TOUCH_DISPLAY,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(A7TouchDisplay),
+};
+static void a7_register(void)
+{
+    type_register_static(&a7_touch_display_type);
+    type_register_static(&a7_type);
+}
 type_init(a7_register)

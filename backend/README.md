@@ -328,6 +328,48 @@ endian byte is 1 (LE); its rows/columns and D9 dimensions retain the existing
 16×27 and 640×1136 personality. These are modeled values, not captured sensor
 firmware output. End-to-end iOS behavior requires integrator validation.
 
+### Mouse input in the Cocoa window
+
+Host mouse touch input is enabled by default. Set `VPHONE_MOUSE_TOUCH=0` on
+the QEMU process to disable registration of the mouse handler. The board's
+640×1136 graphic console belongs to the named `a7-touch-display` sysbus device;
+its bound QEMU absolute-pointer handler scales X/Y from `0..INPUT_EVENT_ABS_MAX`
+to `0..640` / `0..1136` top-left pixels. Cocoa supplies the position without
+relative-pointer acceleration. Input is committed at QEMU's sync boundary,
+after Cocoa's button event and both coordinate events have arrived.
+
+Left press emits start1 followed by down3 at the press position. Dragging emits
+move4 at most once per 16,666,667 ns of QEMU virtual time (about 60 Hz), coalescing
+intermediate positions to the latest point. A stationary hold queues no extra
+frames. Release emits a final move4 at the release position, then up7, even for
+a quick click. Transitions are spaced by one tick; a full touch FIFO delays
+delivery without losing transitions or bursting overdue motion. Both mouse and
+script use the same report 0x74 builder, identity 2, raw `(x,1136-y)`, FIFO and
+GPIO22 falling-edge IRQ path.
+
+Mouse presses are ignored while **any scripted frames remain**, including the
+wait before a scheduled script and gaps between its gestures. They are also
+ignored while a previous mouse release is draining or the reporting gate is
+closed. Release and press again after the script finishes/reporting resumes;
+a held ignored press never starts later. `VPHONE_TOUCH_FORCE=1` bypasses the
+same BF detectable/UI-lock reporting gate for mouse input, but does not bypass
+script ownership. Controller stop/UI-lock or disabling BF contact detection
+cancels the current mouse session along with queued contacts; a fresh click is
+required. Machine reset clears the mouse state and pending timer.
+
+SpringBoard processes touches slowly under emulation. For the lock-screen
+slide, drag slowly rightward near y=1036, from about x=40 to x=600 over roughly
+3 guest seconds, then **pause for about 1 guest second before releasing**.
+A fast swipe may bounce back because UIKit has not processed enough movement
+before the release. Guest seconds can take substantially longer than wall time.
+
+`tests/test_mouse_touch.py` compiles the actual sequencer, QEMU callbacks and
+frame builder with host stubs under ASan/UBSan. It checks coordinate scaling,
+Cocoa event ordering, contact states/identity/raw coordinates, motion coalescing,
+quick clicks, FIFO/gate waits, final release coordinates, ignored buttons/consoles,
+and script/force/disable policies. The SPI harness also checks controller-stop
+cancellation. These tests do not replace a rebuilt QEMU/Cocoa/iOS run.
+
 Run `python3 backend/touch_input_contract_test.py` and its diagnostic `--force`
 variant against the rebuilt QEMU for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
 actual source with host stubs and exercises a complete gesture under ASan/UBSan.

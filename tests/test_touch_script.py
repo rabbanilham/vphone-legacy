@@ -15,7 +15,7 @@ class TouchScriptTests(unittest.TestCase):
             self.skipTest('host C compiler unavailable')
         source = SOURCE.read_text()
         parser = source[source.index('/* Bounded, host-testable script compiler.'):
-                        source.index('typedef struct A7Bridge')]
+                        source.index('/* Host-testable mouse contact sequencer.')]
         harness = r'''
 #include <assert.h>
 #include <stdbool.h>
