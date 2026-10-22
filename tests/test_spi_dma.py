@@ -83,7 +83,8 @@ static void stq_le_p(void *v, uint64_t n) {
     stl_le_p(v,n); stl_le_p((uint8_t *)v+4,n>>32);
 }
 '''
-        harness += extract('/* Bounded, host-testable script compiler.', 'typedef struct A7Bridge')
+        harness += extract('/* Bounded, host-testable script compiler.', '/* Host-testable mouse contact sequencer.')
+        harness += extract('/* Host-testable mouse contact sequencer.', 'static int mouse_touch_scale(')
         harness += extract('#define SPI_FIFO_SIZE', 'typedef struct A7Peripheral')
         harness += r'''
 typedef struct A7Peripheral {
@@ -94,7 +95,7 @@ typedef struct A7Peripheral {
         harness += r'''
 struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[1];
-    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer;
+    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
     bool touch_force;
@@ -120,7 +121,8 @@ static int address_space_write(void *as, hwaddr a, int attrs, const void *b, siz
 }
 '''
         harness += extract('static void touch_gpio_update(', 'static const MemoryRegionOps gpio_ops')
-        harness += extract('static int spi_index(', '/* Recovered ABI: 10513ec')
+        harness += extract('static int spi_index(', '/* Board-owned display device')
+        harness += extract('static uint32_t touch_word(', '/* Recovered ABI: 10513ec')
         harness += extract('static bool ans_ram_range(', 'static bool ans_file_io(')
         harness += extract('static uint64_t sio_pack_msg(', 'static void sio_update_irq(')
         harness += r'''
@@ -401,7 +403,11 @@ int main(void) {
     touch_script_reset(&state);
     assert(timer_deadline==0 && state.touch_script.count==0 && state.touch_step==0);
     /* Reproduce the probe84 stop -> BF metadata/read/modify/write path. */
+    state.mouse_touch.phase=3; state.mouse_touch.pressed=true;
+    state.mouse_touch.button=state.mouse_touch.last_button=true;
     pio(p,stop,16,reply);
+    assert(!state.mouse_touch.phase && !state.mouse_touch.pressed);
+    assert(state.mouse_touch.button && state.mouse_touch.last_button);
     stw_le_p(fetch+7,touch_sum(fetch,3));pio(p,fetch,9,reply); /* drain fresh unlock notification */
     assert(!touch_reporting_enabled(&p->spi.touch));
     unsigned before=state.touch_step;
