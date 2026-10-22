@@ -6,6 +6,7 @@ PDS data -> TSW), then rasterises axis-aligned quads with src-over blending.
 """
 from pathlib import Path
 import struct
+import math
 import sys
 import zlib
 
@@ -286,6 +287,26 @@ def texel(f, tex, x, y):
         return b'\0\0\0\0'
 
 
+def quad_coordinate(pixel, low, high, uv0, uv1):
+    """Interpolate on the original quad, even when viewport clipping crops it."""
+    return uv0 + (uv1 - uv0) * (pixel + 0.5 - low) / (high - low)
+
+
+def quad_affine(xy, uv):
+    """Return U/V affine coefficients from three associated non-collinear vertices."""
+    dx1, dy1 = xy[1][0] - xy[0][0], xy[1][1] - xy[0][1]
+    dx2, dy2 = xy[2][0] - xy[0][0], xy[2][1] - xy[0][1]
+    det = dx1 * dy2 - dx2 * dy1
+    if not math.isfinite(det) or abs(det) < 1e-8:
+        return None
+    out = []
+    for c in range(2):
+        d1, d2 = uv[1][c] - uv[0][c], uv[2][c] - uv[0][c]
+        a, b = (d1 * dy2 - d2 * dy1) / det, (dx1 * d2 - dx2 * d1) / det
+        out.extend((a, b, uv[0][c] - a * xy[0][0] - b * xy[0][1]))
+    return tuple(out) if all(math.isfinite(v) for v in out) else None
+
+
 def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
     count = draw[1]
@@ -433,6 +454,14 @@ def main():
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         tex = texture(f, ppp)
         prog = program(f, ppp)
+        is_blur = prog in BLUR_PROGRAMS
+        blurred_tex = None
+        if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
+            raw_pixels = []
+            for ty in range(tex['h']):
+                for tx in range(tex['w']):
+                    raw_pixels.append(texel(f, tex, tx, ty))
+            blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
 
         step = 4 if count == 4 else 6
         for q_start in range(0, count, step):
@@ -453,15 +482,6 @@ def main():
             if x0 >= x1 or y0 >= y1:
                 continue
             if tex:
-                is_blur = prog in BLUR_PROGRAMS
-                blurred_tex = None
-                if is_blur and tex['w'] > 0 and tex['h'] > 0:
-                    raw_pixels = []
-                    for ty in range(tex['h']):
-                        for tx in range(tex['w']):
-                            raw_pixels.append(texel(f, tex, tx, ty))
-                    blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
-
                 # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
                 # then u,v in texels at +20.
                 uv_off = 4 if stride == 28 else 0
@@ -470,12 +490,18 @@ def main():
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
                 v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
                 su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+                uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
+                cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
                 tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su
                 sub_h = (v1 - v0) * sv
-                is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
+                is_scaled = abs((max(xs) - min(xs)) - sub_w) > 0.1 or abs((max(ys) - min(ys)) - sub_h) > 0.1
+                if uv_map:
+                    step_x = math.hypot(uv_map[0] * su, uv_map[3] * sv)
+                    step_y = math.hypot(uv_map[1] * su, uv_map[4] * sv)
+                    is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
@@ -483,7 +509,8 @@ def main():
                     return tex_cached_rows[ry]
 
                 for y in range(y0, y1):
-                    fv = (v0 + (v1 - v0) * (y - y0 + 0.5) / (y1 - y0)) * sv
+                    fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
+                          quad_coordinate(y, min(ys), max(ys), v0, v1)) * sv
                     if is_scaled and not blurred_tex:
                         v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
                         ty0 = int(v_sample)
@@ -492,13 +519,24 @@ def main():
                         row0 = get_tex_row(ty0)
                         row1 = get_tex_row(ty1) if ty1 != ty0 else row0
                     else:
-                        ty = min(tex['h'] - 1, int(fv))
+                        ty = max(0, min(tex['h'] - 1, int(fv)))
                         row0 = get_tex_row(ty)
 
                     for x in range(x0, x1):
-                        fu = (u0 + (u1 - u0) * (x - x0 + 0.5) / (x1 - x0)) * su
+                        fu = ((uv_map[0] * (x + 0.5) + uv_map[1] * (y + 0.5) + uv_map[2]) if uv_map else
+                              quad_coordinate(x, min(xs), max(xs), u0, u1)) * su
+                        sample_v = fv + uv_map[3] * (x + 0.5) * sv if uv_map else fv
+                        if cross_row and not blurred_tex:
+                            if is_scaled:
+                                v_sample = max(0.0, min(float(tex['h'] - 1), sample_v - 0.5))
+                                ty0 = int(v_sample)
+                                ty1 = min(tex['h'] - 1, ty0 + 1)
+                                fy = v_sample - ty0
+                                row0, row1 = get_tex_row(ty0), get_tex_row(ty1)
+                            else:
+                                row0 = get_tex_row(max(0, min(tex['h'] - 1, int(sample_v))))
                         if blurred_tex:
-                            b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, fv)
+                            b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, sample_v)
                         elif is_scaled:
                             u_sample = max(0.0, min(float(tex['w'] - 1), fu - 0.5))
                             tx0 = int(u_sample)
@@ -515,7 +553,7 @@ def main():
                                 )))) for c in range(4)
                             )
                         else:
-                            tx = min(tex['w'] - 1, int(fu))
+                            tx = max(0, min(tex['w'] - 1, int(fu)))
                             b, g, r, a = row0[tx]
                         if tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
