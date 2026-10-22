@@ -10,6 +10,9 @@
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
+#include "qemu/rcu.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "hw/core/boards.h"
@@ -533,6 +536,15 @@ struct A7State {
     uint32_t agx_queues[32];
     unsigned agx_queue_count;
     uint32_t agx_pending_doorbells;
+    /* Dedicated off-BQL AGX replay render thread state */
+    QemuThread agx_render_thread;
+    QemuMutex agx_render_mutex;
+    QemuCond agx_render_cond;
+    struct AGXRenderJob *agx_job_head;
+    struct AGXRenderJob *agx_job_tail;
+    bool agx_render_thread_running;
+    bool agx_render_thread_exit;
+    unsigned agx_inflight_jobs;
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -5016,6 +5028,48 @@ static bool agx_replay_enabled(void)
     return enabled;
 }
 
+static bool agx_replay_thread_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        /* On by default; VPHONE_AGX_REPLAY_THREAD=0 turns it off for bisects. */
+        const char *v = getenv("VPHONE_AGX_REPLAY_THREAD");
+        enabled = !v || strcmp(v, "0");
+    }
+    return enabled;
+}
+
+/* Snapshot of a 3D pass and its completion requirements, handed to the
+ * dedicated off-BQL render thread. */
+typedef struct AGXRenderJob {
+    A7State *s;
+    uint8_t ta[0x280];
+    uint64_t cat_base;
+    uint64_t target;
+    uint32_t width;
+    uint32_t height;
+
+    /* Stamp to store upon rasterisation completion */
+    bool has_stamp;
+    uint64_t stamp_gva;
+    uint32_t stamp_meta_addr;
+    uint32_t stamp_value;
+    uint32_t stamp_channel;
+    uint32_t queue_block;
+
+    /* Queue flow control to advance read_index upon completion */
+    bool has_queue_ctrl;
+    uint64_t queue_ctrl_gva;
+    uint32_t queue_read_index;
+
+    /* Completion event and interrupt for the kick */
+    bool post_completion;
+    unsigned commands;
+    unsigned stamps;
+
+    struct AGXRenderJob *next;
+} AGXRenderJob;
+
 #define AGX_PDS_HEAP UINT64_C(0x600000000)
 
 static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n)
@@ -5396,7 +5450,11 @@ static bool agx_replay_viewport(const uint32_t *ppp, unsigned n, float vp[4])
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height)
 {
-    static uint32_t row[640 * 4], texrow[0x4000];
+    /* Thread-safety: row and texrow are thread-local (__thread) buffers,
+     * ensuring safe re-entrancy between the dedicated off-BQL render thread
+     * and the inline BQL fallback. Guest memory is accessed via
+     * address_space_read/write on address_space_memory under RCU read lock. */
+    static __thread uint32_t row[640 * 4], texrow[0x4000];
     uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
     uint32_t ppp[64];
     unsigned ppp_count = 0, draws = 0;
@@ -5603,8 +5661,122 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                   (unsigned long long)target, draws);
 }
 
+/* Bottom half scheduled on the main loop context when the off-BQL render
+ * thread finishes rasterising a frame or job. */
+static void agx_replay_complete_bh(void *opaque)
+{
+    AGXRenderJob *job = opaque;
+    A7State *s = job->s;
+
+    /* Thread-safety: agx_replay_complete_bh runs on the main loop context with
+     * the BQL held. Stamp writes, queue control updates, and firmware completion
+     * notifications occur strictly after all frame pixels have been committed to
+     * guest RAM by the off-BQL render thread. */
+    if (job->has_stamp) {
+        agx_gpu_access(s, job->stamp_gva, &job->stamp_value, 4, true);
+        qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
+                      job->queue_block, job->stamp_meta_addr, job->stamp_value,
+                      job->stamp_channel);
+    }
+    if (job->has_queue_ctrl) {
+        smp_wmb();
+        agx_gpu_access(s, job->queue_ctrl_gva, &job->queue_read_index, 4, true);
+    }
+    if (job->post_completion) {
+        qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n",
+                      job->commands, job->stamps);
+        agx_post_fw_message(s, 1); /* type 1: work completed */
+    }
+
+    if (s->agx_inflight_jobs > 0) {
+        s->agx_inflight_jobs--;
+    }
+    g_free(job);
+}
+
+/* Dedicated off-BQL render thread worker loop. */
+static void *agx_render_thread_fn(void *opaque)
+{
+    A7State *s = opaque;
+
+    rcu_register_thread();
+
+    qemu_mutex_lock(&s->agx_render_mutex);
+    while (!s->agx_render_thread_exit) {
+        while (!s->agx_job_head && !s->agx_render_thread_exit) {
+            qemu_cond_wait(&s->agx_render_cond, &s->agx_render_mutex);
+        }
+        if (s->agx_render_thread_exit) {
+            break;
+        }
+
+        AGXRenderJob *job = s->agx_job_head;
+        s->agx_job_head = job->next;
+        if (!s->agx_job_head) {
+            s->agx_job_tail = NULL;
+        }
+        job->next = NULL;
+
+        qemu_mutex_unlock(&s->agx_render_mutex);
+
+        /* Thread-safety: rasterise off the BQL under RCU read lock.
+         * Guest RAM access (address_space_read/write on address_space_memory)
+         * is permitted without the BQL under RCU. No shared emulator machine
+         * state is modified here. */
+        if (job->target != 0) {
+            rcu_read_lock();
+            agx_replay_frame(job->s, job->cat_base, job->ta, job->target,
+                             job->width, job->height);
+            rcu_read_unlock();
+        }
+
+        /* Schedule stamp and kick completion on main context with BQL. */
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                agx_replay_complete_bh, job);
+
+        qemu_mutex_lock(&s->agx_render_mutex);
+    }
+    qemu_mutex_unlock(&s->agx_render_mutex);
+
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void agx_render_ensure_thread(A7State *s)
+{
+    if (!s->agx_render_thread_running && agx_replay_thread_enabled() && agx_replay_enabled()) {
+        s->agx_render_thread_running = true;
+        s->agx_render_thread_exit = false;
+        qemu_thread_create(&s->agx_render_thread, "agx-render",
+                           agx_render_thread_fn, s, QEMU_THREAD_JOINABLE);
+    }
+}
+
+static void agx_enqueue_render_jobs(A7State *s, AGXRenderJob *head, AGXRenderJob *tail)
+{
+    if (!head || !tail) {
+        return;
+    }
+    for (AGXRenderJob *j = head; j; j = j->next) {
+        s->agx_inflight_jobs++;
+    }
+
+    agx_render_ensure_thread(s);
+
+    qemu_mutex_lock(&s->agx_render_mutex);
+    if (s->agx_job_tail) {
+        s->agx_job_tail->next = head;
+    } else {
+        s->agx_job_head = head;
+    }
+    s->agx_job_tail = tail;
+    qemu_cond_signal(&s->agx_render_cond);
+    qemu_mutex_unlock(&s->agx_render_mutex);
+}
+
 /* Diagnostic only: RT0 is a GPU VA, not a META pointer (B1 sections 2/5). */
-static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
+static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
+                         AGXRenderJob **out_job)
 {
     uint8_t raw[0x280];
     hwaddr pa = 0, last_pa = 0;
@@ -5761,7 +5933,18 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
      * passes (e.g. 608x64 backdrops) land in their own coordinate space. */
     const uint8_t *pass_ta = agx_find_ta(s, context_id, raw);
     if (pbe_target && context_cat && agx_replay_enabled() && pass_ta) {
-        agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h);
+        if (!agx_replay_thread_enabled()) {
+            agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h);
+        } else if (out_job) {
+            AGXRenderJob *job = g_new0(AGXRenderJob, 1);
+            job->s = s;
+            job->cat_base = cat_base;
+            job->target = pbe_target;
+            job->width = pass_w;
+            job->height = pass_h;
+            memcpy(job->ta, pass_ta, sizeof(job->ta));
+            *out_job = job;
+        }
     }
     /* +0x68 is PBE register word 0 (swizzle/format), not an address; the
      * colour target comes from the end-of-tile PBE state when available. */
@@ -5902,7 +6085,8 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address)
     }
 }
 
-static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
+static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
+                                AGXRenderJob **local_head, AGXRenderJob **local_tail)
 {
     static int dump_enabled = -1;
     uint32_t pointers[2], read_index, write_index, size;
@@ -5921,17 +6105,83 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
         return 0;
     }
     unsigned done = 0;
+    AGXRenderJob *pending_job = NULL;
+    bool queue_has_job = false;
+
     while (read_index != write_index) {
         uint32_t address, command[4];
         if (!agx_gpu_access(s, entries + read_index * 4, &address, 4, false) ||
             !agx_gpu_access(s, agx_meta_gva(address), command, sizeof(command), false)) {
             break;
         }
-        if (command[0] == 4 && agx_gpu_access(s, agx_meta_gva(command[1]), &command[2], 4, true)) {
-            (*stamps)++;
-            qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
-                          block, command[1], command[2], command[3]);
+        if (command[0] == 4) {
+            if (pending_job) {
+                pending_job->has_stamp = true;
+                pending_job->stamp_gva = agx_meta_gva(command[1]);
+                pending_job->stamp_meta_addr = command[1];
+                pending_job->stamp_value = command[2];
+                pending_job->stamp_channel = command[3];
+                pending_job->queue_block = block;
+                (*stamps)++;
+                read_index = (read_index + 1) % size;
+                pending_job->has_queue_ctrl = true;
+                pending_job->queue_ctrl_gva = control;
+                pending_job->queue_read_index = read_index;
+                if (!*local_head) {
+                    *local_head = pending_job;
+                } else {
+                    (*local_tail)->next = pending_job;
+                }
+                *local_tail = pending_job;
+                queue_has_job = true;
+                pending_job = NULL;
+                done++;
+                continue;
+            } else if (agx_replay_thread_enabled() && (s->agx_inflight_jobs > 0 || *local_head)) {
+                /* Preserve FIFO ordering: queue stamp behind in-flight replay */
+                AGXRenderJob *stamp_job = g_new0(AGXRenderJob, 1);
+                stamp_job->s = s;
+                stamp_job->has_stamp = true;
+                stamp_job->stamp_gva = agx_meta_gva(command[1]);
+                stamp_job->stamp_meta_addr = command[1];
+                stamp_job->stamp_value = command[2];
+                stamp_job->stamp_channel = command[3];
+                stamp_job->queue_block = block;
+                (*stamps)++;
+                read_index = (read_index + 1) % size;
+                stamp_job->has_queue_ctrl = true;
+                stamp_job->queue_ctrl_gva = control;
+                stamp_job->queue_read_index = read_index;
+                if (!*local_head) {
+                    *local_head = stamp_job;
+                } else {
+                    (*local_tail)->next = stamp_job;
+                }
+                *local_tail = stamp_job;
+                queue_has_job = true;
+                done++;
+                continue;
+            } else {
+                if (agx_gpu_access(s, agx_meta_gva(command[1]), &command[2], 4, true)) {
+                    (*stamps)++;
+                    qemu_log_mask(LOG_UNIMP, "AGX META: queue 0x%x stamp 0x%x <- %u (channel %u)\n",
+                                  block, command[1], command[2], command[3]);
+                }
+            }
         } else if (command[0] != 4) {
+            if (pending_job) {
+                pending_job->has_queue_ctrl = true;
+                pending_job->queue_ctrl_gva = control;
+                pending_job->queue_read_index = read_index;
+                if (!*local_head) {
+                    *local_head = pending_job;
+                } else {
+                    (*local_tail)->next = pending_job;
+                }
+                *local_tail = pending_job;
+                queue_has_job = true;
+                pending_job = NULL;
+            }
             if (command[0] == 0 && (getenv("VPHONE_AGX_FRAME_DUMP") || agx_replay_enabled()) &&
                 command[1] < ARRAY_SIZE(s->agx_last_ta)) {
                 uint32_t context = command[1];
@@ -5945,7 +6195,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
                 }
             }
             if (command[0] == 1) {
-                agx_trace_rt(s, block, address);
+                agx_trace_rt(s, block, address, &pending_job);
             }
             if (dump_enabled) {
                 uint8_t raw[0x280];
@@ -5969,8 +6219,23 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps)
         read_index = (read_index + 1) % size;
         done++;
     }
-    smp_wmb();
-    agx_gpu_access(s, control, &read_index, 4, true);
+    if (pending_job) {
+        pending_job->has_queue_ctrl = true;
+        pending_job->queue_ctrl_gva = control;
+        pending_job->queue_read_index = read_index;
+        if (!*local_head) {
+            *local_head = pending_job;
+        } else {
+            (*local_tail)->next = pending_job;
+        }
+        *local_tail = pending_job;
+        queue_has_job = true;
+        pending_job = NULL;
+    }
+    if (!queue_has_job) {
+        smp_wmb();
+        agx_gpu_access(s, control, &read_index, 4, true);
+    }
     return done;
 }
 
@@ -6048,12 +6313,27 @@ static void agx_kick_cb(void *opaque)
         agx_gpu_access(s, control, &read_index, 4, true);
     }
     unsigned commands = 0, stamps = 0;
+    AGXRenderJob *local_head = NULL, *local_tail = NULL;
     for (unsigned q = 0; q < s->agx_queue_count; q++) {
-        commands += agx_drain_queue(s, s->agx_queues[q], &stamps);
+        commands += agx_drain_queue(s, s->agx_queues[q], &stamps, &local_head, &local_tail);
     }
-    if (commands) {
-        qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n", commands, stamps);
-        agx_post_fw_message(s, 1); /* type 1: work completed */
+    if (local_tail) {
+        local_tail->post_completion = true;
+        local_tail->commands = commands;
+        local_tail->stamps = stamps;
+        agx_enqueue_render_jobs(s, local_head, local_tail);
+    } else if (commands) {
+        if (agx_replay_thread_enabled() && s->agx_inflight_jobs > 0) {
+            AGXRenderJob *comp_job = g_new0(AGXRenderJob, 1);
+            comp_job->s = s;
+            comp_job->post_completion = true;
+            comp_job->commands = commands;
+            comp_job->stamps = stamps;
+            agx_enqueue_render_jobs(s, comp_job, comp_job);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n", commands, stamps);
+            agx_post_fw_message(s, 1); /* type 1: work completed */
+        }
     }
 }
 
@@ -6291,6 +6571,19 @@ static void a7_reset(void *opaque)
     s->agx_queue_count = 0;
     s->agx_pending_doorbells = 0;
     s->agx_meta_alive_count = 0;
+    if (s->agx_render_thread_running) {
+        qemu_mutex_lock(&s->agx_render_mutex);
+        AGXRenderJob *job = s->agx_job_head;
+        while (job) {
+            AGXRenderJob *next = job->next;
+            g_free(job);
+            job = next;
+        }
+        s->agx_job_head = NULL;
+        s->agx_job_tail = NULL;
+        qemu_mutex_unlock(&s->agx_render_mutex);
+        s->agx_inflight_jobs = 0;
+    }
     s->ans_clock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ans_calendar_seconds = s->utility_epoch;
     s->ans_elapsed_seconds = 0;
@@ -6754,6 +7047,14 @@ static void a7_init(MachineState *ms)
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vblank_timer_cb, s);
     s->agx_meta_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_meta_alive_cb, s);
     s->agx_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, agx_kick_cb, s);
+    qemu_mutex_init(&s->agx_render_mutex);
+    qemu_cond_init(&s->agx_render_cond);
+    s->agx_job_head = NULL;
+    s->agx_job_tail = NULL;
+    s->agx_render_thread_running = false;
+    s->agx_render_thread_exit = false;
+    s->agx_inflight_jobs = 0;
+    agx_render_ensure_thread(s);
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);
@@ -6793,6 +7094,16 @@ static void set_image(Object *o, Visitor *v, const char *name,
 static void a7_finalize(Object *o)
 {
     A7State *s = A7(o);
+    if (s->agx_render_thread_running) {
+        qemu_mutex_lock(&s->agx_render_mutex);
+        s->agx_render_thread_exit = true;
+        qemu_cond_signal(&s->agx_render_cond);
+        qemu_mutex_unlock(&s->agx_render_mutex);
+        qemu_thread_join(&s->agx_render_thread);
+        s->agx_render_thread_running = false;
+        qemu_mutex_destroy(&s->agx_render_mutex);
+        qemu_cond_destroy(&s->agx_render_cond);
+    }
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }

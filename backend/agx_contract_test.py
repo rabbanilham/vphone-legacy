@@ -355,7 +355,7 @@ def fixture(wait_context=False):
     return struct.pack('<' + 'I' * len(code), *code)
 
 
-def run_case(fill, context=True, replay=None):
+def run_case(fill, context=True, replay=None, replay_thread=None):
     with tempfile.TemporaryDirectory(prefix='a7agx-', dir='/tmp') as directory:
         root = Path(directory)
         (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None))
@@ -379,6 +379,8 @@ def run_case(fill, context=True, replay=None):
                 env.pop(key, None)
             if not replay:
                 env['VPHONE_AGX_REPLAY'] = '0'
+        if replay_thread is not None:
+            env['VPHONE_AGX_REPLAY_THREAD'] = '1' if replay_thread else '0'
         if pbe:
             env['VPHONE_AGX_PBE_SEARCH'] = '1'
         if fill is not None:
@@ -472,11 +474,13 @@ def main():
         run_case(None, context)
         run_case('11223344', context)
     run_case(None, replay=True)
+    run_case(None, replay=True, replay_thread=False)
     run_case(None, replay=False)
     for case in REPLAY_CASES:
         run_case(None, replay=case)
         print(f'PASS: AGX replay {case}: exact guest physical pixels and padding')
     print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')
+    print('PASS: AGX replay inline fallback (VPHONE_AGX_REPLAY_THREAD=0) matches threaded replay')
     print('PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback')
     print('PASS: AGX RT trace; opt-in fill follows noncontiguous GPU mappings and preserves padding')
     print('PASS: AGX META boot program -> one type-0 alive entry on firmware ring 0 and AIC IRQ 84; empty program posts nothing')
