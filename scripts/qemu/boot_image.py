@@ -181,9 +181,14 @@ def omit_unpopulated_devices(root):
     itself and all PMU/GPIO wiring stay. The baseband nodes are kept on
     purpose: without them CommCenter restarts and SpringBoard, which waits on
     CoreTelephony, never reaches the setup greeting (probe-132 vs probe-133).
+    The camera ISP is omitted too: the board has no ISP firmware, so
+    AppleH6CamIn's power-on failed and mediaserverd crashed each time its
+    camera bundle opened it, leaving SpringBoard in 9 s coremedia.recorder
+    timeouts; without the node mediaserverd reports no H6ISP capture device
+    and the greeting renders at ~35 s instead of ~64 s (probe-159 vs probe-160).
     This edits only the loader's in-memory DT, never the firmware input or disk.
     """
-    for path in (("arm-io", "uart2", "oscar"),):
+    for path in (("arm-io", "uart2", "oscar"), ("arm-io", "isp")):
         parent = root
         for name in path[:-1]:
             parent = next((c for c in parent.children

@@ -85,6 +85,9 @@ class LoaderTests(unittest.TestCase):
         add_node(add_node(arm, "mca1"), "audio-baseband-voice")
         add_node(add_node(arm, "uart1"), "bluetooth")
         add_node(add_node(root, "unrelated"), "oscar")
+        isp = add_node(arm, "isp")
+        isp.set_prop("compatible", b"isp,s5l8960x\0")
+        add_node(add_node(root, "unrelated2"), "isp")
         original = serialize_node(root)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
@@ -99,6 +102,9 @@ class LoaderTests(unittest.TestCase):
             self.assertIsNotNone(built.find_node("baseband"))
             self.assertIsNotNone(built.find_node("hsic-baseband"))
             self.assertEqual(built.find_node("uart2").children, [])
+            # The camera ISP has no firmware model; only /arm-io/isp goes.
+            self.assertNotIn(b"isp\0", [c.get_prop("name") for c in built.find_node("arm-io").children])
+            self.assertIsNotNone(built.find_node("unrelated2").children[0])
             self.assertEqual(built.find_node("uart2").get_prop("interrupts"),
                              struct.pack("<I", 142))
             for name in ("hsic-wlan", "audio-baseband-voice", "bluetooth", "oscar"):
