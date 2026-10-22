@@ -5079,7 +5079,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                               unsigned n, AGXTexture *tex)
 {
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
-    uint32_t blocks[4][12];
+    uint32_t blocks[4][8];
     unsigned count = 0;
     bool vibrancy = false;
 
@@ -5099,17 +5099,23 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 break;
             }
             if (agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
-                vibrancy |= !memcmp(blocks[count], luma, sizeof(luma));
+                for (unsigned j = 0; j + 3 <= ARRAY_SIZE(blocks[count]); j++) {
+                    if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
+                        vibrancy = true;
+                        break;
+                    }
+                }
                 count++;
             }
         }
     }
     for (unsigned b = 0; b < count; b++) {
-        /* A TSW starts within the block's first 8 words (word 7 behind the
-         * vibrancy luma constants, handover section 16). Word 8 onwards is the
-         * next allocation: the status-bar blur backdrop otherwise picked up
-         * the following draw's TSW (agy B4). */
-        for (unsigned k = 0; k <= 7; k++) {
+        /* Descriptor blocks in the uniform heap are 16-byte aligned. A valid
+         * TSW is located strictly at offset 0 (stand-alone TSW) or offset 4
+         * (preceded by a 4-word header or sampler). Arbitrary offsets like
+         * k = 6 overran into adjacent allocations and caused the status-bar
+         * blur backdrop to borrow "Searching..." (agy B4/D7). */
+        for (unsigned k = 0; k <= 4; k += 4) {
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
                 return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
