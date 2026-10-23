@@ -71,6 +71,16 @@ class Frame:
     def ta_valid(self):
         return bool(self.header['flags'] & 1)
 
+    def require_matching_ta(self):
+        """Reject old fallback snapshots that paired unrelated command passes."""
+        render_context = struct.unpack_from('<I', self.type1_command, 4)[0]
+        ta_context = struct.unpack_from('<I', self.ta_command, 4)[0]
+        render_param = struct.unpack_from('<I', self.type1_command, 0x10)[0]
+        ta_param = struct.unpack_from('<I', self.ta_command, 0x14)[0]
+        if (not self.ta_valid or render_context != ta_context or
+                not render_param or render_param != ta_param):
+            raise ValueError('render has no matching TA: recapture with complete TA history')
+
     @property
     def capped(self):
         return bool(self.header['flags'] & 2)

@@ -36,6 +36,46 @@ def find_viewport(ppp):
     return None
 
 
+def decode_ppp_clipping(ppp, state=None):
+    if state is None:
+        state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
+    if not ppp:
+        return state
+    hdr = ppp[0]
+    idx = 1
+    if hdr & (1 << 0):
+        if idx < len(ppp):
+            state['scenable'] = bool(ppp[idx] & (1 << 16))
+            idx += 1
+    if hdr & (1 << 1): idx += 1
+    if hdr & (1 << 2): idx += 1
+    if hdr & (1 << 3): idx += 1
+    if hdr & (1 << 4): idx += 1
+    if hdr & (1 << 5):
+        if idx < len(ppp):
+            state['scindex'] = ppp[idx] & 0xffff
+            idx += 1
+    if hdr & (1 << 6): idx += 4
+    if hdr & (1 << 7): idx += 1
+    if hdr & (1 << 8): idx += 1
+    if hdr & (1 << 9): idx += 1
+    if hdr & (1 << 10):
+        if idx + 1 < len(ppp):
+            rc0 = ppp[idx]
+            rc1 = ppp[idx + 1]
+            idx += 2
+            if (rc0 >> 31) & 1:
+                state['has_rc'] = True
+                state['rc_box'] = (((rc0 >> 16) & 0x1ff) * 32,
+                                   ((rc0 & 0x1ff) + 1) * 32,
+                                   ((rc1 >> 16) & 0x1ff) * 32,
+                                   ((rc1 & 0x1ff) + 1) * 32)
+            else:
+                state['has_rc'] = False
+                state['rc_box'] = None
+    return state
+
+
 def find_matrix(f, vs_data):
     """Orthographic vertex matrix (column-major 4x4) referenced by the vertex PDS data."""
     try:
@@ -95,7 +135,7 @@ def vertices(f, vs_data, count):
     for i in range(count):
         v = f.read(buf + i * stride, stride)
         x, y = struct.unpack_from('<2f', v, 0)
-        out.append((x, y, v[16:]))
+        out.append((x, y, v[8:] if stride == 16 else v[16:]))
     return stride, out
 
 
@@ -144,7 +184,7 @@ def decode_tsw(f, tsw):
     else:
         pitch = ((tsw[2] & 0xffff) + 1) * 4
         stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, tsw=tsw)
+    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=not strip and (tsw[0] & 0x8007) == 0x8001, tsw=tsw)
 
 
 def texture(f, ppp):
@@ -176,6 +216,7 @@ def blend_vibrancy(d, s):
     return tuple(min(255, sc + dc * (255 - sa) // 255) for sc, dc in ((sr, dr), (sg, dg), (sb, db), (sa, da)))
 
 
+WALLPAPER = 0x789b8f08a3f3a8cd  # observed CoreImage XY/UV clip-space pass
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
 
 
@@ -278,7 +319,18 @@ def program(f, ppp):
 
 
 def texel(f, tex, x, y):
-    if tex['strip']:
+    if tex.get('twiddled', False):
+        offset, bit, mask = 0, 0, 1
+        while mask < tex['w'] or mask < tex['h']:
+            if mask < tex['h']:
+                offset |= bool(y & mask) << bit
+                bit += 1
+            if mask < tex['w']:
+                offset |= bool(x & mask) << bit
+                bit += 1
+            mask <<= 1
+        gva = tex['addr'] + offset * 4
+    elif tex['strip']:
         gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * 4
     else:
         gva = tex['addr'] + y * tex['stride'] + x * 4
@@ -327,15 +379,16 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     tex = texture(f, ppp)
     prog = program(f, ppp)
 
-    if not tex and stride != 20:
+    if not tex and stride not in (20, 28):
         if stride == 12 and prog in BLUR_PROGRAMS:
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
-        return 'skipped: untextured with stride != 20', {'stride': stride, 'prog': hex(prog)}
+        return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
 
     if tex and tex['w'] * 4 > 0x10000:
         return 'skipped: texture wider than texrow', {'width': tex['w']}
 
-    m = find_matrix(f, vs_data) if stride != 12 else None
+    m = ((1, 1, 0, 0) if stride == 16 and prog == WALLPAPER else
+         find_matrix(f, vs_data) if stride != 12 else None)
     vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
 
     step = 4 if count == 4 else 6
@@ -366,7 +419,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     is_vibrancy = tex.get('vibrancy', False)
 
     uv_off = 4 if stride == 28 else 0
-    uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 else [(0, 0), (1, 1)])
+    uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
     u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
     v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
     su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
@@ -406,6 +459,19 @@ def audit_frame(f):
     return outcomes
 
 
+def render_target_pitch(f, width):
+    """Exact linear PBE pitch, with the older aligned-target fallback."""
+    try:
+        eot = PDS_HEAP | struct.unpack_from('<I', f.type1_command, 0x1bc)[0]
+        pbe = f.u32(eot + 8)
+        tex = decode_tsw(f, [f.u32(pbe + 8 + 4 * i) for i in range(4)])
+        if tex and tex['addr'] == f.header['pbe_target'] and not tex['twiddled']:
+            return tex['stride']
+    except (KeyError, ValueError):
+        pass
+    return ((width + 15) & ~15) * 4
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--audit':
         dumps_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parents[1] / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'
@@ -417,6 +483,7 @@ def main():
             if not bp.exists():
                 continue
             fr = Frame(bp)
+            fr.require_matching_ta()
             for did, out, _ in audit_frame(fr):
                 total_counts[out] += 1
                 category_frames[out].add(i)
@@ -429,6 +496,7 @@ def main():
         return
 
     f = Frame(sys.argv[1])
+    f.require_matching_ta()
     pw = (struct.unpack_from('<I', f.type1_command, 0x74)[0] & 0xffff) + 1
     ph = (struct.unpack_from('<I', f.type1_command, 0x70)[0] & 0xffff) + 1
     target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
@@ -437,7 +505,7 @@ def main():
     if not is_clear_pass(f.type1_command) and target and target in f.pages:
         strip = ((target + 0x9000) // 4096 * 4096 in f.pages and
                  (target + 0xa000) // 4096 * 4096 not in f.pages)
-        stride = 2560 if strip else ((target_w + 15) & ~15) * 4
+        stride = 2560 if strip else render_target_pitch(f, target_w)
         for y in range(target_h):
             for x in range(target_w):
                 gva = (target + (y >> 4) * 0x10000 + (y & 15) * stride + x * 4 if strip
@@ -448,13 +516,39 @@ def main():
                     fb[off:off + 4] = bytes((r, g, b, a))
                 except KeyError:
                     pass
+    scissor_base = struct.unpack_from('<I', f.type1_command, 0x50)[0]
+    clip_state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
     for vs_data, ppp, draw, viewport in walk(f):
+        clip_state = decode_ppp_clipping(ppp, clip_state)
+        clip_x0, clip_y0 = 0, 0
+        clip_x1, clip_y1 = target_w, target_h
+        if clip_state['scenable'] and scissor_base:
+            try:
+                w0 = f.u32(scissor_base + clip_state['scindex'] * 8)
+                w1 = f.u32(scissor_base + clip_state['scindex'] * 8 + 4)
+                clip_x0 = max(clip_x0, w0 >> 16)
+                clip_x1 = min(clip_x1, w0 & 0xffff)
+                clip_y0 = max(clip_y0, w1 >> 16)
+                clip_y1 = min(clip_y1, w1 & 0xffff)
+            except (KeyError, ValueError):
+                pass
+        if clip_state['has_rc'] and clip_state['rc_box']:
+            rc_x0, rc_x1, rc_y0, rc_y1 = clip_state['rc_box']
+            clip_x0 = max(clip_x0, rc_x0)
+            clip_x1 = min(clip_x1, rc_x1)
+            clip_y0 = max(clip_y0, rc_y0)
+            clip_y1 = min(clip_y1, rc_y1)
+
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
         m = find_matrix(f, vs_data) if stride != 12 else None
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         tex = texture(f, ppp)
         prog = program(f, ppp)
+        if stride == 16:
+            if prog != WALLPAPER:
+                continue
+            m = (1, 1, 0, 0)
         is_blur = prog in BLUR_PROGRAMS
         blurred_tex = None
         if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
@@ -475,8 +569,10 @@ def main():
             else:
                 xs = [v[0] for v in q_vs]
                 ys = [v[1] for v in q_vs]
-            x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
-            y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
+            x0 = max(clip_x0, int(round(min(xs))))
+            x1 = min(clip_x1, target_w, pw, int(round(max(xs))))
+            y0 = max(clip_y0, int(round(min(ys))))
+            y1 = min(clip_y1, target_h, ph, int(round(max(ys))))
             print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
                   (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
                                                              for k, v in tex.items() if k != 'tsw'})))
@@ -486,7 +582,7 @@ def main():
                 # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
                 # then u,v in texels at +20.
                 uv_off = 4 if stride == 28 else 0
-                uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24
+                uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER)
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
                 v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
@@ -582,7 +678,7 @@ def main():
                         b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
                         d = (y * target_w + x) * 4
                         fb[d:d + 4] = bytes((r, g, b, a))
-            elif stride == 20:
+            elif stride in (20, 28):
                 colour = struct.unpack_from('<I', q_vs[0][2], 0)[0]
                 r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
                 for y in range(y0, y1):

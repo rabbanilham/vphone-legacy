@@ -490,6 +490,8 @@ typedef struct SepMailbox {
     uint32_t keybag_blob_len;
 } SepMailbox;
 
+typedef struct AGXReplaySnapshot AGXReplaySnapshot;
+
 struct A7State {
     MachineState parent_obj;
     ARMCPU *cpu; /* cpu0 alias for boot setup */
@@ -542,8 +544,11 @@ struct A7State {
     /* Recent TA commands per context: a 3D command pairs with the TA whose
      * +0x14 parameter-buffer address equals its own +0x10 (TA for the next
      * frame is often consumed before the current 3D pass). */
-    uint8_t agx_ta_ring[16][8][0x280];
+    /* TA queues can run ahead of 3D by a complete native command batch.
+     * Eight entries evicted clock/Home passes before their renders arrived. */
+    uint8_t agx_ta_ring[16][256][0x280];
     uint8_t agx_ta_ring_next[16];
+    AGXReplaySnapshot *agx_ta_snapshot[16][256];
     bool agx_last_ta_valid[16];
     unsigned agx_frame_dump_count;
     uint64_t agx_frame_dump_seen;     /* qualifying frames seen, for SKIP/EVERY */
@@ -4860,8 +4865,8 @@ static const uint8_t *agx_find_ta(A7State *s, uint32_t context, const uint8_t *r
     if (context >= ARRAY_SIZE(s->agx_ta_ring)) {
         return NULL;
     }
-    for (unsigned i = 1; i <= 8; i++) {
-        const uint8_t *ta = s->agx_ta_ring[context][(uint8_t)(s->agx_ta_ring_next[context] - i) % 8];
+    for (unsigned i = 1; i <= ARRAY_SIZE(s->agx_ta_ring[context]); i++) {
+        const uint8_t *ta = s->agx_ta_ring[context][(uint8_t)(s->agx_ta_ring_next[context] - i)];
         if (ldl_le_p(ta) == 0 && ldl_le_p(ta + 0x14) == param && param) {
             return ta;
         }
@@ -4918,10 +4923,18 @@ static bool agx_ctx_write(A7State *s, uint64_t cat, uint64_t gva, const void *bu
     return ok;
 }
 
+static const uint8_t *agx_ta_snapshot_page(A7State *s, uint32_t context,
+                                           const uint8_t *raw, uint64_t gva);
+
 static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
                            uint64_t target, uint32_t queue, const uint8_t *raw)
 {
-    const uint8_t *dump_ta = agx_find_ta(s, context, raw) ?: s->agx_last_ta[context];
+    const uint8_t *dump_ta = agx_find_ta(s, context, raw);
+    const uint8_t empty_ta[0x280] = {0};
+    bool ta_valid = dump_ta != NULL;
+    if (!dump_ta) {
+        dump_ta = empty_ta;
+    }
     const char *dir = getenv("VPHONE_AGX_FRAME_DUMP");
     const char *count_env = getenv("VPHONE_AGX_FRAME_DUMP_COUNT");
     unsigned limit = 3, number;
@@ -5017,17 +5030,22 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
                 }
                 stq_le_p(record, gva);
                 stq_le_p(record + 8, pa);
-                if (address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
-                                       record + 16, 4096) != MEMTX_OK ||
-                    fwrite(record, 1, sizeof(record), out) != sizeof(record)) {
+                /* Offline replay sees the same TA-consumed geometry/state
+                 * as live replay, even after the guest reuses upload pages. */
+                const uint8_t *retained = agx_ta_snapshot_page(s, context, raw, gva);
+                if (retained) {
+                    memcpy(record + 16, retained, 4096);
+                } else if (address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                              record + 16, 4096) != MEMTX_OK) {
                     goto done;
                 }
+                if (fwrite(record, 1, sizeof(record), out) != sizeof(record)) { goto done; }
                 pages++;
             }
         }
     }
 finish:
-    stl_le_p(header + 12, (s->agx_last_ta_valid[context] ? 1 : 0) | (capped ? 2 : 0));
+    stl_le_p(header + 12, (ta_valid ? 1 : 0) | (capped ? 2 : 0));
     stq_le_p(header + 48, pages);
     if (fseek(out, 0, SEEK_SET) ||
         fwrite(header, 1, sizeof(header), out) != sizeof(header)) {
@@ -5057,7 +5075,7 @@ finish:
                      (unsigned long long)cat, (unsigned long long)target,
                      queue, s->agx_last_ta_queue[context],
                      (unsigned long long)s->disp_mmu_table, (unsigned long long)pages,
-                     capped ? "true" : "false", s->agx_last_ta_valid[context] ? "true" : "false",
+                     capped ? "true" : "false", ta_valid ? "true" : "false",
                      render_hex, ta_hex);
     close_result = fclose(json);
     json = NULL;
@@ -5110,11 +5128,14 @@ static bool agx_replay_thread_enabled(void)
 typedef struct AGXRenderJob {
     A7State *s;
     uint8_t ta[0x280];
+    AGXReplaySnapshot *snapshot;
     uint64_t cat_base;
     uint64_t target;
     uint32_t width;
+    uint32_t pitch;
     uint32_t height;
     bool is_clear;
+    uint64_t scissor_base;
 
     /* Stamp to store upon rasterisation completion */
     bool has_stamp;
@@ -5139,13 +5160,65 @@ typedef struct AGXRenderJob {
 
 #define AGX_PDS_HEAP UINT64_C(0x600000000)
 
+/* Immutable TA-consumed metadata. Texture pixels and render targets remain
+ * live: native TA consumes geometry/state, while 3D samples the textures. */
+struct AGXReplaySnapshot {
+    gint refs;
+    GHashTable *pages;
+};
+static __thread AGXReplaySnapshot *agx_read_snapshot;
+static __thread bool agx_capture_snapshot;
+
+static const uint8_t *agx_ta_snapshot_page(A7State *s, uint32_t context,
+                                           const uint8_t *raw, uint64_t gva)
+{
+    const uint8_t *ta = agx_find_ta(s, context, raw);
+    if (!ta) { return NULL; }
+    unsigned slot = (ta - &s->agx_ta_ring[context][0][0]) / 0x280;
+    AGXReplaySnapshot *snapshot = s->agx_ta_snapshot[context][slot];
+    return snapshot ? g_hash_table_lookup(snapshot->pages, &gva) : NULL;
+}
+
+static AGXReplaySnapshot *agx_snapshot_ref(AGXReplaySnapshot *snapshot)
+{
+    if (snapshot) { g_atomic_int_inc(&snapshot->refs); }
+    return snapshot;
+}
+static void agx_snapshot_unref(AGXReplaySnapshot *snapshot)
+{
+    if (snapshot && g_atomic_int_dec_and_test(&snapshot->refs)) {
+        g_hash_table_destroy(snapshot->pages);
+        g_free(snapshot);
+    }
+}
+
 static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n)
 {
     uint8_t *out = buf;
     while (n) {
         hwaddr pa;
         size_t chunk = MIN(n, 0x1000 - (gva & 0xfff));
-        if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+        uint64_t base = gva & ~UINT64_C(0xfff);
+        uint8_t *cached = agx_read_snapshot ? g_hash_table_lookup(agx_read_snapshot->pages, &base) : NULL;
+        if (!cached && agx_read_snapshot && agx_capture_snapshot &&
+            g_hash_table_size(agx_read_snapshot->pages) < 1024) {
+            hwaddr page_pa;
+            if (agx_gpu_translate_ctx(s, cat, base, &page_pa)) {
+                cached = g_malloc(4096);
+                if (address_space_read(&address_space_memory, page_pa, MEMTXATTRS_UNSPECIFIED,
+                                       cached, 4096) == MEMTX_OK) {
+                    uint64_t *key = g_new(uint64_t, 1);
+                    *key = base;
+                    g_hash_table_insert(agx_read_snapshot->pages, key, cached);
+                } else {
+                    g_free(cached);
+                    cached = NULL;
+                }
+            }
+        }
+        if (cached) {
+            memcpy(out, cached + (gva & 0xfff), chunk);
+        } else if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
             address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
                                out, chunk) != MEMTX_OK) {
             return false;
@@ -5189,6 +5262,7 @@ typedef struct AGXTexture {
     uint64_t addr;
     uint32_t w, h, stride;
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
+    bool twiddled;              /* uploaded 2D texture, Y-first Morton order */
 } AGXTexture;
 
 enum { AGX_TEX_NONE, AGX_TEX_FOUND, AGX_TEX_VIBRANCY };
@@ -5210,6 +5284,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     AGXSurface sf;
     agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
     tex->strip = sf.strip;
+    tex->twiddled = !sf.strip && (tsw[0] & 0x8007) == 0x8001;
     if (sf.strip) {
         tex->stride = sf.pitch;
     } else if ((tsw[0] & 7) == 1) {
@@ -5289,10 +5364,42 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
 
 static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
 {
+    if (tex->twiddled) {
+        uint64_t offset = 0;
+        unsigned bit = 0;
+        /* Interleave through the smaller padded dimension, then append
+         * the remaining coordinate bits for rectangular textures. */
+        for (unsigned mask = 1; mask < tex->w || mask < tex->h; mask <<= 1) {
+            if (mask < tex->h) { offset |= (uint64_t)!!(y & mask) << bit++; }
+            if (mask < tex->w) { offset |= (uint64_t)!!(x & mask) << bit++; }
+        }
+        return tex->addr + offset * 4;
+    }
     if (tex->strip) {
         return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * 4;
     }
     return tex->addr + (uint64_t)y * tex->stride + x * 4;
+}
+
+/* A Morton row is scattered within 4 KiB tiles. Cache one tile while
+ * gathering it, instead of walking the GPU tables for every pixel. */
+static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
+                            unsigned y, uint32_t *out)
+{
+    if (!tex->twiddled) {
+        return agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), out, tex->w * 4);
+    }
+    uint8_t page[4096];
+    uint64_t cached = UINT64_MAX;
+    for (unsigned x = 0; x < tex->w; x++) {
+        uint64_t gva = agx_texel_gva(tex, x, y), base = gva & ~UINT64_C(0xfff);
+        if (base != cached) {
+            if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+            cached = base;
+        }
+        out[x] = ldl_le_p(page + (gva & 0xfff));
+    }
+    return true;
 }
 
 /* darkenSourceOver / lightenSourceOver: scale the (premultiplied) source by
@@ -5559,9 +5666,96 @@ static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float ou
     return true;
 }
 
+static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
+{
+    AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
+    snapshot->refs = 1;
+    snapshot->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+    agx_read_snapshot = snapshot;
+    agx_capture_snapshot = true;
+    uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
+    uint32_t ppp[64] = {0}, n = 0;
+    for (unsigned guard = 0; guard < 4096; guard++) {
+        uint32_t w[5];
+        if (!agx_ctx_read(s, cat, pc, w, 4)) { break; }
+        unsigned kind = w[0] >> 29;
+        if (kind == 6) { break; }
+        if (kind == 4) {
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 4)) { break; }
+            pc = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u);
+        } else if (kind == 2) {
+            unsigned extra = !!(w[0] & (1u << 28)) + !!(w[0] & (1u << 27)) + 3 * !!(w[0] & (1u << 26));
+            if ((w[0] & (1u << 27)) &&
+                agx_ctx_read(s, cat, pc + 4 + ((w[0] & (1u << 28)) ? 4 : 0), w + 1, 4)) {
+                vs_data = AGX_PDS_HEAP | w[1];
+            }
+            pc += 4 * (1 + extra);
+        } else if (kind == 1) {
+            pc += 12;
+        } else if (kind == 0) {
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 4)) { break; }
+            uint64_t gva = ((uint64_t)(w[0] & 0xff) << 32) | (w[1] & ~3u);
+            n = MIN((w[0] >> 8) & 0xfffff, ARRAY_SIZE(ppp));
+            if (!agx_ctx_read(s, cat, gva, ppp, n * 4)) { n = 0; }
+            pc += 8;
+        } else if (kind == 3) {
+            uint32_t data[20];
+            uint8_t vertices[64 * 64];
+            if (!agx_ctx_read(s, cat, pc + 4, w + 1, 8)) { break; }
+            if (vs_data && agx_ctx_read(s, cat, vs_data, data, sizeof(data))) {
+                unsigned stride = data[0], count = MIN(w[1], 64u);
+                if (stride >= 12 && stride <= 64) {
+                    agx_ctx_read(s, cat, data[2] | ((uint64_t)data[3] << 32), vertices, count * stride);
+                }
+                /* Probe matrix candidates without retaining unrelated pages. */
+                for (unsigned k = 4; k < 20; k += 2) {
+                    uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
+                    float m[16];
+                    agx_capture_snapshot = false;
+                    bool ok = ptr >= 0x1000 && ptr < (UINT64_C(1) << 40) && agx_ctx_read(s, cat, ptr, m, sizeof(m));
+                    agx_capture_snapshot = true;
+                    static const unsigned zeros[] = {1,2,3,4,6,7,8,9,10,11,14};
+                    if (ok) {
+                        for (unsigned j = 0; j < ARRAY_SIZE(zeros); j++) { ok &= m[zeros[j]] == 0; }
+                        if (ok && fabsf(m[15] - 1) < 1e-6f && m[0] != 0 && m[5] != 0) {
+                            agx_ctx_read(s, cat, ptr, m, sizeof(m));
+                            break;
+                        }
+                    }
+                }
+                AGXTexture tex;
+                agx_replay_texture(s, cat, ppp, n, &tex);
+                agx_replay_program(s, cat, ppp, n);
+            }
+            pc += 12;
+        } else { break; }
+    }
+    agx_read_snapshot = NULL;
+    agx_capture_snapshot = false;
+    return snapshot;
+}
+
+static unsigned agx_audit_clock(A7State *s, uint64_t cat, AGXSurface *sf)
+{
+    uint32_t pixels[400];
+    unsigned bright = 0;
+    AGXReplaySnapshot *saved = agx_read_snapshot;
+    agx_read_snapshot = NULL;
+    for (unsigned y = 96; y < 304; y += 4) {
+        if (agx_ctx_read(s, cat, agx_surface_gva(sf, 120, y), pixels, sizeof(pixels))) {
+            for (unsigned x = 0; x < 400; x += 4) {
+                uint32_t p = pixels[x];
+                bright += (p & 255) > 200 && ((p >> 8) & 255) > 200 && ((p >> 16) & 255) > 200;
+            }
+        }
+    }
+    agx_read_snapshot = saved;
+    return bright;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
-                             bool is_clear)
+                             bool is_clear, uint32_t pitch, uint64_t scissor_base)
 {
     /* Thread-safety: row and texrow are thread-local (__thread) buffers,
      * ensuring safe re-entrancy between the dedicated off-BQL render thread
@@ -5572,13 +5766,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     uint32_t ppp[64];
     unsigned ppp_count = 0, draws = 0;
 
-    width = MIN(width, 640u);
-    height = MIN(height, 1136u);
+    width = MIN(width, (uint32_t)ARRAY_SIZE(row));
+    height = MIN(height, 4096u);
     AGXSurface sf;
     agx_surface_layout(s, cat, target, width, &sf);
+    if (!sf.strip && pitch >= width * 4) { sf.pitch = pitch; }
+    bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") && target >= UINT64_C(0x400000000);
+    unsigned before_clock = audit ? agx_audit_clock(s, cat, &sf) : 0;
 
     if (is_clear) {
-        uint32_t zero_row[640];
+        uint32_t zero_row[ARRAY_SIZE(row)];
         memset(zero_row, 0, sizeof(zero_row));
         for (uint32_t y = 0; y < height; y++) {
             agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, y), zero_row, width * 4);
@@ -5587,6 +5784,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
     /* Default viewport covers the pass; PPP state updates it. */
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
+    bool scenable = false;
+    uint16_t scindex = 0;
+    bool has_rc = false;
+    int rc_x0 = 0, rc_y0 = 0, rc_x1 = width, rc_y1 = height;
     for (unsigned guard = 0; guard < 4096; guard++) {
         uint32_t w[5];
         if (!agx_ctx_read(s, cat, pc, w, 4)) {
@@ -5623,6 +5824,43 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 ppp_count = 0;
             }
             agx_replay_viewport(ppp, ppp_count, vp);
+            if (ppp_count > 0) {
+                uint32_t hdr = ppp[0];
+                unsigned idx = 1;
+                if (hdr & (1 << 0)) {
+                    if (idx < ppp_count) {
+                        scenable = (ppp[idx++] & (1 << 16)) != 0;
+                    }
+                }
+                if ((hdr & (1 << 1)) && idx < ppp_count) { idx++; }
+                if ((hdr & (1 << 2)) && idx < ppp_count) { idx++; }
+                if ((hdr & (1 << 3)) && idx < ppp_count) { idx++; }
+                if ((hdr & (1 << 4)) && idx < ppp_count) { idx++; }
+                if (hdr & (1 << 5)) {
+                    if (idx < ppp_count) {
+                        scindex = ppp[idx++] & 0xffff;
+                    }
+                }
+                if (hdr & (1 << 6)) { idx += 4; }
+                if (hdr & (1 << 7)) { idx += 1; }
+                if (hdr & (1 << 8)) { idx += 1; }
+                if (hdr & (1 << 9)) { idx += 1; }
+                if (hdr & (1 << 10)) {
+                    if (idx + 1 < ppp_count) {
+                        uint32_t rc0 = ppp[idx++];
+                        uint32_t rc1 = ppp[idx++];
+                        if ((rc0 >> 31) & 1) {
+                            has_rc = true;
+                            rc_x0 = ((rc0 >> 16) & 0x1ff) * 32;
+                            rc_x1 = ((rc0 & 0x1ff) + 1) * 32;
+                            rc_y0 = ((rc1 >> 16) & 0x1ff) * 32;
+                            rc_y1 = ((rc1 & 0x1ff) + 1) * 32;
+                        } else {
+                            has_rc = false;
+                        }
+                    }
+                }
+            }
             pc += 8;
         } else if (kind == 3) {
             uint32_t stride, count;
@@ -5642,7 +5880,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
             uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
             bool is_blur_prog = agx_is_blur_program(prog);
-            if ((found == AGX_TEX_NONE && stride != 20 && !(stride == 12 && is_blur_prog)) ||
+            bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
+            if ((stride == 16 && !clip_space) ||
+                (found == AGX_TEX_NONE && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 continue;
             }
@@ -5657,8 +5897,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 if (raw_tex && tmp_tex) {
                     bool read_ok = true;
                     for (uint32_t ty = 0; ty < tex.h; ty++) {
-                        if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty),
-                                          raw_tex + (size_t)ty * tex.w, tex.w * 4)) {
+                        if (!agx_texture_row(s, cat, &tex, ty, raw_tex + (size_t)ty * tex.w)) {
                             read_ok = false;
                             break;
                         }
@@ -5674,6 +5913,22 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             unsigned step = (count == 4) ? 4 : 6;
             bool any_drawn = false;
+            int clip_x0 = 0, clip_y0 = 0, clip_x1 = (int)width, clip_y1 = (int)height;
+            if (scenable && scissor_base) {
+                uint32_t sc_words[2];
+                if (agx_ctx_read(s, cat, scissor_base + (uint64_t)scindex * 8, sc_words, sizeof(sc_words))) {
+                    clip_x0 = MAX(clip_x0, (int)(sc_words[0] >> 16));
+                    clip_x1 = MIN(clip_x1, (int)(sc_words[0] & 0xffff));
+                    clip_y0 = MAX(clip_y0, (int)(sc_words[1] >> 16));
+                    clip_y1 = MIN(clip_y1, (int)(sc_words[1] & 0xffff));
+                }
+            }
+            if (has_rc) {
+                clip_x0 = MAX(clip_x0, rc_x0);
+                clip_x1 = MIN(clip_x1, rc_x1);
+                clip_y0 = MAX(clip_y0, rc_y0);
+                clip_y1 = MIN(clip_y1, rc_y1);
+            }
             for (unsigned q_start = 0; q_start + step <= count; q_start += step) {
                 float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
                 float m4[4];
@@ -5687,7 +5942,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
                         break;
                     }
-                    if (transformed) {
+                    if (clip_space) {
+                        xy[0] = xy[0] * vp[0] + vp[1];
+                        xy[1] = xy[1] * vp[2] + vp[3];
+                    } else if (transformed) {
                         /* screen-space position -> NDC -> pass pixels */
                         xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
                         xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
@@ -5707,10 +5965,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
                 uint32_t tint = 0xffffffff;
                 uint32_t colour = 0xff000000;
-                if (stride == 20) {
+                if (stride == 20 || (stride == 28 && !textured)) {
                     agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &colour, 4);
-                } else if (stride == 24 || stride == 28) {
-                    unsigned uv = stride == 28 ? 20 : 16;
+                } else if (stride == 24 || stride == 28 || clip_space) {
+                    unsigned uv = clip_space ? 8 : (stride == 28 ? 20 : 16);
                     u0 = v0 = 1e9; u1 = v1 = -1e9;
                     if (stride == 28) {
                         agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &tint, 4);
@@ -5734,12 +5992,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                 }
 
-                int x0 = MAX(0, (int)lroundf(minx)), y0 = MAX(0, (int)lroundf(miny));
-                int x1 = MIN((int)width, (int)lroundf(maxx)), y1 = MIN((int)height, (int)lroundf(maxy));
+                int x0 = MAX(clip_x0, (int)lroundf(minx)), y0 = MAX(clip_y0, (int)lroundf(miny));
+                int x1 = MIN(clip_x1, (int)lroundf(maxx)), y1 = MIN(clip_y1, (int)lroundf(maxy));
                 if (x0 >= x1 || y0 >= y1 || !(u1 >= u0) || !(v1 >= v0)) {
                     continue;
                 }
                 any_drawn = true;
+                if (audit && y0 < 304 && y1 > 96) {
+                    qemu_log_mask(LOG_UNIMP, "AGX AUDIT draw target 0x%llx stride %u prog 0x%llx rect %d,%d-%d,%d texture 0x%llx tint 0x%x uv %g,%g-%g,%g\n",
+                                  (unsigned long long)target, stride, (unsigned long long)prog, x0,y0,x1,y1,
+                                  (unsigned long long)(textured ? tex.addr : 0), tint, u0,v0,u1,v1);
+                }
 
                 if (stride == 12 && is_blur_prog && !textured) {
                     /* Untextured Gaussian blur backdrop pass on canvas */
@@ -5807,8 +6070,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     quad_tex = g_malloc((size_t)tex.w * tex.h * 4);
                     for (unsigned ty = 0; ty < tex.h; ty++) {
-                        if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty),
-                                          quad_tex + (size_t)ty * tex.w, tex.w * 4)) {
+                        if (!agx_texture_row(s, cat, &tex, ty, quad_tex + (size_t)ty * tex.w)) {
                             g_free(quad_tex);
                             quad_tex = NULL;
                             break;
@@ -5837,20 +6099,20 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             fy = v_sample - (float)ty0;
 
                             if ((int)ty0 != cached_y0) {
-                                if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                                if (!agx_texture_row(s, cat, &tex, ty0, texrow)) {
                                     continue;
                                 }
                                 cached_y0 = (int)ty0;
                             }
                             if (ty1 != ty0 && (int)ty1 != cached_y1) {
-                                if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty1), texrow1, tex.w * 4)) {
+                                if (!agx_texture_row(s, cat, &tex, ty1, texrow1)) {
                                     continue;
                                 }
                                 cached_y1 = (int)ty1;
                             }
                         } else {
                             ty0 = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
-                            if (!agx_ctx_read(s, cat, agx_texel_gva(&tex, 0, ty0), texrow, tex.w * 4)) {
+                            if (!agx_texture_row(s, cat, &tex, ty0, texrow)) {
                                 continue;
                             }
                         }
@@ -5923,6 +6185,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             break;
         }
     }
+    if (audit) {
+        unsigned after_clock = agx_audit_clock(s, cat, &sf);
+        if (before_clock != after_clock || draws > 1) {
+            qemu_log_mask(LOG_UNIMP, "AGX AUDIT result target 0x%llx draws %u clock %u -> %u clear %u strip %u pitch %u\n",
+                          (unsigned long long)target, draws, before_clock, after_clock, is_clear, sf.strip, sf.pitch);
+        }
+    }
     qemu_log_mask(LOG_UNIMP, "AGX replay target 0x%llx draws %u\n",
                   (unsigned long long)target, draws);
 }
@@ -5964,6 +6233,7 @@ static void agx_replay_complete_job(AGXRenderJob *job)
     if (s->agx_inflight_jobs > 0) {
         s->agx_inflight_jobs--;
     }
+    agx_snapshot_unref(job->snapshot);
     g_free(job);
 }
 
@@ -6019,8 +6289,10 @@ static void *agx_render_thread_fn(void *opaque)
          * state is modified here. */
         if (job->target != 0) {
             rcu_read_lock();
+            agx_read_snapshot = job->snapshot;
             agx_replay_frame(job->s, job->cat_base, job->ta, job->target,
-                             job->width, job->height, job->is_clear);
+                             job->width, job->height, job->is_clear, job->pitch, job->scissor_base);
+            agx_read_snapshot = NULL;
             rcu_read_unlock();
         }
 
@@ -6102,6 +6374,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
                   block, address, context_id, (unsigned long long)cat_base,
                   context_cat ? "context slot" : "CAT_BASE0 fallback");
     uint64_t pbe_target = 0;
+    uint32_t pbe_pitch = 0;
     {
         /* End-of-tile PDS data (heap base 0x6_0000_0000 | cmd +0x1bc, size
          * +0x1c0) carries the PBE state words: W0 = A >> 2, W1[5:0] = A >> 34. */
@@ -6141,6 +6414,16 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
                 uint64_t a = ((uint64_t)(pbe[1] & 0x3f) << 34) | ((uint64_t)pbe[0] << 2);
                 if (agx_gpu_translate_ctx(s, cat_base, a, &surface_pa)) {
                     pbe_target = a;
+                    /* PBE's following texture descriptor names the same
+                     * surface and carries exact linear pitch (744-pixel
+                     * CoreImage targets need not be aligned to 16 pixels). */
+                    uint32_t tsw[4];
+                    AGXTexture rt_tex;
+                    if (agx_ctx_read(s, cat_base, words[2] + 8, tsw, sizeof(tsw)) &&
+                        agx_replay_decode_tsw(s, cat_base, tsw, &rt_tex) &&
+                        rt_tex.addr == a && !rt_tex.strip && !rt_tex.twiddled) {
+                        pbe_pitch = rt_tex.stride;
+                    }
                     qemu_log_mask(LOG_UNIMP,
                                   "AGX RT pbe target cmd 0x%x surface 0x%llx pa 0x%llx\n",
                                   address, (unsigned long long)a,
@@ -6188,7 +6471,13 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
             }
         }
     }
-    if (context_id == 1 && context_cat && pbe_target && s->disp_mmu_table) {
+    /* The default captures CA/display work; explicit context selection also
+     * permits early wallpaper/upload passes before display MMU programming. */
+    const char *dump_context = getenv("VPHONE_AGX_FRAME_DUMP_CONTEXT");
+    bool capture_context = dump_context ?
+        (!strcmp(dump_context, "all") || context_id == strtoul(dump_context, NULL, 0)) :
+        (context_id == 1 && s->disp_mmu_table);
+    if (capture_context && context_cat && pbe_target) {
         /* Optional: only dump frames with at least MIN_DRAWS draws (CA
          * redraws only dirty regions, so most frames are small). */
         const char *min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
@@ -6233,16 +6522,36 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
      * passes (e.g. 608x64 backdrops) land in their own coordinate space. */
     const uint8_t *pass_ta = agx_find_ta(s, context_id, raw);
     if (pbe_target && context_cat && agx_replay_enabled() && pass_ta) {
+        unsigned ta_slot = (pass_ta - &s->agx_ta_ring[context_id][0][0]) / 0x280;
+        AGXReplaySnapshot *snapshot = s->agx_ta_snapshot[context_id][ta_slot];
+        uint64_t scissor_base = ldl_le_p(raw + 0x50);
+        if (snapshot && scissor_base) {
+            uint8_t sc_page[4096];
+            hwaddr sc_pa;
+            uint64_t sc_base_page = scissor_base & ~UINT64_C(0xfff);
+            if (!g_hash_table_lookup(snapshot->pages, &sc_base_page) &&
+                agx_gpu_translate_ctx(s, cat_base, sc_base_page, &sc_pa) &&
+                address_space_read(&address_space_memory, sc_pa, MEMTXATTRS_UNSPECIFIED, sc_page, 4096) == MEMTX_OK) {
+                uint64_t *key = g_new(uint64_t, 1);
+                *key = sc_base_page;
+                g_hash_table_insert(snapshot->pages, key, g_memdup2(sc_page, 4096));
+            }
+        }
         if (!agx_replay_thread_enabled()) {
-            agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h, is_clear);
+            agx_read_snapshot = snapshot;
+            agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h, is_clear, pbe_pitch, scissor_base);
+            agx_read_snapshot = NULL;
         } else if (out_job) {
             AGXRenderJob *job = g_new0(AGXRenderJob, 1);
             job->s = s;
+            job->snapshot = agx_snapshot_ref(snapshot);
             job->cat_base = cat_base;
             job->target = pbe_target;
             job->width = pass_w;
+            job->pitch = pbe_pitch;
             job->height = pass_h;
             job->is_clear = is_clear;
+            job->scissor_base = scissor_base;
             memcpy(job->ta, pass_ta, sizeof(job->ta));
             *out_job = job;
         }
@@ -6423,6 +6732,18 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
             !agx_gpu_access(s, agx_meta_gva(address), command, sizeof(command), false)) {
             break;
         }
+        if (command[0] == 3) {
+            /* Native TA/3D queues use type-3 stamp waits to protect VDM and
+             * surface reuse. Ignoring these lets TA run ahead and the guest
+             * overwrite vertices before the corresponding 3D replay. */
+            uint32_t value;
+            if (!agx_gpu_access(s, agx_meta_gva(command[1]), &value, 4, false) ||
+                (int32_t)(value - command[2]) < 0) {
+                timer_mod(s->agx_kick_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+                break;
+            }
+        }
         if (command[0] == 4) {
             if (pending_job) {
                 pending_job->has_stamp = true;
@@ -6497,8 +6818,12 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                 uint8_t ta[0x280];
                 if (agx_gpu_access(s, agx_meta_gva(address), ta, sizeof(ta), false)) {
                     memcpy(s->agx_last_ta[context], ta, sizeof(ta));
-                    memcpy(s->agx_ta_ring[context][s->agx_ta_ring_next[context]++ % 8],
-                           ta, sizeof(ta));
+                    unsigned slot = s->agx_ta_ring_next[context]++;
+                    memcpy(s->agx_ta_ring[context][slot], ta, sizeof(ta));
+                    agx_snapshot_unref(s->agx_ta_snapshot[context][slot]);
+                    uint64_t cat = context < ARRAY_SIZE(s->agx_ctx_cat) - 3 && s->agx_ctx_cat[context + 3] ?
+                                   s->agx_ctx_cat[context + 3] : s->agx_cat_base;
+                    s->agx_ta_snapshot[context][slot] = agx_capture_ta(s, cat, ta);
                     s->agx_last_ta_valid[context] = true;
                     s->agx_last_ta_queue[context] = block;
                 }
@@ -6540,6 +6865,11 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
         *local_tail = pending_job;
         queue_has_job = true;
         pending_job = NULL;
+    }
+    /* An empty poll must not publish the private cursor: its pixels/stamps
+     * are still in flight. Doing so released guest resources before replay. */
+    if (!queue_has_job && host_slot >= 0 && !done) {
+        return 0;
     }
     if (!queue_has_job && host_slot >= 0 && done) {
         /* Older jobs of this queue are still in flight: publish this index
@@ -6902,6 +7232,12 @@ static void a7_reset(void *opaque)
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     memset(s->agx_last_ta, 0, sizeof(s->agx_last_ta));
     memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
+    for (unsigned c = 0; c < ARRAY_SIZE(s->agx_ta_snapshot); c++) {
+        for (unsigned i = 0; i < ARRAY_SIZE(s->agx_ta_snapshot[c]); i++) {
+            agx_snapshot_unref(s->agx_ta_snapshot[c][i]);
+            s->agx_ta_snapshot[c][i] = NULL;
+        }
+    }
     memset(s->agx_ta_ring, 0, sizeof(s->agx_ta_ring));
     memset(s->agx_ta_ring_next, 0, sizeof(s->agx_ta_ring_next));
     memset(s->agx_last_ta_valid, 0, sizeof(s->agx_last_ta_valid));
@@ -6916,6 +7252,7 @@ static void a7_reset(void *opaque)
         AGXRenderJob *job = s->agx_job_head;
         while (job) {
             AGXRenderJob *next = job->next;
+            agx_snapshot_unref(job->snapshot);
             g_free(job);
             job = next;
         }
@@ -6923,6 +7260,7 @@ static void a7_reset(void *opaque)
         s->agx_job_tail = NULL;
         for (job = s->agx_done_head; job; ) {
             AGXRenderJob *next = job->next;
+            agx_snapshot_unref(job->snapshot);
             g_free(job);
             job = next;
         }
