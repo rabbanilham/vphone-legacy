@@ -139,11 +139,11 @@ class AGXDrawCoverageTests(unittest.TestCase):
         self.assertEqual(frames_seen, 150)
         self.assertEqual(total_draws, 533)
         self.assertEqual(counts['approximated: textured quad (bilinear scaled)'], 144)
-        self.assertEqual(counts['replayed exactly: textured quad (1:1 nearest)'], 129)
+        self.assertEqual(counts['replayed exactly: textured quad (1:1 nearest)'], 149)
         self.assertEqual(counts['replayed exactly: solid quad (stride=20)'], 120)
         self.assertEqual(counts['approximated: Gaussian blur (separable 6-tap, canvas backdrop)'], 46)
         self.assertEqual(counts['replayed exactly: dest-in mask (1:1)'], 46)
-        self.assertEqual(counts['approximated: vibrancy (Rec.709 luma-weighted tint)'], 41)
+        self.assertEqual(counts['approximated: vibrancy (Rec.709 luma-weighted tint)'], 21)
         self.assertEqual(counts['replayed exactly: solid multi-quad (2 quads, stride=20)'], 7)
 
     def test_multiquad_cell_separator_preservation(self):

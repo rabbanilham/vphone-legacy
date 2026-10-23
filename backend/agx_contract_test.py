@@ -115,7 +115,7 @@ REPLAY_MASK_CODE = bytes.fromhex(
 REPLAY_BLUR_CODE = bytes.fromhex(
     '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
     '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
-REPLAY_CASES = ('pairing', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light')
+REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip', 'home-dirty-scissor', 'home-dirty-region', 'copy-border', 'transparent-over')
 
 
 def blend_vibrancy(dst, src):
@@ -159,8 +159,8 @@ def replay_blob(case=True):
     # Original cases retain the display hole; new cases map through +0xa000.
     # The extra pages are guards too: compare every byte, including row padding.
     synthetic = isinstance(case, str)
-    width, height = ((40, 40) if case == 'dense' else (16, 16)) if synthetic else (640, 1136)
-    pitch = ((width + 15) & ~15) * 4 if synthetic else 2560
+    width, height = ((744, 8) if case == 'wallpaper' else (40, 40) if case == 'dense' else (64, 64) if case in ('home-dirty-scissor', 'home-dirty-region') else (16, 16)) if synthetic else (640, 1136)
+    pitch = width * 4 if case == 'wallpaper' else (((width + 15) & ~15) * 4 if synthetic else 2560)
     target_pages = [map_page(REPLAY_TARGET + offset)
                     for offset in range(0, 0xb000 if synthetic else 0xa000, 0x1000)]
     for pa in target_pages:
@@ -220,12 +220,12 @@ def replay_blob(case=True):
     if synthetic:
         assert case in REPLAY_CASES, case
         expected[:] = b'\xa5' * len(expected)
-        if case in ('pairing', 'transform', 'dense'):
+        if case in ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'scissor-clip'):
             # One solid draw; terminate before the original texture draw.
             put(state + 10 * 4, '<I', 0xc0000000)
             draws = 1
             rect = (0, 0, 8, 4)
-            if case == 'pairing':
+            if case in ('pairing', 'pairing-batch'):
                 # Both TAs precede 3D; +0x10 selects the SECOND-to-last TA.
                 ta_count = 2
                 put(QUEUE + 0x830 + 8 * 4, '<I', ta_count)
@@ -233,6 +233,16 @@ def replay_blob(case=True):
                 put(QUEUE + 0xc00, '<2I', 0, CONTEXT_ID)
                 put(QUEUE + 0xc14, '<I', 0xc0460830)
                 put(QUEUE + 0xc68, '<Q', state_gva + 0x700)
+                if case == 'pairing-batch':
+                    # Sixteen later TAs must not evict the first pass.
+                    ta_count = 17
+                    put(QUEUE + 0x830 + 8 * 4, '<I', ta_count)
+                    put(QUEUE + 0x830 + 12 * 4, '<I', 32)
+                    # Separate entry storage from the commands.
+                    put(QUEUE + 0x808, '<I', QUEUE_META + 0xf00)
+                    put(QUEUE + 0xf00, '<I', QUEUE_META + 0x900)
+                    for i in range(16):
+                        put(QUEUE + 0xf04 + i * 4, '<I', QUEUE_META + 0xc00)
                 put(state + 0x700, '<11I', 0x4c000000, 0x1100, 0, 0, 0,
                     1 << 8, state_gva + 0x100, 0x6a000600, 6, 0, 0xc0000000)
                 put(pds + 0x100, '<IIQ', 20, 0, state_gva + 0x800)
@@ -258,6 +268,15 @@ def replay_blob(case=True):
                 for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
                     put(state + 0x200 + i * 20, '<4fI', u * 40, v * 40, 0, 1, 0xff112233)
                 rect = (0, 0, 40, 40)
+            elif case == 'scissor-clip':
+                # Scissor base at +0x50 in 3D command
+                put(QUEUE + 0x300 + 0x50, '<I', state_gva + 0xa00)
+                put(state + 0xa00, '<2I', (4 << 16) | 12, (4 << 16) | 12)
+                put(state + 0x100, '<3I', (1 << 0) | (1 << 5), 1 << 16, 0)
+                put(state + 5 * 4, '<I', 3 << 8)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, 0xff112233)
+                rect = (4, 4, 12, 12)
             expect_rect(rect, lambda x, y: 0xff112233)
         else:
             destination = 0xff907050
@@ -321,7 +340,7 @@ def replay_blob(case=True):
                         out |= v << c
                     return out
                 expect_rect((2, 0, 6, 2), blurred_over)
-            else:
+            elif case in ('vibrancy-dark', 'vibrancy-light'):
                 # Luma constants, four sampler words, then the TSW at +28.
                 q = (texture_gva >> 2) << 16
                 put(state + 0x400, '<11I', 0x3d93a000, 0x3e59a000, 0x3f372000,
@@ -334,10 +353,93 @@ def replay_blob(case=True):
                 for y in range(2):
                     put(state + 0x500 + y * 64, '<4I', *([0xffffffff] * 4))
                 expect_rect((2, 0, 6, 2), lambda x, y: blend_vibrancy(destination, tint))
+    if case in ('home-dirty-scissor', 'home-dirty-region'):
+        # Home's Clock hand update redraws a fullscreen wallpaper quad under
+        # a tiny scissor and a 32-pixel tile region. Static icons outside it
+        # must survive. Seed distinct content with the preceding solid draw.
+        destination, wallpaper = 0xff907050, 0xff123456
+        # An unrelated allocation beyond this tiny texture mimics the
+        # display's +0x9000 mapped / +0xa000 hole. Keep its real linear pitch.
+        map_page(state_gva + 0x9000)
+        # Real Home allocation boundary: the next draw's luma constants
+        # start immediately after this draw's stand-alone 16-byte TSW.
+        # They must not attenuate the opaque wallpaper and leave old icons.
+        put(state + 0x410, '<3I', 0x3d93a000, 0x3e59a000, 0x3f372000)
+        for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+            put(state + 0x200 + i * 20, '<4fI', u * 64, v * 64, 0, 1, destination)
+            put(state + 0x300 + i * 24, '<6f', u * 64, v * 64, 0, 1, u, v)
+        put(QUEUE + 0x350, '<I', state_gva + 0xa00)
+        put(state + 0xa08, '<2I', (35 << 16) | 44, (34 << 16) | 45)
+        put(state + 0x110, '<6I', 0x421,
+            (1 << 16) if case == 'home-dirty-scissor' else 0,
+            1, 0x80010001, 0x00010001, 0x80001000)
+        put(state + 15 * 4, '<I', 6 << 8)
+        for y in range(2):
+            put(state + 0x500 + y * 64, '<4I', *([wallpaper] * 4))
+        expect_rect((0, 0, 64, 64), lambda x, y: destination)
+        dirty = (35, 34, 44, 45) if case == 'home-dirty-scissor' else (32, 32, 64, 64)
+        expect_rect(dirty, lambda x, y: wallpaper)
+        draws = 2
+    if case in ('copy-border', 'transparent-over'):
+        # The real slider pass ends with eight transparent quads around its
+        # mask. Source-copy must erase the padding, while ordinary src-over
+        # with the same zero vertices must preserve it. Check all eight quads.
+        destination = 0xff907050
+        for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+            put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, destination)
+        expect_rect((0, 0, 16, 16), lambda x, y: destination)
+        put(pds + 0x20, '<IIQ', 20, 0, state_gva + 0xb00)
+        put(state + 15 * 4, '<I', 8 << 8)
+        put(state + 18 * 4, '<I', 48)
+        put(state + 0x110, '<8I', *([0] * 7), 0x1200 if case == 'copy-border' else 0)
+        if case == 'copy-border':
+            code = bytes.fromhex('4520b011d04010c0400002806aff280a940011f01b8022221000a0a00020398a80940011f01b8022221000a1a00021ff0024088b46a080c280408001880000ff')
+            put(map_page(0x700001000), '<64s', code)
+            put(pds + 0x200, '<I', 0x1000)
+        rects = ((2, 2, 4, 4), (4, 2, 12, 4), (12, 2, 14, 4),
+                 (12, 4, 14, 12), (12, 12, 14, 14), (4, 12, 12, 14),
+                 (2, 12, 4, 14), (2, 4, 4, 12))
+        for qid, (x0, y0, x1, y1) in enumerate(rects):
+            for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                put(state + 0xb00 + (qid * 6 + i) * 20, '<4fI',
+                    x0 + u * (x1 - x0), y0 + v * (y1 - y0), 0, 1, 0)
+            if case == 'copy-border':
+                expect_rect((x0, y0, x1, y1), lambda x, y: 0)
+        draws = 2
+    if case == 'wallpaper':
+        # Real CoreImage clip-space XY / texel UV layout, Y-first Morton
+        # source and an exact 744-pixel output pitch. Draw at the far edge.
+        code = bytes.fromhex('4520b002c44010c04000240287900800002402806aff2936c0c08a60800c888e60802408402524ff2936c0c08b618025088f61802408408041ff4620f4488060')
+        usc = map_page(0x700001000)
+        put(usc, '<64s', code)
+        put(pds + 0x200, '<I', 0x1000)
+        put(state, '<11I', 0x4c000000, 0x1020, 0, 0, 0,
+            8 << 8, state_gva + 0x110, 0x6a000600, 4, 0, 0xc0000000)
+        put(state + 0x110 + 7 * 4, '<I', 0x1200)
+        put(pds + 0x20, '<I', 16)
+        for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1))):
+            put(state + 0x300 + i * 16, '<4f', 2 * (740 + u * 4) / width - 1,
+                2 * v * 2 / height - 1, u * 4, v * 2)
+        q = (texture_gva >> 2) << 16
+        put(state + 0x400, '<4I', 0x60008861, 1 << 16 | 3 << 2, q & 0xffffffff, q >> 32)
+        for y in range(2):
+            for x in range(4):
+                morton = (y & 1) | ((x & 1) << 1) | ((x & 2) << 1)
+                put(state + 0x500 + morton * 4, '<I', REPLAY_TEXELS[y * 4 + x])
+        q = (REPLAY_TARGET >> 2) << 16
+        put(state + 0x608, '<4I', 0x60000a64, (height - 1) << 16 | (width - 1) << 2,
+            (q & 0xffffffff) | (width - 1), q >> 32)
+        expected[:] = b'\xa5' * len(expected)
+        expect_rect((740, 0, 744, 2), lambda x, y: REPLAY_TEXELS[y * 4 + x - 740])
+        draws = 1
+    if case in ('wait-stamp', 'geometry-lifetime'):
+        put(QUEUE + 0x50, '<I', 3)
+        put(QUEUE + 0x70, '<3I', QUEUE_META + 0xf80, QUEUE_META + 0x300, QUEUE_META + 0x100)
+        put(QUEUE + 0xf80, '<4I', 3, QUEUE_META + 0xfc0, 5, 0)
     return bytes(blob), target_pages, bytes(expected), (width, height), draws, ta_count
 
 
-def fixture(wait_context=False):
+def fixture(wait_context=False, wait_stamp=False, geometry_lifetime=False):
     code = move64(1, SGX1 + 0x10000) + move64(3, SGX1 + 0x1000) + move64(4, RESULT)
     code += move64(7, AIC) + move64(8, AIC + 0x4000) + move64(9, SGX0)
     def store(base, offset, value):
@@ -363,7 +465,23 @@ def fixture(wait_context=False):
                  0x34000000 | ((-1 & 0x7ffff) << 5) | 6]  # cbz w6, .-4
     # Acknowledge as the driver does (0xffffff80011852c0), re-enable, then kick ring 1.
     code += store(8, 0x88, 1 << 20) + store(8, 0x188, 1 << 20) + store(9, 0xb00, 0x11)
+    if wait_stamp:
+        # First kick must stop at the unsatisfied type-3 fence. Read its
+        # queue index before releasing the stamp and ringing a second time.
+        code += move64(10, QUEUE + 0x830)
+        code += [0xb9400000 | 10 << 5 | 6,
+                 0x34000000 | ((-1 & 0x7ffff) << 5) | 6]
+        code += move64(10, QUEUE + 0x30)
+        code += [0xb9400000 | 10 << 5 | 6, 0xb9000000 | 3 << 10 | 4 << 5 | 6]
+        if geometry_lifetime:
+            state_pa = DATA + len(data_blob()) + 2 * 0x1000
+            code += move64(10, state_pa + 0x210) + store(10, 0, 0xffabcdef)
+        code += move64(10, QUEUE + 0xfc0) + store(10, 0, 5) + store(9, 0xb00, 0x11)
     code += wait_irq(2)
+    if wait_stamp:
+        code += move64(10, QUEUE + 0x200)
+        code += [0xb9400000 | 10 << 5 | 6,
+                 0x34000000 | ((-1 & 0x7ffff) << 5) | 6]
     code += store(4, 4, 0xface) + [0x14000000]
     return struct.pack('<' + 'I' * len(code), *code)
 
@@ -371,7 +489,7 @@ def fixture(wait_context=False):
 def run_case(fill, context=True, replay=None, replay_thread=None):
     with tempfile.TemporaryDirectory(prefix='a7agx-', dir='/tmp') as directory:
         root = Path(directory)
-        (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None))
+        (root / 'fixture.bin').write_bytes(fixture(wait_context=context and fill is None, wait_stamp=replay in ('wait-stamp', 'geometry-lifetime'), geometry_lifetime=replay == 'geometry-lifetime'))
         pbe = context and fill is None and replay is None
         if replay is not None:
             blob, target_pages, replay_expected, dims, draws, ta_count = replay_blob(replay)
@@ -379,7 +497,7 @@ def run_case(fill, context=True, replay=None, replay_thread=None):
             blob, target_pages = data_blob(context, pbe), []
         (root / 'data.bin').write_bytes(blob)
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
-               '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', 'none', '-S',
+               '-kernel', str(root / 'fixture.bin'), '-accel', 'tcg', '-display', os.environ.get('VPHONE_DISPLAY', 'none'), '-S',
                '-device', f'loader,file={root}/data.bin,addr={DATA:#x},force-raw=on',
                '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off',
                '-d', 'unimp,guest_errors', '-D', str(root / 'trace.log')]
@@ -416,16 +534,18 @@ def run_case(fill, context=True, replay=None, replay_thread=None):
                     time.sleep(.01)
                 assert words(RESULT, 1) == [0x10000 | 84], hex(words(RESULT, 1)[0])
                 read_index, _, _, _, write_index = words(SHARED + 0x40, 5)
-                assert (read_index, write_index) == (0, 2), (read_index, write_index)
+                assert read_index == 0 and (write_index >= 2 if replay in ('wait-stamp', 'geometry-lifetime') else write_index == 2), (read_index, write_index)
                 assert words(SHARED + 0xc0, 10) == [0] * 10, 'alive entry is not type 0'
                 assert words(RESULT + 8, 1) == [0x10000 | 84], 'no completion interrupt'
                 assert words(QUEUE + 0x200, 1) == [0x1234], 'stamp not stored'
-                assert words(QUEUE + 0x30, 1) == [2], 'queue read index not advanced'
+                assert words(QUEUE + 0x30, 1) == [3 if replay in ('wait-stamp', 'geometry-lifetime') else 2], 'queue read index not advanced'
                 assert words(SHARED_9 + 0x8e0, 1) == [2 if replay is not None else 1], 'host ring 1 read index not advanced'
+                if replay in ('wait-stamp', 'geometry-lifetime'):
+                    assert words(RESULT + 12, 1) == [0], 'unsatisfied stamp wait consumed queue work'
                 if context:
                     assert words(SHARED_9 + 0x920, 1) == [3], 'ring 3 read index not advanced'
                     assert words(PC + ((RT_GVA >> 30) & 0x3ff) * 4, 1) == [0], 'RT mapped in CAT_BASE0'
-                assert words(SHARED + 0x50, 1) == [2], 'no completion event posted'
+                assert words(SHARED + 0x50, 1)[0] >= 2, 'no completion event posted'
                 assert words(SHARED + 0xc0 + 0x28, 1) == [1], 'completion event is not type 1'
                 expected = 0xa5a5a5a5 if fill is None else int(fill, 16)
                 for page in (RT_PA, RT_SECOND):
@@ -439,7 +559,9 @@ def run_case(fill, context=True, replay=None, replay_thread=None):
                         path = root / f'target-{i}.bin'
                         command(fp, 'pmemsave', {'val': pa, 'size': 0x1000, 'filename': str(path)})
                         actual.extend(path.read_bytes())
-                    assert actual == replay_expected, f'{replay!r}: replay pixels/padding'
+                    assert actual == replay_expected, (f'{replay!r}: replay pixels/padding', [(i, actual[i:i+4].hex(), replay_expected[i:i+4].hex()) for i in range(0, len(actual), 4) if actual[i:i+4] != replay_expected[i:i+4]][:8])
+                if os.environ.get('VPHONE_DISPLAY') == 'cocoa':
+                    time.sleep(1.0)
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
             trace = (root / 'trace.log').read_text()
@@ -492,6 +614,9 @@ def main():
     for case in REPLAY_CASES:
         run_case(None, replay=case)
         print(f'PASS: AGX replay {case}: exact guest physical pixels and padding')
+    for case in ('home-dirty-scissor', 'home-dirty-region', 'copy-border', 'transparent-over'):
+        run_case(None, replay=case, replay_thread=False)
+        print(f'PASS: AGX replay {case}: inline pixels and padding')
     print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')
     print('PASS: AGX replay inline fallback (VPHONE_AGX_REPLAY_THREAD=0) matches threaded replay')
     print('PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback')

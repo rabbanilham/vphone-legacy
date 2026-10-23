@@ -1,0 +1,1 @@
+PASS: SPI1 native 16-byte probe, masked IRQ, AIC IRQ 137, two HBPP tokens, FIFO drain and W1C

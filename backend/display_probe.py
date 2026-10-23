@@ -348,11 +348,13 @@ def main():
     p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
     p.add_argument('--framebuffer-at', type=float, action='append', default=[],
                    help='Save a QMP framebuffer at these guest-running seconds (repeatable)')
+    p.add_argument('--display-state', action='store_true', help='Save display plane registers and MMU tables beside timed QMP captures')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
     p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
+    p.add_argument('--mouse-swipe', help='Simulate mouse drag via QMP: at,x0,y0,x1,y1,dur,steps')
     args = p.parse_args()
     try:
         hook_dumps = parse_hook_dumps(args.hook_dump)
@@ -484,6 +486,13 @@ def main():
                     framebuffer_at=sorted(set(args.framebuffer_at))
                     framebuffer_captures=[]
                     serial_offset=0; serial_tail=b''; panicked=False
+                    mouse_swipe_done = False
+                    if args.mouse_swipe:
+                        ms_parts = [float(x) for x in args.mouse_swipe.split(',')]
+                        ms_at, ms_x0, ms_y0, ms_x1, ms_y1, ms_dur, ms_steps = (
+                            ms_parts[0], int(ms_parts[1]), int(ms_parts[2]),
+                            int(ms_parts[3]), int(ms_parts[4]), ms_parts[5], int(ms_parts[6])
+                        )
                     def freeze():
                         if gs and clock.resumed is not None:
                             gs.sendall(b'\x03');stop=receive_rsp(gs)
@@ -514,9 +523,40 @@ def main():
                             requested=framebuffer_at.pop(0)
                             path=out/f'framebuffer-at-{requested:g}s.ppm'
                             command(fp,'screendump',{'filename':str(path)})
+                            if args.display_state:
+                                state = command(fp, 'human-monitor-command',
+                                                {'command-line': 'xp /12288xw 0x206204000'})
+                                (out / f'display-at-{requested:g}s.txt').write_text(state)
+                                regs = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', state)]
+                                for offset in range(0x98, 0xc000, 0x100):
+                                    table = regs[offset // 4] << 4
+                                    if 0x800000000 <= table < 0x840000000:
+                                        command(fp, 'pmemsave', {'val': table, 'size': 4096,
+                                                'filename': str(out / f'display-at-{requested:g}s-table-{offset:x}.bin')})
                             framebuffer_captures.append(dict(requested_seconds=requested,
                                                             elapsed_seconds=clock.elapsed(),path=str(path)))
                             save_json(out/'framebuffer-captures.json',framebuffer_captures)
+                        if args.mouse_swipe and not mouse_swipe_done and clock.elapsed() >= ms_at:
+                            mouse_swipe_done = True
+                            command(fp, 'input-send-event', {'device': 'a7-touch-display', 'head': 0, 'events': [
+                                {'type': 'btn', 'data': {'down': True, 'button': 'left'}},
+                                {'type': 'abs', 'data': {'axis': 'x', 'value': int(ms_x0 * 32767 / 640)}},
+                                {'type': 'abs', 'data': {'axis': 'y', 'value': int(ms_y0 * 32767 / 1136)}}
+                            ]})
+                            step_dt = ms_dur / max(1, ms_steps)
+                            for s_idx in range(1, ms_steps + 1):
+                                cur_x = ms_x0 + (ms_x1 - ms_x0) * s_idx / ms_steps
+                                cur_y = ms_y0 + (ms_y1 - ms_y0) * s_idx / ms_steps
+                                time.sleep(step_dt)
+                                command(fp, 'input-send-event', {'device': 'a7-touch-display', 'head': 0, 'events': [
+                                    {'type': 'abs', 'data': {'axis': 'x', 'value': int(cur_x * 32767 / 640)}},
+                                    {'type': 'abs', 'data': {'axis': 'y', 'value': int(cur_y * 32767 / 1136)}}
+                                ]})
+                            command(fp, 'input-send-event', {'device': 'a7-touch-display', 'head': 0, 'events': [
+                                {'type': 'btn', 'data': {'down': False, 'button': 'left'}},
+                                {'type': 'abs', 'data': {'axis': 'x', 'value': int(ms_x1 * 32767 / 640)}},
+                                {'type': 'abs', 'data': {'axis': 'y', 'value': int(ms_y1 * 32767 / 1136)}}
+                            ]})
                         with (out/'serial.log').open('rb') as serial:
                             serial.seek(serial_offset); update=serial.read()
                             serial_offset=serial.tell()

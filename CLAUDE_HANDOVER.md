@@ -694,3 +694,27 @@ Final checks: 207 unit tests OK (3 skipped), complete AGX pixel contracts pass, 
 ### Interactive default changed by user request — 2026-10-23
 
 `backend/live_run.py` now defaults to the complete `build/virtual-activated-profile-v5/` plan/System/Data tuple and MTTCG (`VPHONE_TCG_THREAD` still overrides). Explicit image/plan flags remain available. Missing inputs fail before disk cloning; no baseline fallback. This supersedes earlier notes that baseline is the interactive default. Source images remain protected by disposable clones. The user requested an immediate visible run: Cocoa window `iOS 7 - virtual-activated`, work directory `/tmp/vphone-live-xm3br8zx`; images retained on exit. These launcher changes are not yet committed. The stopped graphics worktree remains stopped.
+
+## 24. Live lock screen, Home after unlock, mouse/short swipe (Claude + Codex + agy, 2026-10-23)
+
+Merged into `agx-meta-hle`: `wt/live-swipe` (556d24b) and `wt/lock-gfx` (fba5381). Reports: `research/reports/T-live-swipe.md`, `G-lock-gfx.md`, `G2-lock-gfx.md`.
+
+- **Touch (agy T + Claude):** releasing a drag now sends 18 stationary move frames (about 300 ms) before up7, so SpringBoard's slow run loop sees more than 50 % travel before touchesEnded. This applies to the mouse path and to `VPHONE_TOUCH_SCRIPT`, with travel measured per gesture, so taps are unaffected. While the button is held, mouse frames stay at 60 Hz, mouse Y gets +16 px for the MultitouchHID fingertip offset, and contact timestamps always increase. A short swipe `at=95;down 40,1036;move 600,1036 dur=0.7 steps=42;up` unlocked in 3/3 scripted boots plus one QMP mouse drag. A real hand-drag in the window is still untested. `display_probe.py --mouse-swipe at,x0,y0,x1,y1,dur,steps` drives the mouse path through QMP.
+- **Graphics (Codex G, then agy G2):**
+  - The TA history per context went from 8 to 256 entries. With 8, 3D passes lost their TA.
+  - TA-time geometry snapshots; type-3 stamp waits are honoured; a queue-cursor fix.
+  - Stride-16 clip-space wallpaper path with a Morton-tiled source and the PBE pitch: the wallpaper now renders.
+  - The 3D command's scissor table (+0x50), ISP scenable/scindex and the region clip rc0/rc1. A full-screen wallpaper redraw had been erasing the clock.
+  - Untextured stride-28 draws: clock digits.
+  - `VPHONE_AGX_REPLAY_AUDIT` gates the clock-audit tracing.
+- **Verified after the merge** (rebuilt main binary, `backend/evidence/merge-20261023-live/`, Cocoa window, 150 s, no panic, 22532 `AGX replay target` = `AGX RT queue`):
+  - At 90 s the lock screen shows wallpaper, clock, date and "slide to unlock".
+  - The short swipe at 95 s unlocks.
+  - At 105 s and 140 s Home is live: icons, labels, dock and status bar.
+  - Tests: 227 unit tests OK; the agx, touch_input, spi_touch and smp contracts pass.
+- **Open:**
+  - Home has ghosting: doubled or offset translucent icons and labels, apparently stale frames of the icon fly-in animation that are not cleared or composited correctly.
+  - A thin black bar with dashes shows near the slider on the lock screen.
+  - Home appeared live in only 1 of 4 boots before G2. Reliability after the merge has been checked on one boot only.
+  - Codex task H (`wt/home-live`, based on `wt/live-swipe` without G2) is investigating that intermittency. It should rebase on `agx-meta-hle` before its results are judged.
+  - agy W continues native Wi-Fi acceptance on `wt/wifi`. Its current lead is that the iOS driver rejects the DT `local-mac-address`.
