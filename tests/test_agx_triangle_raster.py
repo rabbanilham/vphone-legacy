@@ -322,6 +322,161 @@ int main() {
             py_pixels = sum(1 for i in range(0, len(py_fb), 4) if py_fb[i + 3] != 0)
             self.assertEqual(c_pixels, py_pixels)
 
+    def test_degenerate_diagonal_not_classified_as_axis_aligned(self):
+        """A 6-vertex draw with only two distinct points A and B is classified as solid wide line."""
+        # Frame 161 minute hand endpoints: A=(264.58, 260.85), B=(245.58, 284.07)
+        # Sequence of 6 vertices: A, A, B, B, B, A
+        p0 = (264.58, 260.85)
+        p1 = (245.58, 284.07)
+        vs = [
+            (p0[0], p0[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+            (p0[0], p0[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+            (p1[0], p1[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+            (p1[0], p1[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+            (p1[0], p1[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+            (p0[0], p0[1], b'\x33\x33\x33\xff\x00\x00\x00\x00\x00\x00\x00\x00'),
+        ]
+        class DummyFrame:
+            def u32(self, addr): return 28
+            def u64(self, addr): return 0x1000
+            def read(self, addr, n): return b'\x00' * n
+
+        cat, details = aro.classify_draw(DummyFrame(), 0x100, [], [0x6a000600, 6, 0], None, 640, 1136, 640, 1136)
+        # Under the old code, this was misclassified as 'replayed exactly: solid quad (stride=28)'
+        self.assertEqual(cat, 'replayed exactly: solid wide line (stride=28)')
+
+    def test_wide_line_rasteriser_diagonal_coverage(self):
+        """Diagonal line segment rasterises as thin strip with butt ends, not bounding box."""
+        p0 = (264.58, 260.85)
+        p1 = (245.58, 284.07)
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        L2 = dx * dx + dy * dy
+        L = math.sqrt(L2)
+        width = 2.0
+        half_w = width * 0.5
+        half_w2 = half_w * half_w
+
+        # Rasterise into 300x300 buffer
+        w, h = 300, 300
+        x0 = int(math.floor(min(p0[0], p1[0]) - width))
+        x1 = int(math.ceil(max(p0[0], p1[0]) + width))
+        y0 = int(math.floor(min(p0[1], p1[1]) - width))
+        y1 = int(math.ceil(max(p0[1], p1[1]) + width))
+
+        covered = set()
+        for y in range(y0, y1):
+            cy = y + 0.5
+            py = cy - p0[1]
+            for x in range(x0, x1):
+                cx = x + 0.5
+                px = cx - p0[0]
+                dot = px * dx + py * dy
+                if 0.0 <= dot <= L2:
+                    cross = dx * py - dy * px
+                    if cross * cross <= half_w2 * L2:
+                        covered.add((x, y))
+
+        bbox_pixels = (x1 - x0) * (y1 - y0)
+        self.assertGreater(bbox_pixels, 400, 'Bounding box area must be large')
+        self.assertLess(len(covered), 90, f'Covered {len(covered)} pixels, expected thin line (< 90)')
+        self.assertGreater(len(covered), 40, f'Covered {len(covered)} pixels, expected > 40')
+
+        # Verify all covered pixel centers are within half_w perpendicular distance
+        for x, y in covered:
+            cx, cy = x + 0.5, y + 0.5
+            px, py = cx - p0[0], cy - p0[1]
+            dist_perp = abs(dx * py - dy * px) / L
+            self.assertLessEqual(dist_perp, half_w + 1e-4)
+
+    def test_c_wide_line_rasteriser_extracted_compilation(self):
+        """Compile and verify C wide line rasteriser matches Python output."""
+        compiler = shutil.which('cc')
+        if not compiler:
+            self.skipTest('host C compiler unavailable')
+
+        harness = '''
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+int rasterise_line_c(float x0_f, float y0_f, float x1_f, float y1_f, float width, int w, int h, uint32_t *fb) {
+    float dx = x1_f - x0_f;
+    float dy = y1_f - y0_f;
+    float L2 = dx * dx + dy * dy;
+    float half_w = width * 0.5f;
+    float half_w2 = half_w * half_w;
+
+    int x0 = MAX(0, (int)floorf(MIN(x0_f, x1_f) - width));
+    int x1 = MIN(w, (int)ceilf(MAX(x0_f, x1_f) + width));
+    int y0 = MAX(0, (int)floorf(MIN(y0_f, y1_f) - width));
+    int y1 = MIN(h, (int)ceilf(MAX(y0_f, y1_f) + width));
+
+    int count = 0;
+    for (int y = y0; y < y1; y++) {
+        float cy = (float)y + 0.5f;
+        float py = cy - y0_f;
+        for (int x = x0; x < x1; x++) {
+            float cx = (float)x + 0.5f;
+            float px = cx - x0_f;
+            float dot = px * dx + py * dy;
+            if (dot < 0.0f || dot > L2) continue;
+            float cross = dx * py - dy * px;
+            if (cross * cross <= half_w2 * L2) {
+                fb[y * w + x] = 0xff333333;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+int main() {
+    uint32_t fb[64 * 64] = {0};
+    int count = rasterise_line_c(10.0f, 10.0f, 40.0f, 30.0f, 2.0f, 64, 64, fb);
+    printf("C_LINE_PIXELS=%d\\n", count);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as td:
+            src_path = Path(td) / 'test_line.c'
+            bin_path = Path(td) / 'test_line'
+            src_path.write_text(harness)
+
+            res = subprocess.run([compiler, '-O2', str(src_path), '-o', str(bin_path), '-lm'],
+                                 capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f'Compilation failed:\n{res.stderr}')
+
+            res_run = subprocess.run([str(bin_path)], capture_output=True, text=True)
+            self.assertEqual(res_run.returncode, 0, f'Execution failed:\n{res_run.stderr}')
+            c_pixels = int(res_run.stdout.strip().split('=')[1])
+
+            # Python equivalent
+            p0 = (10.0, 10.0)
+            p1 = (40.0, 30.0)
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            L2 = dx * dx + dy * dy
+            half_w2 = 1.0
+            py_pixels = 0
+            for y in range(64):
+                cy = y + 0.5
+                py = cy - p0[1]
+                for x in range(64):
+                    cx = x + 0.5
+                    px = cx - p0[0]
+                    dot = px * dx + py * dy
+                    if 0.0 <= dot <= L2:
+                        cross = dx * py - dy * px
+                        if cross * cross <= half_w2 * L2:
+                            py_pixels += 1
+            self.assertEqual(c_pixels, py_pixels)
+
 
 if __name__ == '__main__':
     unittest.main()

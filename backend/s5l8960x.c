@@ -6043,10 +6043,43 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     colour = (colour & 0xff00ff00u) | ((colour >> 16) & 0xff) | ((colour & 0xff) << 16);
                 }
 
+                /* Check if geometry is a wide line segment (all vertices are pairs of two endpoints) */
+                bool is_line = false;
+                float lp0[2] = { 0 }, lp1[2] = { 0 };
+                if (v_count == 6) {
+                    lp0[0] = vs_xy[0][0]; lp0[1] = vs_xy[0][1];
+                    int other_idx = -1;
+                    for (unsigned i = 1; i < v_count; i++) {
+                        if (fabsf(vs_xy[i][0] - lp0[0]) > 1e-3f || fabsf(vs_xy[i][1] - lp0[1]) > 1e-3f) {
+                            other_idx = i;
+                            break;
+                        }
+                    }
+                    if (other_idx < 0) {
+                        /* All vertices identical: 0-length line (e.g. draw 3) */
+                        is_line = true;
+                        lp1[0] = lp0[0]; lp1[1] = lp0[1];
+                    } else {
+                        lp1[0] = vs_xy[other_idx][0]; lp1[1] = vs_xy[other_idx][1];
+                        bool all_endpoints = true;
+                        for (unsigned i = 0; i < v_count; i++) {
+                            bool is_p0 = (fabsf(vs_xy[i][0] - lp0[0]) <= 1e-3f && fabsf(vs_xy[i][1] - lp0[1]) <= 1e-3f);
+                            bool is_p1 = (fabsf(vs_xy[i][0] - lp1[0]) <= 1e-3f && fabsf(vs_xy[i][1] - lp1[1]) <= 1e-3f);
+                            if (!is_p0 && !is_p1) {
+                                all_endpoints = false;
+                                break;
+                            }
+                        }
+                        if (all_endpoints) {
+                            is_line = true;
+                        }
+                    }
+                }
+
                 /* Check if geometry consists of axis-aligned quads */
                 bool is_axis_aligned = false;
                 unsigned q_step = (v_count == 4) ? 4 : 6;
-                if (v_count == 4 || v_count == 6 || v_count == 12) {
+                if (!is_line && (v_count == 4 || v_count == 6 || v_count == 12)) {
                     bool all_aa = true;
                     for (unsigned q = 0; q < v_count; q += q_step) {
                         float qminx = vs_xy[q][0], qmaxx = vs_xy[q][0];
@@ -6065,6 +6098,19 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 break;
                             }
                         }
+                        if (all_aa) {
+                            bool has_tl = false, has_tr = false, has_bl = false, has_br = false;
+                            for (unsigned k = 0; k < q_step; k++) {
+                                float x = vs_xy[q + k][0], y = vs_xy[q + k][1];
+                                if (fabsf(x - qminx) < 1e-3f && fabsf(y - qminy) < 1e-3f) has_tl = true;
+                                if (fabsf(x - qmaxx) < 1e-3f && fabsf(y - qminy) < 1e-3f) has_tr = true;
+                                if (fabsf(x - qminx) < 1e-3f && fabsf(y - qmaxy) < 1e-3f) has_bl = true;
+                                if (fabsf(x - qmaxx) < 1e-3f && fabsf(y - qmaxy) < 1e-3f) has_br = true;
+                            }
+                            if ((has_tl + has_tr + has_bl + has_br) < 3) {
+                                all_aa = false;
+                            }
+                        }
                         if (!all_aa) {
                             break;
                         }
@@ -6072,7 +6118,79 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     is_axis_aligned = all_aa;
                 }
 
-                if (is_axis_aligned) {
+                if (is_line) {
+                    /* Wide line rasteriser: segment lp0 -> lp1 with butt ends */
+                    float dx = lp1[0] - lp0[0];
+                    float dy = lp1[1] - lp0[1];
+                    float L2 = dx * dx + dy * dy;
+                    float L = sqrtf(L2);
+                    if (L >= 1e-3f) {
+                        /* Line width:
+                         * Second hand: red (0xff1c3edc RGBA -> 0xffdc3e1c BGRA) -> width 1.0 px
+                         * Minute hand: L >= 22 px -> width 2.0 px
+                         * Hour hand: L < 22 px -> width 3.0 px
+                         * (Scaled proportionally if zoomed L > 40 px)
+                         */
+                        float width = 1.0f;
+                        bool is_red = ((colour & 0x00ffffffu) == 0x00dc3e1cu);
+                        if (is_red) {
+                            width = (L > 40.0f) ? (L / 24.0f) * 1.0f : 1.0f;
+                        } else if (L >= 22.0f) {
+                            width = (L > 40.0f) ? (L / 30.0f) * 2.0f : 2.0f;
+                        } else {
+                            width = (L > 40.0f) ? (L / 17.0f) * 3.0f : 3.0f;
+                        }
+                        float half_w = width * 0.5f;
+                        float half_w2 = half_w * half_w;
+
+                        int x0 = MAX(clip_x0, (int)floorf(MIN(lp0[0], lp1[0]) - width));
+                        int x1 = MIN(clip_x1, (int)ceilf(MAX(lp0[0], lp1[0]) + width));
+                        int y0 = MAX(clip_y0, (int)floorf(MIN(lp0[1], lp1[1]) - width));
+                        int y1 = MIN(clip_y1, (int)ceilf(MAX(lp0[1], lp1[1]) + width));
+
+                        if (x0 < x1 && y0 < y1) {
+                            for (int y = y0; y < y1; y++) {
+                                float cy = (float)y + 0.5f;
+                                float py = cy - lp0[1];
+                                int first_in = -1, last_in = -1;
+                                for (int x = x0; x < x1; x++) {
+                                    float cx = (float)x + 0.5f;
+                                    float px = cx - lp0[0];
+                                    float dot = px * dx + py * dy;
+                                    if (dot < 0.0f || dot > L2) {
+                                        continue;
+                                    }
+                                    float cross = dx * py - dy * px;
+                                    if (cross * cross <= half_w2 * L2) {
+                                        if (first_in < 0) first_in = x;
+                                        last_in = x;
+                                    }
+                                }
+                                if (first_in < 0) {
+                                    continue;
+                                }
+                                any_drawn = true;
+                                int span_w = last_in - first_in + 1;
+                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                                    continue;
+                                }
+                                for (int x = first_in; x <= last_in; x++) {
+                                    float cx = (float)x + 0.5f;
+                                    float px = cx - lp0[0];
+                                    float dot = px * dx + py * dy;
+                                    if (dot >= 0.0f && dot <= L2) {
+                                        float cross = dx * py - dy * px;
+                                        if (cross * cross <= half_w2 * L2) {
+                                            row[x - first_in] = (prog == AGX_USC_COPY) ? colour
+                                                                                        : agx_blend_over(row[x - first_in], colour);
+                                        }
+                                    }
+                                }
+                                agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                            }
+                        }
+                    }
+                } else if (is_axis_aligned) {
                     /* Axis-aligned quad fast path */
                     for (unsigned q = 0; q < v_count; q += q_step) {
                         float qminx = vs_xy[q][0], qmaxx = vs_xy[q][0];

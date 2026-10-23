@@ -401,6 +401,19 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
 
     step = 4 if count == 4 else 6
+    is_line = False
+    if count == 6 and not tex and stride in (20, 28):
+        vs_coords = []
+        for v in vs:
+            x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
+            y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
+            vs_coords.append((round(x, 2), round(y, 2)))
+        if len(set(vs_coords)) <= 2:
+            is_line = True
+
+    if is_line:
+        return f'replayed exactly: solid wide line (stride={stride})', {'count': count}
+
     is_axis_aligned = count in (4, 6, 12)
     if is_axis_aligned:
         for q_start in range(0, count, step):
@@ -421,6 +434,15 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
                         (abs(y - miny) < 1e-3 or abs(y - maxy) < 1e-3)):
                     is_axis_aligned = False
                     break
+            if is_axis_aligned:
+                has_tl = has_tr = has_bl = has_br = False
+                for x, y in zip(xs, ys):
+                    if abs(x - minx) < 1e-3 and abs(y - miny) < 1e-3: has_tl = True
+                    if abs(x - maxx) < 1e-3 and abs(y - miny) < 1e-3: has_tr = True
+                    if abs(x - minx) < 1e-3 and abs(y - maxy) < 1e-3: has_bl = True
+                    if abs(x - maxx) < 1e-3 and abs(y - maxy) < 1e-3: has_br = True
+                if (has_tl + has_tr + has_bl + has_br) < 3:
+                    is_axis_aligned = False
             if not is_axis_aligned:
                 break
 
@@ -586,6 +608,54 @@ def main():
                 x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
                 y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
                 vs_xy.append((x, y))
+
+            raw_col = vs[0][2][:4]
+            r, g, b, a = raw_col[0], raw_col[1], raw_col[2], raw_col[3]
+
+            is_line = False
+            if count == 6:
+                pts = list(set((round(p[0], 2), round(p[1], 2)) for p in vs_xy))
+                if len(pts) <= 2:
+                    is_line = True
+
+            if is_line:
+                p0 = vs_xy[0]
+                other = [p for p in vs_xy if abs(p[0] - p0[0]) > 1e-3 or abs(p[1] - p0[1]) > 1e-3]
+                if other:
+                    p1 = other[0]
+                    dx = p1[0] - p0[0]
+                    dy = p1[1] - p0[1]
+                    L2 = dx * dx + dy * dy
+                    L = math.sqrt(L2)
+                    if L >= 1e-3:
+                        is_red = (r > 180 and b < 60) or (vs[0][2][:4] == b'\xdc\x3e\x1c\xff')
+                        if is_red:
+                            width = (L / 24.0) * 1.0 if L > 40.0 else 1.0
+                        elif L >= 22.0:
+                            width = (L / 30.0) * 2.0 if L > 40.0 else 2.0
+                        else:
+                            width = (L / 17.0) * 3.0 if L > 40.0 else 3.0
+                        half_w2 = (width * 0.5) ** 2
+                        x0 = max(clip_x0, int(math.floor(min(p0[0], p1[0]) - width)))
+                        x1 = min(clip_x1, target_w, pw, int(math.ceil(max(p0[0], p1[0]) + width)))
+                        y0 = max(clip_y0, int(math.floor(min(p0[1], p1[1]) - width)))
+                        y1 = min(clip_y1, target_h, ph, int(math.ceil(max(p0[1], p1[1]) + width)))
+                        if x0 < x1 and y0 < y1:
+                            for y in range(y0, y1):
+                                cy = y + 0.5
+                                py = cy - p0[1]
+                                for x in range(x0, x1):
+                                    cx = x + 0.5
+                                    px = cx - p0[0]
+                                    dot = px * dx + py * dy
+                                    if 0.0 <= dot <= L2:
+                                        cross = dx * py - dy * px
+                                        if cross * cross <= half_w2 * L2:
+                                            d = (y * target_w + x) * 4
+                                            for c, src in enumerate((r, g, b, a)):
+                                                fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - a) // 255)
+                continue
+
             is_aa = count in (4, 6, 12)
             step = 4 if count == 4 else 6
             if is_aa:
@@ -603,11 +673,17 @@ def main():
                                 (abs(y - miny) < 1e-3 or abs(y - maxy) < 1e-3)):
                             is_aa = False
                             break
+                    if is_aa:
+                        has_tl = has_tr = has_bl = has_br = False
+                        for x, y in q_coords:
+                            if abs(x - minx) < 1e-3 and abs(y - miny) < 1e-3: has_tl = True
+                            if abs(x - maxx) < 1e-3 and abs(y - miny) < 1e-3: has_tr = True
+                            if abs(x - minx) < 1e-3 and abs(y - maxy) < 1e-3: has_bl = True
+                            if abs(x - maxx) < 1e-3 and abs(y - maxy) < 1e-3: has_br = True
+                        if (has_tl + has_tr + has_bl + has_br) < 3:
+                            is_aa = False
                     if not is_aa:
                         break
-
-            raw_col = vs[0][2][:4]
-            r, g, b, a = raw_col[0], raw_col[1], raw_col[2], raw_col[3]
 
             if is_aa:
                 for q_start in range(0, count, step):

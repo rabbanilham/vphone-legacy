@@ -281,7 +281,7 @@ def replay_blob(case=True):
                 for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
                     put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, 0xff112233)
                 rect = (4, 4, 12, 12)
-            expect_rect(rect, lambda x, y: swap_rb(0xffaabbcc if case in ('pairing', 'pairing-batch') else 0xff112233))
+            expect_rect(rect, lambda x, y: swap_rb(0xff112233))
         else:
             destination = 0xff907050
             for i in range(6):
@@ -436,7 +436,7 @@ def replay_blob(case=True):
         put(state + 0x608, '<4I', 0x60000a64, (height - 1) << 16 | (width - 1) << 2,
             (q & 0xffffffff) | (width - 1), q >> 32)
         expected[:] = b'\xa5' * len(expected)
-        expect_rect((740, 0, 744, 2), lambda x, y: REPLAY_TEXELS[y * 4 + x - 740])
+        expect_rect((740, 0, 744, 2), lambda x, y: swap_rb(REPLAY_TEXELS[y * 4 + x - 740]))
         draws = 1
     if case in ('wait-stamp', 'geometry-lifetime'):
         put(QUEUE + 0x50, '<I', 3)
