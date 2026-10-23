@@ -5149,14 +5149,15 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
-    /* Layout 1 marks GPU-rendered surfaces (agx_surface_layout); otherwise
-     * uploaded linear textures. */
-    tex->strip = false;
-    if ((tsw[0] & 7) == 1) {
-        AGXSurface sf;
-        agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
-        tex->strip = sf.strip;
+    /* Layout 1 or display surfaces with hole at +0xa000 (agx_surface_layout);
+     * otherwise uploaded linear textures. */
+    AGXSurface sf;
+    agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
+    tex->strip = sf.strip;
+    if (sf.strip) {
         tex->stride = sf.pitch;
+    } else if ((tsw[0] & 7) == 1) {
+        tex->stride = ((tex->w + 15) & ~15u) * 4;
     } else {
         /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
         tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
@@ -5711,6 +5712,36 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         g_free(tmp_tex);
                     }
                     continue;
+                }
+
+                bool is_navbar = (x0 == 0 && y0 == 0 && (x1 - x0) >= 640 &&
+                                  (y1 - y0) >= 60 && (y1 - y0) <= 130 &&
+                                  textured && (tex.w == 1 && tex.h == 1));
+                if (is_navbar) {
+                    uint32_t bw = (uint32_t)(x1 - x0), bh = (uint32_t)(y1 - y0);
+                    if (bw > 0 && bh > 0 && bw <= 2048 && bh <= 2048) {
+                        uint32_t *raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        uint32_t *tmp_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        if (raw_tex && tmp_tex) {
+                            bool read_ok = true;
+                            for (uint32_t y = 0; y < bh; y++) {
+                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y0 + y),
+                                                  raw_tex + (size_t)y * bw, bw * 4)) {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                            if (read_ok) {
+                                agx_blur_texture(raw_tex, tmp_tex, bw, bh);
+                                for (uint32_t y = 0; y < bh; y++) {
+                                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y0 + y),
+                                                  raw_tex + (size_t)y * bw, bw * 4);
+                                }
+                            }
+                        }
+                        g_free(raw_tex);
+                        g_free(tmp_tex);
+                    }
                 }
 
                 if (!textured) {

@@ -136,10 +136,11 @@ def decode_tsw(f, tsw):
     # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
     # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
-    strip = False
-    if (tsw[0] & 7) == 1:
-        strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
-        stride = 2560 if strip else ((w + 15) & ~15) * 4
+    strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
+    if strip:
+        stride = 2560
+    elif (tsw[0] & 7) == 1:
+        stride = ((w + 15) & ~15) * 4
     else:
         pitch = ((tsw[2] & 0xffff) + 1) * 4
         stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
@@ -502,6 +503,23 @@ def main():
                     step_x = math.hypot(uv_map[0] * su, uv_map[3] * sv)
                     step_y = math.hypot(uv_map[1] * su, uv_map[4] * sv)
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
+                is_navbar = (x0 == 0 and y0 == 0 and (x1 - x0) >= 640 and
+                             60 <= (y1 - y0) <= 130 and tex['w'] == 1 and tex['h'] == 1)
+                if is_navbar:
+                    bw, bh = x1 - x0, y1 - y0
+                    raw_pixels = []
+                    for y in range(y0, y1):
+                        for x in range(x0, x1):
+                            d = (y * target_w + x) * 4
+                            r, g, b, a = fb[d:d + 4]
+                            raw_pixels.append((b, g, r, a))
+                    blurred = gaussian_blur_texture(raw_pixels, bw, bh)
+                    for y in range(y0, y1):
+                        for x in range(x0, x1):
+                            b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
+                            d = (y * target_w + x) * 4
+                            fb[d:d + 4] = bytes((r, g, b, a))
+
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
