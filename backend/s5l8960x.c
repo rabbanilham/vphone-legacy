@@ -6003,6 +6003,175 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 clip_y0 = MAX(clip_y0, rc_y0);
                 clip_y1 = MIN(clip_y1, rc_y1);
             }
+            clip_x0 = MAX(0, clip_x0);
+            clip_y0 = MAX(0, clip_y0);
+            clip_x1 = MIN((int)width, clip_x1);
+            clip_y1 = MIN((int)height, clip_y1);
+            if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) {
+                continue;
+            }
+
+            if (!textured && !(stride == 12 && is_blur_prog)) {
+                float vs_xy[64][2];
+                float m4[4];
+                bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
+                unsigned v_count = MIN(count, 64u);
+                for (unsigned i = 0; i < v_count; i++) {
+                    float xy[2];
+                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                        v_count = i;
+                        break;
+                    }
+                    if (clip_space) {
+                        xy[0] = xy[0] * vp[0] + vp[1];
+                        xy[1] = xy[1] * vp[2] + vp[3];
+                    } else if (transformed) {
+                        xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
+                        xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
+                    }
+                    vs_xy[i][0] = xy[0];
+                    vs_xy[i][1] = xy[1];
+                }
+                if (v_count == 0) {
+                    continue;
+                }
+
+                uint32_t colour = 0xff000000;
+                if (agx_ctx_read(s, cat, buf + 16, &colour, 4)) {
+                    /* Untextured vertex colour is stored RGBA in memory;
+                     * swap R and B for the internal BGRA framebuffer pipeline. */
+                    colour = (colour & 0xff00ff00u) | ((colour >> 16) & 0xff) | ((colour & 0xff) << 16);
+                }
+
+                /* Check if geometry consists of axis-aligned quads */
+                bool is_axis_aligned = false;
+                unsigned q_step = (v_count == 4) ? 4 : 6;
+                if (v_count == 4 || v_count == 6 || v_count == 12) {
+                    bool all_aa = true;
+                    for (unsigned q = 0; q < v_count; q += q_step) {
+                        float qminx = vs_xy[q][0], qmaxx = vs_xy[q][0];
+                        float qminy = vs_xy[q][1], qmaxy = vs_xy[q][1];
+                        for (unsigned k = 1; k < q_step; k++) {
+                            qminx = MIN(qminx, vs_xy[q + k][0]);
+                            qmaxx = MAX(qmaxx, vs_xy[q + k][0]);
+                            qminy = MIN(qminy, vs_xy[q + k][1]);
+                            qmaxy = MAX(qmaxy, vs_xy[q + k][1]);
+                        }
+                        for (unsigned k = 0; k < q_step; k++) {
+                            float x = vs_xy[q + k][0], y = vs_xy[q + k][1];
+                            if (!((fabsf(x - qminx) < 1e-3f || fabsf(x - qmaxx) < 1e-3f) &&
+                                  (fabsf(y - qminy) < 1e-3f || fabsf(y - qmaxy) < 1e-3f))) {
+                                all_aa = false;
+                                break;
+                            }
+                        }
+                        if (!all_aa) {
+                            break;
+                        }
+                    }
+                    is_axis_aligned = all_aa;
+                }
+
+                if (is_axis_aligned) {
+                    /* Axis-aligned quad fast path */
+                    for (unsigned q = 0; q < v_count; q += q_step) {
+                        float qminx = vs_xy[q][0], qmaxx = vs_xy[q][0];
+                        float qminy = vs_xy[q][1], qmaxy = vs_xy[q][1];
+                        for (unsigned k = 1; k < q_step; k++) {
+                            qminx = MIN(qminx, vs_xy[q + k][0]);
+                            qmaxx = MAX(qmaxx, vs_xy[q + k][0]);
+                            qminy = MIN(qminy, vs_xy[q + k][1]);
+                            qmaxy = MAX(qmaxy, vs_xy[q + k][1]);
+                        }
+                        int x0 = MAX(clip_x0, (int)lroundf(qminx));
+                        int x1 = MIN(clip_x1, (int)lroundf(qmaxx));
+                        int y0 = MAX(clip_y0, (int)lroundf(qminy));
+                        int y1 = MIN(clip_y1, (int)lroundf(qmaxy));
+                        if (x0 >= x1 || y0 >= y1) {
+                            continue;
+                        }
+                        any_drawn = true;
+                        for (int y = y0; y < y1; y++) {
+                            if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4)) {
+                                continue;
+                            }
+                            for (int x = x0; x < x1; x++) {
+                                row[x - x0] = (prog == AGX_USC_COPY) ? colour
+                                                                     : agx_blend_over(row[x - x0], colour);
+                            }
+                            agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
+                        }
+                    }
+                } else {
+                    /* Triangle rasteriser: each consecutive vertex triple is one triangle */
+                    for (unsigned t = 0; t + 2 < v_count; t += 3) {
+                        const float *p0 = vs_xy[t];
+                        const float *p1 = vs_xy[t + 1];
+                        const float *p2 = vs_xy[t + 2];
+                        float det = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+                        if (fabsf(det) < 1e-5f) {
+                            continue;
+                        }
+                        float tminx = MIN(p0[0], MIN(p1[0], p2[0]));
+                        float tmaxx = MAX(p0[0], MAX(p1[0], p2[0]));
+                        float tminy = MIN(p0[1], MIN(p1[1], p2[1]));
+                        float tmaxy = MAX(p0[1], MAX(p1[1], p2[1]));
+
+                        int x0 = MAX(clip_x0, (int)floorf(tminx));
+                        int x1 = MIN(clip_x1, (int)ceilf(tmaxx));
+                        int y0 = MAX(clip_y0, (int)floorf(tminy));
+                        int y1 = MIN(clip_y1, (int)ceilf(tmaxy));
+                        if (x0 >= x1 || y0 >= y1) {
+                            continue;
+                        }
+                        uint32_t tri_colour = colour;
+                        if (agx_ctx_read(s, cat, buf + (uint64_t)t * stride + 16, &tri_colour, 4)) {
+                            tri_colour = (tri_colour & 0xff00ff00u) | ((tri_colour >> 16) & 0xff) | ((tri_colour & 0xff) << 16);
+                        }
+                        for (int y = y0; y < y1; y++) {
+                            float cy = (float)y + 0.5f;
+                            int first_in = -1, last_in = -1;
+                            for (int x = x0; x < x1; x++) {
+                                float cx = (float)x + 0.5f;
+                                float e0 = (p1[0] - p0[0]) * (cy - p0[1]) - (p1[1] - p0[1]) * (cx - p0[0]);
+                                float e1 = (p2[0] - p1[0]) * (cy - p1[1]) - (p2[1] - p1[1]) * (cx - p1[0]);
+                                float e2 = (p0[0] - p2[0]) * (cy - p2[1]) - (p0[1] - p2[1]) * (cx - p2[0]);
+                                bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                                           : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+                                if (inside) {
+                                    if (first_in < 0) first_in = x;
+                                    last_in = x;
+                                }
+                            }
+                            if (first_in < 0) {
+                                continue;
+                            }
+                            any_drawn = true;
+                            int span_w = last_in - first_in + 1;
+                            if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                                continue;
+                            }
+                            for (int x = first_in; x <= last_in; x++) {
+                                float cx = (float)x + 0.5f;
+                                float e0 = (p1[0] - p0[0]) * (cy - p0[1]) - (p1[1] - p0[1]) * (cx - p0[0]);
+                                float e1 = (p2[0] - p1[0]) * (cy - p1[1]) - (p2[1] - p1[1]) * (cx - p1[0]);
+                                float e2 = (p0[0] - p2[0]) * (cy - p2[1]) - (p0[1] - p2[1]) * (cx - p2[0]);
+                                bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                                           : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+                                if (inside) {
+                                    row[x - first_in] = (prog == AGX_USC_COPY) ? tri_colour
+                                                                                : agx_blend_over(row[x - first_in], tri_colour);
+                                }
+                            }
+                            agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                        }
+                    }
+                }
+                if (any_drawn) {
+                    draws++;
+                }
+                continue;
+            }
             for (unsigned q_start = 0; q_start + step <= count; q_start += step) {
                 float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
                 float m4[4];
