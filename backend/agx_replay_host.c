@@ -8,7 +8,12 @@
  * "physical" address here, and pages absent from the dump are unmapped.
  *
  * Usage: agx_replay_host frame.bin out.rgba
- * Writes "RGBA" + u32 width + u32 height + pixels, and a JSON line on stdout.
+ *        agx_replay_host --chain out-prefix frame1.bin frame2.bin ...
+ * Writes "RGBA" + u32 width + u32 height + pixels, and a JSON line on stdout
+ * per dump. A dump records memory when the pass was submitted, before the
+ * live render thread had drawn the passes queued ahead of it; --chain carries
+ * the pages each replay writes into the later dumps, in order, so a sequence
+ * replays as the GPU would have drawn it. Output i is out-prefix-<i>.rgba.
  */
 #include <glib.h>
 #include <math.h>
@@ -35,6 +40,7 @@ typedef struct AGXReplaySnapshot AGXReplaySnapshot;
 static int address_space_memory;
 static GHashTable *host_pages;          /* page GVA -> 4 KiB */
 static GHashTable *host_skips;          /* reason -> count */
+static GHashTable *host_dirty;          /* page GVAs written by the replay */
 static unsigned host_draws, host_guest_errors;
 static bool host_verbose;
 
@@ -90,6 +96,7 @@ static MemTxResult host_access(hwaddr pa, void *buf, size_t n, bool write)
         }
         if (write) {
             memcpy(page + (pa & 0xfff), bytes, chunk);
+            g_hash_table_add(host_dirty, g_memdup2(&base, sizeof(base)));
         } else {
             memcpy(bytes, page + (pa & 0xfff), chunk);
         }
@@ -109,38 +116,54 @@ static void add_skip_json(gpointer key, gpointer value, gpointer data)
                            (const char *)key, GPOINTER_TO_UINT(value));
 }
 
-int main(int argc, char **argv)
+static GHashTable *new_page_table(void)
+{
+    return g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+}
+
+/* Replay one dump; pages in carried (written by earlier passes) override it. */
+static int replay_one(const char *dump, const char *rgba_path, GHashTable *carried)
 {
     uint8_t header[64], raw[0x280], ta[0x280];
     A7State state = {0};
     FILE *in, *out;
+    GHashTableIter it;
+    gpointer key, value;
 
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s frame.bin out.rgba\n", argv[0]);
-        return 2;
-    }
-    host_verbose = getenv("AGX_HOST_VERBOSE") != NULL;
-    host_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
-    host_skips = g_hash_table_new(g_str_hash, g_str_equal);
-    if (!(in = fopen(argv[1], "rb")) || fread(header, 1, 64, in) != 64 ||
+    host_pages = new_page_table();
+    host_dirty = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+    g_hash_table_remove_all(host_skips);
+    host_draws = host_guest_errors = 0;
+    if (!(in = fopen(dump, "rb")) || fread(header, 1, 64, in) != 64 ||
         memcmp(header, "AGXF", 4) || ldl_le_p(header + 4) != 1 ||
         fread(raw, 1, sizeof(raw), in) != sizeof(raw) || fread(ta, 1, sizeof(ta), in) != sizeof(ta)) {
-        fprintf(stderr, "%s: not an AGXF v1 dump\n", argv[1]);
+        fprintf(stderr, "%s: not an AGXF v1 dump\n", dump);
         return 1;
     }
     uint32_t flags = ldl_le_p(header + 12);
     uint64_t cat = ldq_le_p(header + 16), target = ldq_le_p(header + 24);
     uint64_t records = ldq_le_p(header + 48);
     for (uint64_t i = 0; i < records; i++) {
-        uint64_t *key = g_new(uint64_t, 1), pa;
+        uint64_t *gva = g_new(uint64_t, 1), pa;
         uint8_t *page = g_malloc(4096);
-        if (fread(key, 8, 1, in) != 1 || fread(&pa, 8, 1, in) != 1 || fread(page, 1, 4096, in) != 4096) {
-            fprintf(stderr, "%s: truncated page record %llu\n", argv[1], (unsigned long long)i);
+        if (fread(gva, 8, 1, in) != 1 || fread(&pa, 8, 1, in) != 1 || fread(page, 1, 4096, in) != 4096) {
+            fprintf(stderr, "%s: truncated page record %llu\n", dump, (unsigned long long)i);
             return 1;
         }
-        g_hash_table_insert(host_pages, key, page);
+        g_hash_table_insert(host_pages, gva, page);
     }
     fclose(in);
+    unsigned carried_in = 0;
+    if (carried) {
+        g_hash_table_iter_init(&it, carried);
+        while (g_hash_table_iter_next(&it, &key, &value)) {
+            uint8_t *page = g_hash_table_lookup(host_pages, key);
+            if (page) {
+                memcpy(page, value, 4096);
+                carried_in++;
+            }
+        }
+    }
 
     /* The same pass parameters agx_trace_rt derives for agx_replay_frame. */
     uint32_t width = (ldl_le_p(raw + 0x74) & 0xffff) + 1;
@@ -180,8 +203,8 @@ int main(int argc, char **argv)
             row[x * 4 + 2] = b;
         }
     }
-    if (!(out = fopen(argv[2], "wb"))) {
-        perror(argv[2]);
+    if (!(out = fopen(rgba_path, "wb"))) {
+        perror(rgba_path);
         return 1;
     }
     uint32_t dims[2] = { w, h };
@@ -189,16 +212,51 @@ int main(int argc, char **argv)
     fwrite(dims, 4, 2, out);
     fwrite(pixels, 1, (size_t)w * h * 4, out);
     fclose(out);
+    g_free(pixels);
+
+    if (carried) {
+        g_hash_table_iter_init(&it, host_dirty);
+        while (g_hash_table_iter_next(&it, &key, NULL)) {
+            g_hash_table_replace(carried, g_memdup2(key, 8),
+                                 g_memdup2(g_hash_table_lookup(host_pages, key), 4096));
+        }
+    }
 
     GString *skips = g_string_new("{");
     g_hash_table_foreach(host_skips, add_skip_json, skips);
     g_string_append_c(skips, '}');
     printf("{\"width\": %u, \"height\": %u, \"target\": \"0x%llx\", \"clear\": %s, "
            "\"strip\": %s, \"pitch\": %u, \"draws\": %u, \"skips\": %s, "
-           "\"guest_errors\": %u, \"missing_rows\": %u, \"capped\": %s, \"ta_valid\": %s}\n",
+           "\"guest_errors\": %u, \"missing_rows\": %u, \"capped\": %s, \"ta_valid\": %s, "
+           "\"carried_pages\": %u}\n",
            w, h, (unsigned long long)target, is_clear ? "true" : "false",
            sf.strip ? "true" : "false", sf.pitch, host_draws, skips->str,
            host_guest_errors, missing_rows, (flags & 2) ? "true" : "false",
-           (flags & 1) ? "true" : "false");
+           (flags & 1) ? "true" : "false", carried_in);
+    fflush(stdout);
+    g_string_free(skips, true);
+    g_hash_table_destroy(host_pages);
+    g_hash_table_destroy(host_dirty);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    host_verbose = getenv("AGX_HOST_VERBOSE") != NULL;
+    host_skips = g_hash_table_new(g_str_hash, g_str_equal);
+    if (argc >= 4 && !strcmp(argv[1], "--chain")) {
+        GHashTable *carried = new_page_table();
+        for (int i = 3; i < argc; i++) {
+            g_autofree char *path = g_strdup_printf("%s-%d.rgba", argv[2], i - 3);
+            if (replay_one(argv[i], path, carried)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s frame.bin out.rgba | --chain out-prefix frame.bin...\n", argv[0]);
+        return 2;
+    }
+    return replay_one(argv[1], argv[2], NULL);
 }

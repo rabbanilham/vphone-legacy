@@ -13,7 +13,9 @@ boot reaches one app, hence one scene per app. Disk clones are deleted after
 each boot; the dumps (about 21 MiB each) stay in build/agx-corpus/<scene>/dumps.
 
 replay compiles the renderer core of backend/s5l8960x.c into a host harness
-(backend/agx_replay_host.c) and replays every dump with it, audits every dump
+(backend/agx_replay_host.c) and replays every dump with it, chained per scene
+(a dump records memory at submission, before the live render thread drew the
+passes ahead of it; --single replays each dump on its own), audits every dump
 with backend/agx_replay_offline.py, then writes report.html (contact sheet:
 C replay next to the live framebuffer) and summary.json (skipped draws by
 reason, per frame).
@@ -64,6 +66,14 @@ SCENES = {
         'per_at': 90,
         'display_only': False,
         'seconds': 108,
+    },
+    # The second half of the unlock: Home icons and labels flying in.
+    'unlock-home': {
+        'touch': UNLOCK + '|at=106;tap 600,900',
+        'at': [97.5],
+        'per_at': 150,
+        'display_only': False,
+        'seconds': 106,
     },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
@@ -198,6 +208,27 @@ def replay_c(binary, dump, out_png):
     return info
 
 
+def replay_c_chain(binary, frames, report):
+    """One scene in dump order: each pass sees what the earlier ones drew."""
+    prefix = report / f'chain-{frames[0]["scene"]}'
+    result = subprocess.run([str(binary), '--chain', str(prefix), *[str(f['dump']) for f in frames]],
+                            capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+    infos = []
+    for i, f in enumerate(frames):
+        if i >= len(lines):
+            infos.append({'error': (result.stderr or f'exit {result.returncode}').strip()[-400:]})
+            continue
+        info = json.loads(lines[i])
+        rgba = Path(f'{prefix}-{i}.rgba')
+        data = rgba.read_bytes()
+        w, h = struct.unpack_from('<II', data, 4)
+        (report / f'{f["scene"]}-{f["frame"]}.png').write_bytes(png_bytes(w, h, data[12:]))
+        rgba.unlink()
+        infos.append(info)
+    return infos
+
+
 def audit_python(dump):
     sys.path.insert(0, str(BACKEND))
     from agx_frame import Frame
@@ -240,16 +271,25 @@ def replay(args):
 
     with futures.ThreadPoolExecutor(args.jobs) as threads, \
             futures.ProcessPoolExecutor(args.jobs) as processes:
-        c_jobs = {threads.submit(replay_c, binary, f['dump'],
-                                 report / f'{f["scene"]}-{f["frame"]}.png'): f for f in frames}
+        if args.single:
+            c_jobs = {threads.submit(replay_c, binary, f['dump'],
+                                     report / f'{f["scene"]}-{f["frame"]}.png'): [f] for f in frames}
+        else:
+            scenes = {}
+            for f in frames:
+                scenes.setdefault(f['scene'], []).append(f)
+            c_jobs = {threads.submit(replay_c_chain, binary, group, report): group
+                      for group in scenes.values()}
         py_jobs = {processes.submit(audit_python, f['dump']): f for f in frames}
         live = {}
         for f in frames:
             if f['live'] and f['live'].exists() and f['live'] not in live:
                 dst = report / f'live-{f["scene"]}-{round(f["at"])}s.png'
                 live[f['live']] = threads.submit(ppm_to_png, f['live'], dst), dst.name
-        for job, f in c_jobs.items():
-            f['c'] = job.result()
+        for job, group in c_jobs.items():
+            result = job.result()
+            for f, info in zip(group, result if isinstance(result, list) else [result]):
+                f['c'] = info
         for job, f in py_jobs.items():
             f['py'] = job.result()
         for f in frames:
@@ -349,6 +389,8 @@ def main():
     parser.add_argument('--per-at', type=int, default=2)
     parser.add_argument('--min-draws', type=int, default=1)
     parser.add_argument('--jobs', type=int, default=os.cpu_count())
+    parser.add_argument('--single', action='store_true',
+                        help='replay each dump on its own memory instead of chaining a scene')
     args = parser.parse_args()
     if args.command == 'capture':
         capture(args)

@@ -1,6 +1,6 @@
 # Task S: "slide to unlock" glint and the black bar artefact
 
-Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-slider`, branch `wt/slider`. Renderer scope: per-program blend modes and the span primitive in the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `backend/agx_replay_host.c`, `scripts/agx_corpus.py`, `tests/test_agx_*`. Task K (another agy, `wt/clock-hands`) changes vertex colour byte order and adds a triangle rasteriser for untextured draws: do not touch those parts; keep your diff local to blend selection and the span draws so both merge mechanically.
+Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-slider`, branch `wt/slider`. Renderer scope: per-program blend modes and the span primitive in the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Task K (another agy, `wt/clock-hands`) changes vertex colour byte order and adds a triangle rasteriser for untextured draws: do not touch those parts; keep your diff local to blend selection and the span draws so both merge mechanically.
 
 ## Work offline. No QEMU boots.
 Set up your own corpus view exactly as task K describes (symlink `build/agx-corpus/*/dumps` and `probe` into `corpus/`, run `.venv/bin/python scripts/agx_corpus.py --corpus corpus`, which writes `corpus/report/index.html` in about 2 s). Never write into `build/`.
@@ -18,7 +18,7 @@ The label is built every frame by a chain of offscreen passes (repeating pattern
 
 Hypothesis (verify, don't assume): the glinty label uses CoreAnimation compositing filters (plusL / plusD, i.e. plus-lighter and plus-darker) and the replay draws them as src-over. With plus-lighter, black adds nothing (the black bar disappears) and dark grey text becomes light; src-over of the opaque grey fill (draw 6) currently hides the gradient. Identify which programs are plus-lighter / plus-darker / other by testing against expected appearance, implement those blends (C and Python), and implement the span primitive for 0x1a20cc29e8fcc15b.
 
-Passes depend on each other (frame-5 samples what frames 2..4 produced live, with the live bugs). Add a chained mode to the host harness (e.g. `agx_replay_host --chain out.rgba f1.bin f2.bin ...`: pages written by a pass carry over to the later dumps before they replay) and expose it in `scripts/agx_corpus.py`, so the whole lock-screen frame can be checked offline from the earliest offscreen pass to the display pass.
+Passes depend on each other (frame-5 samples what frames 2..4 produced). `scripts/agx_corpus.py` now replays each scene **chained** by default: `backend/agx_replay_host.c --chain` carries the pages each pass writes into the later dumps, so the lock-screen frame can be checked offline from the earliest offscreen pass to the display pass (`--single` gives the old per-dump replay).
 
 ## Measurable target
 - Offline, chained replay of one label cycle ending in a display pass: no black pixels in the bar/dash regions; label lighter than the wallpaper; the glint visible at successive positions in at least three consecutive cycles (save a strip of crops as PNG under `research/evidence/S-slider-glint/`).
