@@ -46,7 +46,7 @@ def fixture_frame(blob):
 
 class HomeDirtyTests(unittest.TestCase):
     def test_fullscreen_wallpaper_preserves_static_home_content(self):
-        for case in ('home-dirty-scissor', 'home-dirty-region'):
+        for case in ('home-dirty-scissor', 'home-dirty-region', 'copy-border', 'transparent-over'):
             with self.subTest(case=case):
                 blob, _, expected, (w, h), _, _ = contract.replay_blob(case)
                 frame = fixture_frame(blob)

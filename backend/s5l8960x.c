@@ -5446,6 +5446,9 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
  * 0x7_0000_0000 heap). The compiled code is identical across boots of this
  * iOS build. */
 #define AGX_USC_DEST_IN UINT64_C(0x4ee01acc47551344)  /* mask: D *= texel alpha */
+/* CA padding clear: observed eight zero-colour quads around the slider mask.
+ * Its USC program replaces D with S; transparent source-over is a no-op. */
+#define AGX_USC_COPY UINT64_C(0x99d4fcf52a8c2ef3)
 
 /* CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
  * Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore. */
@@ -6048,7 +6051,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             continue;
                         }
                         for (int x = x0; x < x1; x++) {
-                            row[x - x0] = agx_blend_over(row[x - x0], colour);
+                            row[x - x0] = prog == AGX_USC_COPY ? colour :
+                                         agx_blend_over(row[x - x0], colour);
                         }
                         agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                     }

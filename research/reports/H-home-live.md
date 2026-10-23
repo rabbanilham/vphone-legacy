@@ -61,7 +61,7 @@ same full-Home dump now produces single opaque icons/labels instead of retaining
 translucent history (`home-vibrancy-fixed.png`; its old dump has a black wallpaper
 source because it predates live wallpaper support).
 
-### Slider bar and damaged labels: false display-strip layout
+### Damaged labels: false display-strip layout
 
 A second independent decoder bug remained after fixing the translucent trails.
 The page-hole heuristic tested `base+0x9000` and `base+0xa000` for every texture,
@@ -80,10 +80,37 @@ display surface containing sixteen 2560-byte rows per 64 KiB strip. Restrict the
 hole test to that shape/alignment in C and offline replay. Dense offscreen
 surfaces and small/offset uploaded glyphs retain their own pitch. Isolated C
 replay now shows readable Compass and all dock labels (`home-layout-fixed.png`).
-The slider artifact persists in a subsequent live capture; its remaining
-source/pass is being captured separately. The native Home fixture adds an unrelated mapped page at the tiny source
-texture's `+0x9000`, with `+0xa000` unmapped, and still requires exact linear
+The slider artifact persisted in a subsequent live capture and had the
+independent cause below. The native Home fixture adds an unrelated mapped page
+at the tiny source texture's `+0x9000`, with `+0xa000` unmapped, and still requires exact linear
 pixels. Decoder tests retain a positive real display-strip case.
+
+### Slider bar: transparent source-copy padding was treated as source-over
+
+Captured consecutive, matching-TA passes after 87 s on the merged build:
+`slider-consecutive/frame-16.bin` renders a 640 x 416 offscreen target
+(`0x10258000`). Its final draw has 48 stride-20 vertices: eight quads around
+`(20,946)-(620,1004)`, covering a six-pixel padding ring out to
+`(14,940)-(626,1010)`. Every vertex colour is zero. Its USC fingerprint is
+`0x99d4fcf52a8c2ef3`. This is the native source-copy padding clear. Treating it
+as source-over makes zero-alpha pixels a no-op and preserves the previous
+blur/highlight output in the ring. The next display pass copies that whole
+612 x 70 region. Subsequent 348 x 58 text-only dirty updates do not cover the
+ring, so the bar stays on screen.
+
+Isolated replay of that exact offscreen pass reproduces the white/black dashed
+border (`slider-wide.png`). Recognizing this observed solid copy program and
+writing the vertex colour, including zero alpha, removes the entire padding
+ring while preserving the text (`slider-wide-fixed.png`). The Python mirror
+uses the same fingerprint and operation. This is deliberately scoped to the
+observed USC program; it does not reinterpret arbitrary transparent src-over
+quads or clear all load passes.
+
+The `copy-border` native contract seeds a solid 16 x 16 target, clears eight
+padding quads using the captured 64 USC bytes, and checks every output byte,
+centre pixel, exterior pixel, padding and guard page. `transparent-over` uses
+the same zero-colour vertices with ordinary src-over and must preserve all
+seeded pixels. Both also run inline and through the offline mirror.
 
 ## H changes
 
@@ -104,7 +131,7 @@ pixels. Decoder tests retain a positive real display-strip case.
   of 129); genuine vibrancy count becomes 21 instead of 41.
 - Opt-in `VPHONE_AGX_FRAME_DUMP_AFTER_NS` bounds captures to a transition.
 
-## Validation (final three boots in progress)
+## Validation (final three boots pending)
 
 All probes: own rebuilt QEMU, visible Cocoa, MTTCG, fresh cloned v5 plan/System/
 Data, one owned QEMU at a time, load < 5 at launch, clones removed after reaping.
@@ -134,9 +161,9 @@ Prescribed swipe starts at 95 s. Acceptance probes append a Settings tap at
 
 | Goal | Result |
 | --- | --- |
-| Home without ghosts at 105/140 s, three fresh boots | Final layout/blend build running |
-| Tap opens native Settings | Final layout/blend build running |
-| Dashed lock-slider bar removed | Layout fix added; final captures pending |
+| Home without ghosts at 105/140 s, three fresh boots | Final copy/blend/layout build pending |
+| Tap opens native Settings | Final copy/blend/layout build pending |
+| Dashed lock-slider bar removed | Source-copy fix added; final captures pending |
 | Live/offline native pixel contract | PASS, threaded and inline |
 | No guest patch / protected source images | PASS so far |
 

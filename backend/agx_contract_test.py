@@ -115,7 +115,7 @@ REPLAY_MASK_CODE = bytes.fromhex(
 REPLAY_BLUR_CODE = bytes.fromhex(
     '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
     '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
-REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip', 'home-dirty-scissor', 'home-dirty-region')
+REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip', 'home-dirty-scissor', 'home-dirty-region', 'copy-border', 'transparent-over')
 
 
 def blend_vibrancy(dst, src):
@@ -380,6 +380,32 @@ def replay_blob(case=True):
         dirty = (35, 34, 44, 45) if case == 'home-dirty-scissor' else (32, 32, 64, 64)
         expect_rect(dirty, lambda x, y: wallpaper)
         draws = 2
+    if case in ('copy-border', 'transparent-over'):
+        # The real slider pass ends with eight transparent quads around its
+        # mask. Source-copy must erase the padding, while ordinary src-over
+        # with the same zero vertices must preserve it. Check all eight quads.
+        destination = 0xff907050
+        for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+            put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, destination)
+        expect_rect((0, 0, 16, 16), lambda x, y: destination)
+        put(pds + 0x20, '<IIQ', 20, 0, state_gva + 0xb00)
+        put(state + 15 * 4, '<I', 8 << 8)
+        put(state + 18 * 4, '<I', 48)
+        put(state + 0x110, '<8I', *([0] * 7), 0x1200 if case == 'copy-border' else 0)
+        if case == 'copy-border':
+            code = bytes.fromhex('4520b011d04010c0400002806aff280a940011f01b8022221000a0a00020398a80940011f01b8022221000a1a00021ff0024088b46a080c280408001880000ff')
+            put(map_page(0x700001000), '<64s', code)
+            put(pds + 0x200, '<I', 0x1000)
+        rects = ((2, 2, 4, 4), (4, 2, 12, 4), (12, 2, 14, 4),
+                 (12, 4, 14, 12), (12, 12, 14, 14), (4, 12, 12, 14),
+                 (2, 12, 4, 14), (2, 4, 4, 12))
+        for qid, (x0, y0, x1, y1) in enumerate(rects):
+            for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                put(state + 0xb00 + (qid * 6 + i) * 20, '<4fI',
+                    x0 + u * (x1 - x0), y0 + v * (y1 - y0), 0, 1, 0)
+            if case == 'copy-border':
+                expect_rect((x0, y0, x1, y1), lambda x, y: 0)
+        draws = 2
     if case == 'wallpaper':
         # Real CoreImage clip-space XY / texel UV layout, Y-first Morton
         # source and an exact 744-pixel output pitch. Draw at the far edge.
@@ -588,7 +614,7 @@ def main():
     for case in REPLAY_CASES:
         run_case(None, replay=case)
         print(f'PASS: AGX replay {case}: exact guest physical pixels and padding')
-    for case in ('home-dirty-scissor', 'home-dirty-region'):
+    for case in ('home-dirty-scissor', 'home-dirty-region', 'copy-border', 'transparent-over'):
         run_case(None, replay=case, replay_thread=False)
         print(f'PASS: AGX replay {case}: inline pixels and padding')
     print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')

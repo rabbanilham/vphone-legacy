@@ -225,6 +225,7 @@ def blend_vibrancy(d, s):
 
 
 WALLPAPER = 0x789b8f08a3f3a8cd  # observed CoreImage XY/UV clip-space pass
+COPY = 0x99d4fcf52a8c2ef3  # CA solid source-copy padding clear (including alpha zero)
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
 
 
@@ -692,7 +693,7 @@ def main():
                     for x in range(x0, x1):
                         d = (y * target_w + x) * 4
                         for c, src in enumerate((r, g, b, a)):
-                            fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
+                            fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - a) // 255)
     png(sys.argv[2], target_w, target_h, bytes(fb))
 
 
