@@ -17,7 +17,7 @@ struct WifiDongle {
     char *ssid;
     WifiProtocol proto;
     QEMUTimer *reenumerate;
-    bool detached_for_go, host_ready, rom_mode;
+    bool detached_for_go, host_ready, rom_mode, resp_notified;
     uint8_t tx[WIFI_FRAME_MAX];
     size_t tx_len;
 };
@@ -111,19 +111,22 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
     }
     if(request==0xc105 && value==1 && index==0) {
         uint8_t ver[8]={0x4e,0xa9,0,0,1,0,0,0};
+        if(w->dl_state==4) {
+            ver[0]=0x23; ver[1]=0xa1; ver[2]=0; ver[3]=0;
+            ver[4]=0x01; ver[5]=0; ver[6]=0; ver[7]=0;
+        }
         p->actual_length=MIN(length,8); memcpy(data,ver,p->actual_length);
-        qemu_log_mask(LOG_UNIMP,"WIFI DL_GETVER actual=%d\n",p->actual_length);
+        qemu_log_mask(LOG_UNIMP,"WIFI DL_GETVER dl_state=%u actual=%d ver=%02x%02x\n",
+                      w->dl_state,p->actual_length,ver[0],ver[1]);
         return;
     }
     if(request==0xc100 && value==1 && index==0) {
         uint8_t state[8]={0,0,0,0, 0,0,0,0};
-        if(!w->runtime) {
-            wifi_st32(state,w->dl_state);
-            wifi_st32(state+4,w->dl_bytes);
-        }
+        wifi_st32(state,w->dl_state);
+        wifi_st32(state+4,w->dl_bytes);
         p->actual_length=MIN(length,8); memcpy(data,state,p->actual_length);
         qemu_log_mask(LOG_UNIMP,"WIFI RDL request=%x state=%u bytes=%u\n",request,
-                      w->runtime?0:w->dl_state,w->runtime?0:w->dl_bytes);
+                      w->dl_state,w->dl_bytes);
         return;
     }
     if(request==0xc102 && value==1 && index==0) {
@@ -134,27 +137,85 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
             timer_mod(s->reenumerate,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1000000);
         } else {
             uint8_t state[8]={0};
+            wifi_st32(state,w->dl_state);
+            wifi_st32(state+4,w->dl_bytes);
             p->actual_length=MIN(length,8); memcpy(data,state,p->actual_length);
         }
-        qemu_log_mask(LOG_UNIMP,"WIFI DL_GO\n");
+        qemu_log_mask(LOG_UNIMP,"WIFI DL_GO state=%u bytes=%u\n",w->dl_state,w->dl_bytes);
+        return;
+    }
+    if(request==0xc111) {
+        static const uint8_t bcm_cis[38] = {
+            0x15, 0x22,                         /* CISTPL_VERS_1, length 34 */
+            0x05, 0x00,                         /* major 5, minor 0 */
+            's', '=', 'A', '1', 0x00,           /* String 0: "s=A1" (HSICChipInfo) */
+            'M', '=', 'I', 'M', 'P', 'E', ' ',
+            'V', '=', 'm', 0x00,                /* String 1: "M=IMPE V=m" (HSICRFHardwareInfo) */
+            'M', 'u', 'r', 'a', 't', 'a', 0x00, /* String 2: "Murata" */
+            'B', 'C', 'M', '4', '3', '3', '4', '2', 0x00, /* String 3: "BCM43342" */
+            0xff, 0x00                          /* CISTPL_END + padding */
+        };
+        uint32_t addr = ((uint32_t)(uint16_t)index << 16) | (uint16_t)value;
+        uint8_t resp[16] = {0};
+        if(addr == 0x1800083a) {
+            wifi_st32(resp + 12, sizeof(bcm_cis) << 3);
+        } else if(addr == 0x18000838) {
+            wifi_st32(resp + 12, 0);
+        } else if(addr >= 0x18000800 && addr < 0x18000800 + sizeof(bcm_cis)) {
+            uint32_t off = addr - 0x18000800;
+            resp[12] = bcm_cis[off];
+            resp[13] = (off + 1 < sizeof(bcm_cis)) ? bcm_cis[off + 1] : 0xff;
+        }
+        p->actual_length = MIN(length, (int)sizeof(resp));
+        memcpy(data, resp, p->actual_length);
+        qemu_log_mask(LOG_UNIMP, "WIFI OTP addr=%08x actual=%d resp12=%02x %02x\n",
+                      addr, p->actual_length, resp[12], resp[13]);
         return;
     }
     if(w->runtime && index==0 && value==0) {
         if(request==0x2100) {
-            if(!wifi_ioctl(w,data,length)) goto stall;
-            qemu_log_mask(LOG_UNIMP,"WIFI CDC cmd=%u status=%d response=%zu queued=%u\n",
-                          wifi_ld32(data),(int32_t)wifi_ld32(w->response+12),w->response_len,w->count);
-            if(length>16 && (wifi_ld32(data)==262 || wifi_ld32(data)==263)) {
+            bool rpc = (length >= 32 && data[0] == 0x01 && data[1] == 0x80);
+            const uint8_t *cmd_data = rpc ? data + 16 : data;
+            size_t cmd_len = rpc ? length - 16 : length;
+            if(!wifi_ioctl(w, cmd_data, cmd_len)) goto stall;
+            if(rpc) {
+                uint8_t rpc_hdr[16] = {0};
+                memcpy(rpc_hdr, data, 16);
+                rpc_hdr[0] = 0x02; rpc_hdr[1] = 0x80;
+                rpc_hdr[4] = (w->response_len + 16) & 0xff;
+                rpc_hdr[5] = ((w->response_len + 16) >> 8) & 0xff;
+                rpc_hdr[2] = 0; rpc_hdr[3] = 0;
+                uint32_t sum = 0;
+                for (int i = 0; i < 16; i += 2) {
+                    if (i == 2) continue;
+                    sum += (uint32_t)rpc_hdr[i] | ((uint32_t)rpc_hdr[i+1] << 8);
+                }
+                sum = (sum & 0xffff) + (sum >> 16);
+                uint16_t csum = (uint16_t)(sum ^ 0xffff);
+                rpc_hdr[2] = csum & 0xff;
+                rpc_hdr[3] = (csum >> 8) & 0xff;
+                memmove(w->response + 16, w->response, w->response_len);
+                memcpy(w->response, rpc_hdr, 16);
+                w->response_len += 16;
+            }
+            s->resp_notified = false;
+            qemu_log_mask(LOG_UNIMP,"WIFI CDC rpc=%d cmd=%u status=%d response=%zu queued=%u\n",
+                          rpc, wifi_ld32(cmd_data),
+                          (int32_t)(rpc ? wifi_ld32(w->response + 28) : wifi_ld32(w->response + 12)),
+                          w->response_len, w->count);
+            if(cmd_len > 16 && (wifi_ld32(cmd_data)==262 || wifi_ld32(cmd_data)==263)) {
                 qemu_log_mask(LOG_UNIMP,"WIFI iovar=%.*s status=%d\n",
-                              (int)MIN((size_t)length-16,(size_t)64),data+16,
-                              (int32_t)wifi_ld32(w->response+12));
+                              (int)MIN(cmd_len-16,(size_t)64), cmd_data+16,
+                              (int32_t)(rpc ? wifi_ld32(w->response + 28) : wifi_ld32(w->response + 12)));
             }
             qemu_format_nic_info_str(qemu_get_queue(s->nic),w->mac);
             wifi_wake(s); return;
         }
-        if(request==0xa101) {
+        if(request==0xa101 || request==0xa100) {
             p->actual_length=MIN((size_t)length,w->response_len);
-            memcpy(data,w->response,p->actual_length); w->response_len=0; return;
+            memcpy(data,w->response,p->actual_length); w->response_len=0;
+            s->resp_notified=false;
+            return;
         }
     }
 stall:
@@ -165,7 +226,8 @@ static void wifi_data(USBDevice *dev, USBPacket *p)
     WifiDongle *s=WIFI_DONGLE(dev); WifiProtocol *w=&s->proto;
     if(!s->host_ready) { p->status=USB_RET_NAK; return; }
     if(p->pid==USB_TOKEN_IN && p->ep->nr==1) {
-        if(!w->response_len) { p->status=USB_RET_NAK; return; }
+        if(!w->response_len || s->resp_notified) { p->status=USB_RET_NAK; return; }
+        s->resp_notified=true;
         uint8_t intr[16]; wifi_notification(w,intr);
         usb_packet_copy(p,intr,MIN(p->iov.size,sizeof(intr))); return;
     }
@@ -191,8 +253,13 @@ static void wifi_data(USBDevice *dev, USBPacket *p)
         uint8_t buf[WIFI_FRAME_MAX];
         if(p->iov.size>sizeof(buf)) { p->status=USB_RET_STALL; return; }
         usb_packet_copy(p,buf,p->iov.size);
-        if(!w->runtime) {
+        if(!w->runtime || w->dl_state!=4 || (p->iov.size>=4 && wifi_ld32(buf)==0x30524448)) {
+            if (p->iov.size>=4 && wifi_ld32(buf)==0x30524448 && w->dl_state==4) {
+                w->dl_state=0; w->dl_bytes=0; w->dl_crc=0xffffffff;
+            }
             if(!wifi_download(w,buf,p->iov.size)) p->status=USB_RET_STALL;
+            qemu_log_mask(LOG_UNIMP,"WIFI DL chunk size=%zu state=%u bytes=%u crc=%08x exp=%08x\n",
+                          p->iov.size,w->dl_state,w->dl_bytes,w->dl_crc,w->dl_expected_crc);
             return;
         }
         if(p->iov.size>sizeof(s->tx)-s->tx_len) { s->tx_len=0; p->status=USB_RET_STALL; return; }

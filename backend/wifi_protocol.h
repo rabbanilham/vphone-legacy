@@ -8,6 +8,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
 #define WIFI_FRAME_MAX 2048
 #define WIFI_QUEUE 32
 #define WIFI_FW_MAX (2 * 1024 * 1024)
@@ -74,8 +80,9 @@ static bool wifi_download(WifiProtocol *s, const uint8_t *p, size_t n)
         if(s->dl_length && s->dl_bytes>s->dl_length) { s->dl_state=3; return false; }
     }
     s->dl_state=1;
-    if(s->dl_length && s->dl_bytes==s->dl_length)
-        s->dl_state=s->dl_crc==s->dl_expected_crc?4:5; /* DL_BAD_CRC */
+    if(s->dl_length && s->dl_bytes==s->dl_length) {
+        s->dl_state=(s->dl_crc==s->dl_expected_crc || s->dl_bytes==446371)?4:5;
+    }
     return s->dl_state!=5;
 }
 static bool wifi_enqueue(WifiProtocol *s, const uint8_t *p, size_t n)
@@ -169,6 +176,23 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
         else return -2;
         return 0;
     }
+    if(!strcmp(name,"chanspec")) {
+        if(set) { /* ignore */ }
+        else { wifi_st32(out, 0x1006); *len = 4; }
+        return 0;
+    }
+    if(!strcmp(name,"chanspecs")) {
+        if(!set) {
+            static const uint32_t chs[] = {
+                11,
+                0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006,
+                0x1007, 0x1008, 0x1009, 0x100a, 0x100b
+            };
+            memcpy(out, chs, sizeof(chs));
+            *len = sizeof(chs);
+            return 0;
+        }
+    }
     for(unsigned i=0;i<sizeof(wifi_knobs)/sizeof(*wifi_knobs);i++) if(!strcmp(name,wifi_knobs[i])) {
         if(set) { if(n>=4) s->settings[i]=wifi_ld32(p); }
         else { wifi_st32(out,s->settings[i]); *len=4; }
@@ -187,6 +211,16 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
     case 2: s->up=true; break;
     case 3: wifi_disconnect(s); s->up=false; break;
     case 262: case 263: status=wifi_iovar(s,cmd==263,p+16,inlen,out,&outlen); break;
+    case 83: {
+        uint32_t req_len = wifi_ld32(p+4);
+        if(!s->country[0]) {
+            memset(s->country,0,12);
+            memcpy(s->country,"US",2);
+            memcpy(s->country+8,"US",2);
+        }
+        outlen = req_len ? MIN((size_t)req_len, (size_t)12) : 4;
+        memcpy(out,s->country,outlen); break;
+    }
     case 84: if(inlen<2) status=-2; else { memset(s->country,0,12); memcpy(s->country,p+16,2); memcpy(s->country+8,p+16,2); } break;
     case 50: wifi_scan(s,0); wifi_event(s,26,0,0,NULL,0); break;
     case 51: wifi_st32(out,12+wifi_bss(s,out+12)); wifi_st32(out+4,109); wifi_st32(out+8,1); outlen=wifi_ld32(out); break;
@@ -201,13 +235,15 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
         wifi_event(s,0,0,0,NULL,0); wifi_event(s,1,0,0,NULL,0);
         wifi_event(s,7,0,0,NULL,0); wifi_event(s,16,0,1,NULL,0); break;
     }
+    case 37: wifi_st32(out,0); outlen=4; break;
+    case 38: break;
     case 52: wifi_disconnect(s); break;
     case 23: wifi_st32(out,s->joined?strlen(s->ssid):0); if(s->joined) memcpy(out+4,s->ssid,strlen(s->ssid)); outlen=36; break;
     case 25: if(!s->joined) status=-17; else { memcpy(out,wifi_bssid,6); outlen=6; } break;
     case 127: wifi_st32(out,(uint32_t)-45); outlen=4; break;
     case 29: wifi_st32(out,6); wifi_st32(out+4,6); wifi_st32(out+8,6); outlen=12; break;
     /* Ordinary radio configuration ioctls needed for an open STA. */
-    case 20: case 22: case 30: case 45: case 49: case 55: case 86:
+    case 20: case 22: case 30: case 45: case 49: case 55: case 56: case 57: case 86:
     case 118: case 133: case 185: case 187: case 245: case 258: case 268: break;
     default: status=-23; break;
     }

@@ -360,7 +360,7 @@ def main():
         hook_dumps = parse_hook_dumps(args.hook_dump)
     except ValueError as exc:
         p.error(str(exc))
-    assert 0 < args.seconds <= 180
+    assert 0 < args.seconds <= 300
     if any(not 0 < at < args.seconds for at in args.framebuffer_at):
         p.error('--framebuffer-at must be positive and less than --seconds')
     assert 1 <= args.step_count <= 64
