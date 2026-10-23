@@ -13,3 +13,6 @@ Set up your corpus view as tasks K/S did (symlink `build/agx-corpus/*/dumps` and
 2. Fix it in C and Python, reusing the existing paths (K's triangle and wide-line rasteriser, S's spans and plus-lighter blends) where they fit.
 3. Target: the chained replay of the Settings frames shows a white pill track with a light grey border behind the knob. Save before/after crops under `research/evidence/U-uiswitch/`. No pixel changes elsewhere without an explanation (compare the whole report before and after). Unit tests pass, add tests for anything new, and `backend/.venv/bin/python scripts/qemu/build_backend.py` compiles.
 4. Commit to `wt/uiswitch` and write `research/reports/U-uiswitch.md`.
+
+## Follow-up 1 (lead, after 21b08da)
+You were right: the old `settings` scene never unlocked. New scene **`settings-all`** (`build/agx-corpus/settings-all/`, recipe in `scripts/agx_corpus.py`): every pass, display and offscreen, from 153 s on, with Settings open (live capture `probe/framebuffer-at-145s.ppm`). It holds 40 dumps, including the 128x64 and 384x64 offscreen passes. Symlink it into your `corpus/` like the others, then do steps 1–4 of the brief on it. Do not boot QEMU.
