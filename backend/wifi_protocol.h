@@ -145,18 +145,30 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
     b[off++]=50; b[off++]=4; memcpy(b+off,wifi_rates+8,4); off+=4;
     b[off++]=3; b[off++]=1; b[off++]=6;
     /* Apple's 11D257 layout differs from Linux brcmfmac v109:
-     * ae9dc0 loads IE length as u16 at +0x74; ae9dd8 loads offset as
-     * u32 at +0x78. Rechecked against the unmodified kernel image. */
-    wifi_st16(b+116,off-128); wifi_st32(b+120,128);
+     * ae9dc0 loads ie_offset as u16 at +0x74 (116) (must be >= 0x7c);
+     * ae9dd8 loads ie_length as u32 at +0x78 (120). */
+    if(s->darwin) {
+        wifi_st16(b+116,128); wifi_st32(b+120,off-128);
+    } else {
+        wifi_st16(b+116,off-128); wifi_st32(b+120,128);
+    }
     wifi_st32(b+4,off); return off;
 }
 static void wifi_scan(WifiProtocol *s, uint16_t sync)
 {
-    uint8_t p[300]={0}; size_t n=wifi_bss(s,p+12);
-    unsigned ev = s->darwin ? 69 : 67;
-    wifi_st32(p,12+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
-    wifi_event(s,ev,8,0,p,n+12);
-    wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,ev,0,0,p,12);
+    uint8_t p[320]={0};
+    if(s->darwin) {
+        size_t n=wifi_bss(s,p+16);
+        wifi_st32(p,16+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
+        wifi_st32(p+12,0);
+        wifi_event(s,69,8,0,p,16+n);
+        wifi_st32(p,16); wifi_st16(p+10,0); wifi_event(s,69,0,0,p,16);
+    } else {
+        size_t n=wifi_bss(s,p+12);
+        wifi_st32(p,12+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
+        wifi_event(s,67,8,0,p,12+n);
+        wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,67,0,0,p,12);
+    }
 }
 static void wifi_disconnect(WifiProtocol *s)
 {
