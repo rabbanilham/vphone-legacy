@@ -595,4 +595,86 @@ df -h .
   - The replay runs in `agx_kick_cb` under the BQL. Exception entry, interrupts and ERET (through the ARM PMU EL-change hook) all take the BQL, so replay time used to stall both vCPUs.
 - **The warm data disk** (`build/diagnostic/data-diagnostic-warm.raw`, icon caches built by one boot) gained only 1–3 s, so it's not the default.
 - **Wi-Fi HSIC:** about 22 s of kernel-thread retries are faithful absent-hardware behaviour (agy D5). There is no early exit.
-- **Taps work through Setup:** language → country → the next steps (probes 161–163). Setup currently ends at its iTunes connection step, where it needs activation; that step is out of scope for this project.
+- **Taps work through Setup:** language → country → the next steps (probes 161–163). The baseline Setup flow ends at its iTunes connection step, where it needs activation. The user subsequently authorized an isolated virtual activation testing profile; see section 23 for its scope and results.
+
+## 23. Virtual activation verified; live Home rendering still open (Codex, 2026-10-23)
+
+### Scope and current result
+
+- The user explicitly authorized guest changes on separate System/Data copies for a `virtual-activated` testing profile. Required: native guest `BrickState=false`, `ActivationState="Activated"`, persistence across service restart and three sequential cold boots, and normal unlock to an interactive Home screen. This is **virtual activation for testing**, without an Apple activation ticket. Baseline remains the default; preserve baseline images and concurrent renderer work.
+- **Activation checks PASS; full plan remains INCOMPLETE.** The real guest Lockdown API returned the requested typed values 127 times across three boots, including after native lockdownd restarts. The persisted native cache agrees. Normal unlock still produces a mostly black live display with a small white rectangle; usable Home interaction is not verified.
+- Authoritative report: `research/reports/virtual-activation-20261023.md`. Evidence: `backend/evidence/virtual-activated-20261023/summary.json` and each `cold-bootN/activation/verification.json`.
+- Do not revive the earlier FactoryActivated plist-only approach or rely on the A1 persistence claim: runtime disproved it. PurpleBuddy/migration configuration alone did not clear the native bricked state. The old setup-only work is historical, not the current profile.
+
+### Profile and exact guest change
+
+- Use **`build/virtual-activated-profile-v5/`**, not intermediate v1–v4. Contains `system.raw`, fresh seed `data.raw`, `profile.json`, `boot/boot_plan.json`, probe executable, pinned QEMU and `s5l8960x.snapshot.c`.
+- `scripts/patchers/patch_virtual_activation.py` accepts only original lockdownd SHA-256 `d1421e2fc37a76732717e23da1c276c80b51d0e2da1599765b0afbbe585d426e`. At file offset `0x12e5c` (VA `0x100012e5c`), replace `c0070034` (`cbz w0, 0x100012f54`) with `1f2003d5` (`nop`). Patched SHA-256: `8919b2e827cc000ae58f3ae8243318b2e466e01c3d7491560263f0853cd6defc`. Hash and byte-context guards reject mismatched, truncated and already-patched inputs.
+- This selects an existing native `dealwith_activation` fallthrough, “Short circuiting activation state to Activated.” Native setters write the existing `Activated` CFString, acknowledgment and BrickState; the original `com.apple.mobile.lockdown.brick_state` notification remains. Getters and host responses are not mocked; no emulator hardware activation answers were changed.
+- That native branch marks global ActivationState **volatile**. Its absence as `-ActivationState` in data_ark is expected. Persistent keys are `com.apple.mobile.lockdown_cache-ActivationState = Activated` and `-BrickState = false`; verify both storage and live API.
+- `scripts/prepare_virtual_activation.py` builds isolated clones, preserves PurpleBuddy/migration settings, adds the probe to xpcd's embedded launch-job cache without dropping existing jobs or changing the section size, and sets guest root:wheel ownership via checked edits to the clean, unmounted clone's HFS catalog. Host mount ownership is not guest ownership.
+- The derived boot uses **`boot-plan-smp-nooscar`**, not the newer noisp plan. It sets `/chosen/debug-enabled=1` and native `amfi_allow_any_signature=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1`; serial confirms acceptance. Boot-args, embedded DT size and NVRAM are kept consistent. This relaxes signing only for this diagnostic profile; no guest-kernel instruction patch.
+- `scripts/virtual_activation_probe.c` calls real `lockdown_connect` / `lockdown_copy_value` / disconnect and records CF string/boolean types. `scripts/patchers/sign_diagnostic_probe.py` gives it a host-verified SHA-1 ad-hoc signature with only `com.apple.private.lockdown.finegrained-get` entries `NULL/ActivationState` and `NULL/BrickState`. Unsigned root clients ran but got nil API values; entitlements matter.
+- Probe job: `org.vphone.virtual-activation-probe`; guest log: `/private/var/root/virtual-activation-probe.jsonl`. After four valid samples it records native launchctl output, stops `com.apple.mobile.lockdown`, reconnects through normal socket activation, then records the new PID and samples. `SBSUndimScreen` keeps the display awake; it does not unlock. Ambient `errno` may be stale even on valid API results.
+
+### Evidence and limitations
+
+| Run | Input disks | Valid native reads, before/after restart | Native PID change |
+| --- | --- | --- | --- |
+| cold-boot1 | Fresh v5 seed | 45 (4 / 41) | 38 → 130 |
+| cold-boot2 | cold-boot1 retained System/Data | 42 (4 / 38) | 43 → 128 |
+| cold-boot3 | cold-boot2 retained System/Data | 40 (4 / 36) | 43 → 127 |
+
+- Every run reached 180 guest-running seconds without kernel panic. QEMU `quit` ended the runs: these are cold power-cycle tests, not graceful guest shutdown validation. HFS journal replay on subsequent boots is possible. Absence of crash reports alone does not prove uninterrupted SpringBoard liveness.
+- `backend/collect_virtual_activation.py` mounts stopped Data read-only, checks the **latest** probe session, native API types/values, distinct launchctl PIDs and persistent keys. It does not infer Home success. `profile.json` correctly has `activation_verified=true`, `home_screen_verified=false`, `runtime_verified=false`; baseline hashes were rechecked unchanged.
+- Pinned QEMU (boots 2/3) SHA-256: `3a2bf2d243d56eaf1c2754eec8e672aaf40ca1a0051c17b4104f8a0dbafbe8b8`. Renderer snapshot SHA-256: `01e86748a13a22f35c2e485624897ce0e73e61f55e8a9c2aad1867239ce847a9`. Avoid silently using a concurrently rebuilt binary.
+- Live QMP captures show “slide to unlock” at 90 s; after the ordinary 95 s swipe, 115/140/170 s captures stay dark with a small rectangle. This persisted with both default replay threading and `VPHONE_AGX_REPLAY_THREAD=0`. IconState pages/dock and installation caches are populated.
+- Boot 3 captured `render-dumps/frame-1.bin` through frame 32. Offline replay of frame 1 gives `home-offline-frame1.png`: stock Home icons, labels and dock, with wallpaper/speckle artifacts. **This is reconstructed GPU output, not a live screenshot or proof of interaction.** The corresponding live replay logs **79 draws** into offscreen target `0x10214000`, context 1, catPA `0x817c11000` (display MMU `0x803d0c000`). Home content is submitted; the subsequent live composite/scanout discrepancy needs investigation.
+- `graphics-audit.md` is agy's audit. Its triple-buffer/fixed-plane diagnosis is **unproven**: `display_update()` already reads the active display MMU, and timed `--framebuffer-at` captures use QMP screendump, not fixed-PA pmemsave. Do not apply a hardware patch solely from that report. This activation task made no renderer/hardware source edits. Coordinate with the renderer owner before changing shared source.
+
+### Reproduce / continue
+
+Interactive launch of the fresh prepared seed (launcher clones its inputs):
+
+```sh
+VPHONE_TCG_THREAD=multi VPHONE_AGX_REPLAY_THREAD=0 \
+.venv/bin/python backend/live_run.py \
+  --qemu-binary build/virtual-activated-profile-v5/qemu-system-aarch64 \
+  --plan build/virtual-activated-profile-v5/boot/boot_plan.json \
+  --system build/virtual-activated-profile-v5/system.raw \
+  --data build/virtual-activated-profile-v5/data.raw \
+  --keep-images --collect-crashlogs
+```
+
+To continue the latest persisted state, explicitly select **both** `backend/evidence/virtual-activated-20261023/cold-boot3/images/system.raw` and its sibling `data.raw`. Do not overwrite the retained evidence.
+
+Fresh reproducible build (requires a new output directory and macOS disk-image attachment):
+
+```sh
+.venv/bin/python scripts/prepare_virtual_activation.py \
+  --output build/virtual-activated-rebuild \
+  --plan backend/evidence/keybag-contract-20261015/boot-plan-smp-nooscar/boot_plan.json
+```
+
+For a timed validation, use `backend/display_probe.py` with the same pinned binary/plan, `--diagnostic-system` and `--diagnostic-data`, `--seconds 180 --stop-condition duration --collect-crashlogs`, repeatable `--framebuffer-at 90/115/140/170` (one flag per time), and a new `--output`. Normal unlock used:
+
+```sh
+VPHONE_TOUCH_SCRIPT='at=95;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up|at=130;down 600,568;move 40,568 dur=3 steps=180;hold 1.0;up'
+```
+
+Extract activation evidence only after stopping the image:
+
+```sh
+.venv/bin/python backend/collect_virtual_activation.py \
+  --data PATH_TO_STOPPED_DATA.raw --output NEW_EVIDENCE_DIRECTORY
+.venv/bin/python backend/agx_replay_offline.py \
+  backend/evidence/virtual-activated-20261023/render-dumps/frame-1.bin \
+  /tmp/virtual-home-reconstructed.png
+```
+
+### Source state, checks and next action
+
+- Publication: activation work is committed on the separate `codex/virtual-activation` branch; the shared Claude checkout is preserved. Shared capture/launcher tooling was already integrated in `c4b5164`. New files: `scripts/prepare_virtual_activation.py`, `scripts/virtual_activation_probe.c`, `scripts/patchers/patch_virtual_activation.py`, `scripts/patchers/sign_diagnostic_probe.py`, `scripts/qemu/hfs_ownership.py`, `backend/collect_virtual_activation.py`, `tests/test_virtual_activation.py`, and the report. Modified `backend/display_probe.py` adds timed active-console captures and optional pinned binary; `backend/live_run.py` adds optional pinned binary. Defaults remain unchanged. Preserve other workers' changes.
+- **51 tests passed**: `test_virtual_activation.py` (8), `test_prepare_diagnostic_disks.py` (7), `test_probe_state.py` (18), `test_crashlogs.py` (18), each via `.venv/bin/python -m unittest discover -s tests -p NAME`. Python compilation and scoped `git diff --check` also passed.
+- Next: investigate the native Home offscreen output through live composition/scanout using fresh retained-state clones and a tracked renderer build. After a fix, repeat native service/storage checks and ordinary unlock, document an interactive live Home screen and crash/panic results, then update manifest/report acceptance. **Do not mark the full plan complete from API success or offline rendering alone.**
+- The user permits delegation through agy CLI (preferred, multiple terminals allowed) and Claude CLI with `--dangerously-skip-permissions`. Earlier activation audits were refused by those agents; the completed agy graphics audit is retained above. No worker is left running for this handover.
