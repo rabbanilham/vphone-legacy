@@ -248,7 +248,7 @@ def runtime_fixture(enumeration_only=False):
 
 
 if __name__ == '__main__':
-    options=('-netdev', 'user,id=wifi0', '-machine', 'wifi-netdev=wifi0,wifi-ssid=vphone-wifi')
+    options=('-netdev', 'user,id=wifi0', '-machine', 'wifi-netdev=wifi0,wifi-ssid=vphone-wifi,wifi-rom=1')
     run_contract(fixture, 'PASS: HOST_READY connection ordering, high-speed reset, native descriptor/string/status/configuration sequence and DL_GETSTATE', options, result_address=0x800018000)
     run_contract(runtime_fixture, 'PASS: TRX CRC download, runtime re-enumeration, CDC, join, slirp ARP and DHCP offer',
                  options, result_address=0x800018000)

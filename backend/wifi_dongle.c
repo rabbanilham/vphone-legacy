@@ -17,7 +17,7 @@ struct WifiDongle {
     char *ssid;
     WifiProtocol proto;
     QEMUTimer *reenumerate;
-    bool detached_for_go, host_ready;
+    bool detached_for_go, host_ready, rom_mode;
     uint8_t tx[WIFI_FRAME_MAX];
     size_t tx_len;
 };
@@ -109,12 +109,34 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
                       request,p->actual_length,dev->configuration);
         return;
     }
-    if(!w->runtime && (request==0xc100 || request==0xc102) && value==1 && index==0) {
-        if(request==0xc102 && w->dl_state!=4) goto stall;
-        uint8_t state[8]; wifi_st32(state,w->dl_state); wifi_st32(state+4,w->dl_bytes);
+    if(request==0xc105 && value==1 && index==0) {
+        uint8_t ver[8]={0x4e,0xa9,0,0,1,0,0,0};
+        p->actual_length=MIN(length,8); memcpy(data,ver,p->actual_length);
+        qemu_log_mask(LOG_UNIMP,"WIFI DL_GETVER actual=%d\n",p->actual_length);
+        return;
+    }
+    if(request==0xc100 && value==1 && index==0) {
+        uint8_t state[8]={0,0,0,0, 0,0,0,0};
+        if(!w->runtime) {
+            wifi_st32(state,w->dl_state);
+            wifi_st32(state+4,w->dl_bytes);
+        }
         p->actual_length=MIN(length,8); memcpy(data,state,p->actual_length);
-        qemu_log_mask(LOG_UNIMP,"WIFI RDL request=%x state=%u bytes=%u\n",request,w->dl_state,w->dl_bytes);
-        if(request==0xc102) timer_mod(s->reenumerate,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1000000);
+        qemu_log_mask(LOG_UNIMP,"WIFI RDL request=%x state=%u bytes=%u\n",request,
+                      w->runtime?0:w->dl_state,w->runtime?0:w->dl_bytes);
+        return;
+    }
+    if(request==0xc102 && value==1 && index==0) {
+        if(!w->runtime) {
+            if(w->dl_state!=4) goto stall;
+            uint8_t state[8]; wifi_st32(state,w->dl_state); wifi_st32(state+4,w->dl_bytes);
+            p->actual_length=MIN(length,8); memcpy(data,state,p->actual_length);
+            timer_mod(s->reenumerate,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1000000);
+        } else {
+            uint8_t state[8]={0};
+            p->actual_length=MIN(length,8); memcpy(data,state,p->actual_length);
+        }
+        qemu_log_mask(LOG_UNIMP,"WIFI DL_GO\n");
         return;
     }
     if(w->runtime && index==0 && value==0) {
@@ -217,7 +239,14 @@ static void wifi_realize(USBDevice *dev, Error **errp)
     wifi_protocol_init(&s->proto,ssid);
     if(!memcmp(s->conf.macaddr.a,"\0\0\0\0\0\0",6)) memcpy(s->conf.macaddr.a,s->proto.mac,6);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);
-    dev->usb_desc=&wifi_rom_desc; usb_desc_init(dev);
+    if (s->rom_mode) {
+        dev->usb_desc=&wifi_rom_desc;
+        s->proto.runtime=false;
+    } else {
+        dev->usb_desc=&wifi_runtime_desc;
+        s->proto.runtime=true;
+    }
+    usb_desc_init(dev);
     s->reenumerate=timer_new_ns(QEMU_CLOCK_VIRTUAL,wifi_reenumerate,s);
     s->nic=qemu_new_nic(&wifi_net_info,&s->conf,TYPE_WIFI_DONGLE,
                         dev->qdev.id,&dev->qdev.mem_reentrancy_guard,s);
@@ -239,10 +268,18 @@ static void wifi_power_reset(WifiDongle *s)
     wifi_protocol_init(&s->proto,ssid);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);
     s->detached_for_go=false; s->host_ready=false; s->tx_len=0;
-    dev->usb_desc=&wifi_rom_desc; usb_desc_init(dev);
+    if (s->rom_mode) {
+        dev->usb_desc=&wifi_rom_desc;
+        s->proto.runtime=false;
+    } else {
+        dev->usb_desc=&wifi_runtime_desc;
+        s->proto.runtime=true;
+    }
+    usb_desc_init(dev);
 }
 static const Property wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(WifiDongle,conf), DEFINE_PROP_STRING("ssid",WifiDongle,ssid),
+    DEFINE_PROP_BOOL("rom",WifiDongle,rom_mode,false),
 };
 static const VMStateDescription wifi_vmstate = {.name=TYPE_WIFI_DONGLE,.unmigratable=1};
 static void wifi_class_init(ObjectClass *oc, const void *data)

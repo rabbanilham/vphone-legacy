@@ -491,6 +491,8 @@ struct A7State {
     AddressSpace usb_dma_as;
     WifiDongle *wifi;
     char *wifi_netdev, *wifi_ssid;
+    uint64_t wifi_rom;
+    bool wifi_mac_patched;
     MemoryRegion usb_otg;
     uint32_t usb_regs[0x10000 / 4];
     A7Bridge usb_aux[4];
@@ -6763,6 +6765,52 @@ static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t v
     }
 }
 
+static void a7_wifi_patch_mac(A7State *s)
+{
+    if (!s->wifi) {
+        return;
+    }
+    char name[32];
+    /* devicetree_pa is 0x8018d4000. local-mac-address is at 0x8018d48d8 */
+    address_space_read(&address_space_memory, 0x8018d48d8, MEMTXATTRS_UNSPECIFIED, name, 18);
+    if (!memcmp(name, "local-mac-address\0", 18)) {
+        address_space_write(&address_space_memory, 0x8018d48fc, MEMTXATTRS_UNSPECIFIED,
+                            s->wifi->conf.macaddr.a, 6);
+        fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x8018d48fc\n",
+                s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                      s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                      s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                      s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        return;
+    }
+    /* Fallback search in devicetree area */
+    for (uint64_t pa = 0x8018d0000; pa < 0x8018e0000 - 48; pa += 4) {
+        address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, name, 18);
+        if (!memcmp(name, "local-mac-address\0", 18)) {
+            uint32_t len = 0;
+            address_space_read(&address_space_memory, pa + 32, MEMTXATTRS_UNSPECIFIED, &len, 4);
+            if (len == 6) {
+                address_space_write(&address_space_memory, pa + 36, MEMTXATTRS_UNSPECIFIED,
+                                    s->wifi->conf.macaddr.a, 6);
+                fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x%" PRIx64 "\n",
+                        s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                        s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                        s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5],
+                        pa + 36);
+                qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                              s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                              s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                              s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "WIFI DeviceTree: local-mac-address not found in PA 0x8018d0000..0x8018e0000\n");
+}
+
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
@@ -6803,12 +6851,17 @@ static void vblank_timer_cb(void *opaque)
             break;
         }
     }
+    if (s->wifi && !s->wifi_mac_patched) {
+        a7_wifi_patch_mac(s);
+        s->wifi_mac_patched = true;
+    }
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
 }
 
 static void a7_reset(void *opaque)
 {
     A7State *s = opaque;
+    s->wifi_mac_patched = false;
     if (s->iop_cpu) {
         cpu_reset(CPU(s->iop_cpu));
         s->iop_started = false;
@@ -7019,6 +7072,7 @@ static void a7_wifi_init(A7State *s, DeviceState *ehci)
     qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
     if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
     qdev_prop_set_string(DEVICE(dev), "port", "1");
+    if (s->wifi_rom) qdev_prop_set_bit(DEVICE(dev), "rom", true);
     usb_realize_and_unref(dev, &SYS_BUS_EHCI(ehci)->ehci.bus, &error_fatal);
     s->wifi = WIFI_DONGLE(dev);
     wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
@@ -7455,6 +7509,8 @@ static void a7_instance_init(Object *o)
                         (void *)offsetof(A7State, wifi_netdev));
     object_property_add(o, "wifi-ssid", "str", get_image, set_image, NULL,
                         (void *)offsetof(A7State, wifi_ssid));
+    object_property_add(o, "wifi-rom", "uint64", get_address, set_address, NULL,
+                        (void *)offsetof(A7State, wifi_rom));
     s->boot_el = 1;
     s->framebuffer = RAM_BASE + GiB - 4 * MiB;
     object_property_add(o, "utility-image", "str", get_image, set_image, NULL,
