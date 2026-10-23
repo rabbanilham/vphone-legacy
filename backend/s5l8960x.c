@@ -5714,36 +5714,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
 
-                bool is_navbar = (x0 == 0 && y0 == 0 && (x1 - x0) >= 640 &&
-                                  (y1 - y0) >= 60 && (y1 - y0) <= 130 &&
-                                  textured && (tex.w == 1 && tex.h == 1));
-                if (is_navbar) {
-                    uint32_t bw = (uint32_t)(x1 - x0), bh = (uint32_t)(y1 - y0);
-                    if (bw > 0 && bh > 0 && bw <= 2048 && bh <= 2048) {
-                        uint32_t *raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
-                        uint32_t *tmp_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
-                        if (raw_tex && tmp_tex) {
-                            bool read_ok = true;
-                            for (uint32_t y = 0; y < bh; y++) {
-                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y0 + y),
-                                                  raw_tex + (size_t)y * bw, bw * 4)) {
-                                    read_ok = false;
-                                    break;
-                                }
-                            }
-                            if (read_ok) {
-                                agx_blur_texture(raw_tex, tmp_tex, bw, bh);
-                                for (uint32_t y = 0; y < bh; y++) {
-                                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y0 + y),
-                                                  raw_tex + (size_t)y * bw, bw * 4);
-                                }
-                            }
-                        }
-                        g_free(raw_tex);
-                        g_free(tmp_tex);
-                    }
-                }
-
                 if (!textured) {
                     for (int y = y0; y < y1; y++) {
                         if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,

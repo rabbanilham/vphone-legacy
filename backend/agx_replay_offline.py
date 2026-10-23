@@ -503,23 +503,6 @@ def main():
                     step_x = math.hypot(uv_map[0] * su, uv_map[3] * sv)
                     step_y = math.hypot(uv_map[1] * su, uv_map[4] * sv)
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
-                is_navbar = (x0 == 0 and y0 == 0 and (x1 - x0) >= 640 and
-                             60 <= (y1 - y0) <= 130 and tex['w'] == 1 and tex['h'] == 1)
-                if is_navbar:
-                    bw, bh = x1 - x0, y1 - y0
-                    raw_pixels = []
-                    for y in range(y0, y1):
-                        for x in range(x0, x1):
-                            d = (y * target_w + x) * 4
-                            r, g, b, a = fb[d:d + 4]
-                            raw_pixels.append((b, g, r, a))
-                    blurred = gaussian_blur_texture(raw_pixels, bw, bh)
-                    for y in range(y0, y1):
-                        for x in range(x0, x1):
-                            b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
-                            d = (y * target_w + x) * 4
-                            fb[d:d + 4] = bytes((r, g, b, a))
-
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
