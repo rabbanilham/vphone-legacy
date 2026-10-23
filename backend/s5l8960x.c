@@ -241,6 +241,7 @@ typedef struct MouseTouch {
     int host_x, host_y, x, y, start_x, start_y;
     bool button, last_button, pressed, dirty;
     unsigned phase; /* 0 idle, 1 start, 2 down, 3 drag/final move, 4 up */
+    unsigned release_frames;
     int64_t due;
 } MouseTouch;
 
@@ -258,13 +259,21 @@ static void mouse_touch_sync(MouseTouch *m, bool allowed, int64_t now)
         m->phase = 1;
         m->pressed = true;
         m->dirty = false;
+        m->release_frames = 0;
         m->due = now;
     } else if (m->phase && m->pressed) {
         m->dirty |= m->x != m->host_x || m->y != m->host_y;
         m->x = m->host_x;
         m->y = m->host_y;
     }
-    if (!m->button) { m->pressed = false; }
+    if (!m->button && m->pressed) {
+        m->pressed = false;
+        int dx = m->x - m->start_x;
+        int dy = m->y - m->start_y;
+        if (dx < 0) { dx = -dx; }
+        if (dy < 0) { dy = -dy; }
+        m->release_frames = (dx > 10 || dy > 10) ? 18 : 3;
+    }
     /* Ignored presses require a release and a fresh press. */
     m->last_button = m->button;
 }
@@ -272,8 +281,7 @@ static void mouse_touch_sync(MouseTouch *m, bool allowed, int64_t now)
 static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
                              TouchScriptFrame *f)
 {
-    if (!m->phase || now < m->due || !ready ||
-        (m->phase == 3 && m->pressed && !m->dirty)) { return false; }
+    if (!m->phase || now < m->due || !ready) { return false; }
     f->ns = now;
     f->x = m->x; f->y = m->y;
     if (m->phase <= 2) {
@@ -283,7 +291,13 @@ static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
     } else if (m->phase == 3) {
         f->state = 4;
         m->dirty = false;
-        if (!m->pressed) { m->phase = 4; }
+        if (!m->pressed) {
+            if (m->release_frames > 0) {
+                m->release_frames--;
+            } else {
+                m->phase = 4;
+            }
+        }
     } else {
         f->state = 7;
         m->phase = 0;
@@ -340,6 +354,7 @@ typedef struct A7Touch {
     uint8_t input_control[4], face_detection, input_reports;
     uint8_t frames[64][56], frame_len[64];
     unsigned frame_head, frame_count;
+    uint32_t last_timestamp_us;
 } A7Touch;
 
 typedef struct A7SPI {
@@ -512,6 +527,7 @@ struct A7State {
     int64_t touch_epoch_ns;
     bool touch_force;
     unsigned touch_step;
+    int touch_settle_frames;
     uint8_t rx[256];
     unsigned rx_count;
     uint32_t ipi[2], ipi_mask[2];
@@ -1416,7 +1432,12 @@ static void touch_enqueue(A7Touch *t, const uint8_t *frame, unsigned len)
 static void touch_contact(A7Touch *t, unsigned state, int x, int y)
 {
     uint8_t f[56] = { 0x74, t->sequence++, 26, 4 };
-    stl_le_p(f + 4, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    uint32_t ts = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    if (ts <= t->last_timestamp_us) {
+        ts = t->last_timestamp_us + 1;
+    }
+    t->last_timestamp_us = ts;
+    stl_le_p(f + 4, ts);
     f[10] = 4; /* contact frame, flags[1:0]=0 -> type 6 */
     stw_le_p(f + 12, 30);
     f[14] = 1;
@@ -1504,6 +1525,28 @@ static void touch_timer_cb(void *opaque)
         return;
     }
     TouchScriptFrame *f = &s->touch_script.frames[s->touch_step];
+    if (f->state == 7) {
+        if (s->touch_settle_frames < 0) {
+            int dx = f->x - s->touch_script.frames[0].x;
+            int dy = f->y - s->touch_script.frames[0].y;
+            if (dx < 0) { dx = -dx; }
+            if (dy < 0) { dy = -dy; }
+            int64_t prev_ns = s->touch_step > 0 ?
+                s->touch_script.frames[s->touch_step - 1].ns : 0;
+            if ((dx > 10 || dy > 10) && (f->ns - prev_ns <= TOUCH_TICK_NS * 2)) {
+                s->touch_settle_frames = 18;
+            } else {
+                s->touch_settle_frames = 0;
+            }
+        }
+        if (s->touch_settle_frames > 0) {
+            s->touch_settle_frames--;
+            touch_contact(t, 4, f->x, f->y);
+            timer_mod(s->touch_timer, now + TOUCH_TICK_NS);
+            return;
+        }
+    }
+    s->touch_settle_frames = -1;
     /* Policy/FIFO waits stretch the remaining timeline, preserving every
      * transition instead of bursting overdue frames into the guest. */
     s->touch_epoch_ns = MAX(s->touch_epoch_ns, now - f->ns);
@@ -1526,6 +1569,7 @@ static void touch_script_reset(A7State *s)
     char error[256];
     timer_del(s->touch_timer);
     s->touch_step = 0;
+    s->touch_settle_frames = -1;
     s->touch_script.count = 0;
     s->touch_force = force && !strcmp(force, "1");
     s->touch_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -1556,8 +1600,12 @@ static void mouse_touch_timer_cb(void *opaque)
                  t->frame_count < ARRAY_SIZE(t->frames);
     if (mouse_touch_next(m, now, ready, &f)) {
         touch_contact(t, f.state, f.x, f.y);
+        qemu_log_mask(LOG_UNIMP, "A7 MOUSE state=%u x=%d y=%d phase=%u rel=%u "
+                      "queued=%u ns=%" PRId64 "\n",
+                      f.state, f.x, f.y, m->phase, m->release_frames,
+                      t->frame_count, now);
     }
-    if (m->phase && (m->phase != 3 || !m->pressed || m->dirty)) {
+    if (m->phase != 0) {
         timer_mod(s->mouse_touch_timer,
                   m->due > now ? m->due : now + TOUCH_TICK_NS);
     } else {
@@ -1575,7 +1623,10 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
         if (evt->abs.axis == INPUT_AXIS_X) {
             m->host_x = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 640);
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            m->host_y = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 1136);
+            int y = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 1136);
+            /* MultitouchHID shifts raw contact ~16 px up in guest Y.
+             * Compensate so mouse clicks land on the intended pixel. */
+            m->host_y = MIN(1136, y + 16);
         }
     } else if (evt->type == INPUT_EVENT_KIND_BTN &&
                evt->btn.button == INPUT_BUTTON_LEFT) {
