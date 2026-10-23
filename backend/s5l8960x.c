@@ -1070,6 +1070,12 @@ static void touch_gpio_level(A7State *s, bool low)
     touch_gpio_update(s);
 }
 
+static bool touch_irq_latched(A7State *s)
+{
+    unsigned group = (ldl_le_p(s->gpio_regs + 22 * 4) >> 16) & 0xff;
+    return group >= 7 || (ldl_le_p(s->gpio_regs + 0x800 + group * 0x40) & (1u << 22));
+}
+
 static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
 {
     A7State *s = opaque;
@@ -1430,6 +1436,14 @@ static void touch_enqueue(A7Touch *t, const uint8_t *frame, unsigned len)
     memcpy(t->frames[tail], frame, len);
     t->frame_len[tail] = len;
     t->frame_count++;
+    /* GPIO22 is edge-triggered. When MultitouchHID configures it while the
+     * line is already low, nothing latches and the guest never reads, so the
+     * FIFO only grows (queued=1,2,3... from the first tap; the unlock swipe
+     * then never arrives). With frames waiting and no status pending, pulse
+     * the line so the driver sees a fresh edge. */
+    if (t->frame_count >= 2 && t->owner->touch_irq_low && !touch_irq_latched(t->owner)) {
+        touch_gpio_level(t->owner, false);
+    }
     touch_gpio_level(t->owner, true);
 }
 
