@@ -678,3 +678,19 @@ Extract activation evidence only after stopping the image:
 - **51 tests passed**: `test_virtual_activation.py` (8), `test_prepare_diagnostic_disks.py` (7), `test_probe_state.py` (18), `test_crashlogs.py` (18), each via `.venv/bin/python -m unittest discover -s tests -p NAME`. Python compilation and scoped `git diff --check` also passed.
 - Next: investigate the native Home offscreen output through live composition/scanout using fresh retained-state clones and a tracked renderer build. After a fix, repeat native service/storage checks and ordinary unlock, document an interactive live Home screen and crash/panic results, then update manifest/report acceptance. **Do not mark the full plan complete from API success or offline rendering alone.**
 - The user permits delegation through agy CLI (preferred, multiple terminals allowed) and Claude CLI with `--dangerously-skip-permissions`. Earlier activation audits were refused by those agents; the completed agy graphics audit is retained above. No worker is left running for this handover.
+
+## Graphics worktree checkpoint — Codex, 2026-10-23
+
+Active graphics work is isolated in `/Users/bagas/.codex/worktrees/graphics-quality/vphone-legacy`, branch `codex/graphics-quality`, based on main `788e3a4`. See **section 24 of that worktree’s CLAUDE_HANDOVER.md** for the current implementation, independent QEMU binaries, tests, audit caveats and remaining validation. Evidence is in that worktree’s `backend/evidence/graphics-quality-20261023/`. The shared renderer and build here were not changed. User requires visible Cocoa windows for future QEMU launches. Graphics-quality acceptance remains incomplete; do not mistake existing main’s newly reproduced live Home for a result solely caused by the new patches.
+
+
+### Graphics work stopped by user — 2026-10-23
+
+Graphics work is stopped; this task’s QEMU, probe, cold-boot orchestrator and audit CLIs are no longer running. The complete latest handover is section24, including **“Stopped by explicit user request”**, in `/Users/bagas/.codex/worktrees/graphics-quality/vphone-legacy/CLAUDE_HANDOVER.md`. Branch `codex/graphics-quality` has uncommitted C/offline interpolation corrections and regression tests; no graphics commit/push/merge was made.
+
+Final checks: 207 unit tests OK (3 skipped), complete AGX pixel contracts pass, Setup control/candidate each completed160 seconds without panic and reached the language list. The three sequential final Home boots were interrupted during boot1; app launch and full UI quality remain unverified. The QMP stop timed out, so only this task’s remaining processes were terminated; preserve its diagnostic disk as a power-cut clone. Read `backend/evidence/graphics-quality-20261023/stopped-status.json` in the graphics worktree for status and the full handover for resumption steps. Do not stage the worktree’s untracked Python-runtime symlinks or touch the shared Claude renderer/build. Resume only upon user instruction, with visible Cocoa QEMU windows.
+
+
+### Interactive default changed by user request — 2026-10-23
+
+`backend/live_run.py` now defaults to the complete `build/virtual-activated-profile-v5/` plan/System/Data tuple and MTTCG (`VPHONE_TCG_THREAD` still overrides). Explicit image/plan flags remain available. Missing inputs fail before disk cloning; no baseline fallback. This supersedes earlier notes that baseline is the interactive default. Source images remain protected by disposable clones. The user requested an immediate visible run: Cocoa window `iOS 7 - virtual-activated`, work directory `/tmp/vphone-live-xm3br8zx`; images retained on exit. These launcher changes are not yet committed. The stopped graphics worktree remains stopped.
