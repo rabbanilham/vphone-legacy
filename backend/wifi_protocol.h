@@ -178,7 +178,7 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     }
     if(!strcmp(name,"chanspec")) {
         if(set) { /* ignore */ }
-        else { wifi_st32(out, 0x1006); *len = 4; }
+        else { wifi_st32(out, 0x1006); *len = 16; }
         return 0;
     }
     if(!strcmp(name,"chanspecs")) {
