@@ -227,6 +227,10 @@ def blend_vibrancy(d, s):
 WALLPAPER = 0x789b8f08a3f3a8cd  # observed CoreImage XY/UV clip-space pass
 COPY = 0x99d4fcf52a8c2ef3  # CA solid source-copy padding clear (including alpha zero)
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
+SPANS = 0x1a20cc29e8fcc15b  # 1-pixel horizontal spans for glyph rows
+PLUS_L = 0x5b133ef7e0c3428c  # CoreAnimation plus-lighter compositing filter
+PLUS_L2 = 0xa225a18725e48d5c  # CoreAnimation plus-lighter gradient variant
+SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
 
 
 def is_clear_pass(type1_command):
@@ -389,6 +393,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     prog = program(f, ppp)
 
     if not tex and stride not in (20, 28):
+        if stride == 16 and prog == SPANS:
+            return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
         if stride == 12 and prog in BLUR_PROGRAMS:
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
@@ -529,6 +535,7 @@ def main():
                     pass
     scissor_base = struct.unpack_from('<I', f.type1_command, 0x50)[0]
     clip_state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
+    last_m = None
     for vs_data, ppp, draw, viewport in walk(f):
         clip_state = decode_ppp_clipping(ppp, clip_state)
         clip_x0, clip_y0 = 0, 0
@@ -552,14 +559,48 @@ def main():
 
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
-        m = find_matrix(f, vs_data) if stride != 12 else None
+        prog = program(f, ppp)
+        m = None
+        if stride != 12:
+            m = find_matrix(f, vs_data)
+            if m:
+                last_m = m
+            elif stride == 16 and prog == SPANS and last_m:
+                m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         tex = texture(f, ppp)
-        prog = program(f, ppp)
         if stride == 16:
-            if prog != WALLPAPER:
+            if prog == WALLPAPER:
+                m = (1, 1, 0, 0)
+            elif prog == SPANS:
+                for k in range(0, count, 2):
+                    if k + 1 >= len(vs):
+                        break
+                    v0, v1 = vs[k], vs[k + 1]
+                    if m:
+                        px0 = (m[0] * v0[0] + m[2]) * vp[0] + vp[1]
+                        px1 = (m[0] * v1[0] + m[2]) * vp[0] + vp[1]
+                        py0 = (m[1] * v0[1] + m[3]) * vp[2] + vp[3]
+                    else:
+                        px0, px1, py0 = v0[0], v1[0], v0[1]
+                    alpha = v0[2][-1] if len(v0[2]) >= 8 else 0
+                    if alpha == 0:
+                        continue
+                    iy = int(round(py0 - 0.5))
+                    if iy < clip_y0 or iy >= clip_y1:
+                        continue
+                    ix0 = max(clip_x0, int(round(min(px0, px1) - 0.5)))
+                    ix1 = min(clip_x1, target_w, pw, int(round(max(px0, px1) - 0.5)))
+                    if ix0 >= ix1:
+                        continue
+                    for ix in range(ix0, ix1):
+                        d = (iy * target_w + ix) * 4
+                        for c in range(3):
+                            fb[d + c] = min(255, alpha + fb[d + c] * (255 - alpha) // 255)
+                        fb[d + 3] = min(255, alpha + fb[d + 3] * (255 - alpha) // 255)
                 continue
-            m = (1, 1, 0, 0)
+            else:
+                continue
         is_blur = prog in BLUR_PROGRAMS
         blurred_tex = None
         if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
@@ -674,6 +715,9 @@ def main():
                             continue
                         if tex.get('vibrancy'):
                             fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
+                        elif prog in (PLUS_L, PLUS_L2):
+                            for c, src in enumerate((r, g, b, a)):
+                                fb[d + c] = min(255, src + fb[d + c])
                         else:
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
@@ -698,7 +742,11 @@ def main():
                     for x in range(x0, x1):
                         d = (y * target_w + x) * 4
                         for c, src in enumerate((r, g, b, a)):
-                            fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - a) // 255)
+                            fb[d + c] = (
+                                src if prog == COPY else
+                                min(255, src + fb[d + c]) if prog == SOLID_PLUS_L else
+                                min(255, src + fb[d + c] * (255 - a) // 255)
+                            )
     png(sys.argv[2], target_w, target_h, bytes(fb))
 
 
