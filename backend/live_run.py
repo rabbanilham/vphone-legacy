@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Run the guest interactively in a Cocoa window (no debugger, no hooks).
 
-Uses the same boot plan and disposable disk clones as display_probe.py, so
-the original/diagnostic images are never written. Clones are removed on exit
-unless --keep-images is given. Touch is only injectable via
-VPHONE_TOUCH_SCRIPT (see backend/README.md); mouse input is not wired yet.
+Defaults to the virtual-activated testing profile and disposable disk clones,
+so the source images are never written. Clones are removed on exit unless
+--keep-images is given. Explicit --plan/--system/--data override the defaults.
 """
 import argparse
 from host_wifi import configure_wifi
@@ -19,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
 from display_probe import FB  # noqa: E402
 
-EVIDENCE = ROOT / 'backend/evidence/keybag-contract-20261015'
+DEFAULT_PROFILE = ROOT / 'build/virtual-activated-profile-v5'
 
 
 def clone_or_copy(src, dst):
@@ -36,9 +35,9 @@ def clone_or_copy(src, dst):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--plan', type=Path, default=EVIDENCE / 'boot-plan-vram/boot_plan.json')
-    p.add_argument('--system', type=Path, default=ROOT / 'build/diagnostic/system-diagnostic-sep.raw')
-    p.add_argument('--data', type=Path, default=ROOT / 'build/diagnostic/data-diagnostic-systembag.raw')
+    p.add_argument('--plan', type=Path, default=DEFAULT_PROFILE / 'boot/boot_plan.json')
+    p.add_argument('--system', type=Path, default=DEFAULT_PROFILE / 'system.raw')
+    p.add_argument('--data', type=Path, default=DEFAULT_PROFILE / 'data.raw')
     p.add_argument('--qemu-binary', type=Path, help='Explicit QEMU binary for a reproducible diagnostic run')
     p.add_argument('--keep-images', action='store_true')
     p.add_argument('--collect-crashlogs', action='store_true',
@@ -46,6 +45,11 @@ def main():
     p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[])
     args = p.parse_args()
+    for path in (args.plan, args.system, args.data):
+        if not path.is_file():
+            p.error(f'Missing input: {path}. Prepare the virtual-activated profile '
+                    'with scripts/prepare_virtual_activation.py or provide explicit '
+                    '--plan, --system and --data paths.')
 
     import json
     plan_path = args.plan.resolve()
@@ -66,7 +70,7 @@ def main():
                f"utility-image={images}/utility.raw,system-writable=1")
     binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
     cmd = [str(binary), '-machine', machine,
-           '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'single'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
+           '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'multi'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
            '-kernel', plan['image'], '-display', 'cocoa',
            '-serial', f'file:{work}/serial.log',
            '-qmp', f'unix:{work}/qmp,server=on,wait=off'] + args.qemu_arg

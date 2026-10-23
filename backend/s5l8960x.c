@@ -5167,14 +5167,15 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
-    /* Layout 1 marks GPU-rendered surfaces (agx_surface_layout); otherwise
-     * uploaded linear textures. */
-    tex->strip = false;
-    if ((tsw[0] & 7) == 1) {
-        AGXSurface sf;
-        agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
-        tex->strip = sf.strip;
+    /* Layout 1 or display surfaces with hole at +0xa000 (agx_surface_layout);
+     * otherwise uploaded linear textures. */
+    AGXSurface sf;
+    agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
+    tex->strip = sf.strip;
+    if (sf.strip) {
         tex->stride = sf.pitch;
+    } else if ((tsw[0] & 7) == 1) {
+        tex->stride = ((tex->w + 15) & ~15u) * 4;
     } else {
         /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
         tex->stride = ((tsw[2] & 0xffff) + 1) * 4;

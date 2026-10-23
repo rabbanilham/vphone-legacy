@@ -136,10 +136,11 @@ def decode_tsw(f, tsw):
     # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
     # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
-    strip = False
-    if (tsw[0] & 7) == 1:
-        strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
-        stride = 2560 if strip else ((w + 15) & ~15) * 4
+    strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
+    if strip:
+        stride = 2560
+    elif (tsw[0] & 7) == 1:
+        stride = ((w + 15) & ~15) * 4
     else:
         pitch = ((tsw[2] & 0xffff) + 1) * 4
         stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
