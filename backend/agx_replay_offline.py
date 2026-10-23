@@ -37,6 +37,7 @@ def find_viewport(ppp):
 
 
 def decode_ppp_clipping(ppp, state=None):
+    """Retain PPP scissor/index and 32-pixel region state across partial updates."""
     if state is None:
         state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
     if not ppp:

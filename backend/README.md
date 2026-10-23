@@ -306,6 +306,10 @@ reporting yet, injection waits. A bounded FIFO preserves transitions when SPI
 reads lag. Reporting waits and full-queue backpressure stretch the remaining
 timeline, including subsequent gestures, rather than dropping or bursting frames.
 A reset cancels the previous timeline and parses the environment again.
+A scripted drag released immediately after movement emits 60 stationary
+settle frames (about one virtual second) before up, so UIKit can consume its
+coalesced pan update with fast clipped replay. Taps do not acquire this
+extra drag settle.
 
 Report 0x70 is UI lock control (`MTDeviceSetUILocked`): 1 enters UI lock,
 2 exits it. The firmware model queues reset-complete `60 02` at final execute

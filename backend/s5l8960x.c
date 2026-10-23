@@ -1544,7 +1544,10 @@ static void touch_timer_cb(void *opaque)
             int64_t prev_ns = s->touch_step > 0 ?
                 s->touch_script.frames[s->touch_step - 1].ns : 0;
             if ((dx > 10 || dy > 10) && (f->ns - prev_ns <= TOUCH_TICK_NS * 2)) {
-                s->touch_settle_frames = 18;
+                /* Keep the final drag position long enough for UIKit's
+                 * coalesced pan update even when clipped AGX replay is fast.
+                 * Taps do not acquire this extra drag settle. */
+                s->touch_settle_frames = 60;
             } else {
                 s->touch_settle_frames = 0;
             }
@@ -4951,6 +4954,13 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
     g_autofree char *render_hex = NULL;
 
     if (!dir || !*dir) {
+        return;
+    }
+    /* Bound captures to the transition under investigation, independent of
+     * how many animation passes boot timing happened to submit beforehand. */
+    const char *after_env = getenv("VPHONE_AGX_FRAME_DUMP_AFTER_NS");
+    if (after_env && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
+                     strtoull(after_env, NULL, 0)) {
         return;
     }
     if (count_env) {

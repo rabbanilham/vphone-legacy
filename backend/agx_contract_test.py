@@ -115,7 +115,7 @@ REPLAY_MASK_CODE = bytes.fromhex(
 REPLAY_BLUR_CODE = bytes.fromhex(
     '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
     '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
-REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip')
+REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip', 'home-dirty-scissor', 'home-dirty-region')
 
 
 def blend_vibrancy(dst, src):
@@ -159,7 +159,7 @@ def replay_blob(case=True):
     # Original cases retain the display hole; new cases map through +0xa000.
     # The extra pages are guards too: compare every byte, including row padding.
     synthetic = isinstance(case, str)
-    width, height = ((744, 8) if case == 'wallpaper' else (40, 40) if case == 'dense' else (16, 16)) if synthetic else (640, 1136)
+    width, height = ((744, 8) if case == 'wallpaper' else (40, 40) if case == 'dense' else (64, 64) if case in ('home-dirty-scissor', 'home-dirty-region') else (16, 16)) if synthetic else (640, 1136)
     pitch = width * 4 if case == 'wallpaper' else (((width + 15) & ~15) * 4 if synthetic else 2560)
     target_pages = [map_page(REPLAY_TARGET + offset)
                     for offset in range(0, 0xb000 if synthetic else 0xa000, 0x1000)]
@@ -340,7 +340,7 @@ def replay_blob(case=True):
                         out |= v << c
                     return out
                 expect_rect((2, 0, 6, 2), blurred_over)
-            else:
+            elif case in ('vibrancy-dark', 'vibrancy-light'):
                 # Luma constants, four sampler words, then the TSW at +28.
                 q = (texture_gva >> 2) << 16
                 put(state + 0x400, '<11I', 0x3d93a000, 0x3e59a000, 0x3f372000,
@@ -353,6 +353,26 @@ def replay_blob(case=True):
                 for y in range(2):
                     put(state + 0x500 + y * 64, '<4I', *([0xffffffff] * 4))
                 expect_rect((2, 0, 6, 2), lambda x, y: blend_vibrancy(destination, tint))
+    if case in ('home-dirty-scissor', 'home-dirty-region'):
+        # Home's Clock hand update redraws a fullscreen wallpaper quad under
+        # a tiny scissor and a 32-pixel tile region. Static icons outside it
+        # must survive. Seed distinct content with the preceding solid draw.
+        destination, wallpaper = 0xff907050, 0xff123456
+        for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+            put(state + 0x200 + i * 20, '<4fI', u * 64, v * 64, 0, 1, destination)
+            put(state + 0x300 + i * 24, '<6f', u * 64, v * 64, 0, 1, u, v)
+        put(QUEUE + 0x350, '<I', state_gva + 0xa00)
+        put(state + 0xa08, '<2I', (35 << 16) | 44, (34 << 16) | 45)
+        put(state + 0x110, '<6I', 0x421,
+            (1 << 16) if case == 'home-dirty-scissor' else 0,
+            1, 0x80010001, 0x00010001, 0x80001000)
+        put(state + 15 * 4, '<I', 6 << 8)
+        for y in range(2):
+            put(state + 0x500 + y * 64, '<4I', *([wallpaper] * 4))
+        expect_rect((0, 0, 64, 64), lambda x, y: destination)
+        dirty = (35, 34, 44, 45) if case == 'home-dirty-scissor' else (32, 32, 64, 64)
+        expect_rect(dirty, lambda x, y: wallpaper)
+        draws = 2
     if case == 'wallpaper':
         # Real CoreImage clip-space XY / texel UV layout, Y-first Morton
         # source and an exact 744-pixel output pitch. Draw at the far edge.
@@ -561,6 +581,9 @@ def main():
     for case in REPLAY_CASES:
         run_case(None, replay=case)
         print(f'PASS: AGX replay {case}: exact guest physical pixels and padding')
+    for case in ('home-dirty-scissor', 'home-dirty-region'):
+        run_case(None, replay=case, replay_thread=False)
+        print(f'PASS: AGX replay {case}: inline pixels and padding')
     print('PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target')
     print('PASS: AGX replay inline fallback (VPHONE_AGX_REPLAY_THREAD=0) matches threaded replay')
     print('PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback')

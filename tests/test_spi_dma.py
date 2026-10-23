@@ -389,24 +389,24 @@ int main(void) {
     assert(lduw_le_p(f+44)==256 && !state.touch_irq_low);
     assert(lduw_le_p(f+46)==256 && lduw_le_p(f+48)==256);
     assert(lduw_le_p(f+50)==256 && lduw_le_p(f+52)==256);
-    for (unsigned i=1;i<=38;i++) {
-        /* 18 stationary settle moves (dx>10, tight final step) precede up7. */
+    for (unsigned i=1;i<=80;i++) {
+        /* 60 stationary settle moves (dx>10, tight final step) precede up7. */
         virtual_ns=timer_deadline;touch_timer_cb(&state);
         pio(p,query,16,reply);pio(p,fetch,63,reply);
-        assert(reply[32]==(i==38?7:i==1?3:4));
+        assert(reply[32]==(i==80?7:i==1?3:4));
         f=reply+5;
         assert(f[26]==1 && f[28]==2);
         assert(lduw_le_p(f+32)==118);
-        assert(lduw_le_p(f+38)==(i==38?0:400));
-        assert(lduw_le_p(f+40)==(i==38?0:300));
+        assert(lduw_le_p(f+38)==(i==80?0:400));
+        assert(lduw_le_p(f+40)==(i==80?0:300));
         for (unsigned off=44;off<=52;off+=2) {
-            assert(lduw_le_p(f+off)==(i==38?0:256));
+            assert(lduw_le_p(f+off)==(i==80?0:256));
         }
         /* Normalize as mt_FillMTContactDirectFromBinary then HID's
          * y inversion: (rawY-minY)/(maxY-minY) -> top-left pixels. */
         assert(1136-lduw_le_p(f+32)==1018);
         assert(lduw_le_p(reply+35)==(i>=19?600:60+30*(i-1)));
-        assert(lduw_le_p(reply+49)==(i==38?0:256));
+        assert(lduw_le_p(reply+49)==(i==80?0:256));
     }
     assert(p->spi.touch.frame_count==0 && !state.touch_irq_low);
     /* Execute rich timelines through the real timer/contact producer.
@@ -426,8 +426,8 @@ int main(void) {
     unsigned count=state.touch_script.count;
     for (unsigned i=0;i<count;i++) {
         TouchScriptFrame *want=&state.touch_script.frames[i];
-        /* The drag's up7 waits behind 18 stationary moves; the tap's does not. */
-        unsigned settle=want->state==7 && want->x==560 ? 18 : 0;
+        /* The drag's up7 waits behind 60 stationary moves; the tap's does not. */
+        unsigned settle=want->state==7 && want->x==560 ? 60 : 0;
         for (unsigned k=0;k<settle;k++) {
             touch_timer_cb(&state);
             assert(state.touch_step==i && p->spi.touch.frame_count==1);
