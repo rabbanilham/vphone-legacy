@@ -81,6 +81,7 @@ static void sysbus_mmio_map(SysBusDevice *d, unsigned slot, uint64_t pa) {
  assert(d->realized && slot==0 && d->index==mapped);
  assert(pa==(mapped ? UINT64_C(0x20c400000) : UINT64_C(0x20c200000))); mapped++;
 }
+static void a7_wifi_init(A7State *s, DeviceState *d) { assert(s && d->index==1); }
 static A7State *owner;
 static void (*irqfn)(void *,int,int);
 static unsigned qemu_allocate_irq(void (*fn)(void *,int,int), void *s, unsigned irq) {

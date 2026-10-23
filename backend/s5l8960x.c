@@ -39,6 +39,8 @@
 #include <sys/file.h>
 #include <math.h>
 
+#include "wifi_dongle.c"
+
 #define TYPE_A7 MACHINE_TYPE_NAME("s5l8960x")
 OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define RAM_BASE UINT64_C(0x800000000)
@@ -487,6 +489,8 @@ struct A7State {
     A7Bridge bridges[NUM_BRIDGES];
     MemoryRegion usb_dma_memory, usb_dma_ram;
     AddressSpace usb_dma_as;
+    WifiDongle *wifi;
+    char *wifi_netdev, *wifi_ssid;
     MemoryRegion usb_otg;
     uint32_t usb_regs[0x10000 / 4];
     A7Bridge usb_aux[4];
@@ -1021,6 +1025,14 @@ static void touch_gpio_update(A7State *s)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 15));
     }
+    if (s->wifi) {
+        config = ldl_le_p(s->gpio_regs + 167 * 4);
+        group = (config >> 16) & 0xff;
+        if (group < 7 && (config & 0xe) == 4) {
+            uint8_t *status = s->gpio_regs + 0x800 + group * 0x40 + (167 / 32) * 4;
+            stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
+        }
+    }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
         for (unsigned w = 0; w < 7; w++) {
@@ -1056,6 +1068,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
             uint8_t byte = s->gpio_regs[off + i];
             if (off + i == 15 * 4) {
                 byte = (byte & ~1) | !s->pmu.irq_low;
+            }
+            if (off + i == 167 * 4 && s->wifi) {
+                byte = (byte & ~1) | 1;
             }
             if (off + i == 22 * 4) {
                 byte = (byte & ~1) | !s->touch_irq_low;
@@ -1115,6 +1130,9 @@ static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             } else {
                 s->gpio_regs[a] = byte;
             }
+        }
+        if (s->wifi && off < 167 * 4 && off + size > 166 * 4) {
+            wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
         }
         touch_gpio_update(s);
         for (unsigned pin = 80; pin <= 83; pin++) {
@@ -6988,10 +7006,22 @@ static const GraphicHwOps display_ops = { .gfx_update = display_update };
 
 /* USB complex DT ranges: arm-io +0xc000000, EHCI +0x200000/+0x400000.
  * Use the EHCI engine, including real reset/run/halt, frame clock, W1C,
- * schedule and IRQ semantics. No USB device is attached by this board.
+ * schedule and IRQ semantics. Optional WLAN attaches to EHCI1 port 1.
  * The root-port counts cover the DT's EHCI0 ports 1/3 and EHCI1 port 1;
  * these are a modeled topology, not recovered capability/OTP dumps.
  */
+static void a7_wifi_init(A7State *s, DeviceState *ehci)
+{
+    if (!s->wifi_netdev) return;
+    USBDevice *dev = USB_DEVICE(qdev_new(TYPE_WIFI_DONGLE));
+    qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
+    if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
+    qdev_prop_set_string(DEVICE(dev), "port", "1");
+    usb_realize_and_unref(dev, USB_BUS(qdev_get_child_bus(ehci, "usb-bus")), &error_fatal);
+    s->wifi = WIFI_DONGLE(dev);
+    wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
+}
+
 static void a7_ehci_class_init(ObjectClass *oc, const void *data)
 {
     SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(oc);
@@ -7030,6 +7060,7 @@ static void a7_usb_init(A7State *s)
         SysBusDevice *bus = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(bus, &error_fatal);
         SYS_BUS_EHCI(dev)->ehci.as = &s->usb_dma_as;
+        if (i == 1) a7_wifi_init(s, dev);
         sysbus_mmio_map(bus, 0, UINT64_C(0x20c200000) + i * 0x200000);
         sysbus_connect_irq(bus, 0, qemu_allocate_irq(a7_usb_irq, s, 163 + i * 2));
     }
@@ -7403,6 +7434,8 @@ static void a7_finalize(Object *o)
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
+    g_free(s->wifi_netdev);
+    g_free(s->wifi_ssid);
     g_free(s->system_image);
     g_free(s->data_image);
     g_free(s->utility_image);
@@ -7413,6 +7446,10 @@ static void a7_instance_init(Object *o)
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;
+    object_property_add(o, "wifi-netdev", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_netdev));
+    object_property_add(o, "wifi-ssid", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_ssid));
     s->boot_el = 1;
     s->framebuffer = RAM_BASE + GiB - 4 * MiB;
     object_property_add(o, "utility-image", "str", get_image, set_image, NULL,
@@ -7458,6 +7495,7 @@ static const TypeInfo a7_touch_display_type = {
 };
 static void a7_register(void)
 {
+    type_register_static(&wifi_type);
     static const unsigned ports[] = { 3, 1 };
     static const TypeInfo ehci_types[] = {
         { .name = "a7.ehci0", .parent = TYPE_SYS_BUS_EHCI,

@@ -38,9 +38,11 @@ def main():
     if not (venv / 'bin/meson').exists():
         parser.error('Build tools missing; run with --install-build-deps')
     shutil.copyfile(BACKEND / 's5l8960x.c', source / 'hw/arm/s5l8960x.c')
+    for wifi_source in ('wifi_dongle.c', 'wifi_protocol.h'):
+        shutil.copyfile(BACKEND / wifi_source, source / 'hw/arm' / wifi_source)
     additions = {
         'hw/arm/meson.build': "\narm_common_ss.add(when: 'CONFIG_S5L8960X', if_true: files('s5l8960x.c'))\n",
-        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
+        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
     }
     for relative, addition in additions.items():
         path = source / relative
@@ -55,10 +57,10 @@ def main():
         run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
-    pcs = [Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2')]
+    pcs = [Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2', 'libslirp')]
     env['PKG_CONFIG_PATH'] = os.pathsep.join(str(p) for p in pcs if p.exists()) + os.pathsep + env.get('PKG_CONFIG_PATH', '')
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
-        '--disable-user', '--disable-tools', '--disable-werror', '--disable-slirp',
+        '--disable-user', '--disable-tools', '--disable-werror', '--enable-slirp',
         '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--disable-vnc',
         '--disable-hvf', '--enable-tcg', '--disable-plugins', '--disable-pvg']
     sdk = args.sdk or (BACKEND / 'macos-sdk' if (BACKEND / 'macos-sdk').exists() else None)

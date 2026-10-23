@@ -101,7 +101,7 @@ static void stl_le_p(void *p, uint32_t v) {
 }
 '''
     types = r'''
-typedef struct { A7D2045 pmu; uint8_t gpio_regs[0x1000];
+typedef struct { void *wifi; A7D2045 pmu; uint8_t gpio_regs[0x1000];
  uint32_t device_irq[32]; uint8_t chestnut_control; } A7State;
 typedef struct { A7State *owner; hwaddr base; uint8_t regs[0x1000];
  bool i2c_active, i2c_read; uint8_t i2c_address;

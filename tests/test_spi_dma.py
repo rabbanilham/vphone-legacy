@@ -93,7 +93,9 @@ typedef struct A7Peripheral {
 '''
         harness += extract('typedef struct SioDMA', '#define SEP_OUTBOX_CAPACITY')
         harness += r'''
+static void wifi_host_ready(void *wifi, bool ready) { (void)wifi; (void)ready; }
 struct A7State {
+    void *wifi;
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
     A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch;
     TouchScript touch_script;
