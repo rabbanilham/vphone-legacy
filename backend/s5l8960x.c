@@ -4953,6 +4953,13 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
     if (!dir || !*dir) {
         return;
     }
+    /* Bound captures to the transition under investigation, independent of
+     * how many animation passes boot timing happened to submit beforehand. */
+    const char *after_env = getenv("VPHONE_AGX_FRAME_DUMP_AFTER_NS");
+    if (after_env && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
+                     strtoull(after_env, NULL, 0)) {
+        return;
+    }
     if (count_env) {
         if (qemu_strtou64(count_env, NULL, 10, &parsed) || parsed > UINT_MAX) {
             qemu_log_mask(LOG_GUEST_ERROR, "AGX FRAME invalid dump count: %s\n", count_env);
@@ -5245,7 +5252,11 @@ static void agx_surface_layout(A7State *s, uint64_t cat, uint64_t base, uint32_t
 {
     hwaddr pa;
     out->base = base;
-    out->strip = agx_gpu_translate_ctx(s, cat, base + 0x9000, &pa) &&
+    /* Only full-width, 64 KiB-aligned display surfaces use 16-row strips.
+     * For small/offset glyph allocations these probes inspect unrelated
+     * neighbours, whose holes must not select a 2560-byte display pitch. */
+    out->strip = w == 640 && !(base & 0xffff) &&
+                 agx_gpu_translate_ctx(s, cat, base + 0x9000, &pa) &&
                  !agx_gpu_translate_ctx(s, cat, base + 0xa000, &pa);
     out->pitch = out->strip ? 2560 : ((w + 15) & ~15u) * 4;
 }
@@ -5310,7 +5321,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
     uint32_t blocks[4][12];
     unsigned count = 0;
-    bool vibrancy = false;
 
     for (unsigned i = 0; i < n; i++) {
         uint32_t data[8];
@@ -5329,12 +5339,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
             }
             if (!agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
                 break;
-            }
-            for (unsigned j = 0; j + 3 <= 8; j++) {
-                if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
-                    vibrancy = true;
-                    break;
-                }
             }
             count++;
         }
@@ -5355,7 +5359,11 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 continue;
             }
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
-                return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
+                /* A stand-alone TSW is only 16 bytes. Constants following
+                 * it can belong to the next draw; their luma weights must
+                 * not turn an opaque wallpaper/icon draw into vibrancy. */
+                return !memcmp(blocks[b], luma, sizeof(luma)) ?
+                       AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
     }
@@ -5438,6 +5446,9 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
  * 0x7_0000_0000 heap). The compiled code is identical across boots of this
  * iOS build. */
 #define AGX_USC_DEST_IN UINT64_C(0x4ee01acc47551344)  /* mask: D *= texel alpha */
+/* CA padding clear: observed eight zero-colour quads around the slider mask.
+ * Its USC program replaces D with S; transparent source-over is a no-op. */
+#define AGX_USC_COPY UINT64_C(0x99d4fcf52a8c2ef3)
 
 /* CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
  * Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore. */
@@ -6040,7 +6051,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             continue;
                         }
                         for (int x = x0; x < x1; x++) {
-                            row[x - x0] = agx_blend_over(row[x - x0], colour);
+                            row[x - x0] = prog == AGX_USC_COPY ? colour :
+                                         agx_blend_over(row[x - x0], colour);
                         }
                         agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                     }
