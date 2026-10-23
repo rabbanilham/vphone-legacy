@@ -879,3 +879,15 @@ Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local 
 - **S, slide-to-unlock glint and black bar** (agy brief `S-slider-glint.md`, `../vphone-wt-slider`, branch `wt/slider`): the glyph mask is drawn as 1-pixel spans (prog 0x1a20cc29e8fcc15b, stride 16) that the replay skips, and the label layer's blends are probably plus-lighter/plus-darker, not src-over. The black line and dashes are draw 1 of the 640x416 pass, outside the dest-in rectangle.
 - Both agy workers must be launched by the user in a terminal (the auto-mode classifier blocks Claude from starting `agy --dangerously-skip-permissions`).
 - **Unlock → Home transition:** a no-dump boot at 0.25 s resolution (`build/agx-corpus/transition-live/`) shows the lock content vanishing at about 98 s, about 3 s of bare wallpaper, then a complete Home at 101 s with no icon fly-in. During that gap the GPU is only asked for the wallpaper and the slider; SpringBoard commits Home late and CoreAnimation, whose begin time has already passed, jumps to the end state. This is guest speed (TCG), not the replay. A real fix is time dilation (virtual clock slower than wall time, e.g. `-icount`), which changes all boot timing: **user decision pending.**
+
+### Update: K and S merged (Claude, MBP, 2026-10-23 night)
+- `wt/clock-hands` (agy K, f6b18c0 + d81099f) and `wt/slider` (agy S, 9f7d467) are merged (5df6884). The conflict was two blocks inserted before the quad loop: kept K's clip clamps, then S's span block (spans are untextured, so they must run before K's untextured path), then K's triangle/wide-line block.
+  - **K:** untextured vertex colours are RGBA. Triangle rasteriser. Clock hands (prog 0xba8c50a79810e866) are wide lines: pairs of identical vertices, u = cross-width.
+  - **S:** plus-lighter blends (0x5b133ef7e0c3428c, 0xa225a18725e48d5c, 0xf137b90c25ab5471) and 1-pixel glyph spans (0x1a20cc29e8fcc15b).
+- Verified: unit tests OK (13 skipped), AGX contract passes, chained corpus has 0 harness errors. One live boot (`backend/evidence/merge-ks-live/`, no panic):
+  - "slide to unlock" is light and translucent, with no black line or dashes;
+  - the Clock icon has thin hour and minute hands and a thin red second hand;
+  - the Settings background is neutral grey;
+  - unlock, Home and Settings work.
+- Offline caveat: chained replays still show grey dashes around the Clock icon and a light outline left of the slider. Neither appears live; both come from passes that were not dumped (the icon face and earlier label passes).
+- Still open: D (time dilation, `exp/time-dilation`, agy running), the glint sweep not yet checked live, and hands without antialiasing (jagged edges).
