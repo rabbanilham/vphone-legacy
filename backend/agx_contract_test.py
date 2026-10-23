@@ -131,6 +131,10 @@ def blend_vibrancy(dst, src):
                for c in range(4))
 
 
+def swap_rb(val):
+    return (val & 0xff00ff00) | ((val & 0xff) << 16) | ((val >> 16) & 0xff)
+
+
 def replay_blob(case=True):
     """Build a replay case and its full physical target oracle using context mappings."""
     blob = bytearray(data_blob())
@@ -215,7 +219,7 @@ def replay_blob(case=True):
                 struct.pack_into('<I', expected, y * pitch + x * 4, pixel(x, y))
     draws, ta_count = 2, 1
     if case is True:
-        expect_rect((0, 0, 8, 4), lambda x, y: 0xff112233)
+        expect_rect((0, 0, 8, 4), lambda x, y: swap_rb(0xff112233))
         expect_rect((2, 0, 6, 2), lambda x, y: REPLAY_TEXELS[y * 4 + x - 2])
     if synthetic:
         assert case in REPLAY_CASES, case
@@ -277,12 +281,12 @@ def replay_blob(case=True):
                 for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
                     put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, 0xff112233)
                 rect = (4, 4, 12, 12)
-            expect_rect(rect, lambda x, y: 0xff112233)
+            expect_rect(rect, lambda x, y: swap_rb(0xff112233))
         else:
             destination = 0xff907050
             for i in range(6):
                 put(state + 0x200 + i * 20 + 16, '<I', destination)
-            expect_rect((0, 0, 8, 4), lambda x, y: destination)
+            expect_rect((0, 0, 8, 4), lambda x, y: swap_rb(destination))
             if case == 'rotate-uv':
                 # Clockwise UVs: U follows output Y; V follows reversed X.
                 for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
@@ -314,7 +318,8 @@ def replay_blob(case=True):
                         *(a << 24 | 0x123456 for a in alphas[y * 4:y * 4 + 4]))
                 def masked(x, y):
                     a = alphas[y * 4 + x - 2]
-                    return sum(((destination >> c) & 255) * a // 255 << c for c in range(0, 32, 8))
+                    dst_bgra = swap_rb(destination)
+                    return sum(((dst_bgra >> c) & 255) * a // 255 << c for c in range(0, 32, 8))
                 expect_rect((2, 0, 6, 2), masked)
             elif case == 'gauss-blur':
                 put(state + 15 * 4, '<I', 8 << 8)
@@ -333,9 +338,10 @@ def replay_blob(case=True):
                 def blurred_over(x, y):
                     a = (blur_texel >> 24) & 0xff
                     out = 0
+                    dst_bgra = swap_rb(destination)
                     for c in range(0, 32, 8):
                         sc = (blur_texel >> c) & 0xff
-                        dc = (destination >> c) & 0xff
+                        dc = (dst_bgra >> c) & 0xff
                         v = min(255, sc + dc * (255 - a) // 255)
                         out |= v << c
                     return out
@@ -352,7 +358,7 @@ def replay_blob(case=True):
                     put(state + 0x300 + i * 28, '<4fI2f', 2 + u * 4, v * 2, 0, 1, tint, u, v)
                 for y in range(2):
                     put(state + 0x500 + y * 64, '<4I', *([0xffffffff] * 4))
-                expect_rect((2, 0, 6, 2), lambda x, y: blend_vibrancy(destination, tint))
+                expect_rect((2, 0, 6, 2), lambda x, y: blend_vibrancy(swap_rb(destination), tint))
     if case in ('home-dirty-scissor', 'home-dirty-region'):
         # Home's Clock hand update redraws a fullscreen wallpaper quad under
         # a tiny scissor and a 32-pixel tile region. Static icons outside it
@@ -376,7 +382,7 @@ def replay_blob(case=True):
         put(state + 15 * 4, '<I', 6 << 8)
         for y in range(2):
             put(state + 0x500 + y * 64, '<4I', *([wallpaper] * 4))
-        expect_rect((0, 0, 64, 64), lambda x, y: destination)
+        expect_rect((0, 0, 64, 64), lambda x, y: swap_rb(destination))
         dirty = (35, 34, 44, 45) if case == 'home-dirty-scissor' else (32, 32, 64, 64)
         expect_rect(dirty, lambda x, y: wallpaper)
         draws = 2
@@ -387,7 +393,7 @@ def replay_blob(case=True):
         destination = 0xff907050
         for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
             put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, destination)
-        expect_rect((0, 0, 16, 16), lambda x, y: destination)
+        expect_rect((0, 0, 16, 16), lambda x, y: swap_rb(destination))
         put(pds + 0x20, '<IIQ', 20, 0, state_gva + 0xb00)
         put(state + 15 * 4, '<I', 8 << 8)
         put(state + 18 * 4, '<I', 48)
@@ -430,7 +436,7 @@ def replay_blob(case=True):
         put(state + 0x608, '<4I', 0x60000a64, (height - 1) << 16 | (width - 1) << 2,
             (q & 0xffffffff) | (width - 1), q >> 32)
         expected[:] = b'\xa5' * len(expected)
-        expect_rect((740, 0, 744, 2), lambda x, y: REPLAY_TEXELS[y * 4 + x - 740])
+        expect_rect((740, 0, 744, 2), lambda x, y: swap_rb(REPLAY_TEXELS[y * 4 + x - 740]))
         draws = 1
     if case in ('wait-stamp', 'geometry-lifetime'):
         put(QUEUE + 0x50, '<I', 3)
