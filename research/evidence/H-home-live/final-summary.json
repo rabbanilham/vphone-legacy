@@ -1,0 +1,203 @@
+{
+  "base": "ae427fc",
+  "settle_frames": 18,
+  "tests": {
+    "unit_total": 232,
+    "skipped": 7,
+    "native_agx": "PASS",
+    "touch_input": "PASS",
+    "spi_touch": "PASS"
+  },
+  "touch_script": "at=78;tap 600,900|at=86;tap 600,900|at=94;tap 600,900|at=95;down 40,1036;move 600,1036 dur=0.7 steps=42;up|at=103;tap 600,900|at=111;tap 600,900|at=119;tap 600,900|at=127;tap 600,900|at=135;tap 600,900|at=143;tap 600,900|at=145;tap 245,815",
+  "runs": {
+    "accept-boot1": {
+      "observations": {
+        "kernel_panic": false,
+        "guest_running_seconds": 155.01141234007082,
+        "wall_seconds": 156.79917625000235,
+        "stop_condition": "duration"
+      },
+      "exit": {
+        "exit_code": 0,
+        "reaped": true
+      },
+      "counts": {
+        "replay": 19968,
+        "rt_queue": 19968
+      },
+      "swipe": [
+        "A7 TOUCH step=27/135 state=1 x=40 y=1036 queued=1 ns=95026955000 forced=0 ui=0 detectable=039f",
+        "A7 TOUCH step=71/135 state=7 x=600 y=1036 queued=1 ns=96192236000 forced=0 ui=0 detectable=039f"
+      ],
+      "captures": [
+        {
+          "requested_seconds": 90.0,
+          "elapsed_seconds": 90.01742050598841,
+          "path": "accept-boot1/framebuffer-at-90s.png",
+          "sha256": "7f40cce413ddaeb5b94c18baa61615987a19c2f49c9171cf2ab216edb7f1eaf2"
+        },
+        {
+          "requested_seconds": 105.0,
+          "elapsed_seconds": 105.0230074240244,
+          "path": "accept-boot1/framebuffer-at-105s.png",
+          "sha256": "4d619595fd91599faeaa3a458175d8b1c003c56dd7a075ef6a6313734e9ad0bd"
+        },
+        {
+          "requested_seconds": 140.0,
+          "elapsed_seconds": 140.02694850511034,
+          "path": "accept-boot1/framebuffer-at-140s.png",
+          "sha256": "34fc108d9b5139c258ce104bd0057c1c5cdb09c21b905d363fc5ec4b0bae2d80"
+        },
+        {
+          "requested_seconds": 152.0,
+          "elapsed_seconds": 152.02636709008948,
+          "path": "accept-boot1/framebuffer-at-152s.png",
+          "sha256": "38343fcc04d293ea28bca88358b16238f71c4c050884e7c823a4218247ea5f8f"
+        }
+      ],
+      "changed_static_home_pixels_105_to_140": 0,
+      "binary_sha256": "d6184c0614fc85f2c5eadd95e9bf090478355ea674d97996685035238dd45fda",
+      "source_sha256": "412d16ec109b515c37868792f8785e16fe17d0e7d8733441a3b10a6613f2d32e",
+      "input_sha256": {
+        "system": "112576a782b78066c3f0451115c6233a5f194e56bbb22dc02658f464f52557bf",
+        "data": "4a46a7d4374888712476a69d1a7f4b4243abd8367a7d9478702200f431f3d97f",
+        "utility": "71a22cbf4d6f0c4c90573ae6ab4218376c4f2bb2e8fa23e19e11a3637ac4cf40"
+      },
+      "images_deleted": true,
+      "source_images_unchanged": true,
+      "launch_load": "18:47 up 2 days, 19:13, 2 users, load averages: 3.23 2.79 2.24",
+      "manual_review": {
+        "home_105": true,
+        "home_140": true,
+        "settings_152": true,
+        "lock_bar_absent_90": true
+      }
+    },
+    "accept-boot2": {
+      "observations": {
+        "kernel_panic": false,
+        "guest_running_seconds": 155.01854487412493,
+        "wall_seconds": 156.8866269160062,
+        "stop_condition": "duration"
+      },
+      "exit": {
+        "exit_code": 0,
+        "reaped": true
+      },
+      "counts": {
+        "replay": 18111,
+        "rt_queue": 18111
+      },
+      "swipe": [
+        "A7 TOUCH step=27/135 state=1 x=40 y=1036 queued=1 ns=95020907000 forced=0 ui=0 detectable=039f",
+        "A7 TOUCH step=71/135 state=7 x=600 y=1036 queued=1 ns=96161206000 forced=0 ui=0 detectable=039f"
+      ],
+      "captures": [
+        {
+          "requested_seconds": 90.0,
+          "elapsed_seconds": 90.04716520814691,
+          "path": "accept-boot2/framebuffer-at-90s.png",
+          "sha256": "f06525bb746b7cb2bb2f5484c7d2db5208ed092d0293bc58a1a9ab9e83922006"
+        },
+        {
+          "requested_seconds": 105.0,
+          "elapsed_seconds": 105.03169120813254,
+          "path": "accept-boot2/framebuffer-at-105s.png",
+          "sha256": "d89d8413d0a4920706a449f40ff951463b4550f97c21a5fb108a909989218332"
+        },
+        {
+          "requested_seconds": 140.0,
+          "elapsed_seconds": 140.01739037322113,
+          "path": "accept-boot2/framebuffer-at-140s.png",
+          "sha256": "9f3405ed5e6364aa314cef47b64e8e895083f8a80e5e5e24f58c8cdf67e7a16e"
+        },
+        {
+          "requested_seconds": 152.0,
+          "elapsed_seconds": 152.00704474913073,
+          "path": "accept-boot2/framebuffer-at-152s.png",
+          "sha256": "167265c694925db18bac920c0aec63cab3d82256855423731d46713035cd3708"
+        }
+      ],
+      "changed_static_home_pixels_105_to_140": 0,
+      "binary_sha256": "d6184c0614fc85f2c5eadd95e9bf090478355ea674d97996685035238dd45fda",
+      "source_sha256": "412d16ec109b515c37868792f8785e16fe17d0e7d8733441a3b10a6613f2d32e",
+      "input_sha256": {
+        "system": "112576a782b78066c3f0451115c6233a5f194e56bbb22dc02658f464f52557bf",
+        "data": "4a46a7d4374888712476a69d1a7f4b4243abd8367a7d9478702200f431f3d97f",
+        "utility": "71a22cbf4d6f0c4c90573ae6ab4218376c4f2bb2e8fa23e19e11a3637ac4cf40"
+      },
+      "images_deleted": true,
+      "source_images_unchanged": true,
+      "launch_load": "18:51  up 2 days, 19:16, 2 users, load averages: 4.29 3.19 2.49",
+      "manual_review": {
+        "home_105": true,
+        "home_140": true,
+        "settings_152": true,
+        "lock_bar_absent_90": true
+      }
+    },
+    "accept-boot3": {
+      "observations": {
+        "kernel_panic": false,
+        "guest_running_seconds": 155.00843391986564,
+        "wall_seconds": 156.7926488329831,
+        "stop_condition": "duration"
+      },
+      "exit": {
+        "exit_code": 0,
+        "reaped": true
+      },
+      "counts": {
+        "replay": 18809,
+        "rt_queue": 18809
+      },
+      "swipe": [
+        "A7 TOUCH step=27/135 state=1 x=40 y=1036 queued=1 ns=95021626000 forced=0 ui=0 detectable=039f",
+        "A7 TOUCH step=71/135 state=7 x=600 y=1036 queued=1 ns=96149200000 forced=0 ui=0 detectable=039f"
+      ],
+      "captures": [
+        {
+          "requested_seconds": 90.0,
+          "elapsed_seconds": 90.014697917999,
+          "path": "accept-boot3/framebuffer-at-90s.png",
+          "sha256": "61b6dc311f40c3626e194268a3a9b298b710d41af33888b1523ca01ae7779cfe"
+        },
+        {
+          "requested_seconds": 105.0,
+          "elapsed_seconds": 105.01678321301006,
+          "path": "accept-boot3/framebuffer-at-105s.png",
+          "sha256": "a045307f658da2fd36b6ed8ebb1b84b9289966c54e86b86ca65e3064d4f7d984"
+        },
+        {
+          "requested_seconds": 140.0,
+          "elapsed_seconds": 140.01738171291072,
+          "path": "accept-boot3/framebuffer-at-140s.png",
+          "sha256": "20ef39e567b3293957c8db703f02250f7de92a95dadb8f6df9a1130796717fa2"
+        },
+        {
+          "requested_seconds": 152.0,
+          "elapsed_seconds": 152.02600208690274,
+          "path": "accept-boot3/framebuffer-at-152s.png",
+          "sha256": "92880db91f45820e0dfe48f3067ee59b11314bca70feb2b67dbc1f00229cc8cb"
+        }
+      ],
+      "changed_static_home_pixels_105_to_140": 0,
+      "binary_sha256": "d6184c0614fc85f2c5eadd95e9bf090478355ea674d97996685035238dd45fda",
+      "source_sha256": "412d16ec109b515c37868792f8785e16fe17d0e7d8733441a3b10a6613f2d32e",
+      "input_sha256": {
+        "system": "112576a782b78066c3f0451115c6233a5f194e56bbb22dc02658f464f52557bf",
+        "data": "4a46a7d4374888712476a69d1a7f4b4243abd8367a7d9478702200f431f3d97f",
+        "utility": "71a22cbf4d6f0c4c90573ae6ab4218376c4f2bb2e8fa23e19e11a3637ac4cf40"
+      },
+      "images_deleted": true,
+      "source_images_unchanged": true,
+      "launch_load": "18:53  up 2 days, 19:19, 2 users, load averages: 2.31 3.03 2.56",
+      "manual_review": {
+        "home_105": true,
+        "home_140": true,
+        "settings_152": true,
+        "lock_bar_absent_90": true
+      }
+    }
+  }
+}

@@ -1,0 +1,56 @@
+............................................................s...s.........../Users/bagas/Downloads/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=5>
+  run_service_fixture()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/bagas/Downloads/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=3>
+  run_service_fixture()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..........................................................s.............................................................Host load 7.00 exceeds 6; waiting 10 seconds.
+Aborting: host load 7.00 exceeds --max-load 6 after waiting 0 seconds; no variants started.
+..PASS: SEP post-boot service endpoints: EP0 (OOL/params/keepalive), EP2 (ART_LOAD), EP7 (Cmd2/4/13/17/18/22/24/25/26/30, reject unsupported)
+
+fast
+QEMU exit                        unknown
+Probe exit                       0
+Panic lines                      0
+GPU hangs                        0
+Framebuffer nonzero bytes        unknown
+0x206204044                      unknown
+0x206204044 writes               0
+0x206204044 distinct writes      []
+0x206204070                      unknown
+0x206204070 writes               0
+0x206204070 distinct writes      []
+
+
+slow
+QEMU exit                        unknown
+Probe exit                       0
+Panic lines                      0
+GPU hangs                        0
+Framebuffer nonzero bytes        unknown
+0x206204044                      unknown
+0x206204044 writes               0
+0x206204044 distinct writes      []
+0x206204070                      unknown
+0x206204070 writes               0
+0x206204070 distinct writes      []
+
+
+third
+QEMU exit                        unknown
+Probe exit                       0
+Panic lines                      0
+GPU hangs                        0
+Framebuffer nonzero bytes        unknown
+0x206204044                      unknown
+0x206204044 writes               0
+0x206204044 distinct writes      []
+0x206204070                      unknown
+0x206204070 writes               0
+0x206204070 distinct writes      []
+
+.........................ss...ss..
+----------------------------------------------------------------------
+Ran 232 tests in 13.231s
+
+OK (skipped=7)

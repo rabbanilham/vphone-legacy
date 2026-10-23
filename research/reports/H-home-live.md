@@ -1,7 +1,10 @@
 # H-home-live: preserve Home and remove animation ghosts
 
 Branch `wt/home-live`; worker Codex. Resumed on 2026-10-23 with the expanded
-Home-ghosting goal. No other worktree edited, no guest-binary changes, no push.
+Home-ghosting goal. **PASS: three fresh boots on the final build**, with live
+Home free of animation ghosts at 105/140 s, no slider bar at 90 s, and native
+Settings opened by the 145 s tap in every run. 18-frame settle retained.
+No other worktree edited, no guest-binary changes, no push.
 
 ## Integration
 
@@ -14,6 +17,11 @@ wallpaper and native scissor/region clipping. H does not reimplement that work.
 Read main handover section 24 and `backend/evidence/merge-20261023-live/`.
 The merged screenshots show live Home with persistent doubled/offset icons,
 labels and a dashed black bar above/left of the lock slider.
+
+On this resume, committed the pending descriptor/layout fixes first as
+`a132fa4`. The concurrent move snapshot `b187436` captured the copy-clear
+implementation, its contracts and report draft while validation was in progress;
+`92f9799` records the passing tests. Preserved that snapshot commit.
 
 Restored the base's **18-frame** scripted release settle before rebuilding.
 Earlier H pilot non-unlocks and its experimental 60-frame settle were on an older
@@ -131,7 +139,7 @@ seeded pixels. Both also run inline and through the offline mirror.
   of 129); genuine vibrancy count becomes 21 instead of 41.
 - Opt-in `VPHONE_AGX_FRAME_DUMP_AFTER_NS` bounds captures to a transition.
 
-## Validation (final three boots pending)
+## Validation: final three boots PASS
 
 All probes: own rebuilt QEMU, visible Cocoa, MTTCG, fresh cloned v5 plan/System/
 Data, one owned QEMU at a time, load < 5 at launch, clones removed after reaping.
@@ -163,22 +171,53 @@ Prescribed swipe starts at 95 s. Acceptance probes append a Settings tap at
 
 | Goal | Result |
 | --- | --- |
-| Home without ghosts at 105/140 s, three fresh boots | Final copy/blend/layout build pending |
-| Tap opens native Settings | Final copy/blend/layout build pending |
-| Dashed lock-slider bar removed | Source-copy fix added; final captures pending |
+| Home without ghosts at 105/140 s, three fresh boots | PASS, 3/3 |
+| Tap opens native Settings | PASS, 3/3 at 152 s |
+| Dashed lock-slider bar removed | PASS, 3/3 at 90 s |
 | Live/offline native pixel contract | PASS, threaded and inline |
-| No guest patch / protected source images | PASS so far |
+| No guest patch / protected source images | PASS; source hashes unchanged; all clones removed |
+
+The acceptance runs are `accept-boot1`, `accept-boot2`, and `accept-boot3`.
+Each ran 155 guest-running seconds, exited normally, and had no kernel panic.
+All twelve screenshots were visually reviewed. Every Home pixel below the
+status bar and outside the Clock icon is byte-identical between 105 and 140 s
+in every run (zero changed pixels); Clock hands update without erasing static
+icons. Display and replay continue through the native Settings transition.
+
+| Fresh boot | Launch load | Replay / RT queue | Lock 90 s | Home 105 / 140 s | Settings 152 s |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 3.23 | 19,968 / 19,968 | [PASS](../evidence/H-home-live/accept-boot1/framebuffer-at-90s.png) | [PASS](../evidence/H-home-live/accept-boot1/framebuffer-at-105s.png) / [PASS](../evidence/H-home-live/accept-boot1/framebuffer-at-140s.png) | [PASS](../evidence/H-home-live/accept-boot1/framebuffer-at-152s.png) |
+| 2 | 4.29 | 18,111 / 18,111 | [PASS](../evidence/H-home-live/accept-boot2/framebuffer-at-90s.png) | [PASS](../evidence/H-home-live/accept-boot2/framebuffer-at-105s.png) / [PASS](../evidence/H-home-live/accept-boot2/framebuffer-at-140s.png) | [PASS](../evidence/H-home-live/accept-boot2/framebuffer-at-152s.png) |
+| 3 | 2.31 | 18,809 / 18,809 | [PASS](../evidence/H-home-live/accept-boot3/framebuffer-at-90s.png) | [PASS](../evidence/H-home-live/accept-boot3/framebuffer-at-105s.png) / [PASS](../evidence/H-home-live/accept-boot3/framebuffer-at-140s.png) | [PASS](../evidence/H-home-live/accept-boot3/framebuffer-at-152s.png) |
+
+[final-summary.json](../evidence/H-home-live/final-summary.json) contains actual
+capture times and hashes, launch loads, source/binary/input hashes, replay and
+queue counts, touch release timestamps, review results, process exits and
+cleanup checks. All three use binary SHA-256
+`d6184c0614fc85f2c5eadd95e9bf090478355ea674d97996685035238dd45fda`
+and C source SHA-256
+`412d16ec109b515c37868792f8785e16fe17d0e7d8733441a3b10a6613f2d32e`.
+
+Reproduce after building and running the contracts:
+
+```sh
+backend/.venv/bin/python research/evidence/H-home-live/run_acceptance.py --prefix rerun-boot 1 2 3
+```
+
+Choose a fresh output prefix to preserve the committed acceptance screenshots. The runner waits for load < 5, serializes Cocoa launches, cleans
+clones only after QEMU is reaped, and converts the four captures per boot.
 
 ## Evidence and limits
 
 Local evidence: `research/evidence/H-home-live/`. Older pre-rebase H pilots are
-retained as historical evidence, not merged-build acceptance. Selected PNGs and
-JSON will be committed; large raw dumps/logs remain local. Completed log files
+retained as historical evidence, not merged-build acceptance. Selected PNGs, diagnostic/provenance JSON, reproduction helpers and the four
+final test logs are committed; large raw dumps/QEMU logs remain local. Completed log files
 may be gzip-compressed. Disposable image clones are deleted with provenance
-checks; the user removed the interrupted old `settle-boot1/images` clone.
+checks; the user removed the interrupted old `settle-boot1/images` and
+`verified-boot3/images` clones. Those interrupted runs are not acceptance evidence.
 
-Clock hands still use the existing axis-aligned quad approximation. Overall
-GPU fidelity is not claimed. Three fresh acceptance boots are being reviewed. The keep-awake taps are a
-validation precondition: a sleeping screen ignores injected touches, and a
+Clock hands and the lock camera-grabber still have existing rendering
+approximations; full GPU fidelity is not claimed. No requested acceptance goal
+remains open. The keep-awake taps are a validation precondition: a sleeping screen ignores injected touches, and a
 static QMP framebuffer can still show the last lit frame. This change does not
 add a power-button/wake model or override native idle policy.

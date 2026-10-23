@@ -1,0 +1,20 @@
+{
+  "accept-boot1": {
+    "home_105": true,
+    "home_140": true,
+    "settings_152": true,
+    "lock_bar_absent_90": true
+  },
+  "accept-boot2": {
+    "home_105": true,
+    "home_140": true,
+    "settings_152": true,
+    "lock_bar_absent_90": true
+  },
+  "accept-boot3": {
+    "home_105": true,
+    "home_140": true,
+    "settings_152": true,
+    "lock_bar_absent_90": true
+  }
+}
