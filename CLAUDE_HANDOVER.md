@@ -891,3 +891,9 @@ Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local 
   - unlock, Home and Settings work.
 - Offline caveat: chained replays still show grey dashes around the Clock icon and a light outline left of the slider. Neither appears live; both come from passes that were not dumped (the icon face and earlier label passes).
 - Still open: D (time dilation, `exp/time-dilation`, agy running), the glint sweep not yet checked live, and hands without antialiasing (jagged edges).
+
+### Update: U and B merged (Claude, MBP, 2026-10-24)
+- `wt/uiswitch` (agy U): the UISwitch track border is draw prog 0x62a99af8d8beb332 (stride 36, 48 vertices, #E6E6E6), which was skipped before. It is now rasterised as a distance-field pill. New corpus scene `settings-all` holds every Settings pass, including the 128x64 knob-shadow passes.
+- `wt/blur` (agy B): CoreAnimation blurs are 1-D passes. Direction and offsets come from the vertex uniforms (`vs_data + 48`), weights from the fragment uniforms, and the 4- and 7-tap programs are replayed exactly, including downsampled sources. The 2-D fallback is kept for the legacy 6-tap and stride-12 backdrops. Identified but not implemented: the navigation bar saturation/tint colour matrix (prog 0x2353a3fe1ca2b71b, 3x3 matrix).
+- The only conflict was the Python audit classification: kept both branches.
+- Verified: 14 tests skipped, all others OK; AGX contract passes; 265 dumps replayed chained with 0 errors. Live boot `backend/evidence/merge-ub-live/` (no panic): lock, Home, Settings normal, and the switch track border shows. **Open:** the knob shadow renders as a grey square behind the knob instead of a soft round shadow (the 128x64 shadow-shape and blur passes).
