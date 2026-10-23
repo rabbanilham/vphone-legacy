@@ -165,6 +165,13 @@ def fragment_words(f, ppp):
     return found
 
 
+def is_strip_surface(f, base, width):
+    """Full-width aligned display buffers, not small glyph allocation neighbours."""
+    return (width == 640 and base % 0x10000 == 0 and
+            (base + 0x9000) // 4096 * 4096 in f.pages and
+            (base + 0xa000) // 4096 * 4096 not in f.pages)
+
+
 def decode_tsw(f, tsw):
     if tsw[0] >> 28 != 6:
         return None
@@ -177,7 +184,7 @@ def decode_tsw(f, tsw):
     # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
     # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
-    strip = (addr + 0x9000) // 4096 * 4096 in f.pages and (addr + 0xa000) // 4096 * 4096 not in f.pages
+    strip = is_strip_surface(f, addr, w)
     if strip:
         stride = 2560
     elif (tsw[0] & 7) == 1:
@@ -189,9 +196,8 @@ def decode_tsw(f, tsw):
 
 
 def texture(f, ppp):
-    """First texture state word block among the fragment data; None for vibrancy."""
+    """Decode a texture and only the luma prefix of its selected descriptor."""
     words = fragment_words(f, ppp)
-    vibrancy = any(tuple(ws[i:i + 3]) == LUMA for _, ws in words for i in range(6))
     for _, ws in words:
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
@@ -201,7 +207,8 @@ def texture(f, ppp):
             if len(ws) >= k + 4:
                 tex = decode_tsw(f, ws[k:k + 4])
                 if tex:
-                    tex['vibrancy'] = vibrancy
+                    # Trailing constants may be the next draw's allocation.
+                    tex['vibrancy'] = tuple(ws[:3]) == LUMA
                     return tex
     return None
 
@@ -504,8 +511,7 @@ def main():
     fb = bytearray(target_w * target_h * 4)
     target = f.header.get('pbe_target')
     if not is_clear_pass(f.type1_command) and target and target in f.pages:
-        strip = ((target + 0x9000) // 4096 * 4096 in f.pages and
-                 (target + 0xa000) // 4096 * 4096 not in f.pages)
+        strip = is_strip_surface(f, target, target_w)
         stride = 2560 if strip else render_target_pitch(f, target_w)
         for y in range(target_h):
             for x in range(target_w):

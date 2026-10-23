@@ -71,7 +71,8 @@ class HomeDirtyTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             replay.main()
         self.assertEqual(result, [bytes((0x12, 0x34, 0x56, 255)) * (w * h)])
-        self.assertNotEqual(result[0][:4], expected[:4])
+        static_rgba = bytes((expected[2], expected[1], expected[0], expected[3]))
+        self.assertNotEqual(result[0][:4], static_rgba)
 
     def test_partial_ppp_update_retains_dirty_region(self):
         state = replay.decode_ppp_clipping([0x421, 1 << 16, 7, 0x80060007, 0x00080009])

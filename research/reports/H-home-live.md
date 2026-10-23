@@ -1,129 +1,155 @@
-# H-home-live: preserve live Home during Clock dirty redraws
+# H-home-live: preserve Home and remove animation ghosts
 
-Task H, branch `wt/home-live`, based on `wt/live-swipe` `d096333`.
-Worker: Codex. No guest binaries or source images changed. No other worktree
-was edited, no branches merged elsewhere, and nothing pushed.
+Branch `wt/home-live`; worker Codex. Resumed on 2026-10-23 with the expanded
+Home-ghosting goal. No other worktree edited, no guest-binary changes, no push.
 
-## Root cause and comparison
+## Integration
 
-The apparent intermittent success in T-live-swipe was a capture-time effect.
-`boot1-scripted/framebuffer-at-102s.png` shows Home during its unlock animation;
-**that same run's final `framebuffer.png` is already black with the rectangle**.
-In the adjacent MMIO timestamp ranges, its large Home draws continue until
-about 102.25 s. Boots 2/3 finish those draws around 97.8 s. Thus all four
-original runs lose settled Home, even though one briefly displays it at 102 s.
+Saved the requested WIP first as `3915b66`, then rebased only H's additions onto
+`agx-meta-hle` `ae427fc` (rebased WIP `cebf2e0`). Dropped the older duplicate
+`01af599` and `bd38b2b` commits. The base supplies the final G2 implementation
+(`8ca7caa`), expanded TA history, geometry snapshots, stamp waits, queue cursor,
+wallpaper and native scissor/region clipping. H does not reimplement that work.
 
-Original replay/RT queue totals:
+Read main handover section 24 and `backend/evidence/merge-20261023-live/`.
+The merged screenshots show live Home with persistent doubled/offset icons,
+labels and a dashed black bar above/left of the lock slider.
 
-| Original run | AGX replay target | AGX RT queue |
-| --- | ---: | ---: |
-| boot1-scripted | 20741 | 21166 |
-| boot2-scripted | 18956 | 19356 |
-| boot3-scripted | 20368 | 20852 |
-| mouse-drag | 21981 | 22299 |
+Restored the base's **18-frame** scripted release settle before rebuilding.
+Earlier H pilot non-unlocks and its experimental 60-frame settle were on an older
+candidate and are not proof against the merged build. Any subsequent settle
+change requires native SpringBoard scroll-hook evidence, per user instruction.
 
-All three display targets (`0x400000000`, `0x400470000`, `0x4008e0000`) receive
-large Home draws in failed runs too. `[DISP0]` stderr logs rotate the MMU tables,
-keep layer0 base zero and complete swap tokens. The isolated replay of the
-fresh baseline's full Home dump also draws icons, labels and dock. This is
-not simply a GPU stall or Home permanently confined to an offscreen surface.
+## Findings
 
-The decisive fresh settled-Home capture is
-`research/evidence/H-home-live/prerequisite-dumps/frame-1.bin`:
+### Previous black-Home problem
 
-- 12 submitted draws; first draw samples the 744 x 1392 wallpaper into a
-  full-display quad with shader fingerprint `0x8646b974188714ee`.
-- Type-1 command `+0x50` is scissor-table GVA `0x101d8000`.
-- PPP enables scissoring, index 0. Table words `0x00d700f6`, `0x011c0128`
-  restrict coverage to **[215,246) x [284,296)**.
-- Region words restrict the draw to **[192,256) x [256,320)** in 32-pixel tiles.
-- These are the Clock icon's moving-hand update. Ignoring both clips redraws
-  wallpaper over the entire screen while only the Clock fragment is restored.
-  On the original renderer that wallpaper is black; with the wallpaper fix it
-  is visible wallpaper, still without Home icons.
+The original apparent intermittent success was a capture-time effect.
+T-live-swipe boot1's 102-second image shows the unlock animation, but **its final
+105-second image is already black with the rectangle**. Boot1's large Home
+passes finish near 102 s; the other runs finish near 98 s. All three display
+targets receive Home, and display swaps rotate/complete. The already-integrated
+G2 clipping fix addresses the later full-screen overwrite from the Clock's
+small dirty update. H's retained regression checks that a wallpaper quad under
+a tiny scissor or tile region preserves all static content outside coverage.
 
-This agrees with G's independently found lock-clock erasure. It is a shared
-missing coverage contract, rather than evidence for a scanout workaround.
+### Home ghosting: false vibrancy from the next draw's allocation
 
-## Changes and coordination
+The new defect is in texture/blend classification, rather than evidence for a
+blanket clear of load passes or a scanout workaround.
 
-1. Cherry-picked permitted prerequisite `a77b241` as local `01af599`: expanded
-   TA history, TA-consumed geometry snapshots, stamp waits, private queue cursor,
-   stride-16 wallpaper and PBE pitch. Read G's report first.
-2. Applied a **read-only snapshot of G2's in-progress clipping candidate** in
-   this worktree. The other worktree was never modified. Snapshot saved as
-   `research/evidence/H-home-live/G2-candidate.patch`, SHA-256
-   `bf1d85cf59b10ec8f7032825b65f5d91bc5c69c031b6e19616878b8d8e164d33`.
-   G2 owns the clipping discovery/implementation: PPP scissor/index state,
-   tile-region bounds, replay job scissor address/snapshot, and offline mirror.
-   The snapshot also includes G2's untextured stride-28 path and context-selective
-   dump option. This is not a claim that G2's concurrent work is finalized.
-   Merge/rebase should retain one copy of that shared change.
-3. Added Home-specific native pixel contracts: first seed a full target with
-   distinct static content, then redraw a full-size textured wallpaper quad
-   under a tiny indexed scissor plus tile region, or under tile region alone.
-   Compare every physical target byte including guards/padding. Both threaded
-   and inline replay are exercised.
-4. Added offline parity tests using those same fixtures through real GPU page
-   tables; verify partial PPP state inheritance/region disable. A negative
-   oracle deliberately disables clipping and proves that the old behavior
-   replaces the entire target with wallpaper.
-5. Added `VPHONE_AGX_FRAME_DUMP_AFTER_NS` for bounded transition captures.
-   It is opt-in and does not change ordinary replay.
+In an actual full Home pass (`baseline-dumps/frame-8.bin`):
 
-6. The faster clipped renderer exposed the short swipe's release heuristic:
-   the original 18 stationary release frames bounced in two clipping runs,
-   although the same gesture did unlock in another. Increase scripted drag
-   release settling to 60 frames (one virtual second). Movement remains the
-   prescribed 0.7 s / 42 steps; taps get no extra settle. SPI tests verify all
-   60 stationary reports, up ordering, and a subsequent tap. Mouse behavior
-   is unchanged. This addresses a measured validation regression, rather than
-   claiming that the supplied short swipe was already reliable on this build.
+- Draw 0 uses ordinary wallpaper shader `0x8646b974188714ee`.
+- Its stand-alone, **16-byte** texture descriptor begins at `0x10200054`.
+- The next draw's Rec.709 luma constants begin immediately afterward at
+  `0x10200064` (`3d93a000 3e59a000 3f372000`).
+- Replay reads 48-byte descriptor windows and previously searched all their
+  words/all candidate blocks for those constants. It therefore classified the
+  opaque wallpaper, and some ordinary icons, as vibrancy draws.
+- `agx_blend_vibrancy` scales source alpha by destination luminance. An opaque
+  wallpaper redraw then becomes translucent and retains previous animation
+  positions in the display buffer. Later Clock-only dirty passes cannot repair
+  that static history. The source wallpaper itself is clean, with alpha 255.
+- Genuine vibrancy draw 1 (`0x682361cfceff644a`) has the luma constants **at the
+  start of its own selected descriptor**, followed by its sampler/TSW. This
+  remains supported.
 
-No display timing, swap token or framebuffer routing changes were made.
+`ghost-diagnosis.json` preserves the first three draws' shader fingerprints,
+addresses, descriptors and corrected classifications. Isolated C replay of the
+same full-Home dump now produces single opaque icons/labels instead of retaining
+translucent history (`home-vibrancy-fixed.png`; its old dump has a black wallpaper
+source because it predates live wallpaper support).
 
-## Validation
+### Slider bar and damaged labels: false display-strip layout
 
-All launches use Cocoa, this worktree's rebuilt QEMU, MTTCG, and cloned fresh
-v5 plan/System/Data. Each timed launch waits for host load < 5. Script begins
-with the prescribed gesture:
+A second independent decoder bug remained after fixing the translucent trails.
+The page-hole heuristic tested `base+0x9000` and `base+0xa000` for every texture,
+including glyphs that occupy much less memory. Those probes can hit unrelated
+neighbouring allocations and falsely select the display's **2560-byte** pitch.
 
-```
-at=95;down 40,1036;move 600,1036 dur=0.7 steps=42;up
-```
+In the same full Home dump, the 106 x 30 Compass label at `0x1042c800` was
+classified as a strip texture, as were several 78-pixel-high label shadows.
+Those are uploaded linear glyph images, not display buffers. Their rows then
+sample unrelated RAM, producing dashed bars/coloured text. The lock-slider
+artifact also varied between captures, so the first apparently clean lock
+capture was insufficient proof of its removal.
 
-Validation runs append `|at=145;tap 245,815` to launch Settings only after the
-140-second Home capture. No forced input or guest patch is used.
+The recovered strip format is specifically a 640-pixel-wide, 64 KiB-aligned
+display surface containing sixteen 2560-byte rows per 64 KiB strip. Restrict the
+hole test to that shape/alignment in C and offline replay. Dense offscreen
+surfaces and small/offset uploaded glyphs retain their own pitch. Isolated C
+replay now shows readable Compass and all dock labels (`home-layout-fixed.png`).
+The slider artifact persists in a subsequent live capture; its remaining
+source/pass is being captured separately. The native Home fixture adds an unrelated mapped page at the tiny source
+texture's `+0x9000`, with `+0xa000` unmapped, and still requires exact linear
+pixels. Decoder tests retain a positive real display-strip case.
 
-- Fresh rebuilt baseline: `baseline/`, 145 s, no panic; live Home erased at
-  102/140 s, isolated full-Home dump draws Home (`baseline-offline.png`).
-- TA/fence/wallpaper prerequisite alone: `prerequisite/`, 155 s, no panic;
-  wallpaper and rectangle at 102/140 s; captures identify the missing clips.
-- First clipping pilot: `clipping-boot1/`, 155 s, no panic; the short swipe
-  bounced and stayed locked. **Not a Home success.** The fixed lock clock/date
-  remain visible. This is an observed input/timing limitation and is retained.
-- Second clipping pilot: `clipping-hooked/`, 155 s, no panic; Home visible at
-  102 and 140 s; tap opens native Settings by 152 s. Although a bounded hook
-  configuration was supplied, no hooks installed; screenshots and touch logs
-  are the evidence, not a native gesture-hook claim.
+## H changes
 
-- First pre-settle validation: `final-boot1/`, short swipe bounced and remained
-  locked at 102/140 s. Stopped the waiting validation loop before boot 2; no
-  QEMU was interrupted. This run is not included as a Home success.
+- Live and offline texture decoders classify vibrancy only from the selected
+  descriptor's luma prefix. Trailing words or another pointer's luma no longer
+  change an ordinary texture's blend mode. No blanket framebuffer clears.
+- Native Home pixel contracts seed distinct static content, redraw an opaque
+  full-target wallpaper quad under a small indexed scissor/tile region, and
+  place another draw's luma constants immediately after its 16-byte TSW. Check
+  every physical output byte and guard/padding in threaded and inline replay.
+- Offline parity uses those same fixtures through real GPU page tables. Tests
+  cover partial PPP inheritance/region disable and deliberately reproduce the
+  old un-clipped overwrite. Descriptor tests cover trailing luma and luma in a
+  different candidate pointer while retaining genuine prefixed vibrancy.
+- Corrected an older test that explicitly required the erroneous trailing-luma
+  behavior. The historical 533-draw audit still skips zero draws: 20 formerly
+  misclassified vibrancy draws are ordinary exact textured draws (149 instead
+  of 129); genuine vibrancy count becomes 21 instead of 41.
+- Opt-in `VPHONE_AGX_FRAME_DUMP_AFTER_NS` bounds captures to a transition.
 
-Final three-boot acceptance on the 60-frame build: pending.
+## Validation (final three boots in progress)
 
-Tests: full native AGX contract passed with Cocoa, including both new Home
-cases; separate inline Home contracts passed. Final unit/native rerun pending.
+All probes: own rebuilt QEMU, visible Cocoa, MTTCG, fresh cloned v5 plan/System/
+Data, one owned QEMU at a time, load < 5 at launch, clones removed after reaping.
+Prescribed swipe starts at 95 s. Acceptance probes append a Settings tap at
+145 s, after the 105/140 s Home captures.
 
-## Evidence and remaining limits
+- Rebased build with restored 18-frame settle: **230 unit tests OK, 7 skipped**;
+  full native AGX, touch_input and spi_touch contracts pass.
+- Final layout/blend build: **232 unit tests OK, 7 skipped**. Full native AGX (including
+  both Home cases threaded/inline), touch_input and spi_touch contracts pass.
+- `ghost-boot1/`: 155 s, no panic. The 90/105 s screenshots show clean lock
+  content and **no dashed slider bar**, but it did not unlock; this is
+  **not a Home success**. The native-hook run below separates sleep from a pan
+  bounce, so these screenshots alone do not justify increasing settle length.
+- `scroll-18/`: verified SpringBoard kernel trigger and executable scroll
+  callbacks installed; initial page 1 callback at 72.2 s, **no scroll callbacks
+  at the 95 s gesture**. Chestnut powers off at 85.11 s, and the injected touch
+  FIFO grows to 63 entries instead of draining. This is input while asleep,
+  not a demonstrated 18-frame pan bounce. Kept 18 frames.
+- `scroll-18-awake/` adds blank-area taps at 78/86/94 s, then every eight seconds
+  after unlock. The prescribed 95 s swipe is unchanged. This is normal native
+  input to keep the screen awake, not forced input, a guest patch, or an
+  emulator display-power override. `sb_lsv_will_end` targets `(0,0)` at
+  96.194 s, followed by page-0 callbacks at 96.500 s. Home is free of fly-in
+  ghosts at 105/140 s, and the 145 s tap opens Settings by 152 s.
+  `scroll-comparison.json` preserves critical callbacks. **18 frames retained**.
 
-All H evidence is local at `research/evidence/H-home-live/`. Disposable image
-clones are removed after their process-exit record confirms reaping. Original
-profile hashes are checked by `probe_cleanup.py`. Large dumps/logs are local
-artifacts, not staged wholesale into git.
+| Goal | Result |
+| --- | --- |
+| Home without ghosts at 105/140 s, three fresh boots | Final layout/blend build running |
+| Tap opens native Settings | Final layout/blend build running |
+| Dashed lock-slider bar removed | Layout fix added; final captures pending |
+| Live/offline native pixel contract | PASS, threaded and inline |
+| No guest patch / protected source images | PASS so far |
 
-This fixes static Home erasure, not overall GPU fidelity. Visible animation
-trails, distorted Clock hands, icon/label sampling artifacts, and some Settings
-text remain. Do not describe these screenshots as pixel-correct iOS rendering.
-Final goal status and test totals will be filled after the three fresh boots.
+## Evidence and limits
+
+Local evidence: `research/evidence/H-home-live/`. Older pre-rebase H pilots are
+retained as historical evidence, not merged-build acceptance. Selected PNGs and
+JSON will be committed; large raw dumps/logs remain local. Completed log files
+may be gzip-compressed. Disposable image clones are deleted with provenance
+checks; the user removed the interrupted old `settle-boot1/images` clone.
+
+Clock hands still use the existing axis-aligned quad approximation. Overall
+GPU fidelity is not claimed. Three fresh acceptance boots are being reviewed. The keep-awake taps are a
+validation precondition: a sleeping screen ignores injected touches, and a
+static QMP framebuffer can still show the last lit frame. This change does not
+add a power-button/wake model or override native idle policy.

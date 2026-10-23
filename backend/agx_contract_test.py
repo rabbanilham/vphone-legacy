@@ -358,6 +358,13 @@ def replay_blob(case=True):
         # a tiny scissor and a 32-pixel tile region. Static icons outside it
         # must survive. Seed distinct content with the preceding solid draw.
         destination, wallpaper = 0xff907050, 0xff123456
+        # An unrelated allocation beyond this tiny texture mimics the
+        # display's +0x9000 mapped / +0xa000 hole. Keep its real linear pitch.
+        map_page(state_gva + 0x9000)
+        # Real Home allocation boundary: the next draw's luma constants
+        # start immediately after this draw's stand-alone 16-byte TSW.
+        # They must not attenuate the opaque wallpaper and leave old icons.
+        put(state + 0x410, '<3I', 0x3d93a000, 0x3e59a000, 0x3f372000)
         for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
             put(state + 0x200 + i * 20, '<4fI', u * 64, v * 64, 0, 1, destination)
             put(state + 0x300 + i * 24, '<6f', u * 64, v * 64, 0, 1, u, v)

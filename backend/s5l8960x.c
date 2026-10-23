@@ -1544,10 +1544,7 @@ static void touch_timer_cb(void *opaque)
             int64_t prev_ns = s->touch_step > 0 ?
                 s->touch_script.frames[s->touch_step - 1].ns : 0;
             if ((dx > 10 || dy > 10) && (f->ns - prev_ns <= TOUCH_TICK_NS * 2)) {
-                /* Keep the final drag position long enough for UIKit's
-                 * coalesced pan update even when clipped AGX replay is fast.
-                 * Taps do not acquire this extra drag settle. */
-                s->touch_settle_frames = 60;
+                s->touch_settle_frames = 18;
             } else {
                 s->touch_settle_frames = 0;
             }
@@ -5255,7 +5252,11 @@ static void agx_surface_layout(A7State *s, uint64_t cat, uint64_t base, uint32_t
 {
     hwaddr pa;
     out->base = base;
-    out->strip = agx_gpu_translate_ctx(s, cat, base + 0x9000, &pa) &&
+    /* Only full-width, 64 KiB-aligned display surfaces use 16-row strips.
+     * For small/offset glyph allocations these probes inspect unrelated
+     * neighbours, whose holes must not select a 2560-byte display pitch. */
+    out->strip = w == 640 && !(base & 0xffff) &&
+                 agx_gpu_translate_ctx(s, cat, base + 0x9000, &pa) &&
                  !agx_gpu_translate_ctx(s, cat, base + 0xa000, &pa);
     out->pitch = out->strip ? 2560 : ((w + 15) & ~15u) * 4;
 }
@@ -5320,7 +5321,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
     uint32_t blocks[4][12];
     unsigned count = 0;
-    bool vibrancy = false;
 
     for (unsigned i = 0; i < n; i++) {
         uint32_t data[8];
@@ -5339,12 +5339,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
             }
             if (!agx_ctx_read(s, cat, ptr, blocks[count], sizeof(blocks[count]))) {
                 break;
-            }
-            for (unsigned j = 0; j + 3 <= 8; j++) {
-                if (!memcmp(blocks[count] + j, luma, sizeof(luma))) {
-                    vibrancy = true;
-                    break;
-                }
             }
             count++;
         }
@@ -5365,7 +5359,11 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 continue;
             }
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
-                return vibrancy ? AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
+                /* A stand-alone TSW is only 16 bytes. Constants following
+                 * it can belong to the next draw; their luma weights must
+                 * not turn an opaque wallpaper/icon draw into vibrancy. */
+                return !memcmp(blocks[b], luma, sizeof(luma)) ?
+                       AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
     }

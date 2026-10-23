@@ -131,8 +131,8 @@ class AgxTswDecodeTests(unittest.TestCase):
         tex = replay_module.texture(frame, ppp)
         self.assertIsNone(tex, "TSW at offset k=6 must not be matched (overrun prevention)")
 
-    def test_vibrancy_detection_at_offset_0_and_4(self):
-        """Vibrancy Rec.709 luma weights at offset 0 and offset 4 must be recognized."""
+    def test_vibrancy_requires_selected_descriptor_luma_prefix(self):
+        """A luma prefix is vibrancy; adjacent allocation bytes are not."""
         tsw = self._make_tsw(158, 48, 0x10200000)
         luma = [0x3d93a000, 0x3e59a000, 0x3f372000]
 
@@ -145,14 +145,39 @@ class AgxTswDecodeTests(unittest.TestCase):
         self.assertIsNotNone(tex_a)
         self.assertTrue(tex_a['vibrancy'], "LUMA at offset 0 must set vibrancy=True")
 
-        # Case B: TSW at offset 0, LUMA at offset 4 (the status bar composite pattern)
+        # Case B: stand-alone TSW followed by the next allocation's luma.
         desc_b = tsw + luma + [0]
         f_path_b = Path(self.temp.name) / 'frame_vib_b.bin'
         f_path_b.write_bytes(make_frame_with_pds([0x10100000, 0], [(0x10100000, desc_b)]))
         frame_b = frame_module.Frame(f_path_b)
         tex_b = replay_module.texture(frame_b, [0x80004020])
         self.assertIsNotNone(tex_b)
-        self.assertTrue(tex_b['vibrancy'], "LUMA at offset 4 must set vibrancy=True")
+        self.assertFalse(tex_b['vibrancy'], "Adjacent luma must not make an opaque draw translucent")
+
+    def test_luma_in_another_pointer_does_not_taint_selected_texture(self):
+        tsw = self._make_tsw(158, 48, 0x10200000)
+        luma = [0x3d93a000, 0x3e59a000, 0x3f372000]
+        path = Path(self.temp.name) / 'adjacent_pointer.bin'
+        path.write_bytes(make_frame_with_pds(
+            [0x10100000, 0, 0x10101000, 0],
+            [(0x10100000, tsw), (0x10101000, luma + [0] + tsw)]))
+        tex = replay_module.texture(frame_module.Frame(path), [0x80004020])
+        self.assertIsNotNone(tex)
+        self.assertFalse(tex['vibrancy'])
+
+    def test_glyph_neighbour_hole_does_not_select_display_pitch(self):
+        class Memory:
+            pages = {0x10200000: bytes(4096), 0x10209000: bytes(4096)}
+        tex = replay_module.decode_tsw(Memory(), self._make_tsw(106, 30))
+        self.assertFalse(tex['strip'])
+        self.assertEqual(tex['stride'], 448)
+        # Even a full-width uploaded suballocation must be aligned to a
+        # display strip before holes can imply display addressing.
+        tex = replay_module.decode_tsw(Memory(), self._make_tsw(640, 32, 0x10200020))
+        self.assertFalse(tex['strip'])
+        tex = replay_module.decode_tsw(Memory(), self._make_tsw(640, 1136))
+        self.assertTrue(tex['strip'])
+        self.assertEqual(tex['stride'], 2560)
 
     def test_stride_12_blur_backdrop_no_texture(self):
         """A stride-12 draw whose PDS block has uniforms at 0 and next draw's TSW at +32 must get tex=None."""
