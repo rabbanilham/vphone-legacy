@@ -778,3 +778,78 @@ From now on:
 - **Per worktree:** symlink `build`, `.venv` and `backend/.venv` to the main checkout. Copy `backend/upstream` with `cp -cR` so each worktree builds its own QEMU, then run `backend/.venv/bin/python scripts/qemu/build_backend.py`.
 - **Smoke test:** `.venv/bin/python backend/live_run.py` opens the Cocoa window. Lock screen at about 90 s; unlock with a drag across "slide to unlock"; the display sleeps about 30 s after the lock screen appears. For a timed check use `research/tasks/merge-live.sh`: short swipe at 95 s, captures at 90/105/140 s, clones deleted afterwards.
 - **Also install:** Codex CLI and agy (Antigravity CLI), logged in, if workers will be used.
+
+## 26. Two Macs working in parallel (Claude, 2026-10-23 night)
+
+Section 25's setup notes still apply. This section replaces its "Immediate next steps".
+
+### Machines
+| Machine | Hardware | Role | Load budget |
+| --- | --- | --- | --- |
+| **MBP** | MacBook Pro M4 Pro, 24 GB | **Graphics plus integration** (about 2/3 of the work). The only machine that merges into `agx-meta-hle` and edits `CLAUDE_HANDOVER.md`. | Up to 2 QEMU at once, at most one of them a graphics boot |
+| **MBA** | MacBook Air M2, 8 GB (`Bagass-MacBook-Air`, the original machine with all images and evidence) | **Wi-Fi/network** (about 1/3). agy W already runs here (conversation `cbc997fa-cdd7-4d46-bd37-3f67b1dc2b98`, worktree `/Users/bagas/Downloads/vphone-wt-wifi`). | One QEMU at a time, no other heavy jobs |
+
+### State at the split (all on origin)
+- `agx-meta-hle` (c916c7e-plus, this commit): live lock screen and Home, short swipe.
+- `wt/home-live` **6c1f927**: Codex H, done, **not merged yet**.
+  - 3/3 fresh boots: Home without ghosting at 105/140 s, slider bar gone at 90 s, and a tap opens Settings by 152 s (`research/evidence/H-home-live/accept-boot*`, report `research/reports/H-home-live.md`).
+  - Fixes: the vibrancy misclassification (the next allocation's luma constants), glyph vs display-surface layout, and the slider mask padding source-copy clear.
+  - Probes use keep-awake taps; settle stays at 18 frames.
+  - Tests: 232 unit tests OK; the AGX and touch contracts pass.
+  - Remaining artefacts: the Clock icon's hands draw as square blocks, and the UISwitch (Airplane Mode) has no track.
+- `wt/wifi` **064c653**: agy W (report `research/reports/W-wifi-native.md`).
+  - Stage 1 (HSIC enumeration, TRX, re-enumeration) passes natively, and so does stage 2 (AppleBCMWLAN attaches, no 22 s retry loop).
+  - Stages 3–5 (scan, join, DHCP) pass only in the synthetic contract. Natively they were "UI-gated": Settings was unreachable before `wt/home-live`.
+  - Settings now opens and shows **Wi-Fi: Off**.
+
+### File ownership (no overlap)
+| Area | Owner | Files / regions |
+| --- | --- | --- |
+| AGX replay, display, frame dumps, offline replay | MBP | AGX/display parts of `backend/s5l8960x.c`, `backend/agx_*.py`, `tests/test_agx_*`, `backend/display_probe.py` |
+| Touch and buttons (input) | MBP (second worker) | touch/mouse/GPIO-button parts of `s5l8960x.c`, `tests/test_touch_script.py`, `test_mouse_touch.py`, `test_spi_dma.py` |
+| Wi-Fi, HSIC/EHCI, slirp | MBA | `backend/wifi_dongle.c`, `wifi_protocol.h`, `host_wifi.py`, `wifi_contract_test.py`, `ehci_contract_test.py`, the EHCI/HSIC/Wi-Fi parts of `s5l8960x.c`, `live_run.py --wifi` |
+| `CLAUDE_HANDOVER.md`, merges into `agx-meta-hle`, pushes of `agx-meta-hle` | MBP | MBA writes only `research/reports/W-*.md` and pushes only `wt/wifi`/`wt/net-*` |
+
+Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local to your region so merges stay mechanical. If a change has to cross regions, write it in your report and let the MBP do it.
+
+### MBP queue (graphics and integration)
+1. **Setup** per section 25. Copy from the MBA (same path `/Users/bagas/Downloads/vphone-legacy`):
+   - `build/virtual-activated-profile-v5/`
+   - `backend/evidence/keybag-contract-20261015/boot-plan-{noeffaceable,smp-nooscar,smp-noisp}/` and that directory's top-level `*.json`
+   - optionally `backend/evidence/virtual-activated-20261023/render-dumps/`
+   Then build and run the tests.
+2. **Merge `wt/home-live` → `agx-meta-hle`.** Rebuild, run the unit tests and the AGX/touch contracts, do one live boot with `research/tasks/merge-live.sh` plus keep-awake taps (see `research/evidence/H-home-live/awake-touch-script.txt`), then push. **Tell the MBA once it is pushed:** Wi-Fi stages 3–6 depend on it.
+3. **Frame-dump corpus plus a one-command offline replay** (strategy section 25). Capture lock, Home, Settings, Settings → General, Clock, Calendar and one app-launch transition. Add a script (e.g. `scripts/agx_corpus.py`) that replays everything in C and in Python and produces a contact sheet and a list of failed/skipped draws in under a minute. Commit the small dumps or the capture recipe, not the GB clones.
+4. **Graphics targets from the corpus audit, in order:**
+   - Clock icon hands (square blocks);
+   - the UISwitch track;
+   - each app screen's failed draws;
+   - app-open and close transitions.
+   One renderer worker (Codex or agy) with a measurable offline target, and one live boot per merge.
+5. **Input (second worker, parallel with 3–4, input files only):**
+   - The **Home button**: map a host key to the A7 menu-button GPIO so apps can be closed. Today nothing exits an app.
+   - A real hand-drag in the window: check that the 18-frame settle unlocks.
+   - Taps in apps.
+6. **Merge `wt/wifi`** when the MBA reports stages 3–6. Integration happens only on the MBP.
+
+### MBA queue (Wi-Fi/network)
+1. Leave agy W running (it was mid-task at the split). Do no new boots until the MBP has pushed the `wt/home-live` merge (MBP step 2). Meanwhile do synthetic contract and analysis work only.
+2. After that push: `git -C ../vphone-wt-wifi fetch && git merge origin/agx-meta-hle`, rebuild, rerun the Wi-Fi/EHCI contracts.
+3. Native stages 3–6 through the UI:
+   - unlock, then tap Settings → Wi-Fi → switch on;
+   - scan shows the host SSID; join;
+   - DHCP ACK in `wifi.pcap` (`filter-dump`);
+   - the Wi-Fi icon in the status bar.
+   Evidence goes in `research/acceptance-wifi-native-N/`. Keep it out of git except for summary JSON/PNG.
+4. Then a short network check: DNS and HTTP in the pcap. Opening Safari to a page is optional; its rendering defects belong to the MBP.
+5. Push `wt/wifi` and report in `research/reports/W-wifi-native.md`. **Do not merge into `agx-meta-hle`.**
+6. If Wi-Fi is blocked, MBA side work must use no QEMU (decoding and analysis from existing evidence). No graphics renderer edits.
+
+### Rules for both machines
+- The QEMU Cocoa window must always be visible (`VPHONE_DISPLAY=cocoa`; `live_run.py` always does). Delete disposable `<output>/images` clones (about 3 GB) after each probe. Wait for load < 5 before timing measurements.
+- Workers:
+  - Codex: `-m gpt-6.1-sol -c model_reasoning_effort="medium" --dangerously-bypass-approvals-and-sandbox`, stdin `/dev/null`.
+  - agy: `--model gemini-3.8-flash-high --dangerously-skip-permissions -p="..."`, one visible terminal tab per worker.
+  - On agy quota: `/logout` and switch accounts. On a Codex limit: stop. On Codex capacity errors: retry later with the same model.
+- These rules were Claude memories on the MBA. A fresh Claude on the MBP must take them from here.
+- Sync through origin only: `git fetch` before starting work, small commits, push branches often. No force-push on shared branches.
