@@ -29,3 +29,13 @@ Two root causes, both confirmed by the lead:
 - `.venv/bin/python -m unittest discover -s tests` passes; add unit tests for the rasteriser and the colour order. `backend/.venv/bin/python scripts/qemu/build_backend.py` still compiles.
 
 Do not boot QEMU; the lead (Claude, MBP) does one live boot at merge time. Commit to `wt/clock-hands` and write `research/reports/K-clock-hands.md`.
+
+## Follow-up 1 (lead review of f6b18c0, 2026-10-23)
+Your colour order fix and the triangle rasteriser are right (frames 91 and 120: thin red second hand). But **diagonal hands are still blocks**: replay the corpus chained (the default) and crop x 190..300, y 250..360 of `unlock-frame-161.png`: a dark square (minute hand) and a red square (second hand). Your before/after crops used frame 91, where the hands are nearly vertical, so a bounding box looks thin.
+
+Cause: the hands (prog 0xba8c50a79810e866, n=6, stride 28) are not triangles. Every vertex comes in identical pairs, e.g. frame-161 draw 7: A,A,B,B,B,A with A=(264.58,260.85), B=(245.58,284.07), so every triangle has zero area and your code falls back to the box. The attribute after the colour is a cross-width coordinate: u=0.375 / 0.625 on the minute hand (v=0.5), u=0.5 everywhere on the second hand. This is a **line primitive with a width** (CoreGraphics antialiased stroke): the segment A→B is drawn with a width from pipeline state, and u runs across the width.
+
+Do:
+1. Find where the primitive type and line width come from: the VDM index-list word (w[0]/w[1] bits, primitive topology), the PPP state words of that draw (look for a float or fixed-point width that differs between hour, minute and second hand), or the u range. Compare the hour (draw 3/5), minute (draw 7) and second (draw 9) hands in frames 91..161.
+2. Rasterise these as wide lines: distance from pixel centre to segment A→B ≤ width/2, with flat (butt) ends; the n=48 caps (prog 0x6c01d033fd937c7c) already round the ends. Same colour order, blending and clipping as your triangles. Keep the generic triangle path for real triangles.
+3. Target: chained `unlock-frame-161.png` and every settled Home frame 91..161 show thin hands at their angle (hour about 3 px, minute about 2 px, second about 1 px wide), no blocks; save a strip of crops (frames 91, 120, 140, 161) to `research/evidence/K-clock-hands/`. The same regression rules apply. Amend the report, commit to `wt/clock-hands`.
