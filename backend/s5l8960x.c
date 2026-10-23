@@ -5535,8 +5535,10 @@ static uint32_t agx_blend_plus_darker(uint32_t dst, uint32_t src)
     return out;
 }
 
-/* CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
+/* CoreAnimation narrow Gaussian blur shaders.
  * Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore. */
+#define AGX_USC_BLUR_4TAP UINT64_C(0x0cda5e479d40815f)
+#define AGX_USC_BLUR_7TAP UINT64_C(0xf82f9a96aff1e034)
 #define AGX_USC_BLUR_1 UINT64_C(0x115ac3fe908dec8a)
 #define AGX_USC_BLUR_2 UINT64_C(0x90d330877114e752)
 #define AGX_USC_BLUR_3 UINT64_C(0xb443c1f6a714b429)
@@ -5549,7 +5551,8 @@ static uint32_t agx_blend_plus_darker(uint32_t dst, uint32_t src)
 
 static inline bool agx_is_blur_program(uint64_t prog)
 {
-    return prog == AGX_USC_BLUR_1 || prog == AGX_USC_BLUR_2 ||
+    return prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP ||
+           prog == AGX_USC_BLUR_1 || prog == AGX_USC_BLUR_2 ||
            prog == AGX_USC_BLUR_3 || prog == AGX_USC_BLUR_4 ||
            prog == AGX_USC_BLUR_5 || prog == AGX_USC_BLUR_6 ||
            prog == AGX_USC_BLUR_7 || prog == AGX_USC_BLUR_8 ||
@@ -5566,6 +5569,29 @@ static const struct {
     { 6.3704f, 0.0417f },
     { 8.3332f, 0.0126f },
     { 10.2979f, 0.0027f },
+};
+
+static const struct {
+    float offset;
+    float weight;
+} agx_blur_taps_4[] = {
+    { 0.638336f, 0.275844f },
+    { 2.348645f, 0.185744f },
+    { 4.245085f, 0.035760f },
+    { 6.164516f, 0.002652f },
+};
+
+static const struct {
+    float offset;
+    float weight;
+} agx_blur_taps_7[] = {
+    { 0.662207f, 0.118916f },
+    { 2.475021f, 0.141265f },
+    { 4.455121f, 0.107065f },
+    { 6.435364f, 0.069256f },
+    { 8.415810f, 0.038236f },
+    { 10.396517f, 0.018016f },
+    { 12.377541f, 0.007245f },
 };
 
 static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
@@ -5613,17 +5639,25 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
-static void agx_blur_texture(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h)
+static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
+                        const float *offsets, const float *weights, unsigned n_taps,
+                        bool is_vertical)
 {
-    /* Pass 1: Horizontal blur from buf_in to buf_tmp */
+    if (!n_taps || !w || !h) return;
     for (uint32_t y = 0; y < h; y++) {
         for (uint32_t x = 0; x < w; x++) {
             float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            for (size_t t = 0; t < ARRAY_SIZE(agx_blur_taps); t++) {
-                float off = agx_blur_taps[t].offset;
-                float weight = agx_blur_taps[t].weight;
-                uint32_t s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
-                uint32_t s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
+            for (unsigned t = 0; t < n_taps; t++) {
+                float off = offsets[t];
+                float weight = weights[t];
+                uint32_t s_pos, s_neg;
+                if (is_vertical) {
+                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
+                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
+                } else {
+                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
+                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
+                }
                 for (unsigned c = 0; c < 4; c++) {
                     float cp = (float)((s_pos >> (c * 8)) & 0xff);
                     float cn = (float)((s_neg >> (c * 8)) & 0xff);
@@ -5640,32 +5674,20 @@ static void agx_blur_texture(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, ui
             buf_tmp[y * w + x] = out;
         }
     }
-
-    /* Pass 2: Vertical blur from buf_tmp to buf_in */
-    for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = 0; x < w; x++) {
-            float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            for (size_t t = 0; t < ARRAY_SIZE(agx_blur_taps); t++) {
-                float off = agx_blur_taps[t].offset;
-                float weight = agx_blur_taps[t].weight;
-                uint32_t s_pos = agx_sample_bilinear(buf_tmp, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
-                uint32_t s_neg = agx_sample_bilinear(buf_tmp, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
-                for (unsigned c = 0; c < 4; c++) {
-                    float cp = (float)((s_pos >> (c * 8)) & 0xff);
-                    float cn = (float)((s_neg >> (c * 8)) & 0xff);
-                    acc[c] += (cp + cn) * weight;
-                }
-            }
-            uint32_t out = 0;
-            for (unsigned c = 0; c < 4; c++) {
-                int iv = (int)lroundf(acc[c]);
-                if (iv < 0) iv = 0;
-                if (iv > 255) iv = 255;
-                out |= (uint32_t)iv << (c * 8);
-            }
-            buf_in[y * w + x] = out;
-        }
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        buf_in[i] = buf_tmp[i];
     }
+}
+
+static void agx_blur_texture(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h)
+{
+    float offs[6], ws[6];
+    for (size_t t = 0; t < ARRAY_SIZE(agx_blur_taps); t++) {
+        offs[t] = agx_blur_taps[t].offset;
+        ws[t] = agx_blur_taps[t].weight;
+    }
+    agx_blur_1d(buf_in, buf_tmp, w, h, offs, ws, 6, false);
+    agx_blur_1d(buf_in, buf_tmp, w, h, offs, ws, 6, true);
 }
 
 static uint64_t agx_replay_program(A7State *s, uint64_t cat, const uint32_t *ppp, unsigned n)
@@ -5849,6 +5871,103 @@ static unsigned agx_audit_clock(A7State *s, uint64_t cat, AGXSurface *sf)
     return bright;
 }
 
+static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
+                                    const uint32_t *ppp, unsigned ppp_count,
+                                    uint64_t prog,
+                                    float *offsets, float *weights, unsigned *n_taps,
+                                    bool *is_vertical)
+{
+    unsigned def_taps = 6;
+    bool def_vert = false;
+    unsigned max_taps = 6;
+    if (prog == AGX_USC_BLUR_4TAP) {
+        def_taps = 4;
+        max_taps = 4;
+        for (unsigned i = 0; i < 4; i++) {
+            offsets[i] = agx_blur_taps_4[i].offset;
+            weights[i] = agx_blur_taps_4[i].weight;
+        }
+    } else if (prog == AGX_USC_BLUR_7TAP) {
+        def_taps = 7;
+        max_taps = 7;
+        for (unsigned i = 0; i < 7; i++) {
+            offsets[i] = agx_blur_taps_7[i].offset;
+            weights[i] = agx_blur_taps_7[i].weight;
+        }
+    } else {
+        def_taps = 6;
+        max_taps = 6;
+        for (unsigned i = 0; i < 6; i++) {
+            offsets[i] = agx_blur_taps[i].offset;
+            weights[i] = agx_blur_taps[i].weight;
+        }
+    }
+    *n_taps = def_taps;
+    *is_vertical = def_vert;
+
+    if (vs_data) {
+        uint32_t vs_hdr[16];
+        if (agx_ctx_read(s, cat, vs_data, vs_hdr, sizeof(vs_hdr))) {
+            uint64_t u_ptr = vs_hdr[12] | ((uint64_t)vs_hdr[13] << 32);
+            if (u_ptr >= 0x1000 && u_ptr < (UINT64_C(1) << 40)) {
+                uint32_t u_words[48];
+                if (agx_ctx_read(s, cat, u_ptr, u_words, sizeof(u_words))) {
+                    float ox0 = *(float *)&u_words[16];
+                    float oy0 = *(float *)&u_words[17];
+                    if (fabsf(ox0) > 0.01f && fabsf(oy0) < 0.001f) {
+                        *is_vertical = false;
+                    } else if (fabsf(oy0) > 0.01f && fabsf(ox0) < 0.001f) {
+                        *is_vertical = true;
+                    }
+                    unsigned read_taps = 0;
+                    for (unsigned i = 0; i < max_taps; i++) {
+                        float off = *is_vertical ? *(float *)&u_words[16 + 4 * i + 1]
+                                                 : *(float *)&u_words[16 + 4 * i];
+                        if (off > 0.05f && off < 50.0f) {
+                            offsets[i] = off;
+                            read_taps++;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (read_taps >= 3) {
+                        *n_taps = read_taps;
+                    }
+                }
+            }
+        }
+    }
+
+    if (ppp && ppp_count) {
+        for (unsigned i = 0; i < ppp_count; i++) {
+            if ((ppp[i] & 0xc0000000) != 0x80000000) continue;
+            uint32_t data[8];
+            if (!agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], data, sizeof(data))) continue;
+            for (unsigned k = 0; k < 8; k += 2) {
+                uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
+                if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) break;
+                uint32_t f_words[16];
+                if (!agx_ctx_read(s, cat, ptr, f_words, sizeof(f_words))) break;
+                for (unsigned s_idx = 0; s_idx + *n_taps <= 16; s_idx++) {
+                    float sum = 0.0f;
+                    bool ok = true;
+                    for (unsigned t = 0; t < *n_taps; t++) {
+                        float w = *(float *)&f_words[s_idx + t];
+                        if (w < 0.0005f || w > 0.6f) { ok = false; break; }
+                        sum += w;
+                    }
+                    if (ok && fabsf(sum - 0.5f) < 0.01f) {
+                        for (unsigned t = 0; t < *n_taps; t++) {
+                            weights[t] = *(float *)&f_words[s_idx + t];
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear, uint32_t pitch, uint64_t scissor_base)
@@ -6009,7 +6128,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                     }
                     if (read_ok) {
-                        agx_blur_texture(raw_tex, tmp_tex, tex.w, tex.h);
+                        float blur_offs[8], blur_ws[8];
+                        unsigned blur_taps = 0;
+                        bool blur_vert = false;
+                        agx_extract_blur_params(s, cat, vs_data, ppp, ppp_count, prog,
+                                                blur_offs, blur_ws, &blur_taps, &blur_vert);
+                        agx_blur_1d(raw_tex, tmp_tex, tex.w, tex.h,
+                                    blur_offs, blur_ws, blur_taps, blur_vert);
                         blurred_tex = raw_tex;
                         raw_tex = NULL;
                     }
@@ -6468,7 +6593,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 }
                             }
                             if (read_ok) {
-                                agx_blur_texture(raw_tex, tmp_tex, bw, bh);
+                                float blur_offs[8], blur_ws[8];
+                                unsigned blur_taps = 0;
+                                bool blur_vert = false;
+                                agx_extract_blur_params(s, cat, vs_data, ppp, ppp_count, prog,
+                                                        blur_offs, blur_ws, &blur_taps, &blur_vert);
+                                if (prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP) {
+                                    agx_blur_1d(raw_tex, tmp_tex, bw, bh,
+                                                blur_offs, blur_ws, blur_taps, blur_vert);
+                                } else {
+                                    agx_blur_texture(raw_tex, tmp_tex, bw, bh);
+                                }
                                 for (uint32_t y = 0; y < bh; y++) {
                                     agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y0 + y),
                                                   raw_tex + (size_t)y * bw, bw * 4);

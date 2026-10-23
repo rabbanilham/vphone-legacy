@@ -260,6 +260,27 @@ BLUR_PROGRAMS = {
     0xa4c025e0be54470a,
 }
 
+BLUR_4TAP = 0x0cda5e479d40815f
+BLUR_7TAP = 0xf82f9a96aff1e034
+ALL_BLUR_PROGRAMS = BLUR_PROGRAMS | {BLUR_4TAP, BLUR_7TAP}
+
+BLUR_TAPS_4 = [
+    (0.638336, 0.275844),
+    (2.348645, 0.185744),
+    (4.245085, 0.035760),
+    (6.164516, 0.002652),
+]
+
+BLUR_TAPS_7 = [
+    (0.662207, 0.118916),
+    (2.475021, 0.141265),
+    (4.455121, 0.107065),
+    (6.435364, 0.069256),
+    (8.415810, 0.038236),
+    (10.396517, 0.018016),
+    (12.377541, 0.007245),
+]
+
 BLUR_TAPS = [
     (0.6575, 0.1666),
     (2.4492, 0.1759),
@@ -268,6 +289,81 @@ BLUR_TAPS = [
     (8.3332, 0.0126),
     (10.2979, 0.0027),
 ]
+
+
+def extract_blur_params(f, vs_data, ppp, prog):
+    """Extract tap offsets, weights, direction and tap count for a blur draw."""
+    if prog == BLUR_4TAP:
+        taps = BLUR_TAPS_4
+        def_dir = 'horizontal'
+    elif prog == BLUR_7TAP:
+        taps = BLUR_TAPS_7
+        def_dir = 'horizontal'
+    else:
+        taps = BLUR_TAPS
+        def_dir = 'both'
+
+    offsets = [t[0] for t in taps]
+    weights = [t[1] for t in taps]
+    direction = def_dir
+    n_taps = len(taps)
+    max_taps = 4 if prog == BLUR_4TAP else (7 if prog == BLUR_7TAP else 6)
+
+    # 1. Inspect vertex uniforms (vs_data + 48)
+    if vs_data:
+        try:
+            raw_vsd = [f.u32(vs_data + 4 * i) for i in range(16)]
+            u_ptr = raw_vsd[12] | (raw_vsd[13] << 32)
+            if 0x1000 <= u_ptr < (1 << 40):
+                p_words = [f.u32(u_ptr + 4 * j) for j in range(48)]
+                ox0 = struct.unpack('<f', struct.pack('<I', p_words[16]))[0]
+                oy0 = struct.unpack('<f', struct.pack('<I', p_words[17]))[0]
+                is_vert = None
+                if abs(ox0) > 0.01 and abs(oy0) < 0.001:
+                    is_vert = False
+                elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
+                    is_vert = True
+
+                if is_vert is not None:
+                    direction = 'vertical' if is_vert else 'horizontal'
+                    read_offs = []
+                    for j in range(16, 16 + 4 * max_taps, 4):
+                        ox = struct.unpack('<f', struct.pack('<I', p_words[j]))[0]
+                        oy = struct.unpack('<f', struct.pack('<I', p_words[j + 1]))[0]
+                        val = oy if is_vert else ox
+                        if 0.05 < val < 50.0:
+                            read_offs.append(val)
+                        else:
+                            break
+                    if len(read_offs) >= 3:
+                        offsets = read_offs
+                        n_taps = len(read_offs)
+        except Exception:
+            pass
+
+    # 2. Inspect fragment uniforms for weights
+    if ppp:
+        try:
+            words = fragment_words(f, ppp)
+            for _, ws in words:
+                fl = [struct.unpack('<f', struct.pack('<I', w))[0] for w in ws]
+                for i in range(len(fl)):
+                    if i + n_taps <= len(fl):
+                        sub = fl[i:i + n_taps]
+                        if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                            weights = list(sub)
+                            break
+                if len(weights) == n_taps and weights != [t[1] for t in taps]:
+                    break
+        except Exception:
+            pass
+
+    return {
+        'direction': direction,
+        'offsets': offsets,
+        'weights': weights,
+        'n_taps': n_taps,
+    }
 
 
 def sample_bilinear(buf, w, h, u, v):
@@ -293,29 +389,40 @@ def sample_bilinear(buf, w, h, u, v):
     return tuple(out)
 
 
-def gaussian_blur_texture(buf, w, h, taps=BLUR_TAPS):
-    tmp_buf = [None] * (w * h)
-    for y in range(h):
-        for x in range(w):
-            acc = [0.0, 0.0, 0.0, 0.0]
-            for off, weight in taps:
-                sp = sample_bilinear(buf, w, h, x + 0.5 + off, y + 0.5)
-                sn = sample_bilinear(buf, w, h, x + 0.5 - off, y + 0.5)
-                for c in range(4):
-                    acc[c] += (sp[c] + sn[c]) * weight
-            tmp_buf[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
+def gaussian_blur_texture(buf, w, h, taps=None, offsets=None, weights=None, direction='both'):
+    if offsets is not None and weights is not None:
+        taps = list(zip(offsets, weights))
+    elif taps is None:
+        taps = BLUR_TAPS
 
-    out_buf = [None] * (w * h)
-    for y in range(h):
-        for x in range(w):
-            acc = [0.0, 0.0, 0.0, 0.0]
-            for off, weight in taps:
-                sp = sample_bilinear(tmp_buf, w, h, x + 0.5, y + 0.5 + off)
-                sn = sample_bilinear(tmp_buf, w, h, x + 0.5, y + 0.5 - off)
-                for c in range(4):
-                    acc[c] += (sp[c] + sn[c]) * weight
-            out_buf[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
-    return out_buf
+    current = buf
+    if direction in ('horizontal', 'both'):
+        out_h = [None] * (w * h)
+        for y in range(h):
+            for x in range(w):
+                acc = [0.0, 0.0, 0.0, 0.0]
+                for off, weight in taps:
+                    sp = sample_bilinear(current, w, h, x + 0.5 + off, y + 0.5)
+                    sn = sample_bilinear(current, w, h, x + 0.5 - off, y + 0.5)
+                    for c in range(4):
+                        acc[c] += (sp[c] + sn[c]) * weight
+                out_h[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
+        current = out_h
+
+    if direction in ('vertical', 'both'):
+        out_v = [None] * (w * h)
+        for y in range(h):
+            for x in range(w):
+                acc = [0.0, 0.0, 0.0, 0.0]
+                for off, weight in taps:
+                    sp = sample_bilinear(current, w, h, x + 0.5, y + 0.5 + off)
+                    sn = sample_bilinear(current, w, h, x + 0.5, y + 0.5 - off)
+                    for c in range(4):
+                        acc[c] += (sp[c] + sn[c]) * weight
+                out_v[y * w + x] = tuple(max(0, min(255, int(round(acc[c])))) for c in range(4))
+        current = out_v
+
+    return current
 
 
 def program(f, ppp):
@@ -395,7 +502,12 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if not tex and stride not in (20, 28):
         if stride == 16 and prog == SPANS:
             return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
-        if stride == 12 and prog in BLUR_PROGRAMS:
+        if stride == 12 and prog in ALL_BLUR_PROGRAMS:
+            if prog in (BLUR_4TAP, BLUR_7TAP):
+                params = extract_blur_params(f, vs_data, ppp, prog)
+                d_name = params['direction']
+                n = params['n_taps']
+                return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
 
@@ -465,7 +577,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
         # Untextured glyphs (clock digits): RGBA colour at +16, like stride 20.
         return 'replayed exactly: solid quad (stride=28)', {'count': count}
 
-    is_blur = prog in BLUR_PROGRAMS
+    is_blur = prog in ALL_BLUR_PROGRAMS
     is_dest_in = prog == DEST_IN
     is_vibrancy = tex.get('vibrancy', False)
 
@@ -483,6 +595,15 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
 
     if is_blur:
+        if prog in (BLUR_4TAP, BLUR_7TAP):
+            params = extract_blur_params(f, vs_data, ppp, prog)
+            d_name = params['direction']
+            n = params['n_taps']
+            return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap)', {
+                'prog': hex(prog),
+                'direction': d_name,
+                'taps': n,
+            }
         return 'approximated: Gaussian blur (separable 6-tap)', {'prog': hex(prog)}
     elif is_dest_in:
         if is_scaled:
@@ -634,14 +755,20 @@ def main():
                 continue
             else:
                 continue
-        is_blur = prog in BLUR_PROGRAMS
+        is_blur = prog in ALL_BLUR_PROGRAMS
         blurred_tex = None
         if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
+            params = extract_blur_params(f, vs_data, ppp, prog)
             raw_pixels = []
             for ty in range(tex['h']):
                 for tx in range(tex['w']):
                     raw_pixels.append(texel(f, tex, tx, ty))
-            blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
+            blurred_tex = gaussian_blur_texture(
+                raw_pixels, tex['w'], tex['h'],
+                offsets=params['offsets'],
+                weights=params['weights'],
+                direction=params['direction']
+            )
 
         if not tex and stride in (20, 28):
             vs_xy = []
@@ -879,7 +1006,8 @@ def main():
                         else:
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
-            elif stride == 12 and prog in BLUR_PROGRAMS:
+            elif stride == 12 and prog in ALL_BLUR_PROGRAMS:
+                params = extract_blur_params(f, vs_data, ppp, prog)
                 bw, bh = x1 - x0, y1 - y0
                 raw_pixels = []
                 for y in range(y0, y1):
@@ -887,7 +1015,12 @@ def main():
                         d = (y * target_w + x) * 4
                         r, g, b, a = fb[d:d + 4]
                         raw_pixels.append((b, g, r, a))
-                blurred = gaussian_blur_texture(raw_pixels, bw, bh)
+                blurred = gaussian_blur_texture(
+                    raw_pixels, bw, bh,
+                    offsets=params['offsets'],
+                    weights=params['weights'],
+                    direction=params['direction']
+                )
                 for y in range(y0, y1):
                     for x in range(x0, x1):
                         b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
