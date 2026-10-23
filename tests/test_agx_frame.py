@@ -74,6 +74,21 @@ class FrameTests(unittest.TestCase):
         self.assertIn('0x0000001000..0x0000003000', text)
         self.assertIn('capped: True', text)
 
+    def test_reject_unrelated_fallback_ta(self):
+        raw = bytearray(synthetic())
+        struct.pack_into('<I', raw, 64 + 0x10, 0xc0460230)
+        struct.pack_into('<I', raw, 64 + 0x280 + 0x14, 0xc0460640)
+        self.path.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, 'no matching TA'):
+            frame_module.Frame(self.path).require_matching_ta()
+        struct.pack_into('<I', raw, 64 + 0x280 + 0x14, 0xc0460230)
+        self.path.write_bytes(raw)
+        frame_module.Frame(self.path).require_matching_ta()
+        struct.pack_into('<I', raw, 12, 0)
+        self.path.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, 'no matching TA'):
+            frame_module.Frame(self.path).require_matching_ta()
+
     def test_reject_corrupt_files(self):
         valid = synthetic()
         variants = [b'', valid[:63], valid[:-1], valid + b'x',

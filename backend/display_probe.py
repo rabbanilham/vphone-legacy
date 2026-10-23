@@ -321,6 +321,7 @@ def main():
     p.add_argument('--snapshot-at', type=float, action='append', default=[], help='Guest-running seconds at which to save an extra CA thread snapshot (needs --user-hooks)')
     p.add_argument('--framebuffer-at', type=float, action='append', default=[],
                    help='Save a QMP framebuffer at these guest-running seconds (repeatable)')
+    p.add_argument('--display-state', action='store_true', help='Save display plane registers and MMU tables beside timed QMP captures')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
@@ -485,6 +486,16 @@ def main():
                             requested=framebuffer_at.pop(0)
                             path=out/f'framebuffer-at-{requested:g}s.ppm'
                             command(fp,'screendump',{'filename':str(path)})
+                            if args.display_state:
+                                state = command(fp, 'human-monitor-command',
+                                                {'command-line': 'xp /12288xw 0x206204000'})
+                                (out / f'display-at-{requested:g}s.txt').write_text(state)
+                                regs = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', state)]
+                                for offset in range(0x98, 0xc000, 0x100):
+                                    table = regs[offset // 4] << 4
+                                    if 0x800000000 <= table < 0x840000000:
+                                        command(fp, 'pmemsave', {'val': table, 'size': 4096,
+                                                'filename': str(out / f'display-at-{requested:g}s-table-{offset:x}.bin')})
                             framebuffer_captures.append(dict(requested_seconds=requested,
                                                             elapsed_seconds=clock.elapsed(),path=str(path)))
                             save_json(out/'framebuffer-captures.json',framebuffer_captures)
