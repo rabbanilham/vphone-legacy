@@ -1,6 +1,6 @@
 ## Common rules (all workers)
-- Read CLAUDE_HANDOVER.md sections 20-23 first (and backend/README.md for tooling). The project emulates an iPhone 5s (A7, iOS 7) in a patched QEMU (`backend/s5l8960x.c`).
-- Work ONLY in your own worktree and commit only to your own branch. Do not touch /Users/bagas/Downloads/vphone-legacy (main checkout) or any other worktree, do not merge into other branches, do not push.
+- Read CLAUDE_HANDOVER.md sections 24-27 first (and backend/README.md for tooling). The project emulates an iPhone 5s (A7, iOS 7) in a patched QEMU (`backend/s5l8960x.c`).
+- Work ONLY in your own worktree and commit only to your own branch. Do not touch the main checkout (on the MBP `/Users/bagas/Documents/Projects/vphone/vphone-legacy`, on the MBA `/Users/bagas/Downloads/vphone-legacy`) or any other worktree, do not merge into other branches, do not push.
 - `build/` is a symlink to the shared image store: never write into it. The default profile is `build/virtual-activated-profile-v5/` (plan `boot/boot_plan.json`, `system.raw`, `data.raw`); `backend/live_run.py` uses it by default with MTTCG and always clones images. For timed probes use `backend/display_probe.py` with `--plan/--diagnostic-system/--diagnostic-data` pointing at those files and a fresh `--output` under your worktree.
 - Build your own QEMU in this worktree: `backend/.venv/bin/python scripts/qemu/build_backend.py` (writes backend/bin/qemu-system-aarch64 here). Rebuild once before blaming a regression; compare `AGX replay target` vs `AGX RT queue` counts in qemu-trace.log.
 - Every QEMU launch must show the Cocoa window: `VPHONE_DISPLAY=cocoa` for display_probe.py; live_run.py always does.
