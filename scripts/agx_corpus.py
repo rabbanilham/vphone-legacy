@@ -83,6 +83,14 @@ SCENES = {
         'display_only': False,
         'seconds': 106,
     },
+    # Every pass of the settled Settings screen (offscreen switch passes too).
+    'settings-all': {
+        'touch': UNLOCK + '|at=111;tap 600,900|at=119;tap 600,900|at=127;tap 600,900|at=130;tap 245,815',
+        'at': [145],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 160,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],
