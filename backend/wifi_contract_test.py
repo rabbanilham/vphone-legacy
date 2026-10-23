@@ -9,78 +9,14 @@ from gpio_contract_test import move64
 
 
 def fixture():
-    code = move64(4, 0x800002000)
-    expected = []
-    op = 0x20c400010
-
-    def write(addr, value):
-        code.extend(move64(2, addr) + move64(0, value) + [0xb9000040])
-
-    def read(addr, value, mask=None):
-        code.extend(move64(2, addr) + [0xb9400043])
-        if mask is not None:
-            code.extend(move64(5, mask) + [0x0a050063])
-        code.append(0xb9000003 | len(expected) << 10 | 4 << 5)
-        expected.append(value)
-
-    # GPIO166 host-ready, GPIO167 external device-ready; input ignores latch.
-    write(0x20e300298, 3)
-    read(0x20e30029c, 1, 1)
-    write(op, 2)
-    write(op + 0x40, 1)
-    read(op + 0x44, 1, 1)
-    write(op + 0x44, 0x1100)
-    write(op + 0x44, 0x1000)
-    read(op + 0x44, 5, 5)
-
-    def control(setup, length):
-        write(op, 0)
-        # Circular async QH, address zero, EP0, high speed, DTC, head, MPS64.
-        qh = [0x11002, (64 << 16) | (1 << 15) | (1 << 14) | (2 << 12),
-              1 << 30, 0, 0x12000, 1, 0, 0, 0, 0, 0, 0]
-        for i, word in enumerate(qh):
-            write(0x800011000 + i * 4, word)
-        tds = [[0x12040, 1, (8 << 16) | (3 << 10) | (2 << 8) | 0x80, 0x13000, 0, 0, 0, 0],
-               [0x12080, 1, (1 << 31) | (length << 16) | (3 << 10) | (1 << 8) | 0x80, 0x14000, 0, 0, 0, 0],
-               [1, 1, (1 << 31) | (3 << 10) | 0x80, 0, 0, 0, 0, 0]]
-        for k, td in enumerate(tds):
-            for i, word in enumerate(td):
-                write(0x800012000 + k * 64 + i * 4, word)
-        for i, word in enumerate(struct.unpack('<II', setup)):
-            write(0x800013000 + 4 * i, word)
-        for i in range(0, length, 4):
-            write(0x800014000 + i, 0xdeadbeef)
-        write(op + 0x18, 0x11000)
-        write(op, 0x21)
-        # Poll final status qTD Active; harness supplies an external deadline.
-        code.extend(move64(2, 0x800012088))
-        code.extend([0xb9400043, 0x373fffe3])  # ldr w3,[x2]; tbnz w3,#7,-4
-        for k in range(3):
-            read(0x800012008 + k * 64, 0, 0x7fff00fc)
-        write(op, 0)
-
-    control(struct.pack('<BBHHH', 0x80, 6, 0x100, 0, 18), 18)
-    read(0x800014000, 0x02000112)
-    read(0x800014008, 0x43340a5c)
-    read(0x800014010, 0x00000103, 0xffff)
-    control(struct.pack('<BBHHH', 0x80, 6, 0x200, 0, 39), 39)
-    read(0x800014000, 0x00270209)
-    read(0x800014014, 0x00400381)
-    read(0x800014018, 0x82050701)
-    control(struct.pack('<BBHHH', 0xc1, 0, 1, 0, 8), 8)
-    read(0x800014000, 0)
-    read(0x800014004, 0)
-    write(0x800002000 + 4 * len(expected), 0xface)
-    expected.append(0xface)
-    code.append(0x14000000)
-    assert len(code) * 4 < 0x2000, 'fixture overlaps results'
-    return struct.pack('<' + 'I' * len(code), *code), expected
+    return runtime_fixture(enumeration_only=True)
 
 
-def runtime_fixture():
+def runtime_fixture(enumeration_only=False):
     """TRX -> runtime PID -> CDC -> association -> slirp ARP/DHCP replies."""
     import binascii
-    code = move64(4, 0x800010000)
+    code = move64(4, 0x800018000)
+    address = 0
     expected = []
     op = 0x20c400010
     ram = 0x800000000
@@ -120,16 +56,17 @@ def runtime_fixture():
         write(op + 0x44, 0x1000)
         read(op + 0x44, 5, 5)
 
-    def transfer(ep, pid, length, setup=None, payload=None):
+    def transfer(ep, pid, length, setup=None, payload=None, response_length=None):
         write(op, 0)
-        words(ram+qh, [qh | 2, ((512 if ep else 64) << 16) | 0xc000 | (2 << 12) | (ep << 8),
+        words(ram+qh, [qh | 2, ((512 if ep else 64) << 16) | 0xc000 | (2 << 12) | (ep << 8) | address,
                        1 << 30, 0, td, 1, 0, 0, 0, 0, 0, 0])
         tds = []
         if setup is not None:
             blob(ram+setup_addr, setup)
             tds.append([td+64, 1, (8 << 16) | 0xe80, setup_addr, 0, 0, 0, 0])
         if length:
-            tds.append([td+64*len(tds)+64 if setup is not None else 1, 1,
+            tds.append([td+64*len(tds)+64 if setup is not None else 1,
+                        td+64*len(tds)+64 if setup is not None else 1,
                         (0x80000000 if setup is not None else 0) | (length << 16) | 0xc80 | (pid << 8), buf, 0, 0, 0, 0])
         if setup is not None:
             tds.append([1, 1, 0x80000c80 | ((0 if pid else 1) << 8), 0, 0, 0, 0, 0])
@@ -143,12 +80,19 @@ def runtime_fixture():
         write(op, 0x21)
         poll(ram+td+64*(len(tds)-1)+8, 7, True)
         for k in range(len(tds)):
-            read(ram+td+64*k+8, 0, 0xfc)  # no Active/Halt/Babble/XactErr
+            if setup is not None:
+                residual = length-response_length if length and pid==1 and k==1 and response_length is not None else 0
+                read(ram+td+64*k+8,residual<<16,0x7fff00fc)
+            else:
+                read(ram+td+64*k+8,0,0xfc)  # no Active/Halt/Babble/XactErr
         write(op, 0)
 
-    def control(request_type, request, value, length, data=None):
+    def control(request_type, request, value, length, data=None, index=0, response_length=None):
+        nonlocal address
         transfer(0, 1 if request_type & 0x80 else 0, length,
-                 struct.pack('<BBHHH', request_type, request, value, 0, length), data)
+                 struct.pack('<BBHHH', request_type, request, value, index, length), data, response_length=response_length)
+        if request_type == 0 and request == 5:
+            address = value
 
     def ioctl(cmd, data=b'', output=None, notify=False):
         packet = struct.pack('<IIII', cmd, len(data), 0x43210002 if cmd in (26,263) else 0x43210000, 0) + data
@@ -166,11 +110,72 @@ def runtime_fixture():
                 part=output[i:i+4]
                 read(ram+buf+16+i, int.from_bytes(part,'little'), (1 << (8*len(part)))-1)
 
-    write(0x20e300298, 3)
+    # DEVICE_READY is sideband power/awake; initial USB connect waits for
+    # HOST_READY, rather than being connected at machine initialization.
+    read(0x20e30029c,1,1)
+    read(op+0x44,0,1)
+    write(0x20e300298,2)
+    read(op+0x44,0,1)
+    write(0x20e300298,3)
+    read(op+0x44,1,1)
     write(op, 2)
     write(op + 0x40, 1)
     port_reset()
-    control(0, 9, 1, 0)  # configuration 1 opens ROM bulk endpoint
+    # IOUSBFamily enumerates at a nonzero USB address. The old contract
+    # exercised only exact-size descriptor reads at address zero.
+    control(0x80,6,0x100,8)
+    read(ram+buf,0x02000112)
+    control(0,5,7,0)
+    control(0x80,6,0x100,18)
+    read(ram+buf+8,0x43340a5c)
+    read_bytes(ram+buf+14,bytes([1,2,3,1]))
+    control(0x80,0,0,2)
+    read_bytes(ram+buf,b'\x01\x00')  # externally powered HSIC module
+    control(0x82,0,0,2,index=0)
+    read_bytes(ram+buf,b'\0\0')
+    for index,text in [(0,None),(1,'Broadcom'),(2,'BCM43342 HSIC'),(3,'433420000001')]:
+        desc=bytes([4,3,9,4]) if text is None else bytes([2+2*len(text),3])+text.encode('utf-16le')
+        control(0x80,6,0x300+index,2,index=0 if not index else 0x409)
+        read_bytes(ram+buf,desc[:2])
+        control(0x80,6,0x300+index,255,index=0 if not index else 0x409,response_length=len(desc))
+        read_bytes(ram+buf,desc)
+    # GetFullConfigurationDescriptor b75664 first asks for FOUR bytes;
+    # b75798 then asks for exactly wTotalLength. Nine-byte retry is also
+    # covered, although it is only used after a failed four-byte probe.
+    for length in (4,9,39):
+        control(0x80,6,0x200,length)
+        read(ram+buf,0x00270209)
+    read_bytes(ram+buf+4,bytes([1,1,0,0xc0,0]))
+    read_bytes(ram+buf+18,bytes([7,5,0x81,3,64,0,1]))
+    read_bytes(ram+buf+25,bytes([7,5,0x82,2,0,2,0]))
+    read_bytes(ram+buf+32,bytes([7,5,2,2,0,2,0]))
+    control(0x80,8,0,1)
+    read_bytes(ram+buf,b'\0')
+    control(0,9,1,0)  # b761cc: bmRequestType=0, request9, value1
+    control(0x80,8,0,1)
+    read_bytes(ram+buf,b'\1')
+    control(0x80,0,0,2)
+    read_bytes(ram+buf,b'\x01\0')
+    control(0x81,0,0,2,index=0)
+    read_bytes(ram+buf,b'\0\0')
+    for endpoint in (0x81,0x82,2):
+        control(0x82,0,0,2,index=endpoint)
+        read_bytes(ram+buf,b'\0\0')
+    control(0x81,10,0,1,index=0)
+    read_bytes(ram+buf,b'\0')
+    # idle-disconnect=0: host-ready low after bring-up is not unplug.
+    write(0x20e300298,2)
+    read(op+0x44,1,1)
+    write(0x20e300298,3)
+    if enumeration_only:
+        control(0xc1,0,1,8)
+        read(ram+buf,0)
+        read(ram+buf+4,0)
+        write(0x800018000+4*len(expected),0xface)
+        expected.append(0xface)
+        code.append(0x14000000)
+        assert len(code)*4 < 0x18000
+        return struct.pack('<'+'I'*len(code),*code), expected
     trx = bytearray(64)
     struct.pack_into('<II',trx,0,0x30524448,len(trx))
     struct.pack_into('<I',trx,8,binascii.crc32(trx[12:]) ^ 0xffffffff)
@@ -182,6 +187,7 @@ def runtime_fixture():
     poll(op+0x44,0,True)
     poll(op+0x44,0,False)
     port_reset()
+    address=0
     control(0x80,6,0x100,18)
     read(ram+buf+8,0xbd210a5c)
     control(0,9,1,0)
@@ -234,15 +240,15 @@ def runtime_fixture():
     read_bytes(ram+buf+46,bytes.fromhex('02010600'))  # BOOTREPLY/Ethernet/6-byte MAC
     read_bytes(ram+buf+50,bytes.fromhex('43342001'))  # transaction ID echoed
     read_bytes(ram+buf+62,bytes([10,0,2,15]))  # yiaddr 10.0.2.15
-    write(0x800010000+4*len(expected),0xface)
+    write(0x800018000+4*len(expected),0xface)
     expected.append(0xface)
     code.append(0x14000000)
-    assert len(code)*4 < 0x10000, 'fixture overlaps results'
+    assert len(code)*4 < 0x18000, 'fixture overlaps results'
     return struct.pack('<'+'I'*len(code),*code), expected
 
 
 if __name__ == '__main__':
     options=('-netdev', 'user,id=wifi0', '-machine', 'wifi-netdev=wifi0,wifi-ssid=vphone-wifi')
-    run_contract(fixture, 'PASS: HSIC GPIO, EHCI1 high-speed reset, USB descriptors and DL_GETSTATE', options)
+    run_contract(fixture, 'PASS: HOST_READY connection ordering, high-speed reset, native descriptor/string/status/configuration sequence and DL_GETSTATE', options, result_address=0x800018000)
     run_contract(runtime_fixture, 'PASS: TRX CRC download, runtime re-enumeration, CDC, join, slirp ARP and DHCP offer',
-                 options, result_address=0x800010000)
+                 options, result_address=0x800018000)

@@ -29,6 +29,32 @@ FB = 0x8018e0000
 FB_SIZE = 2560 * 1136
 
 
+MAIN_CHECKOUT = Path('/Users/bagas/Downloads/vphone-legacy')
+
+
+def resolve_hook_path(value):
+    """Hook JSON uses repository-relative evidence paths; prefer this tree."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    local = ROOT / path
+    if local.exists():
+        return local
+    main = MAIN_CHECKOUT / path
+    return main if main.exists() else local
+
+
+def load_user_hooks(path):
+    hooks = json.loads(resolve_hook_path(path).read_text())
+    for key in ('cache_path', 'index_path'):
+        if key in hooks:
+            hooks[key] = str(resolve_hook_path(hooks[key]))
+    if 'exe_paths' in hooks:
+        hooks['exe_paths'] = {name: str(resolve_hook_path(value))
+                              for name, value in hooks['exe_paths'].items()}
+    return hooks
+
+
 def digest(path):
     with Path(path).open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
@@ -390,7 +416,7 @@ def main():
         for prefix in sorted(max_hits, key=len, reverse=True):
             if name.startswith(prefix):return max_hits[prefix]
         return 24 if pc in user_expected else 8
-    user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
+    user_hooks = load_user_hooks(args.user_hooks) if args.user_hooks else None
     user_installed = False
     user_expected = {}
     exe_installed = {}

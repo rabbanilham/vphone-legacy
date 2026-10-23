@@ -58,6 +58,15 @@ static void wifi_wake(WifiDongle *s)
 static void wifi_host_ready(WifiDongle *s, bool ready)
 {
     s->host_ready=ready;
+    /* The module is powered (DEVICE_READY), but cannot signal an HSIC
+     * connection until the platform enables the host link. Low HOST_READY
+     * after enumeration is bus idle, not power loss (DT idle-disconnect=0). */
+    if(ready && !USB_DEVICE(s)->attached && !s->detached_for_go) {
+        usb_device_attach(USB_DEVICE(s),&error_abort);
+        qemu_log_mask(LOG_UNIMP,"WIFI HSIC attach host_ready=1 pid=%04x\n",
+                      s->proto.runtime?0xbd21:0x4334);
+    }
+    qemu_log_mask(LOG_UNIMP,"WIFI HOST_READY=%u attached=%u\n",ready,USB_DEVICE(s)->attached);
     if(ready) { wifi_wake(s); qemu_flush_queued_packets(qemu_get_queue(s->nic)); }
 }
 static void wifi_reenumerate(void *opaque)
@@ -70,15 +79,36 @@ static void wifi_reenumerate(void *opaque)
     } else {
         s->proto.runtime=true; dev->usb_desc=&wifi_runtime_desc;
         usb_desc_init(dev); s->detached_for_go=false;
-        usb_device_attach(dev,&error_abort);
-        qemu_log_mask(LOG_UNIMP,"WIFI runtime attach 0a5c:bd21\n");
+        if(s->host_ready) usb_device_attach(dev,&error_abort);
+        qemu_log_mask(LOG_UNIMP,"WIFI runtime attach 0a5c:bd21 attached=%u\n",dev->attached);
     }
 }
 static void wifi_control(USBDevice *dev, USBPacket *p, int request,
                          int value, int index, int length, uint8_t *data)
 {
     WifiDongle *s=WIFI_DONGLE(dev); WifiProtocol *w=&s->proto;
-    if(usb_desc_handle_control(dev,p,request,value,index,length,data)>=0) return;
+    qemu_log_mask(LOG_UNIMP,"WIFI EP0 addr=%u speed=%u req=%04x value=%04x index=%04x length=%d\n",
+                  dev->addr,dev->speed,request,value,index,length);
+    /* QEMU's generic helper accepts unmatched nonzero configurations.
+     * This device implements exactly configuration 1 and interface 0. */
+    if(request==0x0009 && value!=0 && value!=1) goto stall;
+    if((request==0x8100 || request==0x8200) && value==0) {
+        bool valid=request==0x8100 ? dev->configuration==1 && index==0 :
+            (index==0 || index==0x80 || (dev->configuration==1 &&
+             (index==0x81 || index==0x82 || index==2)));
+        if(!valid) goto stall;
+        uint8_t status[2]={0,0};
+        if(request==0x8200) {
+            USBEndpoint *ep=usb_ep_get(dev,index&0x80?USB_TOKEN_IN:USB_TOKEN_OUT,index&15);
+            status[0]=ep->halted;
+        }
+        p->actual_length=MIN(length,2); memcpy(data,status,p->actual_length); return;
+    }
+    if(usb_desc_handle_control(dev,p,request,value,index,length,data)>=0) {
+        qemu_log_mask(LOG_UNIMP,"WIFI EP0 complete req=%04x actual=%d configuration=%d\n",
+                      request,p->actual_length,dev->configuration);
+        return;
+    }
     if(!w->runtime && (request==0xc100 || request==0xc102) && value==1 && index==0) {
         if(request==0xc102 && w->dl_state!=4) goto stall;
         uint8_t state[8]; wifi_st32(state,w->dl_state); wifi_st32(state+4,w->dl_bytes);
@@ -173,12 +203,14 @@ static NetClientInfo wifi_net_info = {
 static void wifi_reset(USBDevice *dev)
 {
     WifiDongle *s=WIFI_DONGLE(dev);
+    qemu_log_mask(LOG_UNIMP,"WIFI USB reset pid=%04x speed=%u\n",s->proto.runtime?0xbd21:0x4334,dev->speed);
     s->proto.response_len=0; s->proto.count=0; s->proto.head=0; s->tx_len=0;
     /* USB bus reset must preserve downloaded RAM and runtime personality. */
 }
 static void wifi_realize(USBDevice *dev, Error **errp)
 {
     WifiDongle *s=WIFI_DONGLE(dev);
+    dev->auto_attach=0; /* HSIC PHY starts only on the board HOST_READY signal. */
     const char *ssid=s->ssid?s->ssid:getenv("VPHONE_WIFI_SSID");
     if(!ssid || !*ssid) ssid="vphone-wifi";
     if(strlen(ssid)>32) { error_setg(errp,"Wi-Fi SSID exceeds 32 bytes"); return; }
@@ -201,17 +233,13 @@ static void wifi_unrealize(USBDevice *dev)
 static void wifi_power_reset(WifiDongle *s)
 {
     USBDevice *dev=USB_DEVICE(s);
-    bool change_personality=s->proto.runtime || s->detached_for_go;
     char ssid[33]; memcpy(ssid,s->proto.ssid,sizeof(ssid));
     timer_del(s->reenumerate);
-    if(change_personality && dev->attached) usb_device_detach(dev);
+    if(dev->attached) usb_device_detach(dev);
     wifi_protocol_init(&s->proto,ssid);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);
     s->detached_for_go=false; s->host_ready=false; s->tx_len=0;
-    if(change_personality) {
-        dev->usb_desc=&wifi_rom_desc; usb_desc_init(dev);
-        usb_device_attach(dev,&error_abort); usb_device_reset(dev);
-    }
+    dev->usb_desc=&wifi_rom_desc; usb_desc_init(dev);
 }
 static const Property wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(WifiDongle,conf), DEFINE_PROP_STRING("ssid",WifiDongle,ssid),

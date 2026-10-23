@@ -405,3 +405,18 @@ maintainer run. With `-d unimp`, `WIFI RDL`, `WIFI runtime attach`, `WIFI CDC`,
 `WIFI iovar` and `WIFI RX event` messages identify protocol progress. A QEMU
 `filter-dump` object on `wifi0` can capture Ethernet/DHCP without instrumenting
 the guest.
+
+Probe180 follow-up: the configured module asserts sideband DEVICE_READY first,
+then waits for GPIO166 HOST_READY before advertising its initial USB connection.
+Later HOST_READY lows retain the connection (`idle-disconnect=0`); a whole-board
+reset requires a fresh handshake. Standard EP0 requests, lengths, USB address,
+speed, reset and configuration results are now logged under `-d unimp`, alongside
+RDL/CDC messages. The Wi-Fi contract includes nonzero USB addressing, the native
+four-byte configuration header probe, full/short string reads, device/interface/
+endpoint GET_STATUS and SET_CONFIGURATION(1). Native acceptance after this
+lifecycle correction still requires a maintainer boot.
+
+User-hook JSON paths (`cache_path`, `index_path`, `exe_paths`) in display_probe
+resolve relative to this checkout first. If absent here, they fall back to the
+main checkout `/Users/bagas/Downloads/vphone-legacy`. Explicit absolute paths
+are preserved.
