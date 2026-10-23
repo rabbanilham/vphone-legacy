@@ -94,6 +94,8 @@ def fixture():
         # a transaction error, so only the running schedule is observable.
         read(op + 4, 0x8000, 0x8000)  # async schedule active
         write(op, 0)
+        # Schedule shutdown completes in EHCI's bottom half.
+        code.extend(move64(2, op + 4) + [0xb9400043, 0x3667ffe3])
         read(op + 4, 0x1000, 0x1000)
         write(op + 4, 0x3f)
     write(0x800002000 + len(expected) * 4, 0xface)
@@ -103,14 +105,14 @@ def fixture():
     return struct.pack('<' + 'I' * len(code), *code), expected
 
 
-def main(make_fixture=fixture, success_message=None):
+def main(make_fixture=fixture, success_message=None, extra_args=(), result_address=0x800002000):
     payload, expected = make_fixture()
     with tempfile.TemporaryDirectory(prefix='a7ehci-', dir='/tmp') as directory:
         root = Path(directory)
         image = root / 'fixture.bin'; image.write_bytes(payload)
         cmd = [str(BINARY), '-machine', 's5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
                '-kernel', str(image), '-accel', 'tcg', '-display', 'none', '-S',
-               '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off']
+               '-qmp', f'unix:{root}/qmp.sock,server=on,wait=off', *extra_args]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 5
@@ -123,7 +125,7 @@ def main(make_fixture=fixture, success_message=None):
                 json.loads(fp.readline()); command(fp, 'qmp_capabilities'); command(fp, 'cont')
                 while True:
                     dump = command(fp, 'human-monitor-command', {
-                        'command-line': f'xp /{len(expected)}wx 0x800002000'})
+                        'command-line': f'xp /{len(expected)}wx {result_address:#x}'})
                     actual = [int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]+)', dump)]
                     if actual and actual[-1] == 0xface:
                         break

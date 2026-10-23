@@ -92,6 +92,12 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
             if(!wifi_ioctl(w,data,length)) goto stall;
             qemu_log_mask(LOG_UNIMP,"WIFI CDC cmd=%u status=%d response=%zu queued=%u\n",
                           wifi_ld32(data),(int32_t)wifi_ld32(w->response+12),w->response_len,w->count);
+            if(length>16 && (wifi_ld32(data)==262 || wifi_ld32(data)==263)) {
+                qemu_log_mask(LOG_UNIMP,"WIFI iovar=%.*s status=%d\n",
+                              (int)MIN((size_t)length-16,(size_t)64),data+16,
+                              (int32_t)wifi_ld32(w->response+12));
+            }
+            qemu_format_nic_info_str(qemu_get_queue(s->nic),w->mac);
             wifi_wake(s); return;
         }
         if(request==0xa101) {
@@ -107,16 +113,19 @@ static void wifi_data(USBDevice *dev, USBPacket *p)
     WifiDongle *s=WIFI_DONGLE(dev); WifiProtocol *w=&s->proto;
     if(!s->host_ready) { p->status=USB_RET_NAK; return; }
     if(p->pid==USB_TOKEN_IN && p->ep->nr==1) {
-        if(!w->response_len && !w->count) { p->status=USB_RET_NAK; return; }
-        /* HSIC interrupt header checked at f5d234: bits14:12 == 1.
-         * Lower bits indicate data/control availability. */
-        uint8_t intr[8]={0}; wifi_st16(intr,0x1000 | (w->count?1:0) | (w->response_len?2:0));
+        if(!w->response_len) { p->status=USB_RET_NAK; return; }
+        uint8_t intr[16]; wifi_notification(w,intr);
         usb_packet_copy(p,intr,MIN(p->iov.size,sizeof(intr))); return;
     }
     if(p->ep->nr!=2) { p->status=USB_RET_STALL; return; }
     if(p->pid==USB_TOKEN_IN) {
         if(!w->count) { p->status=USB_RET_NAK; return; }
         WifiFrame *f=&w->queue[w->head];
+        if(!f->pos && f->len>=76 && f->data[16]==0x88 && f->data[17]==0x6c) {
+            qemu_log_mask(LOG_UNIMP,"WIFI RX event=%u status=%u flags=%x\n",
+                          ldl_be_p(f->data+32),ldl_be_p(f->data+36),
+                          lduw_be_p(f->data+30));
+        }
         size_t n=MIN(p->iov.size,f->len-f->pos);
         usb_packet_copy(p,f->data+f->pos,n); f->pos+=n;
         /* Exact maxpacket frames need a ZLP to terminate a larger host read. */
@@ -152,7 +161,8 @@ static ssize_t wifi_receive(NetClientState *nc, const uint8_t *buf, size_t n)
     assert(bql_locked());
     if(!s->proto.runtime || !s->proto.up || !s->proto.joined) return n;
     if(n>WIFI_FRAME_MAX-4) return n;
-    if(!s->host_ready || !wifi_enqueue(&s->proto,buf,n)) return 0;
+    if(!s->host_ready || s->proto.count >= WIFI_QUEUE-8 ||
+       !wifi_enqueue(&s->proto,buf,n)) return 0;
     wifi_wake(s); return n;
 }
 static void wifi_net_cleanup(NetClientState *nc) { WIFI_DONGLE(qemu_get_nic_opaque(nc))->nic=NULL; }
@@ -185,6 +195,23 @@ static void wifi_unrealize(USBDevice *dev)
 {
     WifiDongle *s=WIFI_DONGLE(dev);
     timer_free(s->reenumerate); if(s->nic) qemu_del_nic(s->nic);
+}
+/* A whole-board power reset starts the ROM again. A USB bus reset above
+ * deliberately preserves firmware RAM, as required during re-enumeration. */
+static void wifi_power_reset(WifiDongle *s)
+{
+    USBDevice *dev=USB_DEVICE(s);
+    bool change_personality=s->proto.runtime || s->detached_for_go;
+    char ssid[33]; memcpy(ssid,s->proto.ssid,sizeof(ssid));
+    timer_del(s->reenumerate);
+    if(change_personality && dev->attached) usb_device_detach(dev);
+    wifi_protocol_init(&s->proto,ssid);
+    memcpy(s->proto.mac,s->conf.macaddr.a,6);
+    s->detached_for_go=false; s->host_ready=false; s->tx_len=0;
+    if(change_personality) {
+        dev->usb_desc=&wifi_rom_desc; usb_desc_init(dev);
+        usb_device_attach(dev,&error_abort); usb_device_reset(dev);
+    }
 }
 static const Property wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(WifiDongle,conf), DEFINE_PROP_STRING("ssid",WifiDongle,ssid),

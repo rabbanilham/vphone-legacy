@@ -93,7 +93,8 @@ typedef struct A7Peripheral {
 '''
         harness += extract('typedef struct SioDMA', '#define SEP_OUTBOX_CAPACITY')
         harness += r'''
-static void wifi_host_ready(void *wifi, bool ready) { (void)wifi; (void)ready; }
+static bool wifi_ready;
+static void wifi_host_ready(void *wifi, bool ready) { assert(wifi); wifi_ready=ready; }
 struct A7State {
     void *wifi;
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
@@ -518,6 +519,19 @@ int main(void) {
     /* Level-low type 6 (flags bit0) latches whenever the line is low. */
     stl_le_p(gpio+0x800,0);stl_le_p(gpio+88,0x206);touch_gpio_update(&state);
     assert(gpio_read(&state,0x800,4)==(1u<<22));
+    /* Optional external WLAN input, group2 word5 bit7, and host-ready. */
+    state.wifi=&state;
+    gpio_write(&state,166*4,3,4);assert(wifi_ready);
+    gpio_write(&state,166*4,2,4);assert(!wifi_ready);
+    assert((gpio_read(&state,167*4,4)&1)==1);
+    gpio_write(&state,167*4,0x20004,4);
+    assert(ldl_le_p(gpio+0x894)&(1u<<7));
+    assert(state.device_irq[3]&(1u<<14));
+    gpio_write(&state,167*4,0x2000e,4);
+    gpio_write(&state,0x894,1u<<7,4);
+    assert(!(state.device_irq[3]&(1u<<14)));
+    state.wifi=NULL;
+    assert((gpio_read(&state,167*4,4)&1)==0);
     return 0;
 }
 '''

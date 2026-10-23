@@ -23,6 +23,7 @@ typedef struct WifiProtocol {
     WifiFrame queue[WIFI_QUEUE];
     unsigned head, count;
     uint32_t settings[24];
+    uint16_t notification_seq;
 } WifiProtocol;
 static uint16_t wifi_ld16(const uint8_t *p) { return p[0] | p[1] << 8; }
 static uint32_t wifi_ld32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
@@ -109,12 +110,16 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
     wifi_st16(b+14,100); wifi_st16(b+16,1); b[18]=sl; memcpy(b+19,s->ssid,sl);
     wifi_st32(b+52,sizeof(wifi_rates)); memcpy(b+56,wifi_rates,sizeof(wifi_rates));
     wifi_st16(b+72,0x1006); wifi_st16(b+76,(uint16_t)-45); b[78]=(uint8_t)-92;
-    b[84]=6; wifi_st16(b+116,off);
+    b[84]=6;
     b[off++]=0; b[off++]=sl; memcpy(b+off,s->ssid,sl); off+=sl;
     b[off++]=1; b[off++]=8; memcpy(b+off,wifi_rates,8); off+=8;
     b[off++]=50; b[off++]=4; memcpy(b+off,wifi_rates+8,4); off+=4;
     b[off++]=3; b[off++]=1; b[off++]=6;
-    wifi_st32(b+120,off-128); wifi_st32(b+4,off); return off;
+    /* Apple's 11D257 layout differs from Linux brcmfmac v109:
+     * ae9dc0 loads IE length as u16 at +0x74; ae9dd8 loads offset as
+     * u32 at +0x78. Rechecked against the unmodified kernel image. */
+    wifi_st16(b+116,off-128); wifi_st32(b+120,128);
+    wifi_st32(b+4,off); return off;
 }
 static void wifi_scan(WifiProtocol *s, uint16_t sync)
 {
@@ -143,7 +148,7 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     const char *name=(const char *)p; size_t key=end-p+1;
     p+=key; n-=key; *len=0;
     if(!strcmp(name,"ver") && !set) {
-        const char ver[]="wl0: Oct 28 2013 19:17:43 version 6.25.87.120 (r) FWID 01-532b87c9";
+        const char ver[]="wl0: Oct 28 2013 23:32:03 version 6.25.87.120 (r) FWID 01-532b87c9";
         memcpy(out,ver,sizeof(ver)); *len=sizeof(ver); return 0;
     }
     if(!strcmp(name,"cap") && !set) { memcpy(out,"sta escan",10); *len=10; return 0; }
@@ -158,6 +163,7 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     }
     if(!strcmp(name,"escan") && set) {
         if(n<8 || wifi_ld32(p)!=1) return -2;
+        if(s->count>WIFI_QUEUE-2) return -22;
         if(wifi_ld16(p+4)==1) wifi_scan(s,wifi_ld16(p+6));
         else if(wifi_ld16(p+4)==2) wifi_event(s,67,4,0,NULL,0);
         else return -2;
@@ -182,7 +188,7 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
     case 3: wifi_disconnect(s); s->up=false; break;
     case 262: case 263: status=wifi_iovar(s,cmd==263,p+16,inlen,out,&outlen); break;
     case 84: if(inlen<2) status=-2; else { memset(s->country,0,12); memcpy(s->country,p+16,2); memcpy(s->country+8,p+16,2); } break;
-    case 50: wifi_scan(s,0); break;
+    case 50: wifi_scan(s,0); wifi_event(s,26,0,0,NULL,0); break;
     case 51: wifi_st32(out,12+wifi_bss(s,out+12)); wifi_st32(out+4,109); wifi_st32(out+8,1); outlen=wifi_ld32(out); break;
     case 26: {
         size_t sl=strlen(s->ssid);
@@ -190,6 +196,7 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
         if(inlen<36 || wifi_ld32(p+16)!=sl || memcmp(p+20,s->ssid,sl)) {
             wifi_event(s,0,3,0,NULL,0); break;
         }
+        if(s->count>WIFI_QUEUE-4) { status=-22; break; }
         s->joined=true;
         wifi_event(s,0,0,0,NULL,0); wifi_event(s,1,0,0,NULL,0);
         wifi_event(s,7,0,0,NULL,0); wifi_event(s,16,0,1,NULL,0); break;
@@ -208,6 +215,17 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
     wifi_st32(s->response+8,(flags & ~1u) | (status?1:0));
     wifi_st32(s->response+12,(uint32_t)status);
     memcpy(s->response+16,out,outlen); s->response_len=16+outlen; return true;
+}
+/* HSIC extended interrupt header (f66324/f689b8): valid bit15,
+ * channel1 in bits14:12, one's-complement checksum, sequence at +6. */
+static void wifi_notification(WifiProtocol *s, uint8_t out[16])
+{
+    memset(out,0,16); wifi_st16(out,0x9001);
+    wifi_st16(out+4,16); wifi_st16(out+6,s->notification_seq++);
+    uint32_t sum=0;
+    for(unsigned i=0;i<16;i+=2) sum+=wifi_ld16(out+i);
+    sum=(sum&0xffff)+(sum>>16);
+    wifi_st16(out+2,(uint16_t)~sum);
 }
 static bool wifi_bdc_payload(const uint8_t *p, size_t n, size_t *off)
 {

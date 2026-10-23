@@ -6900,6 +6900,7 @@ static void a7_reset(void *opaque)
     if (s->gpio_regs) {
         memset(s->gpio_regs, 0, GPIO_SIZE);
     }
+    if (s->wifi) wifi_power_reset(s->wifi);
     s->touch_irq_low = false;
     for (int i = 0; i < NUM_BRIDGES; i++) {
         if (s->bridges[i].regs) {
@@ -7017,7 +7018,7 @@ static void a7_wifi_init(A7State *s, DeviceState *ehci)
     qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
     if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
     qdev_prop_set_string(DEVICE(dev), "port", "1");
-    usb_realize_and_unref(dev, USB_BUS(qdev_get_child_bus(ehci, "usb-bus")), &error_fatal);
+    usb_realize_and_unref(dev, &SYS_BUS_EHCI(ehci)->ehci.bus, &error_fatal);
     s->wifi = WIFI_DONGLE(dev);
     wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
 }
@@ -7050,8 +7051,11 @@ static void a7_usb_init(A7State *s)
      * low alias to system memory would also change CPU and other DMA views.
      * No USB iommu-parent/DART exists in the N53 DT. */
     memory_region_init(&s->usb_dma_memory, OBJECT(s), "a7.usb-dma", UINT64_C(0x100000000));
+    /* Alias the bounded system DRAM aperture, not the entire RAM leaf.
+     * QEMU 11 flattens a full-leaf, zero-offset alias to the RAM region;
+     * that loses the relocation when the leaf lives at RAM_BASE. */
     memory_region_init_alias(&s->usb_dma_ram, OBJECT(s), "a7.usb-dram",
-                             MACHINE(s)->ram, 0, GiB);
+                             get_system_memory(), RAM_BASE, GiB);
     memory_region_add_subregion(&s->usb_dma_memory, 0, &s->usb_dma_ram);
     address_space_init(&s->usb_dma_as, &s->usb_dma_memory, "a7.usb-dma");
     static const char *const types[] = { "a7.ehci0", "a7.ehci1" };

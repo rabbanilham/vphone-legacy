@@ -77,10 +77,12 @@ int main(void) {
  assert(wifi_ld32(b)==109 && !memcmp(b+8,wifi_bssid,6));
  assert(wifi_ld16(b+16)==1 && b[18]==12 && !memcmp(b+19,"Test network",12));
  assert((int16_t)wifi_ld16(b+76)==-45 && wifi_ld16(b+72)==0x1006);
- size_t ie=wifi_ld16(b+116), end=ie+wifi_ld32(b+120);
+ size_t ie=wifi_ld32(b+120), end=ie+wifi_ld16(b+116);
  while(ie<end) { assert(b[ie]!=48 && b[ie]!=221); ie+=2+b[ie+1]; }
  assert(ie==end && wifi_ld32(b+4)==end);
  assert(w.queue[1].data[39]==0); w.count=w.head=0;
+ cmd(50,0,NULL,0);assert(w.count==3 && w.queue[2].data[35]==26);
+ cmd(51,0,NULL,0);assert(wifi_ld32(w.response+24)==1);w.count=w.head=0;
  uint8_t ssid[36]={12,0,0,0}; memcpy(ssid+4,"Test network",12);
  cmd(26,2,ssid,36); assert((int32_t)wifi_ld32(w.response+12)==-4 && !w.joined);
  cmd(2,0,NULL,0); cmd(26,2,ssid,36); assert(w.joined && w.count==4);
@@ -91,6 +93,11 @@ int main(void) {
  uint8_t frame[64]={0}; for(unsigned i=0;i<WIFI_QUEUE;i++) assert(wifi_enqueue(&w,frame,64));
  assert(!wifi_enqueue(&w,frame,64)); w.count=0;
  assert(!wifi_enqueue(&w,frame,WIFI_FRAME_MAX));
+ uint8_t notification[16]; wifi_notification(&w,notification);
+ assert((wifi_ld16(notification)&0xf000)==0x9000 && wifi_ld16(notification+6)==0);
+ unsigned sum=0;for(unsigned i=0;i<16;i+=2) sum+=wifi_ld16(notification+i);
+ assert(((sum&65535)+(sum>>16))==65535);
+ wifi_notification(&w,notification);assert(wifi_ld16(notification+6)==1);
  size_t off; uint8_t tx[64]={0x20,0,0,2};
  assert(wifi_bdc_payload(tx,sizeof(tx),&off) && off==12);
  tx[3]=255; assert(!wifi_bdc_payload(tx,sizeof(tx),&off));
