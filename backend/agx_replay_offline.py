@@ -231,6 +231,7 @@ SPANS = 0x1a20cc29e8fcc15b  # 1-pixel horizontal spans for glyph rows
 PLUS_L = 0x5b133ef7e0c3428c  # CoreAnimation plus-lighter compositing filter
 PLUS_L2 = 0xa225a18725e48d5c  # CoreAnimation plus-lighter gradient variant
 SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
+PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 
 
 def is_clear_pass(type1_command):
@@ -395,6 +396,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if not tex and stride not in (20, 28):
         if stride == 16 and prog == SPANS:
             return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
+        if stride == 36 and prog == PILL_BORDER:
+            return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
         if stride == 12 and prog in BLUR_PROGRAMS:
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
@@ -642,6 +645,78 @@ def main():
                 for tx in range(tex['w']):
                     raw_pixels.append(texel(f, tex, tx, ty))
             blurred_tex = gaussian_blur_texture(raw_pixels, tex['w'], tex['h'])
+
+        if not tex and stride == 36 and prog == PILL_BORDER:
+            step = 6
+            for q_start in range(0, count, step):
+                q_vs = vs[q_start:q_start + step]
+                if len(q_vs) < step:
+                    break
+                xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0] for v in q_vs]
+                ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1] for v in q_vs]
+                qminx, qmaxx = min(xs), max(xs)
+                qminy, qmaxy = min(ys), max(ys)
+                qw, qh = qmaxx - qminx, qmaxy - qminy
+                if qw < 1e-3 or qh < 1e-3:
+                    continue
+
+                tl = tr = bl = br = None
+                for i, v in enumerate(q_vs):
+                    u1, v1, u2, v2 = struct.unpack_from('<4f', v[2], 4)
+                    px, py = xs[i], ys[i]
+                    if abs(px - qminx) < 1e-2 and abs(py - qminy) < 1e-2: tl = (u1, v1, u2, v2)
+                    if abs(px - qmaxx) < 1e-2 and abs(py - qminy) < 1e-2: tr = (u1, v1, u2, v2)
+                    if abs(px - qminx) < 1e-2 and abs(py - qmaxy) < 1e-2: bl = (u1, v1, u2, v2)
+                    if abs(px - qmaxx) < 1e-2 and abs(py - qmaxy) < 1e-2: br = (u1, v1, u2, v2)
+
+                if not (tl and tr and bl and br):
+                    continue
+
+                du1 = max(abs(tr[0] - tl[0]), abs(br[0] - bl[0]))
+                dv1 = max(abs(bl[1] - tl[1]), abs(br[1] - tr[1]))
+                du2 = max(abs(tr[2] - tl[2]), abs(br[2] - bl[2]))
+                dv2 = max(abs(bl[3] - tl[3]), abs(br[3] - tr[3]))
+                scale1 = max(du1 / qw, dv1 / qh)
+                scale2 = max(du2 / qw, dv2 / qh)
+                if scale1 < 1e-5: scale1 = 1.0 / 31.0
+                if scale2 < 1e-5: scale2 = 1.0 / 28.0
+
+                raw_col = q_vs[0][2][:4]
+                base_r, base_g, base_b, base_a = raw_col[0], raw_col[1], raw_col[2], raw_col[3]
+
+                x0 = max(clip_x0, int(math.floor(qminx)))
+                x1 = min(clip_x1, target_w, pw, int(math.ceil(qmaxx)))
+                y0 = max(clip_y0, int(math.floor(qminy)))
+                y1 = min(clip_y1, target_h, ph, int(math.ceil(qmaxy)))
+                if x0 >= x1 or y0 >= y1:
+                    continue
+
+                for y in range(y0, y1):
+                    cy = y + 0.5
+                    fy = (cy - qminy) / qh
+                    for x in range(x0, x1):
+                        cx = x + 0.5
+                        fx = (cx - qminx) / qw
+                        u1 = (1.0 - fx) * (1.0 - fy) * tl[0] + fx * (1.0 - fy) * tr[0] + (1.0 - fx) * fy * bl[0] + fx * fy * br[0]
+                        v1 = (1.0 - fx) * (1.0 - fy) * tl[1] + fx * (1.0 - fy) * tr[1] + (1.0 - fx) * fy * bl[1] + fx * fy * br[1]
+                        u2 = (1.0 - fx) * (1.0 - fy) * tl[2] + fx * (1.0 - fy) * tr[2] + (1.0 - fx) * fy * bl[2] + fx * fy * br[2]
+                        v2 = (1.0 - fx) * (1.0 - fy) * tl[3] + fx * (1.0 - fy) * tr[3] + (1.0 - fx) * fy * bl[3] + fx * fy * br[3]
+                        r1 = math.sqrt(u1 * u1 + v1 * v1)
+                        r2 = math.sqrt(u2 * u2 + v2 * v2)
+                        outer_cov = max(0.0, min(1.0, 0.5 - (r1 - 1.0) / scale1))
+                        inner_cov = max(0.0, min(1.0, 0.5 + (r2 - 1.0) / scale2))
+                        cov = outer_cov * inner_cov
+                        if cov > 0.0:
+                            d = (y * target_w + x) * 4
+                            src_a = int(round(base_a * cov))
+                            src_r = int(round(base_r * cov))
+                            src_g = int(round(base_g * cov))
+                            src_b = int(round(base_b * cov))
+                            fb[d + 0] = min(255, src_r + fb[d + 0] * (255 - src_a) // 255)
+                            fb[d + 1] = min(255, src_g + fb[d + 1] * (255 - src_a) // 255)
+                            fb[d + 2] = min(255, src_b + fb[d + 2] * (255 - src_a) // 255)
+                            fb[d + 3] = min(255, src_a + fb[d + 3] * (255 - src_a) // 255)
+            continue
 
         if not tex and stride in (20, 28):
             vs_xy = []

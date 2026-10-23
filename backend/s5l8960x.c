@@ -5512,6 +5512,7 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 #define AGX_USC_PLUS_L UINT64_C(0x5b133ef7e0c3428c)
 #define AGX_USC_PLUS_L2 UINT64_C(0xa225a18725e48d5c)
 #define AGX_USC_SOLID_PLUS_L UINT64_C(0xf137b90c25ab5471)
+#define AGX_USC_PILL_BORDER UINT64_C(0x62a99af8d8beb332)
 
 /* Additive blend (CoreAnimation plusL / plusLighter): clamp(S + D, 0, 255). */
 static inline uint32_t agx_blend_plus_lighter(uint32_t dst, uint32_t src)
@@ -5981,8 +5982,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             bool is_blur_prog = agx_is_blur_program(prog);
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
             bool is_span = stride == 16 && prog == AGX_USC_SPANS;
+            bool is_pill = stride == 36 && prog == AGX_USC_PILL_BORDER;
             if ((stride == 16 && !clip_space && !is_span) ||
-                (found == AGX_TEX_NONE && !is_span && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
+                (found == AGX_TEX_NONE && !is_span && !is_pill && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
                                 found == AGX_TEX_NONE ? "untextured with unsupported stride" :
@@ -6094,6 +6096,167 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     agx_ctx_write(s, cat, agx_surface_gva(&sf, ix0, iy), row, (ix1 - ix0) * 4);
                     any_drawn = true;
+                }
+                if (any_drawn) {
+                    draws++;
+                }
+                continue;
+            }
+            if (is_pill) {
+                for (unsigned q_start = 0; q_start + 6 <= count; q_start += 6) {
+                    float vs_xy[6][2];
+                    float vs_uv1[6][2], vs_uv2[6][2];
+                    uint32_t colour = 0xff000000;
+                    bool read_ok = true;
+                    for (unsigned i = 0; i < 6; i++) {
+                        uint64_t v_gva = buf + (uint64_t)(q_start + i) * stride;
+                        float xy[2];
+                        float uvs[4];
+                        if (!agx_ctx_read(s, cat, v_gva, xy, 8) ||
+                            !agx_ctx_read(s, cat, v_gva + 20, uvs, 16)) {
+                            read_ok = false;
+                            break;
+                        }
+                        if (i == 0) {
+                            if (agx_ctx_read(s, cat, v_gva + 16, &colour, 4)) {
+                                colour = (colour & 0xff00ff00u) | ((colour >> 16) & 0xff) | ((colour & 0xff) << 16);
+                            }
+                        }
+                        if (transformed) {
+                            xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
+                            xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
+                        }
+                        vs_xy[i][0] = xy[0];
+                        vs_xy[i][1] = xy[1];
+                        vs_uv1[i][0] = uvs[0];
+                        vs_uv1[i][1] = uvs[1];
+                        vs_uv2[i][0] = uvs[2];
+                        vs_uv2[i][1] = uvs[3];
+                    }
+                    if (!read_ok) {
+                        break;
+                    }
+                    float qminx = vs_xy[0][0], qmaxx = vs_xy[0][0];
+                    float qminy = vs_xy[0][1], qmaxy = vs_xy[0][1];
+                    for (unsigned i = 1; i < 6; i++) {
+                        qminx = MIN(qminx, vs_xy[i][0]);
+                        qmaxx = MAX(qmaxx, vs_xy[i][0]);
+                        qminy = MIN(qminy, vs_xy[i][1]);
+                        qmaxy = MAX(qmaxy, vs_xy[i][1]);
+                    }
+                    float qw = qmaxx - qminx;
+                    float qh = qmaxy - qminy;
+                    if (qw < 1e-3f || qh < 1e-3f) {
+                        continue;
+                    }
+
+                    float u1_tl = 0, v1_tl = 0, u2_tl = 0, v2_tl = 0;
+                    float u1_tr = 0, v1_tr = 0, u2_tr = 0, v2_tr = 0;
+                    float u1_bl = 0, v1_bl = 0, u2_bl = 0, v2_bl = 0;
+                    float u1_br = 0, v1_br = 0, u2_br = 0, v2_br = 0;
+
+                    for (unsigned i = 0; i < 6; i++) {
+                        if (fabsf(vs_xy[i][0] - qminx) < 1e-2f && fabsf(vs_xy[i][1] - qminy) < 1e-2f) {
+                            u1_tl = vs_uv1[i][0]; v1_tl = vs_uv1[i][1];
+                            u2_tl = vs_uv2[i][0]; v2_tl = vs_uv2[i][1];
+                        }
+                        if (fabsf(vs_xy[i][0] - qmaxx) < 1e-2f && fabsf(vs_xy[i][1] - qminy) < 1e-2f) {
+                            u1_tr = vs_uv1[i][0]; v1_tr = vs_uv1[i][1];
+                            u2_tr = vs_uv2[i][0]; v2_tr = vs_uv2[i][1];
+                        }
+                        if (fabsf(vs_xy[i][0] - qminx) < 1e-2f && fabsf(vs_xy[i][1] - qmaxy) < 1e-2f) {
+                            u1_bl = vs_uv1[i][0]; v1_bl = vs_uv1[i][1];
+                            u2_bl = vs_uv2[i][0]; v2_bl = vs_uv2[i][1];
+                        }
+                        if (fabsf(vs_xy[i][0] - qmaxx) < 1e-2f && fabsf(vs_xy[i][1] - qmaxy) < 1e-2f) {
+                            u1_br = vs_uv1[i][0]; v1_br = vs_uv1[i][1];
+                            u2_br = vs_uv2[i][0]; v2_br = vs_uv2[i][1];
+                        }
+                    }
+
+                    float du1 = MAX(fabsf(u1_tr - u1_tl), fabsf(u1_br - u1_bl));
+                    float dv1 = MAX(fabsf(v1_bl - v1_tl), fabsf(v1_br - v1_tr));
+                    float du2 = MAX(fabsf(u2_tr - u2_tl), fabsf(u2_br - u2_bl));
+                    float dv2 = MAX(fabsf(v2_bl - v2_tl), fabsf(v2_br - v2_tr));
+                    float scale1 = MAX(du1 / qw, dv1 / qh);
+                    float scale2 = MAX(du2 / qw, dv2 / qh);
+                    if (scale1 < 1e-5f) scale1 = 1.0f / 31.0f;
+                    if (scale2 < 1e-5f) scale2 = 1.0f / 28.0f;
+
+                    int x0 = MAX(clip_x0, (int)floorf(qminx));
+                    int x1 = MIN(clip_x1, (int)ceilf(qmaxx));
+                    int y0 = MAX(clip_y0, (int)floorf(qminy));
+                    int y1 = MIN(clip_y1, (int)ceilf(qmaxy));
+                    if (x0 >= x1 || y0 >= y1) {
+                        continue;
+                    }
+
+                    uint32_t base_a = (colour >> 24) & 0xff;
+                    uint32_t base_b = (colour >> 16) & 0xff;
+                    uint32_t base_g = (colour >> 8) & 0xff;
+                    uint32_t base_r = colour & 0xff;
+
+                    for (int y = y0; y < y1; y++) {
+                        float cy = (float)y + 0.5f;
+                        float fy = (cy - qminy) / qh;
+                        int first_in = -1, last_in = -1;
+                        for (int x = x0; x < x1; x++) {
+                            float cx = (float)x + 0.5f;
+                            float fx = (cx - qminx) / qw;
+                            float u1 = (1.0f - fx) * (1.0f - fy) * u1_tl + fx * (1.0f - fy) * u1_tr +
+                                       (1.0f - fx) * fy * u1_bl + fx * fy * u1_br;
+                            float v1 = (1.0f - fx) * (1.0f - fy) * v1_tl + fx * (1.0f - fy) * v1_tr +
+                                       (1.0f - fx) * fy * v1_bl + fx * fy * v1_br;
+                            float u2 = (1.0f - fx) * (1.0f - fy) * u2_tl + fx * (1.0f - fy) * u2_tr +
+                                       (1.0f - fx) * fy * u2_bl + fx * fy * u2_br;
+                            float v2 = (1.0f - fx) * (1.0f - fy) * v2_tl + fx * (1.0f - fy) * v2_tr +
+                                       (1.0f - fx) * fy * v2_bl + fx * fy * v2_br;
+                            float r1 = sqrtf(u1 * u1 + v1 * v1);
+                            float r2 = sqrtf(u2 * u2 + v2 * v2);
+                            float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
+                            float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
+                            if (outer_cov > 0.0f && inner_cov > 0.0f) {
+                                if (first_in < 0) first_in = x;
+                                last_in = x;
+                            }
+                        }
+                        if (first_in < 0) {
+                            continue;
+                        }
+                        any_drawn = true;
+                        int span_w = last_in - first_in + 1;
+                        if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                            continue;
+                        }
+                        for (int x = first_in; x <= last_in; x++) {
+                            float cx = (float)x + 0.5f;
+                            float fx = (cx - qminx) / qw;
+                            float u1 = (1.0f - fx) * (1.0f - fy) * u1_tl + fx * (1.0f - fy) * u1_tr +
+                                       (1.0f - fx) * fy * u1_bl + fx * fy * u1_br;
+                            float v1 = (1.0f - fx) * (1.0f - fy) * v1_tl + fx * (1.0f - fy) * v1_tr +
+                                       (1.0f - fx) * fy * v1_bl + fx * fy * v1_br;
+                            float u2 = (1.0f - fx) * (1.0f - fy) * u2_tl + fx * (1.0f - fy) * u2_tr +
+                                       (1.0f - fx) * fy * u2_bl + fx * fy * u2_br;
+                            float v2 = (1.0f - fx) * (1.0f - fy) * v2_tl + fx * (1.0f - fy) * v2_tr +
+                                       (1.0f - fx) * fy * v2_bl + fx * fy * v2_br;
+                            float r1 = sqrtf(u1 * u1 + v1 * v1);
+                            float r2 = sqrtf(u2 * u2 + v2 * v2);
+                            float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
+                            float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
+                            outer_cov = (outer_cov < 0.0f) ? 0.0f : (outer_cov > 1.0f ? 1.0f : outer_cov);
+                            inner_cov = (inner_cov < 0.0f) ? 0.0f : (inner_cov > 1.0f ? 1.0f : inner_cov);
+                            float cov = outer_cov * inner_cov;
+                            if (cov > 0.0f) {
+                                uint32_t a = (uint32_t)lroundf((float)base_a * cov);
+                                uint32_t b = (uint32_t)lroundf((float)base_b * cov);
+                                uint32_t g = (uint32_t)lroundf((float)base_g * cov);
+                                uint32_t r = (uint32_t)lroundf((float)base_r * cov);
+                                uint32_t src = (a << 24) | (b << 16) | (g << 8) | r;
+                                row[x - first_in] = agx_blend_over(row[x - first_in], src);
+                            }
+                        }
+                        agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                    }
                 }
                 if (any_drawn) {
                     draws++;
