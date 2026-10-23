@@ -175,6 +175,7 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
     if(w->runtime && index==0 && value==0) {
         if(request==0x2100) {
             bool rpc = (length >= 32 && data[0] == 0x01 && data[1] == 0x80);
+            if(rpc) w->darwin = true;
             const uint8_t *cmd_data = rpc ? data + 16 : data;
             size_t cmd_len = rpc ? length - 16 : length;
             if(!wifi_ioctl(w, cmd_data, cmd_len)) goto stall;
@@ -235,10 +236,11 @@ static void wifi_data(USBDevice *dev, USBPacket *p)
     if(p->pid==USB_TOKEN_IN) {
         if(!w->count) { p->status=USB_RET_NAK; return; }
         WifiFrame *f=&w->queue[w->head];
-        if(!f->pos && f->len>=76 && f->data[16]==0x88 && f->data[17]==0x6c) {
+        size_t ev_off = w->darwin ? 20 : 4;
+        if(!f->pos && f->len>=72+ev_off && f->data[12+ev_off]==0x88 && f->data[13+ev_off]==0x6c) {
             qemu_log_mask(LOG_UNIMP,"WIFI RX event=%u status=%u flags=%x\n",
-                          ldl_be_p(f->data+32),ldl_be_p(f->data+36),
-                          lduw_be_p(f->data+30));
+                          ldl_be_p(f->data+28+ev_off),ldl_be_p(f->data+32+ev_off),
+                          lduw_be_p(f->data+26+ev_off));
         }
         size_t n=MIN(p->iov.size,f->len-f->pos);
         usb_packet_copy(p,f->data+f->pos,n); f->pos+=n;
