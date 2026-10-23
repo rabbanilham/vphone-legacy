@@ -24,3 +24,6 @@ Touch-script pacing (`at=` seconds, 16.67 ms ticks) and probe timing stay on the
 4. Save filmstrips (PNG, small) and a JSON summary under `research/evidence/D-time-dilation/`, and write `research/reports/D-time-dilation.md` with a recommendation (which k, if any, as the default for `backend/live_run.py`). Commit to `exp/time-dilation`. Do not merge or push.
 
 Delete each boot's `<output>/images` (the script does) and wait for `uptime` load < 5 before timing measurements. Never write into `build/` except `build/dilation/<run>/` outputs.
+
+## Follow-up 1 (lead, after the quota stop)
+Your previous run stopped on the agy quota with uncommitted work in this worktree: touch tick, settle window and mouse pacing scaled by k (`TOUCH_TICK_NS * vphone_time_dilation()`), plus an `A7 TOUCH DEQUEUE` log, and evidence under `research/evidence/D-time-dilation/` (`k2-unlock-at95`, `k2-unlock-hold`, `k2-unlock-slow`, …). The latest k=2 run (swipe at 95 s) still did not unlock: lock screen through 108 s. Review that diff, commit what is useful (keep k=1 a no-op), then continue with goal 1. If k=2 cannot unlock after a few focused attempts, write down what you ruled out, try k=3 once, and finish the report with whatever you measured (boot time per k is already a result). Always commit and write `research/reports/D-time-dilation.md` before you stop.
