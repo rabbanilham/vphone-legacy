@@ -5508,6 +5508,32 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 /* CA padding clear: observed eight zero-colour quads around the slider mask.
  * Its USC program replaces D with S; transparent source-over is a no-op. */
 #define AGX_USC_COPY UINT64_C(0x99d4fcf52a8c2ef3)
+#define AGX_USC_SPANS UINT64_C(0x1a20cc29e8fcc15b)
+#define AGX_USC_PLUS_L UINT64_C(0x5b133ef7e0c3428c)
+#define AGX_USC_PLUS_L2 UINT64_C(0xa225a18725e48d5c)
+#define AGX_USC_SOLID_PLUS_L UINT64_C(0xf137b90c25ab5471)
+
+/* Additive blend (CoreAnimation plusL / plusLighter): clamp(S + D, 0, 255). */
+static inline uint32_t agx_blend_plus_lighter(uint32_t dst, uint32_t src)
+{
+    uint32_t out = 0;
+    for (unsigned c = 0; c < 32; c += 8) {
+        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff);
+        out |= MIN(v, 255u) << c;
+    }
+    return out;
+}
+
+__attribute__((unused))
+static uint32_t agx_blend_plus_darker(uint32_t dst, uint32_t src)
+{
+    uint32_t out = 0;
+    for (unsigned c = 0; c < 32; c += 8) {
+        int v = (int)((src >> c) & 0xff) + (int)((dst >> c) & 0xff) - 255;
+        out |= (uint32_t)MAX(v, 0) << c;
+    }
+    return out;
+}
 
 /* CoreAnimation narrow Gaussian blur shaders (sigma = 3.5, 6 bilinear tap pairs).
  * Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore. */
@@ -5854,6 +5880,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
     /* Default viewport covers the pass; PPP state updates it. */
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
+    float last_m4[4];
+    bool has_last_m4 = false;
     bool scenable = false;
     uint16_t scindex = 0;
     bool has_rc = false;
@@ -5952,13 +5980,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
             bool is_blur_prog = agx_is_blur_program(prog);
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
-            if ((stride == 16 && !clip_space) ||
-                (found == AGX_TEX_NONE && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
+            bool is_span = stride == 16 && prog == AGX_USC_SPANS;
+            if ((stride == 16 && !clip_space && !is_span) ||
+                (found == AGX_TEX_NONE && !is_span && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
-                AGX_REPLAY_SKIP(stride == 16 && !clip_space ? "stride 16 outside the wallpaper program" :
+                AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
                                 found == AGX_TEX_NONE ? "untextured with unsupported stride" :
                                 "texture wider than texrow");
                 continue;
+            }
+            if (is_span) {
+                count = MIN(w[1], 1024u);
             }
             bool textured = found != AGX_TEX_NONE;
             bool vibrancy = found == AGX_TEX_VIBRANCY;
@@ -6011,6 +6043,63 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 continue;
             }
 
+            float m4[4];
+            bool transformed = false;
+            if (stride != 12) {
+                if (agx_replay_matrix(s, cat, vs_data, m4)) {
+                    memcpy(last_m4, m4, sizeof(m4));
+                    has_last_m4 = true;
+                    transformed = true;
+                } else if (is_span && has_last_m4) {
+                    memcpy(m4, last_m4, sizeof(m4));
+                    transformed = true;
+                }
+            }
+            if (is_span) {
+                for (unsigned k = 0; k + 1 < count; k += 2) {
+                    float xy0[2], xy1[2];
+                    if (!agx_ctx_read(s, cat, buf + (uint64_t)k * stride, xy0, 8) ||
+                        !agx_ctx_read(s, cat, buf + (uint64_t)(k + 1) * stride, xy1, 8)) {
+                        break;
+                    }
+                    if (transformed) {
+                        xy0[0] = (m4[0] * xy0[0] + m4[2]) * vp[0] + vp[1];
+                        xy0[1] = (m4[1] * xy0[1] + m4[3]) * vp[2] + vp[3];
+                        xy1[0] = (m4[0] * xy1[0] + m4[2]) * vp[0] + vp[1];
+                        xy1[1] = (m4[1] * xy1[1] + m4[3]) * vp[2] + vp[3];
+                    }
+                    uint8_t alpha = 0;
+                    agx_ctx_read(s, cat, buf + (uint64_t)k * stride + 15, &alpha, 1);
+                    if (alpha == 0) {
+                        continue;
+                    }
+                    int iy = (int)lroundf(xy0[1] - 0.5f);
+                    if (iy < clip_y0 || iy >= clip_y1) {
+                        continue;
+                    }
+                    float min_x = MIN(xy0[0], xy1[0]);
+                    float max_x = MAX(xy0[0], xy1[0]);
+                    int ix0 = MAX(clip_x0, (int)lroundf(min_x - 0.5f));
+                    int ix1 = MIN(clip_x1, (int)lroundf(max_x - 0.5f));
+                    if (ix0 >= ix1) {
+                        continue;
+                    }
+                    if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, ix0, iy), row, (ix1 - ix0) * 4)) {
+                        continue;
+                    }
+                    uint32_t a = alpha;
+                    uint32_t span_c = (a << 24) | (a << 16) | (a << 8) | a;
+                    for (int x = ix0; x < ix1; x++) {
+                        row[x - ix0] = agx_blend_over(row[x - ix0], span_c);
+                    }
+                    agx_ctx_write(s, cat, agx_surface_gva(&sf, ix0, iy), row, (ix1 - ix0) * 4);
+                    any_drawn = true;
+                }
+                if (any_drawn) {
+                    draws++;
+                }
+                continue;
+            }
             if (!textured && !(stride == 12 && is_blur_prog)) {
                 float vs_xy[64][2];
                 float m4[4];
@@ -6292,8 +6381,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             for (unsigned q_start = 0; q_start + step <= count; q_start += step) {
                 float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
-                float m4[4];
-                bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
                 float quad_xy[3][2], quad_uv[3][2], uv_map[6];
                 bool affine = false;
                 unsigned quad_vertices = 0;
@@ -6402,6 +6489,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                         for (int x = x0; x < x1; x++) {
                             row[x - x0] = prog == AGX_USC_COPY ? colour :
+                                         prog == AGX_USC_SOLID_PLUS_L ? agx_blend_plus_lighter(row[x - x0], colour) :
                                          agx_blend_over(row[x - x0], colour);
                         }
                         agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
@@ -6534,6 +6622,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             row[x - x0] = out;
                         } else if (vibrancy) {
                             row[x - x0] = agx_blend_vibrancy(dst, src);
+                        } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2) {
+                            row[x - x0] = agx_blend_plus_lighter(dst, src);
                         } else {
                             row[x - x0] = agx_blend_over(dst, src);
                         }
