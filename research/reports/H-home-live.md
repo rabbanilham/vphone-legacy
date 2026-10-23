@@ -140,8 +140,10 @@ Prescribed swipe starts at 95 s. Acceptance probes append a Settings tap at
 
 - Rebased build with restored 18-frame settle: **230 unit tests OK, 7 skipped**;
   full native AGX, touch_input and spi_touch contracts pass.
-- Final layout/blend build: **232 unit tests OK, 7 skipped**. Full native AGX (including
-  both Home cases threaded/inline), touch_input and spi_touch contracts pass.
+- Final copy/blend/layout build: **232 unit tests OK, 7 skipped**
+  (`unit-copy-final.log`). Full native AGX, including both Home and both copy/over
+  cases threaded/inline (`agx-copy-final.log`), touch_input and spi_touch
+  contracts pass (`touch-copy-final.log`, `spi-touch-copy-final.log`).
 - `ghost-boot1/`: 155 s, no panic. The 90/105 s screenshots show clean lock
   content and **no dashed slider bar**, but it did not unlock; this is
   **not a Home success**. The native-hook run below separates sleep from a pan
