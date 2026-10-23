@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded native display evidence on independent disks; never synthesizes pixels."""
 import argparse
+from host_wifi import configure_wifi
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -323,6 +324,7 @@ def main():
                    help='Save a QMP framebuffer at these guest-running seconds (repeatable)')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
+    p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     args = p.parse_args()
@@ -419,9 +421,10 @@ def main():
             cmd += ['-gdb', f'unix:{gdb},server=on,wait=off']
         for image in plan.get('auxiliary_images', []):
             cmd += ['-device', f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
+        env = configure_wifi(cmd, args.wifi)
         save_json(out / 'command.json', cmd)
         with (out / 'stdout.log').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
-            proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+            proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, env=env)
             save_json(out / 'process.json', dict(pid=proc.pid))
             qs = gs = None
             try:
