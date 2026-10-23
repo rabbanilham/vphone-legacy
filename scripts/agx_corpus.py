@@ -75,6 +75,14 @@ SCENES = {
         'display_only': False,
         'seconds': 106,
     },
+    # The blank 98..101 s gap of a normal-speed unlock (icons should fly in).
+    'unlock-flyin': {
+        'touch': UNLOCK,
+        'at': [98.3, 99.3, 100.3],
+        'per_at': 15,
+        'display_only': False,
+        'seconds': 106,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],

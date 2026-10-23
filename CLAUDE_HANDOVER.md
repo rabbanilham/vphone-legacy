@@ -862,3 +862,20 @@ Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local 
 - Still visible: the Clock icon hands are square blocks, and the Airplane Mode UISwitch has no track.
 - **MBA:** this push is the go-ahead for MBA queue step 2 (merge `origin/agx-meta-hle` into `wt/wifi`).
 - Next on the MBP: section 26 step 3 (frame-dump corpus and one-command offline replay). `codex` is not installed on the MBP; `agy` is.
+
+## 28. Offline AGX corpus, wallpaper colours, touch IRQ, unlock analysis (Claude, MBP, 2026-10-23)
+
+### Offline corpus (section 26 step 3: done)
+- `scripts/agx_corpus.py capture [--scene …]` boots once per scene (`settings`, `clock`, `calendar`, `unlock`, `unlock-home`, `unlock-flyin`) with `VPHONE_AGX_FRAME_DUMP_AT` windows (new: `_AT`, `_PER_AT`, `_DISPLAY=1`; the JSON sidecar has `vclock_ns` and `dump_window`). Dumps live in `build/agx-corpus/<scene>/dumps` (about 21 MiB each, gitignored).
+- `scripts/agx_corpus.py` (no arguments) compiles the AGX replay core of `s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`) into `backend/agx_replay_host.c`, replays every scene **chained** (each pass sees the pages earlier passes wrote; a dump is taken at submission, before the live render thread drew the passes queued ahead of it), runs the Python audit, and writes `build/agx-corpus/report/index.html` + `summary.json`. 225–335 dumps take about 4 s. `AGX_REPLAY_SKIP(reason)` counts the draws the C replay leaves out.
+- **Caveat:** dumping every pass stalls the guest (21 MiB written per pass on the QEMU thread), so scenes with `display_only: False` are right frame by frame but slow the animation itself. To judge animation timing, capture framebuffers without dumps (`--framebuffer-at` every 0.25 s).
+
+### Fixed
+- **Wallpaper colours** (verified live): the CoreImage clip-space wallpaper source is RGBA. The stock `/Library/Wallpaper/iPhone/101@2x~iphone.png` (blue nebula) matched the yellow live render exactly with R/B exchanged. Fixed in C and Python.
+- **Touch IRQ** (`1cbb103`): in the boots where the unlock swipe never arrived (2 of about 7), the guest read no touch frame at all: `queued=1,2,3,…` from the first tap at 78 s. GPIO22 is edge-triggered and, configured while the line was already low, latched nothing. `touch_enqueue` now pulses the line when frames wait with no status pending. Three boots since then drained normally; not yet a reliability measurement.
+
+### Open, with owners
+- **K, Clock icon hands** (agy brief `research/tasks/K-clock-hands.md`, worktree `../vphone-wt-clock-hands`, branch `wt/clock-hands`): untextured vertex colours are RGBA, not BGRA (second hand 0xff1c3edc = #DC3E1C renders blue; the Clock app's grouped background renders #F4EFEF instead of #EFEFF4), and rotated hands / n=48 path fans are drawn as bounding boxes.
+- **S, slide-to-unlock glint and black bar** (agy brief `S-slider-glint.md`, `../vphone-wt-slider`, branch `wt/slider`): the glyph mask is drawn as 1-pixel spans (prog 0x1a20cc29e8fcc15b, stride 16) that the replay skips, and the label layer's blends are probably plus-lighter/plus-darker, not src-over. The black line and dashes are draw 1 of the 640x416 pass, outside the dest-in rectangle.
+- Both agy workers must be launched by the user in a terminal (the auto-mode classifier blocks Claude from starting `agy --dangerously-skip-permissions`).
+- **Unlock → Home transition:** a no-dump boot at 0.25 s resolution (`build/agx-corpus/transition-live/`) shows the lock content vanishing at about 98 s, about 3 s of bare wallpaper, then a complete Home at 101 s with no icon fly-in. During that gap the GPU is only asked for the wallpaper and the slider; SpringBoard commits Home late and CoreAnimation, whose begin time has already passed, jumps to the end state. This is guest speed (TCG), not the replay. A real fix is time dilation (virtual clock slower than wall time, e.g. `-icount`), which changes all boot timing: **user decision pending.**
