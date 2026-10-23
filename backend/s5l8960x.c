@@ -1527,8 +1527,13 @@ static void touch_timer_cb(void *opaque)
     TouchScriptFrame *f = &s->touch_script.frames[s->touch_step];
     if (f->state == 7) {
         if (s->touch_settle_frames < 0) {
-            int dx = f->x - s->touch_script.frames[0].x;
-            int dy = f->y - s->touch_script.frames[0].y;
+            /* Travel is measured from this gesture's start, not the script's. */
+            unsigned start = s->touch_step;
+            while (start > 0 && s->touch_script.frames[start].state != 1) {
+                start--;
+            }
+            int dx = f->x - s->touch_script.frames[start].x;
+            int dy = f->y - s->touch_script.frames[start].y;
             if (dx < 0) { dx = -dx; }
             if (dy < 0) { dy = -dy; }
             int64_t prev_ns = s->touch_step > 0 ?
