@@ -150,7 +150,7 @@ class AGXPassLoadTests(unittest.TestCase):
 
         # Check agx_replay_frame signature and row-wise clear
         self.assertIn('static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,', source)
-        self.assertIn('bool is_clear, uint32_t pitch)', source)
+        self.assertIn('bool is_clear, uint32_t pitch, uint64_t scissor_base)', source)
         self.assertIn('if (is_clear) {', source)
         self.assertIn('uint32_t zero_row[ARRAY_SIZE(row)];', source)
         self.assertIn('agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, y), zero_row, width * 4);', source)
@@ -161,7 +161,7 @@ class AGXPassLoadTests(unittest.TestCase):
         # Check render thread forwards is_clear
         self.assertIn('job->is_clear = is_clear;', source)
         self.assertIn('agx_replay_frame(job->s, job->cat_base, job->ta, job->target,', source)
-        self.assertIn('job->width, job->height, job->is_clear, job->pitch);', source)
+        self.assertIn('job->width, job->height, job->is_clear, job->pitch, job->scissor_base);', source)
 
     def test_c_compilation_pass_load(self):
         """Compile a C test snippet exercising the clear-row logic."""

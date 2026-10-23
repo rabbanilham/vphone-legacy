@@ -36,6 +36,46 @@ def find_viewport(ppp):
     return None
 
 
+def decode_ppp_clipping(ppp, state=None):
+    if state is None:
+        state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
+    if not ppp:
+        return state
+    hdr = ppp[0]
+    idx = 1
+    if hdr & (1 << 0):
+        if idx < len(ppp):
+            state['scenable'] = bool(ppp[idx] & (1 << 16))
+            idx += 1
+    if hdr & (1 << 1): idx += 1
+    if hdr & (1 << 2): idx += 1
+    if hdr & (1 << 3): idx += 1
+    if hdr & (1 << 4): idx += 1
+    if hdr & (1 << 5):
+        if idx < len(ppp):
+            state['scindex'] = ppp[idx] & 0xffff
+            idx += 1
+    if hdr & (1 << 6): idx += 4
+    if hdr & (1 << 7): idx += 1
+    if hdr & (1 << 8): idx += 1
+    if hdr & (1 << 9): idx += 1
+    if hdr & (1 << 10):
+        if idx + 1 < len(ppp):
+            rc0 = ppp[idx]
+            rc1 = ppp[idx + 1]
+            idx += 2
+            if (rc0 >> 31) & 1:
+                state['has_rc'] = True
+                state['rc_box'] = (((rc0 >> 16) & 0x1ff) * 32,
+                                   ((rc0 & 0x1ff) + 1) * 32,
+                                   ((rc1 >> 16) & 0x1ff) * 32,
+                                   ((rc1 & 0x1ff) + 1) * 32)
+            else:
+                state['has_rc'] = False
+                state['rc_box'] = None
+    return state
+
+
 def find_matrix(f, vs_data):
     """Orthographic vertex matrix (column-major 4x4) referenced by the vertex PDS data."""
     try:
@@ -339,10 +379,10 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     tex = texture(f, ppp)
     prog = program(f, ppp)
 
-    if not tex and stride != 20:
+    if not tex and stride not in (20, 28):
         if stride == 12 and prog in BLUR_PROGRAMS:
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
-        return 'skipped: untextured with stride != 20', {'stride': stride, 'prog': hex(prog)}
+        return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
 
     if tex and tex['w'] * 4 > 0x10000:
         return 'skipped: texture wider than texrow', {'width': tex['w']}
@@ -476,7 +516,29 @@ def main():
                     fb[off:off + 4] = bytes((r, g, b, a))
                 except KeyError:
                     pass
+    scissor_base = struct.unpack_from('<I', f.type1_command, 0x50)[0]
+    clip_state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
     for vs_data, ppp, draw, viewport in walk(f):
+        clip_state = decode_ppp_clipping(ppp, clip_state)
+        clip_x0, clip_y0 = 0, 0
+        clip_x1, clip_y1 = target_w, target_h
+        if clip_state['scenable'] and scissor_base:
+            try:
+                w0 = f.u32(scissor_base + clip_state['scindex'] * 8)
+                w1 = f.u32(scissor_base + clip_state['scindex'] * 8 + 4)
+                clip_x0 = max(clip_x0, w0 >> 16)
+                clip_x1 = min(clip_x1, w0 & 0xffff)
+                clip_y0 = max(clip_y0, w1 >> 16)
+                clip_y1 = min(clip_y1, w1 & 0xffff)
+            except (KeyError, ValueError):
+                pass
+        if clip_state['has_rc'] and clip_state['rc_box']:
+            rc_x0, rc_x1, rc_y0, rc_y1 = clip_state['rc_box']
+            clip_x0 = max(clip_x0, rc_x0)
+            clip_x1 = min(clip_x1, rc_x1)
+            clip_y0 = max(clip_y0, rc_y0)
+            clip_y1 = min(clip_y1, rc_y1)
+
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
         m = find_matrix(f, vs_data) if stride != 12 else None
@@ -507,8 +569,10 @@ def main():
             else:
                 xs = [v[0] for v in q_vs]
                 ys = [v[1] for v in q_vs]
-            x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
-            y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
+            x0 = max(clip_x0, int(round(min(xs))))
+            x1 = min(clip_x1, target_w, pw, int(round(max(xs))))
+            y0 = max(clip_y0, int(round(min(ys))))
+            y1 = min(clip_y1, target_h, ph, int(round(max(ys))))
             print(f'draw n={count} stride={stride} rect=({x0},{y0})-({x1},{y1}) tex=' +
                   (tex if isinstance(tex, str) else str(tex and {k: (hex(v) if isinstance(v, int) else v)
                                                              for k, v in tex.items() if k != 'tsw'})))
@@ -614,7 +678,7 @@ def main():
                         b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
                         d = (y * target_w + x) * 4
                         fb[d:d + 4] = bytes((r, g, b, a))
-            elif stride == 20:
+            elif stride in (20, 28):
                 colour = struct.unpack_from('<I', q_vs[0][2], 0)[0]
                 r, g, b, a = (colour >> 16) & 0xff, (colour >> 8) & 0xff, colour & 0xff, colour >> 24
                 for y in range(y0, y1):

@@ -115,7 +115,7 @@ REPLAY_MASK_CODE = bytes.fromhex(
 REPLAY_BLUR_CODE = bytes.fromhex(
     '2a0a949999af1b800033000080408001880020ff3a8a80949999af1b800033000082'
     '4080038800210024088b4520b006c44010c0400002806aff4620f44c8060')
-REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light')
+REPLAY_CASES = ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'dest-in', 'gauss-blur', 'clip-top-left', 'clip-bottom-right', 'rotate-uv', 'vibrancy-dark', 'vibrancy-light', 'scissor-clip')
 
 
 def blend_vibrancy(dst, src):
@@ -220,7 +220,7 @@ def replay_blob(case=True):
     if synthetic:
         assert case in REPLAY_CASES, case
         expected[:] = b'\xa5' * len(expected)
-        if case in ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense'):
+        if case in ('pairing', 'pairing-batch', 'wait-stamp', 'geometry-lifetime', 'wallpaper', 'transform', 'dense', 'scissor-clip'):
             # One solid draw; terminate before the original texture draw.
             put(state + 10 * 4, '<I', 0xc0000000)
             draws = 1
@@ -268,6 +268,15 @@ def replay_blob(case=True):
                 for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
                     put(state + 0x200 + i * 20, '<4fI', u * 40, v * 40, 0, 1, 0xff112233)
                 rect = (0, 0, 40, 40)
+            elif case == 'scissor-clip':
+                # Scissor base at +0x50 in 3D command
+                put(QUEUE + 0x300 + 0x50, '<I', state_gva + 0xa00)
+                put(state + 0xa00, '<2I', (4 << 16) | 12, (4 << 16) | 12)
+                put(state + 0x100, '<3I', (1 << 0) | (1 << 5), 1 << 16, 0)
+                put(state + 5 * 4, '<I', 3 << 8)
+                for i, (u, v) in enumerate(((0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1))):
+                    put(state + 0x200 + i * 20, '<4fI', u * 16, v * 16, 0, 1, 0xff112233)
+                rect = (4, 4, 12, 12)
             expect_rect(rect, lambda x, y: 0xff112233)
         else:
             destination = 0xff907050
@@ -498,6 +507,8 @@ def run_case(fill, context=True, replay=None, replay_thread=None):
                         command(fp, 'pmemsave', {'val': pa, 'size': 0x1000, 'filename': str(path)})
                         actual.extend(path.read_bytes())
                     assert actual == replay_expected, (f'{replay!r}: replay pixels/padding', [(i, actual[i:i+4].hex(), replay_expected[i:i+4].hex()) for i in range(0, len(actual), 4) if actual[i:i+4] != replay_expected[i:i+4]][:8])
+                if os.environ.get('VPHONE_DISPLAY') == 'cocoa':
+                    time.sleep(1.0)
                 command(fp, 'quit')
             assert proc.wait(timeout=5) == 0
             trace = (root / 'trace.log').read_text()
