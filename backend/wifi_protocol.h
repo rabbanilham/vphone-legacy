@@ -91,9 +91,14 @@ static bool wifi_enqueue(WifiProtocol *s, const uint8_t *p, size_t n)
     WifiFrame *f=&s->queue[(s->head+s->count)%WIFI_QUEUE];
     f->pos=0;
     if(s->darwin) {
-        if(n>WIFI_FRAME_MAX-20) return false;
+        /* Broadcom FullMAC bulk IN frames on Darwin HSIC require a 16-byte
+         * Channel 2 header (0xa001) and a 4-byte FCS/trailer so that
+         * DeviceBuffer length > bdc_offset + 0x4c + datalen in handleEventPacket.
+         */
+        size_t pad = 4;
+        if(n > WIFI_FRAME_MAX - 20 - pad) return false;
         uint8_t hdr[16]={0};
-        size_t total_payload = 4 + n;
+        size_t total_payload = 4 + n + pad;
         wifi_st16(hdr, 0xa001);
         wifi_st16(hdr + 4, 16 + total_payload);
         wifi_st16(hdr + 6, s->notification_seq_rx++);
@@ -104,7 +109,8 @@ static bool wifi_enqueue(WifiProtocol *s, const uint8_t *p, size_t n)
         memcpy(f->data, hdr, 16);
         memcpy(f->data+16, (uint8_t[]){0x20,0,0,0}, 4);
         memcpy(f->data+20, p, n);
-        f->len = 20 + n;
+        memset(f->data+20+n, 0, pad);
+        f->len = 20 + n + pad;
     } else {
         if(n>WIFI_FRAME_MAX-4) return false;
         memcpy(f->data,(uint8_t[]){0x20,0,0,0},4);
@@ -157,18 +163,11 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
 static void wifi_scan(WifiProtocol *s, uint16_t sync)
 {
     uint8_t p[320]={0};
-    if(s->darwin) {
-        size_t n=wifi_bss(s,p+16);
-        wifi_st32(p,16+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
-        wifi_st32(p+12,0);
-        wifi_event(s,69,8,0,p,16+n);
-        wifi_st32(p,16); wifi_st16(p+10,0); wifi_event(s,69,0,0,p,16);
-    } else {
-        size_t n=wifi_bss(s,p+12);
-        wifi_st32(p,12+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
-        wifi_event(s,67,8,0,p,12+n);
-        wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,67,0,0,p,12);
-    }
+    size_t n=wifi_bss(s,p+12);
+    unsigned ev = s->darwin ? 69 : 67;
+    wifi_st32(p,12+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
+    wifi_event(s,ev,8,0,p,n+12);
+    wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,ev,0,0,p,12);
 }
 static void wifi_disconnect(WifiProtocol *s)
 {
