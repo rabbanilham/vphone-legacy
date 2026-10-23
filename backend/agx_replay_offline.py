@@ -422,6 +422,9 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
         if count == 12:
             return 'replayed exactly: solid multi-quad (2 quads, stride=20)', {'count': count}
         return 'replayed exactly: solid quad (stride=20)', {'count': count}
+    if not tex and stride == 28:
+        # Untextured glyphs (clock digits): BGRA colour at +16, like stride 20.
+        return 'replayed exactly: solid quad (stride=28)', {'count': count}
 
     is_blur = prog in BLUR_PROGRAMS
     is_dest_in = prog == DEST_IN
@@ -660,6 +663,8 @@ def main():
                         else:
                             tx = max(0, min(tex['w'] - 1, int(fu)))
                             b, g, r, a = row0[tx]
+                        if stride == 16 and prog == WALLPAPER:
+                            b, r = r, b     # CoreImage wallpaper source is RGBA
                         if tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255

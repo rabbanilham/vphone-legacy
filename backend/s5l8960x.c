@@ -552,6 +552,8 @@ struct A7State {
     bool agx_last_ta_valid[16];
     unsigned agx_frame_dump_count;
     uint64_t agx_frame_dump_seen;     /* qualifying frames seen, for SKIP/EVERY */
+    unsigned agx_frame_dump_window;   /* 1 + current DUMP_AT index, 0 before the first */
+    unsigned agx_frame_dump_in_window;
     uint64_t agx_shared_gva;
     uint32_t agx_meta_alive_count;
     uint32_t agx_queues[32];
@@ -4971,6 +4973,39 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
         return;
     }
     {
+        /* AT lists virtual-clock seconds, one per screen of a corpus run;
+         * each opens a window for the next PER_AT qualifying passes. */
+        const char *at_env = getenv("VPHONE_AGX_FRAME_DUMP_AT");
+        if (at_env) {
+            const char *per_env = getenv("VPHONE_AGX_FRAME_DUMP_PER_AT");
+            unsigned per_at = per_env ? strtoul(per_env, NULL, 0) : 2;
+            double now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9;
+            unsigned window = 0, index = 0;
+            for (const char *p = at_env; *p; index++) {
+                char *end;
+                double at = strtod(p, &end);
+                if (end == p) {
+                    break;
+                }
+                if (at <= now) {
+                    window = index + 1;
+                }
+                p = *end == ',' ? end + 1 : end;
+            }
+            if (!window) {
+                return;
+            }
+            if (window != s->agx_frame_dump_window) {
+                s->agx_frame_dump_window = window;
+                s->agx_frame_dump_in_window = 0;
+            }
+            if (s->agx_frame_dump_in_window >= per_at) {
+                return;
+            }
+            s->agx_frame_dump_in_window++;
+        }
+    }
+    {
         /* SKIP leaves early boot frames out; EVERY spreads dumps over time. */
         const char *skip_env = getenv("VPHONE_AGX_FRAME_DUMP_SKIP");
         const char *every_env = getenv("VPHONE_AGX_FRAME_DUMP_EVERY");
@@ -5077,12 +5112,15 @@ finish:
                      "\"queue\": \"0x%x\", \"ta_queue\": \"0x%x\",\n"
                      "  \"display_mmu_table\": \"0x%llx\", \"record_count\": %llu, "
                      "\"capped\": %s, \"ta_valid\": %s,\n"
+                     "  \"vclock_ns\": %lld, \"dump_window\": %u,\n"
                      "  \"type1_command\": \"%s\",\n  \"ta_command\": \"%s\"\n}\n",
                      context, (unsigned)ldl_le_p(header + 12),
                      (unsigned long long)cat, (unsigned long long)target,
                      queue, s->agx_last_ta_queue[context],
                      (unsigned long long)s->disp_mmu_table, (unsigned long long)pages,
                      capped ? "true" : "false", ta_valid ? "true" : "false",
+                     (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                     s->agx_frame_dump_window,
                      render_hex, ta_hex);
     close_result = fclose(json);
     json = NULL;
@@ -5164,6 +5202,13 @@ typedef struct AGXRenderJob {
 
     struct AGXRenderJob *next;
 } AGXRenderJob;
+
+/* AGX_REPLAY_CORE_BEGIN: from here to AGX_REPLAY_CORE_END is also compiled
+ * into the offline host harness (backend/agx_replay_host.c), which defines
+ * AGX_REPLAY_SKIP to count the draws that replay leaves out. */
+#ifndef AGX_REPLAY_SKIP
+#define AGX_REPLAY_SKIP(reason) do { } while (0)
+#endif
 
 #define AGX_PDS_HEAP UINT64_C(0x600000000)
 
@@ -5885,6 +5930,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             count = MIN(w[1], 64u);
             if (!vs_data || !agx_ctx_read(s, cat, vs_data, &stride, 4) ||
                 !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 12 || stride > 64) {
+                AGX_REPLAY_SKIP("no vertex data or stride outside 12..64");
                 continue;
             }
 
@@ -5895,6 +5941,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             if ((stride == 16 && !clip_space) ||
                 (found == AGX_TEX_NONE && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
+                AGX_REPLAY_SKIP(stride == 16 && !clip_space ? "stride 16 outside the wallpaper program" :
+                                found == AGX_TEX_NONE ? "untextured with unsupported stride" :
+                                "texture wider than texrow");
                 continue;
             }
             bool textured = found != AGX_TEX_NONE;
@@ -6163,6 +6212,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
                             src = texrow[tx];
                         }
+                        if (clip_space) {
+                            /* CoreImage's wallpaper source is RGBA (stock
+                             * 101@2x matches only with R/B exchanged). */
+                            src = (src & 0xff00ff00u) | ((src >> 16) & 0xff) | ((src & 0xff) << 16);
+                        }
                         uint32_t dst = row[x - x0], out = 0;
                         if (tint != 0xffffffff) {
                             uint32_t m = 0;
@@ -6207,6 +6261,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     qemu_log_mask(LOG_UNIMP, "AGX replay target 0x%llx draws %u\n",
                   (unsigned long long)target, draws);
 }
+/* AGX_REPLAY_CORE_END */
 
 /* Publish one finished job (main loop, BQL held). */
 static void agx_replay_complete_job(AGXRenderJob *job)
@@ -6496,7 +6551,10 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
         const uint8_t *dump_ta = agx_find_ta(s, context_id, raw);
         bool offscreen = (ldl_le_p(raw + 0x74) & 0xffff) != 639 ||
                          (ldl_le_p(raw + 0x70) & 0xffff) != 1135;
+        /* OFFSCREEN=1 keeps only offscreen passes, DISPLAY=1 only display ones
+         * (load passes, so each replays to the whole screen). */
         if ((!getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") || offscreen) &&
+            (!getenv("VPHONE_AGX_FRAME_DUMP_DISPLAY") || !offscreen) &&
             (!min_env || (dump_ta && agx_vdm_draw_count(s, cat_base, dump_ta) >=
                                      strtoul(min_env, NULL, 0)))) {
             agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
@@ -7255,6 +7313,8 @@ static void a7_reset(void *opaque)
     memset(s->agx_last_ta_valid, 0, sizeof(s->agx_last_ta_valid));
     s->agx_frame_dump_count = 0;
     s->agx_frame_dump_seen = 0;
+    s->agx_frame_dump_window = 0;
+    s->agx_frame_dump_in_window = 0;
     s->agx_shared_gva = 0;
     s->agx_queue_count = 0;
     s->agx_pending_doorbells = 0;
