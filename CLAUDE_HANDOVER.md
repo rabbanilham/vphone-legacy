@@ -718,3 +718,63 @@ Merged into `agx-meta-hle`: `wt/live-swipe` (556d24b) and `wt/lock-gfx` (fba5381
   - Home appeared live in only 1 of 4 boots before G2. Reliability after the merge has been checked on one boot only.
   - Codex task H (`wt/home-live`, based on `wt/live-swipe` without G2) is investigating that intermittency. It should rebase on `agx-meta-hle` before its results are judged.
   - agy W continues native Wi-Fi acceptance on `wt/wifi`. Its current lead is that the iOS driver rejects the DT `local-mac-address`.
+
+## 25. Moving to another Mac: state, strategy, how to resume (Claude, 2026-10-23 evening)
+
+The user is moving this work to a more powerful Mac. Read this section first, then section 24.
+
+### Branch state (local; push status is in the table)
+
+| Branch | Head | What it contains | On origin? |
+| --- | --- | --- | --- |
+| `agx-meta-hle` | this commit | Integration branch: section 24 merges (live lock screen and Home, short swipe). Main checkout `/Users/bagas/Downloads/vphone-legacy`. | origin is at e63a591; push needed |
+| `wt/home-live` | a132fa4 (+ uncommitted edits while Codex H runs) | Codex H, rebased on `agx-meta-hle`. Fixes Home icon ghosting: an opaque wallpaper draw was misclassified as vibrancy because the next allocation's luma constants followed its texture descriptor. Also fixes a glyph texture mistaken for a display surface (corrupt Compass/Phone labels, dashed bar by the slider). Adds keep-awake taps for probes and a Home dirty-redraw contract. One fresh boot passed: Home without ghosts at 105/140 s, and a tap opened Settings. The final 3-boot series was still running. **Next: check its report `research/reports/H-home-live.md`, then merge.** | no |
+| `wt/wifi` | 064c653 | agy W: BCM43342 HSIC Wi-Fi, merged with `agx-meta-hle` at e63a591. The latest commit emulates the runtime descriptor and patches the DT `local-mac-address`, which the iOS driver had rejected as invalid. Native acceptance runs are `research/acceptance-wifi-native-1..7/` (untracked). Stages 1–6 (enumeration, driver attach, scan, join, DHCP, Settings) are not all proven. **Next: read the W report (when written) and the latest acceptance run, then continue from the first failing stage.** | no |
+| `wt/lock-gfx`, `wt/live-swipe` | 8ca7caa, d096333 | Already merged into `agx-meta-hle`. Can be deleted. | no |
+
+The worktrees on the old Mac are `/Users/bagas/Downloads/vphone-wt-<name>`. On the new Mac, recreate only what is needed with `git worktree add ../vphone-wt-<name> <branch>`, plus the per-worktree setup below.
+
+### Workers (all were on the old Mac; none carry over)
+- Codex CLI: `codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" --dangerously-bypass-approvals-and-sandbox -C <worktree> "<prompt>" < /dev/null`. Resume with `codex exec resume -m gpt-6.1-sol ... <session-id> "<msg>"`. Session ids are local to the old Mac. On the new Mac start fresh: give the worker the branch's report plus the relevant handover section.
+- agy: `agy --model gemini-3.8-flash-high --dangerously-skip-permissions -p="<prompt>"`, launched in a script that `cd`s to the worktree. `--conversation <id> -i "..."` resumes only on the same machine. On the first run in a folder agy asks "trust this folder", and only the user can press Enter.
+- Failure modes seen today: Codex usage limit, agy "Individual quota reached" (fix with `/logout` and a new account), and Codex "Selected model is at capacity" (retry later; the user chose to keep gpt-6.1-sol).
+- Task prompts and launch scripts are in `research/tasks/` (committed): `_common.md` holds the shared rules, plus `G-`, `G2-`, `T-`, `W-` and `H-*.md` and the `run-*`/`resume-*` scripts. **The scripts hard-code `/Users/bagas/Downloads/...` paths.**
+
+### Strategy agreed with the user (fast and effective)
+The user judged graphics progress over half a day too slow. Root causes:
+- Every fix was validated with 150 s live boots, three of them per fix, while three workers shared the CPU (load 7–8).
+- Two workers fixed the same scissor bug separately (G2 on the lock clock, H on Home).
+- Restarts from worker limits and capacity errors, and broad prompts.
+
+From now on:
+1. **Offline first.** Record one frame-dump corpus from the merged build: lock screen, Home, Settings, one app. Use `VPHONE_AGX_FRAME_DUMP=<dir>`, `_COUNT`, `_SKIP`/`_EVERY`, and `_OFFSCREEN=1`. Then add one command (to build) that replays every dump through the C replay and through `backend/agx_replay_offline.py` (`--audit`), producing a contact sheet and a list of failed or skipped draws in under a minute. Develop fixes against that corpus. Run a live boot only at merge time.
+2. **One renderer owner at a time.** Only one worker edits the AGX replay (`backend/s5l8960x.c` replay, `agx_replay_offline.py`). Give it a measurable offline target, for example "failed draws in the Home dump: N → 0". Other workers analyse or decode only.
+3. **One live boot per merge**, not three per fix. Use three boots only for intermittent problems.
+4. **CPU budget.** Wi-Fi boots must not overlap graphics boots. Wait for load < 5 before any timing measurement.
+5. **Claude integrates.** Merge, rebuild, one boot, a short report, and short single-target prompts for workers.
+
+**Immediate next steps:**
+1. Merge `wt/home-live` after reviewing it (rebuild, tests, one boot).
+2. Build the corpus and the offline command.
+3. Take the next graphics target from the corpus audit (Settings/app screens).
+4. Resume Wi-Fi without overlapping graphics boots.
+
+### Setting up the new Mac
+- **Keep the same path if possible: `/Users/bagas/Downloads/vphone-legacy`.** Boot plans store absolute paths. `build/virtual-activated-profile-v5/boot/boot_plan.json` points to `build/virtual-activated-profile-v5/boot/KernelMemory.bin` and `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin`. The noisp/nooscar plans point into their own directories. With a different user or path, rewrite them: `grep -rl /Users/bagas/Downloads/vphone-legacy build backend/evidence | xargs sed -i '' 's|/Users/bagas/Downloads/vphone-legacy|<new root>|g'`.
+- **Code:** `git clone https://github.com/rabbanilham/vphone-legacy.git` and `git checkout agx-meta-hle`, after the branches above are pushed.
+- **Large untracked inputs to copy** (git ignores them). The old repo folder is 87 GB, mostly evidence; the minimum set is about 3.3 GB:
+  - `build/virtual-activated-profile-v5/` (3.1 GB, the default `live_run.py` profile: system.raw, data.raw, boot/, pinned QEMU).
+  - `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/`, `boot-plan-smp-nooscar/`, `boot-plan-smp-noisp/` (36 MB each) and the hook JSONs in that directory (`sb-scroll-hooks.json` and others, `*.json` at its top level).
+  - Optional: `backend/evidence/merge-20261023-live/` (the last merged live run) and `backend/evidence/virtual-activated-20261023/render-dumps/` (Home frame dumps for offline replay).
+  - Optional, for baseline/setup work: `build/diagnostic/` (8 GB).
+  - Copy with `rsync -a --progress <old>:/Users/bagas/Downloads/vphone-legacy/<path> <same path>`, or an external disk. APFS clones are not preserved over rsync; that's fine.
+- **Host tools:** Homebrew `glib pixman libslirp` (installed on the old Mac). Python venvs:
+  ```bash
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+  python3 scripts/qemu/build_backend.py --fetch --install-build-deps
+  ```
+  This creates `backend/.venv` with meson/ninja, clones pinned QEMU into `backend/upstream`, and builds `backend/bin/qemu-system-aarch64`. Then run `.venv/bin/python -m unittest discover -s tests` (227 tests pass on `agx-meta-hle`) and `VPHONE_DISPLAY=cocoa .venv/bin/python backend/agx_contract_test.py`.
+- **Per worktree:** symlink `build`, `.venv` and `backend/.venv` to the main checkout. Copy `backend/upstream` with `cp -cR` so each worktree builds its own QEMU, then run `backend/.venv/bin/python scripts/qemu/build_backend.py`.
+- **Smoke test:** `.venv/bin/python backend/live_run.py` opens the Cocoa window. Lock screen at about 90 s; unlock with a drag across "slide to unlock"; the display sleeps about 30 s after the lock screen appears. For a timed check use `research/tasks/merge-live.sh`: short swipe at 95 s, captures at 90/105/140 s, clones deleted afterwards.
+- **Also install:** Codex CLI and agy (Antigravity CLI), logged in, if workers will be used.

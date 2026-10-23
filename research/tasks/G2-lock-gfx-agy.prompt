@@ -1,0 +1,29 @@
+# Task G2 (agy): continue Codex's lock-screen graphics work
+Worktree: /Users/bagas/Downloads/vphone-wt-lock-gfx (branch wt/lock-gfx). Report id: G2-lock-gfx (also update research/reports/G-lock-gfx.md).
+
+Codex was stopped mid-task (usage limit). FIRST read `research/reports/G-lock-gfx.md` in this worktree: it lists what Codex changed (all UNCOMMITTED in the working tree: backend/s5l8960x.c, agx_replay_offline.py, agx_frame.py, agx_contract_test.py, display_probe.py, tests), what works, and the evidence in backend/evidence/G-lock-gfx/. Keep Codex's changes; build on them. The full Codex log is /Users/bagas/Downloads/vphone-legacy/research/tasks/G-lock-gfx.log (read the narration, skip the huge outputs).
+
+## Current state
+- Live lock screen now shows the star-field wallpaper + "slide to unlock" (final/lock-75.png). Clock and date are still missing.
+- Live Home after unlock: still wallpaper + small white rectangle (final/home-115.png), although the isolated C replay of the same dump draws Home (c-home.png).
+- Latest finding (cursor-audit-r2): the clock IS drawn into all three display buffers, then ERASED by a later one-draw wallpaper pass. Suspected: missing clipping / scissor / dirty-region handling on that draw, so the full-screen wallpaper redraw covers regions it should not touch.
+- backend/bin/qemu-system-aarch64 is OLDER than the last s5l8960x.c edit: rebuild first.
+
+## Steps
+1. Rebuild QEMU (`backend/.venv/bin/python scripts/qemu/build_backend.py`), run `.venv/bin/python -m unittest discover -s tests` and `backend/agx_contract_test.py` (Cocoa window: VPHONE_DISPLAY=cocoa). Then commit Codex's WIP as-is on wt/lock-gfx ("WIP from Codex: ...", Co-Authored-By: Codex <noreply@openai.com>) so it is safe.
+2. Decode the state of the one-draw wallpaper pass that overwrites the clock (scissor/clip rect, ISP/PPP state words, dirty region, load/store flags, which TA it pairs with) and compare with the pass that draws the clock. Implement the missing clip in the live replay AND the offline mirror. Add a contract: a clipped redraw must not touch pixels outside its region.
+3. Live probe (display_probe.py, VPHONE_DISPLAY=cocoa, `--framebuffer-at 75 --framebuffer-at 90 --framebuffer-at 115 --framebuffer-at 140`, unlock swipe `VPHONE_TOUCH_SCRIPT='at=95;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up'`): check clock+date on the lock screen and Home icons/dock after unlock. If Home is still missing, apply the same analysis to the Home passes.
+4. Check the wallpaper colour channel order (BGRA vs RGBA) against the source texture.
+5. Remove or env-gate the temporary `agx_audit_clock` tracing.
+6. Tests + contracts pass, commit, update the report with PASS/FAIL per goal and evidence paths.
+## Common rules (all workers)
+- Read CLAUDE_HANDOVER.md sections 20-23 first (and backend/README.md for tooling). The project emulates an iPhone 5s (A7, iOS 7) in a patched QEMU (`backend/s5l8960x.c`).
+- Work ONLY in your own worktree and commit only to your own branch. Do not touch /Users/bagas/Downloads/vphone-legacy (main checkout) or any other worktree, do not merge into other branches, do not push.
+- `build/` is a symlink to the shared image store: never write into it. The default profile is `build/virtual-activated-profile-v5/` (plan `boot/boot_plan.json`, `system.raw`, `data.raw`); `backend/live_run.py` uses it by default with MTTCG and always clones images. For timed probes use `backend/display_probe.py` with `--plan/--diagnostic-system/--diagnostic-data` pointing at those files and a fresh `--output` under your worktree.
+- Build your own QEMU in this worktree: `backend/.venv/bin/python scripts/qemu/build_backend.py` (writes backend/bin/qemu-system-aarch64 here). Rebuild once before blaming a regression; compare `AGX replay target` vs `AGX RT queue` counts in qemu-trace.log.
+- Every QEMU launch must show the Cocoa window: `VPHONE_DISPLAY=cocoa` for display_probe.py; live_run.py always does.
+- Delete disposable image clones (`<output>/images`, ~3 GB) after each probe. Keep evidence small (logs, PNGs, json).
+- macOS mediaanalysisd sometimes loads the CPU; wait for `uptime` load < 5 before timing measurements. Other workers run QEMU in parallel; keep at most one QEMU of your own running at a time.
+- Lock screen timing on this profile: "slide to unlock" around 90 s guest; the display idles off ~30 s after content appears (touches are ignored while dark). Working scripted unlock: `VPHONE_TOUCH_SCRIPT='at=95;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up'`.
+- No guest-binary patching unless your task says so. Fix things in the emulator/board model.
+- Write your report to `research/reports/<task-id>.md` (what you found, what changed, evidence paths, PASS/FAIL per goal, what is still open) and commit code + report with a clear message ending in a `Co-Authored-By:` line for yourself. Do not claim success without evidence.
