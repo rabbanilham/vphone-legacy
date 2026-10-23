@@ -853,3 +853,12 @@ Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local 
   - On agy quota: `/logout` and switch accounts. On a Codex limit: stop. On Codex capacity errors: retry later with the same model.
 - These rules were Claude memories on the MBA. A fresh Claude on the MBP must take them from here.
 - Sync through origin only: `git fetch` before starting work, small commits, push branches often. No force-push on shared branches.
+
+## 27. MBP set up; `wt/home-live` merged and verified (Claude, 2026-10-23)
+
+- **MBP checkout is `/Users/bagas/Documents/Projects/vphone/vphone-legacy`**, not `~/Downloads/...`. `build/virtual-activated-profile-v5/` was copied from the MBA (system/data/plan/profile hashes match `profiles/virtual-activated/`). Its `boot/boot_plan.json` was rewritten to this root; the MBA original is kept as `boot_plan.json.orig-mba`. The plan's `ANSRegion.bin` (sha256 `e45348cd…`) was cloned from `build/ios712-validated/boot/` into `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/`. No other keybag evidence or render dumps are on the MBP yet.
+- `wt/home-live` merged into `agx-meta-hle`. 232 unit tests OK (3 pass-load tests now skip when the probe-164 dumps are absent); agx, touch_input, spi_touch and smp contracts pass.
+- `research/tasks/merge-live.sh` now runs from any checkout, uses H's keep-awake touch script and captures 90/105/140/152 s. One live boot (`backend/evidence/merge-20261023-mbp-live/`, 160 s, MTTCG, no panic): lock screen at 90 s, swipe unlocks, Home without ghosting at 105/140 s, Settings open at 152 s (Wi-Fi: Off).
+- Still visible: the Clock icon hands are square blocks, and the Airplane Mode UISwitch has no track.
+- **MBA:** this push is the go-ahead for MBA queue step 2 (merge `origin/agx-meta-hle` into `wt/wifi`).
+- Next on the MBP: section 26 step 3 (frame-dump corpus and one-command offline replay). `codex` is not installed on the MBP; `agy` is.
