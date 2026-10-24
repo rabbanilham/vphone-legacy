@@ -215,16 +215,14 @@ def build_harness(out_dir):
     return binary
 
 
-def replay_c(binary, dump, out_png):
-    rgba = out_png.with_suffix('.rgba')
-    result = subprocess.run([str(binary), str(dump), str(rgba)], capture_output=True, text=True)
+def replay_c(binary, dump, rgba_path):
+    result = subprocess.run([str(binary), str(dump), str(rgba_path)], capture_output=True, text=True)
     if result.returncode:
-        return {'error': (result.stderr or f'exit {result.returncode}').strip()[-400:]}
+        err = (result.stderr or f'exit {result.returncode}').strip()[-400:] or f'exit {result.returncode}'
+        return {'error': err}
+    if not rgba_path.exists():
+        return {'error': f'Missing RGBA output file {rgba_path.name}'}
     info = json.loads(result.stdout)
-    data = rgba.read_bytes()
-    w, h = struct.unpack_from('<II', data, 4)
-    out_png.write_bytes(png_bytes(w, h, data[12:]))
-    rgba.unlink()
     info['stderr'] = result.stderr.strip().splitlines()[-5:]
     return info
 
@@ -232,12 +230,12 @@ def replay_c(binary, dump, out_png):
 def parse_scenes_arg(scenes_arg):
     if not scenes_arg:
         return None
-    res = set()
+    res = []
     for item in scenes_arg:
         for part in str(item).split(','):
             part = part.strip()
-            if part:
-                res.add(part)
+            if part and part not in res:
+                res.append(part)
     return res if res else None
 
 
@@ -248,7 +246,7 @@ def parse_frame_spec(spec: str):
       - Single frame: '5' or 'frame-5'
       - Ranges: '5..10', '5-10', '5:10'
       - Open-start: '..10', ':10', '-10'
-      - Open-end: '5..', '5:'
+      - Open-end: '5..', '5:', '5-'
       - Comma-separated combinations: '1,3,5..7'
     """
     if not spec:
@@ -258,73 +256,113 @@ def parse_frame_spec(spec: str):
     for raw_part in spec.split(','):
         part = raw_part.strip()
         if not part:
-            continue
+            raise ValueError(f"Empty segment in frame filter: '{spec}'")
         if part.startswith('frame-'):
             sub = part[len('frame-'):]
-            if sub.isdigit():
-                val = int(sub)
-                matchers.append(lambda idx, stem, v=val, s=part: idx == v or stem == s)
-            else:
-                matchers.append(lambda idx, stem, s=part: stem == s)
+            if not sub.isdigit():
+                raise ValueError(f"Invalid frame identifier: '{part}' in '{spec}'")
+            val = int(sub)
+            matchers.append(lambda idx, stem, v=val, s=part: idx == v or stem == s)
             continue
 
         if '..' in part:
-            a, b = part.split('..', 1)
-            min_v = int(a.strip()) if a.strip() else None
-            max_v = int(b.strip()) if b.strip() else None
+            parts = part.split('..')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid range syntax: '{part}' in '{spec}'")
+            a, b = parts[0].strip(), parts[1].strip()
+            if a and not a.isdigit():
+                raise ValueError(f"Invalid range start '{a}' in '{spec}'")
+            if b and not b.isdigit():
+                raise ValueError(f"Invalid range end '{b}' in '{spec}'")
+            if not a and not b:
+                raise ValueError(f"Empty range '..' in '{spec}'")
+            min_v = int(a) if a else None
+            max_v = int(b) if b else None
+            if min_v is not None and max_v is not None and min_v > max_v:
+                raise ValueError(f"Range start {min_v} greater than end {max_v} in '{spec}'")
             matchers.append(lambda idx, stem, lo=min_v, hi=max_v:
                             (lo is None or idx >= lo) and (hi is None or idx <= hi))
         elif ':' in part:
-            a, b = part.split(':', 1)
-            min_v = int(a.strip()) if a.strip() else None
-            max_v = int(b.strip()) if b.strip() else None
+            parts = part.split(':')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid range syntax: '{part}' in '{spec}'")
+            a, b = parts[0].strip(), parts[1].strip()
+            if a and not a.isdigit():
+                raise ValueError(f"Invalid range start '{a}' in '{spec}'")
+            if b and not b.isdigit():
+                raise ValueError(f"Invalid range end '{b}' in '{spec}'")
+            if not a and not b:
+                raise ValueError(f"Empty range ':' in '{spec}'")
+            min_v = int(a) if a else None
+            max_v = int(b) if b else None
+            if min_v is not None and max_v is not None and min_v > max_v:
+                raise ValueError(f"Range start {min_v} greater than end {max_v} in '{spec}'")
             matchers.append(lambda idx, stem, lo=min_v, hi=max_v:
                             (lo is None or idx >= lo) and (hi is None or idx <= hi))
         elif '-' in part:
             if part.startswith('-'):
-                hi = int(part[1:].strip())
+                sub = part[1:].strip()
+                if not sub.isdigit():
+                    raise ValueError(f"Invalid range end in '{part}' in '{spec}'")
+                hi = int(sub)
                 matchers.append(lambda idx, stem, hi=hi: idx <= hi)
             elif part.endswith('-'):
-                lo = int(part[:-1].strip())
+                sub = part[:-1].strip()
+                if not sub.isdigit():
+                    raise ValueError(f"Invalid range start in '{part}' in '{spec}'")
+                lo = int(sub)
                 matchers.append(lambda idx, stem, lo=lo: idx >= lo)
             else:
-                a, b = part.split('-', 1)
-                min_v = int(a.strip())
-                max_v = int(b.strip())
+                parts = part.split('-')
+                if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+                    raise ValueError(f"Invalid range format '{part}' in '{spec}'")
+                min_v = int(parts[0].strip())
+                max_v = int(parts[1].strip())
+                if min_v > max_v:
+                    raise ValueError(f"Range start {min_v} greater than end {max_v} in '{spec}'")
                 matchers.append(lambda idx, stem, lo=min_v, hi=max_v: lo <= idx <= hi)
         else:
-            if part.isdigit():
-                val = int(part)
-                matchers.append(lambda idx, stem, v=val: idx == v)
-            else:
-                matchers.append(lambda idx, stem, s=part: stem == s)
-
-    if not matchers:
-        return lambda idx, stem: True
+            if not part.isdigit():
+                raise ValueError(f"Invalid frame number: '{part}' in '{spec}'")
+            val = int(part)
+            matchers.append(lambda idx, stem, v=val: idx == v)
 
     return lambda idx, stem: any(m(idx, stem) for m in matchers)
 
 
 def resolve_report_dir(args) -> Path:
     if getattr(args, 'output', None):
-        report = Path(args.output)
-        report.mkdir(parents=True, exist_ok=True)
+        report = Path(args.output).resolve()
+        if report.exists():
+            if any(report.iterdir()):
+                raise FileExistsError(
+                    f"Output directory '{report}' exists and is not empty; "
+                    "specify an empty or new directory to prevent overwriting existing reports."
+                )
+        else:
+            report.mkdir(parents=True, exist_ok=False)
         return report
 
-    default_report = args.corpus / 'report'
+    default_report = (args.corpus / 'report').resolve()
     if getattr(args, 'unique_output', False) or default_report.exists():
         timestamp = time.strftime('%Y%m%d-%H%M%S')
-        unique_name = f'report-{timestamp}'
-        report = args.corpus / unique_name
-        if report.exists():
-            report = args.corpus / f'report-{timestamp}-{os.getpid()}'
-        report.mkdir(parents=True, exist_ok=True)
-        if default_report.exists() and not getattr(args, 'unique_output', False):
-            print(f'Preserving existing {default_report}; writing to new report directory {report}', flush=True)
-        return report
+        idx = 0
+        while True:
+            suffix = f"-{idx}" if idx > 0 else ""
+            candidate = args.corpus / f"report-{timestamp}{suffix}"
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                if default_report.exists() and not getattr(args, 'unique_output', False):
+                    print(f"Preserving existing {default_report}; writing to new report directory {candidate}", flush=True)
+                return candidate.resolve()
+            except FileExistsError:
+                idx += 1
 
-    default_report.mkdir(parents=True, exist_ok=True)
-    return default_report
+    try:
+        default_report.mkdir(parents=True, exist_ok=False)
+        return default_report
+    except FileExistsError:
+        return resolve_report_dir(type('Args', (), {**vars(args), 'unique_output': True})())
 
 
 def replay_c_chain(binary, frames, report):
@@ -335,17 +373,33 @@ def replay_c_chain(binary, frames, report):
     lines = result.stdout.splitlines()
     infos = []
     for i, f in enumerate(frames):
-        if i >= len(lines):
-            infos.append({'error': (result.stderr or f'exit {result.returncode}').strip()[-400:]})
-            continue
-        info = json.loads(lines[i])
         rgba = Path(f'{prefix}-{i}.rgba')
-        if f.get('selected', True) and rgba.exists():
-            data = rgba.read_bytes()
-            w, h = struct.unpack_from('<II', data, 4)
-            (report / f'{f["scene"]}-{f["frame"]}.png').write_bytes(png_bytes(w, h, data[12:]))
-        if rgba.exists():
-            rgba.unlink()
+        is_selected = f.get('selected', True)
+
+        info = None
+        if i < len(lines):
+            try:
+                info = json.loads(lines[i])
+            except Exception as e:
+                info = {'error': f'Corrupt JSON from harness line {i}: {e}'}
+        else:
+            err = (result.stderr or f'exit {result.returncode}').strip()[-400:] or f'harness exit {result.returncode}'
+            info = {'error': err}
+
+        if result.returncode != 0 and 'error' not in info:
+            err = (result.stderr or f'exit {result.returncode}').strip()[-400:] or f'harness exit {result.returncode}'
+            info['error'] = err
+
+        if is_selected:
+            if not rgba.exists() and 'error' not in info:
+                info['error'] = f'Missing RGBA output file {rgba.name}'
+            f['rgba_path'] = rgba if rgba.exists() else None
+        else:
+            if rgba.exists():
+                rgba.unlink()
+            f['rgba_path'] = None
+
+        f['c'] = info
         infos.append(info)
     return infos
 
@@ -366,29 +420,39 @@ def audit_python(dump):
 
 def replay(args):
     start_total = time.monotonic()
-    report = resolve_report_dir(args)
+    try:
+        report = resolve_report_dir(args)
+    except FileExistsError as e:
+        print(f'error: {e}', file=sys.stderr)
+        return 1
 
     t0_build = time.monotonic()
     binary = build_harness(args.corpus / '.harness')
     t_build = time.monotonic() - t0_build
 
     scene_filter = parse_scenes_arg(args.scene)
-    frame_matcher = parse_frame_spec(args.frames) if getattr(args, 'frames', None) else None
-
-    scene_dirs = sorted(p for p in args.corpus.iterdir() if (p / 'dumps').is_dir())
+    all_scene_dirs = {p.name: p for p in sorted(args.corpus.iterdir()) if (p / 'dumps').is_dir()}
     if scene_filter:
-        scene_dirs = [p for p in scene_dirs if p.name in scene_filter]
+        unknown = [s for s in scene_filter if s not in all_scene_dirs]
+        if unknown:
+            print(f'error: unknown scene(s) {unknown}. Available under {args.corpus}: {sorted(all_scene_dirs)}', file=sys.stderr)
+            return 1
+        scene_dirs = [all_scene_dirs[s] for s in scene_filter]
+    else:
+        scene_dirs = list(all_scene_dirs.values())
 
     if not scene_dirs:
-        if scene_filter:
-            print(f'no matching scenes found under {args.corpus} for {sorted(scene_filter)}')
-        else:
-            print(f'no dumps under {args.corpus}; run "{Path(sys.argv[0]).name} capture" first')
+        print(f'no dumps under {args.corpus}; run "{Path(sys.argv[0]).name} capture" first', file=sys.stderr)
+        return 1
+
+    try:
+        frame_matcher = parse_frame_spec(args.frames) if getattr(args, 'frames', None) else None
+    except ValueError as e:
+        print(f'error: {e}', file=sys.stderr)
         return 1
 
     scene_chains = {}
     selected_frames = []
-    dependency_prefix = {}
 
     for scene_dir in scene_dirs:
         recipe = json.loads((scene_dir / 'recipe.json').read_text()) if (scene_dir / 'recipe.json').exists() else {}
@@ -426,33 +490,34 @@ def replay(args):
         else:
             last_idx = max(matching_indices)
             chain = scene_frame_objs[:last_idx + 1]
-            prefix_names = []
             for f in chain:
                 if not f['selected']:
                     f['is_prefix'] = True
-                    prefix_names.append(f['frame'])
                 else:
                     selected_frames.append(f)
-            if prefix_names:
-                dependency_prefix[scene_dir.name] = prefix_names
             scene_chains[scene_dir.name] = chain
 
     if not selected_frames:
-        print(f'no dumps matched the specified filter (scenes: {args.scene}, frames: {getattr(args, "frames", None)})')
+        print(f'error: no dumps matched the specified filter (scenes: {args.scene}, frames: {getattr(args, "frames", None)})', file=sys.stderr)
         return 1
 
     t0_c = time.monotonic()
     with futures.ThreadPoolExecutor(args.jobs) as threads:
         if args.single:
             c_jobs = {threads.submit(replay_c, binary, f['dump'],
-                                     report / f'{f["scene"]}-{f["frame"]}.png'): [f] for f in selected_frames}
+                                     report / f'tmp-{f["scene"]}-{f["frame"]}.rgba'): f for f in selected_frames}
+            for job, f in c_jobs.items():
+                info = job.result()
+                f['c'] = info
+                rgba = report / f'tmp-{f["scene"]}-{f["frame"]}.rgba'
+                f['rgba_path'] = rgba if rgba.exists() and 'error' not in info else None
         else:
             c_jobs = {threads.submit(replay_c_chain, binary, chain, report): chain
                       for chain in scene_chains.values()}
-        for job, group in c_jobs.items():
-            result = job.result()
-            for f, info in zip(group, result if isinstance(result, list) else [result]):
-                f['c'] = info
+            for job, group in c_jobs.items():
+                result = job.result()
+                for f, info in zip(group, result if isinstance(result, list) else [result]):
+                    f['c'] = info
     t_c = time.monotonic() - t0_c
 
     t0_py = time.monotonic()
@@ -466,24 +531,76 @@ def replay(args):
             f['py'] = {'draws': 0, 'outcomes': [], 'suppressed': True}
     t_py = time.monotonic() - t0_py
 
+    # Dependency prefix aggregation and prerequisite validation
+    prefix_errors = 0
+    prefix_skips = {}
+    dependency_prefix = {}
+    total_prefix_frames = sum(len(chain) - sum(1 for f in chain if f.get('selected'))
+                              for chain in scene_chains.values())
+
+    for scene_name, chain in scene_chains.items():
+        scene_prefix_frames = [f for f in chain if not f.get('selected')]
+        if scene_prefix_frames:
+            prefix_names = []
+            scene_prefix_failed = False
+            first_fail_msg = None
+            for pf in scene_prefix_frames:
+                prefix_names.append(pf['frame'])
+                c_info = pf.get('c', {})
+                if 'error' in c_info:
+                    prefix_errors += 1
+                    scene_prefix_failed = True
+                    if not first_fail_msg:
+                        first_fail_msg = f"{pf['frame']} failed ({c_info['error']})"
+                for reason, n in c_info.get('skips', {}).items():
+                    prefix_skips[reason] = prefix_skips.get(reason, 0) + n
+
+            dependency_prefix[scene_name] = {
+                'frames': prefix_names,
+                'prefix_errors': sum(1 for pf in scene_prefix_frames if 'error' in pf.get('c', {})),
+                'prefix_skips': {
+                    r: sum(pf.get('c', {}).get('skips', {}).get(r, 0) for pf in scene_prefix_frames)
+                    for pf in scene_prefix_frames for r in pf.get('c', {}).get('skips', {})
+                }
+            }
+            if scene_prefix_failed:
+                for sf in chain:
+                    if sf.get('selected') and 'error' not in sf.get('c', {}):
+                        sf['c']['error'] = f"Dependency prerequisite error: {first_fail_msg}"
+
     t0_export = time.monotonic()
     with futures.ThreadPoolExecutor(args.jobs) as threads:
+        def export_frame_png(f):
+            rgba = f.get('rgba_path')
+            if rgba and rgba.exists():
+                data = rgba.read_bytes()
+                w, h = struct.unpack_from('<II', data, 4)
+                (report / f'{f["scene"]}-{f["frame"]}.png').write_bytes(png_bytes(w, h, data[12:]))
+                rgba.unlink()
+            elif f.get('selected') and 'error' not in f.get('c', {}):
+                f['c']['error'] = 'Missing RGBA output file'
+
+        export_jobs = [threads.submit(export_frame_png, f) for f in selected_frames]
+
         live = {}
         for f in selected_frames:
             if f['live'] and f['live'].exists() and f['live'] not in live:
                 dst = report / f'live-{f["scene"]}-{round(f["at"])}s.png'
                 live[f['live']] = threads.submit(ppm_to_png, f['live'], dst), dst.name
+
+        for job in export_jobs:
+            job.result()
         for f in selected_frames:
             f['live_png'] = live[f['live']][1] if f['live'] in live else None
         for job, _ in live.values():
             job.result()
 
-    total_prefix_frames = sum(len(chain) - sum(1 for f in chain if f.get('selected'))
-                              for chain in scene_chains.values())
     totals = {
         'frames': len(selected_frames),
         'selected_frames': len(selected_frames),
         'prefix_frames': total_prefix_frames,
+        'prefix_errors': prefix_errors,
+        'prefix_skips': prefix_skips,
         'c_only': bool(getattr(args, 'c_only', False)),
         'c_errors': 0,
         'c_draws': 0,
@@ -497,7 +614,7 @@ def replay(args):
         if 'error' in c:
             totals['c_errors'] += 1
         else:
-            totals['c_draws'] += c['draws']
+            totals['c_draws'] += c.get('draws', 0)
             for reason, n in c.get('skips', {}).items():
                 totals['c_skips'][reason] = totals['c_skips'].get(reason, 0) + n
         if 'error' in py:
@@ -508,8 +625,9 @@ def replay(args):
                 totals['py_outcomes'][res] = totals['py_outcomes'].get(res, 0) + 1
         f['py_skipped'] = [[d, r] for d, r in py.get('outcomes', []) if r.startswith('skipped')]
 
-    t_export = time.monotonic() - t0_export
-    t_total = time.monotonic() - start_total
+    t_export_end = time.monotonic()
+    t_export = t_export_end - t0_export
+    t_total = t_export_end - start_total
 
     totals['timings'] = {
         'build_s': round(t_build, 3),
@@ -524,13 +642,13 @@ def replay(args):
         'totals': totals,
         'dependency_prefix': dependency_prefix,
         'filter': {
-            'scenes': sorted(list(scene_filter)) if scene_filter else None,
+            'scenes': scene_filter,
             'frames': getattr(args, 'frames', None),
             'c_only': bool(getattr(args, 'c_only', False)),
         },
         'frames': [
             {k: (str(v) if isinstance(v, Path) else v) for k, v in f.items()
-             if k not in ('py', 'live')} | {
+             if k not in ('py', 'live', 'rgba_path')} | {
                  'py_draws': None if f['py'].get('suppressed') else f['py'].get('draws'),
                  'py_error': f['py'].get('error'),
              }
@@ -545,7 +663,8 @@ def replay(args):
     print(f'{len(selected_frames)} dumps{prefix_str} in {timings["total_s"]} s -> {report / "index.html"}')
     print(f'Timings: build {timings["build_s"]}s, C replay {timings["c_replay_s"]}s, '
           f'Python audit {timings["py_audit_s"]}s, export {timings["export_s"]}s')
-    print(f'C replay: {totals["c_draws"]} draws drawn, {totals["c_errors"]} harness errors')
+    print(f'C replay: {totals["c_draws"]} draws drawn, {totals["c_errors"]} harness errors' +
+          (f', {prefix_errors} prefix dependency errors' if prefix_errors else ''))
     for reason, n in sorted(totals['c_skips'].items(), key=lambda kv: -kv[1]):
         print(f'  C skipped {n:5}  {reason}')
     if getattr(args, 'c_only', False):
@@ -561,7 +680,9 @@ def replay(args):
               f'Python skipped {len(f["py_skipped"])}' +
               (f', C error {f["c"]["error"]}' if 'error' in f['c'] else '') +
               (f', Python error {f["py"]["error"]}' if 'error' in f['py'] else ''))
-    return 0
+
+    failed = totals['c_errors'] > 0 or prefix_errors > 0 or totals['py_errors'] > 0
+    return 1 if failed else 0
 
 
 def write_html(path, frames, totals):

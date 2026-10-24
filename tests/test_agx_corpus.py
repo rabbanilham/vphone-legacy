@@ -1,17 +1,3 @@
-"""The offline host harness must keep compiling the renderer QEMU runs."""
-
-from pathlib import Path
-import shutil
-import subprocess
-import sys
-import tempfile
-import unittest
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'scripts'))
-import agx_corpus  # noqa: E402
-
-
 """The offline host harness and fast iteration tools for AGX replay."""
 
 import hashlib
@@ -21,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -53,9 +41,11 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
     def test_parse_scenes_arg(self):
         self.assertIsNone(agx_corpus.parse_scenes_arg(None))
         self.assertIsNone(agx_corpus.parse_scenes_arg([]))
-        self.assertEqual(agx_corpus.parse_scenes_arg(['settings']), {'settings'})
-        self.assertEqual(agx_corpus.parse_scenes_arg(['settings', 'clock']), {'settings', 'clock'})
-        self.assertEqual(agx_corpus.parse_scenes_arg(['settings,clock', 'calendar']), {'settings', 'clock', 'calendar'})
+        self.assertEqual(agx_corpus.parse_scenes_arg(['settings']), ['settings'])
+        self.assertEqual(agx_corpus.parse_scenes_arg(['settings', 'clock']), ['settings', 'clock'])
+        self.assertEqual(agx_corpus.parse_scenes_arg(['settings,clock', 'calendar']), ['settings', 'clock', 'calendar'])
+        # Order preservation & deduplication
+        self.assertEqual(agx_corpus.parse_scenes_arg(['clock,settings', 'clock']), ['clock', 'settings'])
 
     def test_parse_frame_spec(self):
         m_single = agx_corpus.parse_frame_spec('5')
@@ -94,6 +84,56 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
         self.assertFalse(m_multi(4, 'frame-4'))
         self.assertTrue(m_multi(6, 'frame-6'))
 
+    def test_parse_frame_spec_rejects_invalid(self):
+        invalid_specs = [
+            '10..5',       # min > max
+            '10-5',        # min > max
+            'abc',         # non-numeric
+            'frame-xyz',   # non-numeric stem
+            '5-10-15',     # malformed range
+            '..',          # empty range
+            ':',           # empty range
+            '5,,10',       # empty segment
+        ]
+        for bad in invalid_specs:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    agx_corpus.parse_frame_spec(bad)
+
+    def test_resolve_report_dir_rejects_nonempty_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td) / 'my_existing_dir'
+            output_dir.mkdir()
+            precious = output_dir / 'report.txt'
+            precious.write_text('important content')
+
+            args = type('Args', (), {
+                'corpus': Path(td),
+                'output': output_dir,
+                'unique_output': False,
+            })()
+            with self.assertRaises(FileExistsError):
+                agx_corpus.resolve_report_dir(args)
+            self.assertTrue(precious.exists(), 'Precious file must not be modified or deleted')
+
+    def test_resolve_report_dir_atomic_allocation_fixed_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            args = type('Args', (), {
+                'corpus': corpus,
+                'output': None,
+                'unique_output': True,
+            })()
+            with patch('time.strftime', return_value='20261025-120000'):
+                dir1 = agx_corpus.resolve_report_dir(args)
+                dir2 = agx_corpus.resolve_report_dir(args)
+                dir3 = agx_corpus.resolve_report_dir(args)
+
+            self.assertEqual(dir1.name, 'report-20261025-120000')
+            self.assertEqual(dir2.name, 'report-20261025-120000-1')
+            self.assertEqual(dir3.name, 'report-20261025-120000-2')
+            self.assertTrue(dir1.exists() and dir2.exists() and dir3.exists())
+
     def test_output_preservation_never_deletes_existing(self):
         with tempfile.TemporaryDirectory() as td:
             corpus = Path(td)
@@ -113,26 +153,19 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
             self.assertTrue(resolved.name.startswith('report-'))
             self.assertTrue(resolved.exists())
 
-    def test_output_unique_and_explicit(self):
+    def test_unknown_scene_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             corpus = Path(td)
-            args_unique = type('Args', (), {
+            (corpus / 'clock' / 'dumps').mkdir(parents=True)
+            args = type('Args', (), {
                 'corpus': corpus,
+                'scene': ['clock,clok'],
+                'frames': None,
                 'output': None,
-                'unique_output': True,
-            })()
-            out1 = agx_corpus.resolve_report_dir(args_unique)
-            self.assertTrue(out1.name.startswith('report-'))
-
-            custom_dir = corpus / 'custom_output_dir'
-            args_explicit = type('Args', (), {
-                'corpus': corpus,
-                'output': custom_dir,
                 'unique_output': False,
             })()
-            out2 = agx_corpus.resolve_report_dir(args_explicit)
-            self.assertEqual(out2, custom_dir)
-            self.assertTrue(custom_dir.exists())
+            exit_code = agx_corpus.replay(args)
+            self.assertEqual(exit_code, 1, 'Replay must reject unknown scenes even when one matches')
 
     def test_c_only_and_report_fields_integration(self):
         sibling_corpus = ROOT.parent / 'vphone-legacy/build/agx-corpus'
@@ -162,6 +195,7 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
             self.assertEqual(totals['frames'], 1)
             self.assertEqual(totals['selected_frames'], 1)
             self.assertEqual(totals['prefix_frames'], 4)
+            self.assertEqual(totals['prefix_errors'], 0)
             self.assertTrue(totals['c_only'])
             self.assertEqual(totals['py_draws'], 0)
             self.assertEqual(totals['py_errors'], 0)
@@ -177,8 +211,9 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
 
             # Dependency prefix
             self.assertIn('clock', summary['dependency_prefix'])
-            self.assertEqual(summary['dependency_prefix']['clock'],
+            self.assertEqual(summary['dependency_prefix']['clock']['frames'],
                              ['frame-1', 'frame-2', 'frame-3', 'frame-4'])
+            self.assertEqual(summary['dependency_prefix']['clock']['prefix_errors'], 0)
 
             # Frame record
             self.assertEqual(len(summary['frames']), 1)
@@ -251,6 +286,80 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
 
             self.assertEqual(full_hash, prefix_hash, 'Selected frame with prefix must match full chain replay!')
             self.assertNotEqual(full_hash, alone_hash, 'Frame replayed alone lacks carried state and must not match!')
+
+    def test_mocked_harness_failure_and_prefix_error_propagation(self):
+        """Simulate harness failures and prerequisite errors without private firmware."""
+        with tempfile.TemporaryDirectory() as td:
+            corpus = Path(td)
+            dumps_dir = corpus / 'testscene' / 'dumps'
+            dumps_dir.mkdir(parents=True)
+            for i in range(1, 4):
+                (dumps_dir / f'frame-{i}.bin').write_bytes(b'DUMP')
+                (dumps_dir / f'frame-{i}.json').write_text('{"vclock_ns": 0}')
+
+            report_dir = corpus / 'test_report'
+
+            # Case A: Harness exits with error code 1 even if lines were emitted
+            mock_proc = MagicMock()
+            mock_proc.returncode = 1
+            mock_proc.stdout = '{"draws": 1, "skips": {}}\n'
+            mock_proc.stderr = 'fatal harness crash'
+
+            with patch('subprocess.run', return_value=mock_proc), \
+                 patch('agx_corpus.build_harness', return_value=Path('/bin/true')):
+                args = type('Args', (), {
+                    'corpus': corpus,
+                    'scene': ['testscene'],
+                    'frames': '1',
+                    'c_only': True,
+                    'output': report_dir,
+                    'unique_output': False,
+                    'jobs': 1,
+                    'single': False,
+                })()
+                exit_code = agx_corpus.replay(args)
+                self.assertEqual(exit_code, 1, 'Nonzero harness returncode must cause nonzero exit')
+                summary = json.loads((report_dir / 'summary.json').read_text())
+                self.assertGreater(summary['totals']['c_errors'], 0)
+
+            # Case B: Prefix pass fails (frame-1 fails, frame-2 selected)
+            shutil.rmtree(report_dir)
+            mock_proc_fail = MagicMock()
+            mock_proc_fail.returncode = 0
+            # frame-1 has an error, frame-2 succeeds
+            mock_proc_fail.stdout = (
+                '{"draws": 0, "skips": {}, "error": "broken texture decode"}\n'
+                '{"draws": 5, "skips": {}}\n'
+            )
+            mock_proc_fail.stderr = ''
+
+            # Create dummy rgba for frame-2
+            def fake_run(cmd, *args, **kwargs):
+                if '--chain' in cmd:
+                    prefix = cmd[cmd.index('--chain') + 1]
+                    # write prefix-1.rgba for frame-2
+                    rgba = Path(f'{prefix}-1.rgba')
+                    rgba.write_bytes(b'RGBA\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+                    return mock_proc_fail
+                return mock_proc_fail
+
+            with patch('subprocess.run', side_effect=fake_run), \
+                 patch('agx_corpus.build_harness', return_value=Path('/bin/true')):
+                args2 = type('Args', (), {
+                    'corpus': corpus,
+                    'scene': ['testscene'],
+                    'frames': '2',
+                    'c_only': True,
+                    'output': report_dir,
+                    'unique_output': False,
+                    'jobs': 1,
+                    'single': False,
+                })()
+                exit_code2 = agx_corpus.replay(args2)
+                self.assertEqual(exit_code2, 1, 'Prerequisite prefix failure must cause nonzero exit')
+                summary2 = json.loads((report_dir / 'summary.json').read_text())
+                self.assertEqual(summary2['totals']['prefix_errors'], 1)
+                self.assertIn('Dependency prerequisite error', summary2['frames'][0]['c']['error'])
 
 
 if __name__ == '__main__':
