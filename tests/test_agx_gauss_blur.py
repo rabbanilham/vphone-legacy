@@ -1,5 +1,6 @@
 """Offline tests for CoreAnimation Gaussian blur replay in AGX HLE."""
 from pathlib import Path
+import os
 import shutil
 import struct
 import subprocess
@@ -405,6 +406,17 @@ int main(int argc, char **argv) {{
         self.assertAlmostEqual(p3['offsets'][1], 3.2, places=5)
         self.assertAlmostEqual(p3['offsets'][2], 5.0, places=5)
 
+        vs_7 = [0] * 16
+        for off, _ in aro.BLUR_TAPS_7:
+            vs_7.extend([0, struct.unpack('<I', struct.pack('<f', off))[0], 0, 0])
+        vs_7.extend([0] * 4)
+        mf_7 = MockFrame(vs_7)
+        p7 = aro.extract_blur_params(mf_7, mf_7.vs_data, [], aro.BLUR_7TAP)
+        self.assertEqual(p7['direction'], 'vertical')
+        self.assertEqual(p7['n_taps'], 7)
+        for actual, (expected, _) in zip(p7['offsets'], aro.BLUR_TAPS_7):
+            self.assertAlmostEqual(actual, expected, places=5)
+
     def test_c_blur_param_extraction(self):
         """Verify atomic validation of blur taps in compiled C helper from s5l8960x.c."""
         compiler = shutil.which('cc')
@@ -508,20 +520,24 @@ int main(int argc, char **argv) {{
         if (fabsf(offsets[0] - 1.2f) > 1e-4f || fabsf(offsets[1] - 2.4f) > 1e-4f) return 8;
         printf("VALID_3TAP_OK\\n");
         return 0;
-    }} else if (!strcmp(test, "valid_4tap_prog")) {{
-        /* 4-tap vertical program */
+    }} else if (!strcmp(test, "valid_4tap_prog") || !strcmp(test, "valid_7tap_prog")) {{
+        bool seven = !strcmp(test, "valid_7tap_prog");
+        unsigned expected_taps = seven ? 7 : 4;
         float *u = (float *)(mock_mem + (u_ptr - mock_base));
-        for (int i = 0; i < 4; i++) {{
+        for (unsigned i = 0; i < expected_taps; i++) {{
             u[16 + 4 * i] = 0.0f;
-            u[16 + 4 * i + 1] = agx_blur_taps_4[i].offset;
+            u[16 + 4 * i + 1] = seven ? agx_blur_taps_7[i].offset : agx_blur_taps_4[i].offset;
         }}
         float offsets[8], weights[8];
         unsigned n_taps = 0;
         bool is_vertical = false;
-        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, AGX_USC_BLUR_4TAP, offsets, weights, &n_taps, &is_vertical);
-        if (n_taps != 4 || is_vertical != true) return 9;
-        if (fabsf(offsets[0] - agx_blur_taps_4[0].offset) > 1e-4f) return 10;
-        printf("VALID_4TAP_PROG_OK\\n");
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, seven ? AGX_USC_BLUR_7TAP : AGX_USC_BLUR_4TAP, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != expected_taps || is_vertical != true) return 9;
+        for (unsigned i = 0; i < expected_taps; i++) {{
+            float expected = seven ? agx_blur_taps_7[i].offset : agx_blur_taps_4[i].offset;
+            if (fabsf(offsets[i] - expected) > 1e-4f) return 10;
+        }}
+        printf("VALID_%uTAP_PROG_OK\\n", expected_taps);
         return 0;
     }}
     return 100;
@@ -536,7 +552,7 @@ int main(int argc, char **argv) {{
                                  capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, f'Compilation failed:\n{res.stderr}')
 
-            for subtest in ['fallback_zero', 'partial_1tap', 'partial_2tap', 'valid_3tap', 'valid_4tap_prog']:
+            for subtest in ['fallback_zero', 'partial_1tap', 'partial_2tap', 'valid_3tap', 'valid_4tap_prog', 'valid_7tap_prog']:
                 sub_res = subprocess.run([str(bin_path), subtest], capture_output=True, text=True)
                 self.assertEqual(sub_res.returncode, 0, f'C subtest {subtest} failed:\n{sub_res.stderr}')
                 self.assertIn(f'{subtest.upper()}_OK', sub_res.stdout)
@@ -547,7 +563,8 @@ int main(int argc, char **argv) {{
         sys.path.insert(0, str(ROOT / 'backend'))
         import agx_replay_offline as aro
 
-        dump_path = Path('/Users/bagas/Documents/Projects/vphone/vphone-legacy/build/agx-corpus/unlock/dumps/frame-9.bin')
+        corpus = Path(os.environ.get('VPHONE_AGX_CORPUS', ROOT / 'build/agx-corpus'))
+        dump_path = corpus / 'unlock/dumps/frame-9.bin'
         if not dump_path.exists():
             self.skipTest(f'{dump_path} does not exist')
 
