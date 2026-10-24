@@ -61,29 +61,21 @@ class TestAGXUntexturedStrides(unittest.TestCase):
         self.assertEqual(len(offline.ALL_BLUR_PROGRAMS), 9 + 22 + 2)
 
     def test_c_source_defines_and_dispatch(self):
-        """Verify backend/s5l8960x.c defines all 31 blur constants and dispatches them in agx_is_blur_program."""
+        """Verify backend/s5l8960x.c defines exact 4-tap and 7-tap constants and uses preamble matching."""
         text = C_SOURCE.read_text(encoding='utf-8')
         c_defines = {}
         for m in re.finditer(r'#define\s+(AGX_USC_BLUR_\w+)\s+UINT64_C\((0x[0-9a-fA-F]+)\)', text):
             name, val = m.group(1), int(m.group(2), 16)
             c_defines[name] = val
 
-        # Check all 31 numbered blur shaders + 4TAP + 7TAP exist in C
         self.assertIn('AGX_USC_BLUR_4TAP', c_defines)
         self.assertIn('AGX_USC_BLUR_7TAP', c_defines)
-        for i in range(1, 32):
-            self.assertIn(f'AGX_USC_BLUR_{i}', c_defines)
-
-        # Check all 22 new blur programs match their expected values
-        c_blur_12_values = {c_defines[f'AGX_USC_BLUR_{i}'] for i in range(10, 32)}
-        self.assertEqual(c_blur_12_values, BLUR_PROGRAMS_12_EXPECTED)
-
-        # Verify agx_is_blur_program checks all 31 numbered blur shaders
-        func_match = re.search(r'static inline bool agx_is_blur_program\(uint64_t prog\)\s*\{(.*?)\}', text, re.DOTALL)
-        self.assertIsNotNone(func_match)
-        body = func_match.group(1)
-        for i in range(1, 32):
-            self.assertIn(f'AGX_USC_BLUR_{i}', body)
+        # Verify 41-byte preamble exists in C
+        self.assertIn('agx_blur_preamble', text)
+        self.assertIn('agx_is_blur_code', text)
+        # Verify hardcoded hash list has been removed from dispatch
+        for i in range(10, 32):
+            self.assertNotIn(f'AGX_USC_BLUR_{i}', c_defines)
 
     def test_c_skip_reason_parity(self):
         """Verify C code contains the precise skip string 'stride 24 untextured with program 0x0'."""
@@ -105,7 +97,7 @@ class TestAGXUntexturedStrides(unittest.TestCase):
         self.assertEqual(details.get('prog'), '0x23e324c0933a2344')
 
     def test_corpus_frame_stride_24_prog_0_audit(self):
-        """Verify audit on unlock frame-5 correctly classifies draw 2 as stride 24 with prog 0x0."""
+        """Verify audit on unlock frame-5 correctly replayed draw 2 with PPP state retention."""
         dump_path = ROOT / 'corpus' / 'unlock' / 'dumps' / 'frame-5.bin'
         if not dump_path.exists():
             self.skipTest('corpus dump not present')
@@ -115,9 +107,9 @@ class TestAGXUntexturedStrides(unittest.TestCase):
         self.assertGreater(len(outcomes), 2)
         did, res, details = outcomes[2]
         self.assertEqual(did, 2)
-        self.assertEqual(res, 'skipped: stride 24 untextured with program 0x0')
-        self.assertEqual(details.get('stride'), 24)
-        self.assertEqual(details.get('prog'), '0x0')
+        # With Task GC PPP retention, draw 2 inherits Draw 1 texture and prog 0x8eb52cf6fe248b1d
+        self.assertEqual(res, 'replayed exactly: textured quad (1:1 nearest)')
+        self.assertEqual(details.get('prog'), '0x8eb52cf6fe248b1d')
 
     def test_corpus_blur_preamble_verification(self):
         """Verify all 22 blur programs in the corpus start with the exact 41-byte preamble."""
@@ -136,7 +128,8 @@ class TestAGXUntexturedStrides(unittest.TestCase):
                     if stride == 12:
                         pr = offline.program(f, ppp)
                         if pr in BLUR_PROGRAMS_12_EXPECTED and pr not in found_progs:
-                            off = f.u32(0x600000000 | ppp[7])
+                            pds_ptr = ppp[6] if len(ppp) == 32 else ppp[7]
+                            off = f.u32(0x600000000 | pds_ptr)
                             code = f.read(0x700000000 | off, 64)
                             found_progs[pr] = code[:41].hex()
             except Exception:
