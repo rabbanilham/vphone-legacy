@@ -219,7 +219,11 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     }
     if(!strcmp(name,"chanspec")) {
         if(set) { /* ignore */ }
-        else { wifi_st32(out, 0x1006); *len = 4; }
+        else {
+            memset(out, 0, 16);
+            wifi_st32(out, 0x1006);
+            *len = s->darwin ? 9 : 4;
+        }
         return 0;
     }
     if(!strcmp(name,"chanspecs")) {
