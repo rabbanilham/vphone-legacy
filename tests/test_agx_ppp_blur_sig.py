@@ -11,7 +11,6 @@ Verifies:
 from pathlib import Path
 import re
 import unittest
-from PIL import Image
 
 from backend.agx_frame import Frame
 import backend.agx_replay_offline as offline
