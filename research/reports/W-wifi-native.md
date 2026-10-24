@@ -4,16 +4,16 @@
 
 This report covers the native acceptance validation and model corrections for the BCM43342 FullMAC USB Wi-Fi emulation on the HSIC/EHCI1 port in worktree `/Users/bagas/Downloads/vphone-wt-wifi` (`wt/wifi` branch), booting an iPhone 5s (`s5l8960x`) on iOS 7.1.2 (`11D257`) with the `build/virtual-activated-profile-v5` profile.
 
-### Results Matrix (updated 2026-10-24, wt/wifi `ac80495`)
+### Results Matrix (updated 2026-10-24, wt/wifi `53c4f9f`)
 
 | Stage | Goal | Native iOS 7.1.2 boot | Evidence | Status |
 |---|---|---|---|---|
 | **1** | HSIC enumeration, TRX download, re-enumeration as `0a5c:bd21` | Passes | `research/acceptance-wifi-native-7/qemu-trace.log` | **PASS** |
 | **2** | AppleBCMWLAN attaches without the ~22 s retry loop | Passes | `research/acceptance-wifi-native-7/serial.log` | **PASS** |
-| **3** | Scan returns `vphone-wifi` | Driver caches the BSS (ch 6, RSSI -45, SNR 47); wifid logs `Auto join scan found: vphone-wifi` and `discovered 1 networks` on every scan; scans finish in ~0.8 s | `research/acceptance-wifi-native-41/wifi-logs/wifiManager.log`, `-48/wifi-logs/`, `-55/serial.log` | **PASS (wifid)**; Settings list not re-verified (touch, see section 7) |
-| **4** | Join / association | wifid `Joined: vphone-wifi`; driver `WLC_SET_SSID` -> `WLC_E_JOIN/ASSOC/LINK(flags 1)` -> `APPLE80211_M_ASSOC_DONE` | `research/acceptance-wifi-native-55/serial.log`, `-55/wifi-logs/wifiManager.log` | **PASS (auto-join of a known network)** |
+| **3** | Scan returns `vphone-wifi` | Driver caches the BSS (ch 6, RSSI -45, SNR 47); wifid logs `Auto join scan found: vphone-wifi` and `discovered 1 networks` on every scan; scans finish in ~0.8 s | `research/acceptance-wifi-native-56/framebuffer-at-186s.png` (Settings lists `vphone-wifi` with signal bars), `-55/serial.log` | **PASS (UI)** |
+| **4** | Join / association | wifid `Joined: vphone-wifi`; driver `WLC_SET_SSID` -> `WLC_E_JOIN/ASSOC/LINK(flags 1)` -> `APPLE80211_M_ASSOC_DONE` | `research/acceptance-wifi-native-56/framebuffer-at-210s.png` (checkmark after tapping the row), `-55/serial.log` (auto-join) | **PASS (manual tap and auto-join)** |
 | **5** | DHCP lease via slirp | DISCOVER/OFFER/REQUEST/ACK, lease 10.0.2.15, router 10.0.2.2, ARP probe/announce, IPv6 RS/RA | `research/acceptance-wifi-native-55/wifi.pcap` (536 packets) | **PASS** |
-| **6** | Connected | wifid: `IPv4 Primary interface is en0`; DNS (`captive.apple.com`, `init.itunes.apple.com`) answered; captive check HTTP 200 `Success`; HTTPS sessions to Apple | `research/acceptance-wifi-native-55/wifi.pcap`, `-55/wifi-logs/wifiManager.log` | **PASS (system)**; status-bar icon not visually verified (display asleep, touch) |
+| **6** | Connected | wifid: `IPv4 Primary interface is en0`; DNS (`captive.apple.com`, `init.itunes.apple.com`) answered; captive check HTTP 200 `Success`; HTTPS sessions to Apple | `research/acceptance-wifi-native-55/wifi.pcap`, `-55/wifi-logs/wifiManager.log` | **PASS**: Wi-Fi icon in the status bar, `-56/framebuffer-at-210s.png` |
 
 Tests at `ac80495`: 238 unit tests OK (7 skipped); `wifi_contract_test.py` and `ehci_contract_test.py` PASS.
 
@@ -174,10 +174,11 @@ VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi backend/.venv/bin/python backend/di
 
 ## 7. Open Items
 
-- **Touch (MBP).** From run 48 on, the guest never fetches touch frames (`A7 TOUCH ... queued` keeps rising from the first tap at 78 s),
-  even in run 52 **without** `--wifi`, where no Wi-Fi code runs; runs 41-43 with the same board code worked. So it is not a Wi-Fi
-  regression; the Settings list (stage 3 in the UI) and the status-bar icon (stage 6) need a working touch/keep-awake timeline to re-verify.
-- **Status-bar icon** and the Settings checkmark: re-run the Settings timeline once touch is stable
-  (`research/tasks/W2-wifi-ui.txt` timeline, tap row 1 at about 300,440).
+- **Touch was a host-side problem, fixed in `53c4f9f`.** Runs 48-52 ran while the host display was off (pmset log:
+  off 21:39:48); macOS App Nap / timer coalescing then starved QEMU, and because guest time follows the host clock the guest rendered
+  from 60-80 s instead of 40 s, idled its display before the scripted keep-awake taps, and never fetched touch frames. Reproduced by
+  activating another app 15 s into a run (`research/acceptance-touch-6`: 0 frames before 70 s, `queued=9`); with
+  `backend/patches/0003-cocoa-disable-app-nap.patch` (NSActivityUserInitiated|LatencyCritical) the same test renders from 40 s and
+  drains touch (`acceptance-touch-7`). Display-off itself was not re-tested on purpose (it would switch off the user's screen).
 - `WIFI escan done` and the `ns=` field on `WIFI iovar` lines are deliberate trace aids; drop them if the trace gets too noisy.
 - Still refused (tolerated by the driver): `pfn_set`, `btc_params`, `event_log_tag_control`, `awdl_*`, `mpc_dur`, `pwrstats`, `tlv`, `rssi_event` and a few PM knobs.
