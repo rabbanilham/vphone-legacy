@@ -154,7 +154,10 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
      * ae9dc0 loads ie_offset as u16 at +0x74 (116) (must be >= 0x7c);
      * ae9dd8 loads ie_length as u32 at +0x78 (120). */
     if(s->darwin) {
+        wifi_st16(b+78,(uint16_t)-45);
+        b[80]=30;
         wifi_st16(b+116,128); wifi_st32(b+120,off-128);
+        wifi_st16(b+124,(uint16_t)-92);
     } else {
         wifi_st16(b+116,off-128); wifi_st32(b+120,128);
     }
