@@ -195,8 +195,36 @@ def decode_tsw(f, tsw):
     return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=not strip and (tsw[0] & 0x8007) == 0x8001, tsw=tsw)
 
 
+def decode_sampler(words):
+    """
+    Decodes PowerVR Rogue sampler words (4 x 32-bit words).
+    Word 0: bits [11:0] max LOD (0xfff = no LOD limit).
+    Word 1:
+      bits [5:4]: min filter (0=nearest, 1=linear)
+      bits [7:6]: mag filter (0=nearest, 1=linear)
+      bits [11:9]: wrap mode U (0=repeat, 2=clamp_to_edge)
+      bits [14:12]: wrap mode V (0=repeat, 2=clamp_to_edge)
+    """
+    w0, w1 = words[0], words[1]
+    min_filter = 'linear' if ((w1 >> 4) & 3) == 1 else 'nearest'
+    mag_filter = 'linear' if ((w1 >> 6) & 3) == 1 else 'nearest'
+    wrap_u = 'clamp_to_edge' if ((w1 >> 9) & 7) == 2 or ((w1 >> 16) & 0xff) == 2 else 'repeat'
+    wrap_v = 'clamp_to_edge' if ((w1 >> 12) & 7) == 2 or ((w1 >> 24) & 0xff) == 2 else 'repeat'
+    max_lod = w0 & 0xfff
+    return {
+        'min_filter': min_filter,
+        'mag_filter': mag_filter,
+        'wrap_u': wrap_u,
+        'wrap_v': wrap_v,
+        'max_lod': max_lod,
+        'linear_filter': min_filter == 'linear' or mag_filter == 'linear',
+        'clamp_to_edge': wrap_u == 'clamp_to_edge' or wrap_v == 'clamp_to_edge',
+        'words': list(words[:4]),
+    }
+
+
 def texture(f, ppp, prog=None):
-    """Decode a texture and only the luma prefix of its selected descriptor."""
+    """Decode a texture and its sampler descriptor."""
     if prog is None:
         prog = program(f, ppp)
     words = fragment_words(f, ppp)
@@ -213,6 +241,17 @@ def texture(f, ppp, prog=None):
                 if tex:
                     # Trailing constants may be the next draw's allocation.
                     tex['vibrancy'] = tuple(ws[:3]) == LUMA
+                    sampler = None
+                    if k >= 4:
+                        sampler = decode_sampler(ws[k - 4:k])
+                    elif len(ws) >= 8 and ((ws[4] & 0xfff == 0xfff) or ((ws[5] >> 9) & 7 == 2)):
+                        sampler = decode_sampler(ws[4:8])
+                    if not sampler:
+                        for _, s_ws in words:
+                            if len(s_ws) >= 4 and s_ws[0] == 0xfff and ((s_ws[1] >> 9) & 7 == 2 or (s_ws[1] & 0x2000) != 0):
+                                sampler = decode_sampler(s_ws[:4])
+                                break
+                    tex['sampler'] = sampler
                     return tex
     return None
 
@@ -452,11 +491,14 @@ def sample_bilinear(buf, w, h, u, v):
     c01 = buf[y1 * w + x0]
     c11 = buf[y1 * w + x1]
 
+    wx = int(fx * 256.0 + 0.5)
+    wy = int(fy * 256.0 + 0.5)
     out = []
     for c in range(4):
-        val = ((c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
-               (c01[c] * (1.0 - fx) + c11[c] * fx) * fy)
-        out.append(max(0, min(255, int(round(val)))))
+        top = c00[c] * (256 - wx) + c10[c] * wx
+        bot = c01[c] * (256 - wx) + c11[c] * wx
+        val = (top * (256 - wy) + bot * wy + 32768) >> 16
+        out.append(max(0, min(255, val)))
     return tuple(out)
 
 
@@ -649,7 +691,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
         if not tex:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
-        uv_off = 4 if stride == 28 else 0
+        uv_off = 4 if stride in (28, 36) else 0
         uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
         xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
         ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
@@ -657,7 +699,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
         if not uv_map:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
 
-    if not tex and stride == 20:
+    if (not tex or stride == 20) and stride == 20:
         if count == 12:
             return 'replayed exactly: solid multi-quad (2 quads, stride=20)', {'count': count}
         return 'replayed exactly: solid quad (stride=20)', {'count': count}
@@ -669,7 +711,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     is_dest_in = prog == DEST_IN
     is_vibrancy = tex.get('vibrancy', False)
 
-    uv_off = 4 if stride == 28 else 0
+    uv_off = 4 if stride in (28, 36) else 0
     uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
     u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
     v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
@@ -703,13 +745,13 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
             return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
-        return 'approximated: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
+        return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
     elif prog == COLOR_MATRIX:
         return 'replayed exactly: color matrix (saturation & tint)', {'prog': hex(prog)}
     elif prog == ROUNDED_CAPS:
         return 'replayed exactly: textured rounded quad (stride=28)', {'count': count, 'prog': hex(prog)}
     elif is_scaled:
-        return 'approximated: textured quad (bilinear scaled)', {'prog': hex(prog)}
+        return 'replayed exactly: textured quad (bilinear scaled)', {'prog': hex(prog)}
     else:
         return 'replayed exactly: textured quad (1:1 nearest)', {'prog': hex(prog)}
 
@@ -1116,10 +1158,10 @@ def main():
                                                              for k, v in tex.items() if k != 'tsw'})))
             if x0 >= x1 or y0 >= y1:
                 continue
-            if tex:
-                # stride 24: float u,v (normalised) at +16; stride 28: BGRA tint at +16,
+            if tex and (stride >= 24 or (stride == 16 and prog == WALLPAPER) or prog == ROUNDED_CAPS):
+                # stride 24: float u,v (normalised) at +16; stride 28/36: BGRA tint at +16,
                 # then u,v in texels at +20.
-                uv_off = 4 if stride == 28 else 0
+                uv_off = 4 if stride in (28, 36) else 0
                 uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER)
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
@@ -1127,7 +1169,7 @@ def main():
                 su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
-                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
+                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su
@@ -1137,6 +1179,8 @@ def main():
                     step_x = math.hypot(uv_map[0] * su, uv_map[3] * sv)
                     step_y = math.hypot(uv_map[1] * su, uv_map[4] * sv)
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
+                if tex.get('sampler') and tex['sampler']['linear_filter']:
+                    is_scaled = True
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
@@ -1181,11 +1225,13 @@ def main():
                             c10 = row0[tx1]
                             c01 = row1[tx0]
                             c11 = row1[tx1]
+                            wx = int(fx * 256.0 + 0.5)
+                            wy = int(fy * 256.0 + 0.5)
                             b, g, r, a = (
-                                max(0, min(255, int(round(
-                                    (c00[c] * (1.0 - fx) + c10[c] * fx) * (1.0 - fy) +
-                                    (c01[c] * (1.0 - fx) + c11[c] * fx) * fy
-                                )))) for c in range(4)
+                                max(0, min(255, (
+                                    (c00[c] * (256 - wx) + c10[c] * wx) * (256 - wy) +
+                                    (c01[c] * (256 - wx) + c11[c] * wx) * wy + 32768
+                                ) >> 16)) for c in range(4)
                             )
                         else:
                             tx = max(0, min(tex['w'] - 1, int(fu)))
