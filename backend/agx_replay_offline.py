@@ -1282,17 +1282,7 @@ def main():
                             g = max(0, min(255, int(round(gout * 255.0))))
                             b = max(0, min(255, int(round(bout * 255.0))))
                             a = 255
-                        if prog == ROUNDED_CAPS:
-                            cov = (r * a) // (255 * 255) if a else 0
-                            ta = (tint >> 24) & 0xff
-                            tr = (tint >> 16) & 0xff
-                            tg = (tint >> 8) & 0xff
-                            tb = tint & 0xff
-                            a = (ta * cov) // 255
-                            r = (tr * a) // 255
-                            g = (tg * a) // 255
-                            b = (tb * a) // 255
-                        elif tint != 0xffffffff:
+                        if tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4

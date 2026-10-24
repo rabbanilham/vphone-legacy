@@ -7105,14 +7105,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
                         uint32_t dst = row[x - x0], out = 0;
-                        if (prog == AGX_USC_ROUNDED_CAPS) {
-                            uint32_t cov = (((src >> 16) & 0xff) * (src >> 24)) / 255;
-                            uint32_t a = ((tint >> 24) * cov) / 255;
-                            uint32_t r = (((tint >> 16) & 0xff) * a) / 255;
-                            uint32_t g = (((tint >> 8) & 0xff) * a) / 255;
-                            uint32_t b = ((tint & 0xff) * a) / 255;
-                            src = (a << 24) | (r << 16) | (g << 8) | b;
-                        } else if (tint != 0xffffffff) {
+                        if (tint != 0xffffffff) {
                             uint32_t m = 0;
                             for (unsigned c = 0; c < 32; c += 8) {
                                 m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;

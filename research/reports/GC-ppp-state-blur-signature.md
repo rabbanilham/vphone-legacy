@@ -318,3 +318,9 @@ No iOS boot compatibility is claimed.
    A parallel worker in `vphone-wt-gfx-d` is working on exact bilinear sampling and vibrancy shader parameter extraction. Task GC changes to PPP retention and signature matching are completely orthogonal and ready for merge.
 2. **Dynamic Tap Parameter Extraction in C**:
    Currently, Python extracts dynamic 4/6/7-tap parameters from vertex uniforms (`vs_data + 48`), while C uses the standard 6-tap separable Gaussian kernel for canvas backdrop blurs. If custom kernel weights are needed in C, uniform parsing can be exposed in `agx_replay_frame`.
+
+---
+
+## 8. Lead review (Claude, 2026-10-24)
+
+The `ROUNDED_CAPS` coverage modulation (§2.3 fix 1) was **reverted** in C and Python before merge, and its corpus-dependent test was removed. The same program draws the lock-screen "slide to unlock" label: with the change the label turned pale grey on every `settings` lock-screen frame (MAE against the live 90 s capture in the label region went from 1.7 to 16.7). The 12 skips are still eliminated with the change reverted, signature-based blur detection is still in place, and the C replay of all 287 report frames is pixel-identical to the pre-GC baseline. The thin UISwitch shadow edge stays open: the fix has to tell the knob texture apart from glyph text (texture identity or sampler state), not key on the program alone.

@@ -145,22 +145,6 @@ class TestAGXPPPStateBlurSignature(unittest.TestCase):
         self.assertIn('agx_blur_preamble', text)
         self.assertIn('agx_is_blur_code', text)
 
-    def test_uiswitch_shadow_edge_smooth_transition(self):
-        """Verify knob shadow edge in settings-all frame-1 has a smooth gradient without dipping to 194."""
-        report_f1 = ROOT / 'corpus' / 'report' / 'settings-all-frame-1.png'
-        if not report_f1.exists():
-            self.skipTest('report image settings-all-frame-1.png not generated')
-        im = Image.open(str(report_f1)).convert('RGB')
-
-        # At scissor boundary x=508, y=208, previously dipped to 194.
-        # With coverage modulation in ROUNDED_CAPS, track fill is preserved and shadow gradient is smooth.
-        p507 = im.getpixel((507, 208))[0]
-        p508 = im.getpixel((508, 208))[0]
-        p509 = im.getpixel((509, 208))[0]
-
-        self.assertGreaterEqual(p508, 225, f"Pixel at x=508 dipped to {p508}; cliff not resolved")
-        self.assertLessEqual(abs(p507 - p508), 20, f"Abrupt step from {p507} to {p508} at x=508")
-
 
 if __name__ == '__main__':
     unittest.main()
