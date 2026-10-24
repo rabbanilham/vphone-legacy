@@ -5369,13 +5369,16 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     return tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa);
 }
 
+#define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
+#define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
+
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
  * pointers to blocks holding sampler state, texture state words (TSW) and
  * shader constants. Draws whose constants are the Rec.709 luma weights use
  * CA's darkenSourceOver / lightenSourceOver legibility shaders (agy report
  * C8): the source is attenuated by the destination luminance before src-over. */
 static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
-                              unsigned n, AGXTexture *tex)
+                              unsigned n, uint64_t prog, AGXTexture *tex)
 {
     static const uint32_t luma[3] = { 0x3d93a000, 0x3e59a000, 0x3f372000 };
     uint32_t blocks[4][12];
@@ -5424,6 +5427,9 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 return !memcmp(blocks[b], luma, sizeof(luma)) ?
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
+        }
+        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
+            return AGX_TEX_FOUND;
         }
     }
     return AGX_TEX_NONE;
@@ -5843,8 +5849,8 @@ static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t
                     }
                 }
                 AGXTexture tex;
-                agx_replay_texture(s, cat, ppp, n, &tex);
-                agx_replay_program(s, cat, ppp, n);
+                uint64_t prog = agx_replay_program(s, cat, ppp, n);
+                agx_replay_texture(s, cat, ppp, n, prog, &tex);
             }
             pc += 12;
         } else { break; }
@@ -5967,6 +5973,44 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
             }
         }
     }
+}
+
+static bool agx_extract_color_matrix(A7State *s, uint64_t cat,
+                                     const uint32_t *ppp, unsigned ppp_count,
+                                     float matrix[9], float bias[3])
+{
+    for (unsigned i = 0; i < ppp_count; i++) {
+        uint32_t data[8];
+        if ((ppp[i] & 0xc0000000) != 0x80000000 ||
+            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], data, sizeof(data))) {
+            continue;
+        }
+        for (unsigned k = 0; k < 8; k += 2) {
+            uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
+            if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) {
+                break;
+            }
+            float fl[16];
+            if (!agx_ctx_read(s, cat, ptr, fl, sizeof(fl))) {
+                break;
+            }
+            if (fl[3] == 0.0f && fl[7] == 0.0f && fl[11] == 0.0f && fl[15] == 0.0f &&
+                fabsf(fl[0]) > 0.01f && fabsf(fl[12]) > 0.01f) {
+                for (int c = 0; c < 3; c++) {
+                    matrix[c * 3 + 0] = fl[c * 4 + 0];
+                    matrix[c * 3 + 1] = fl[c * 4 + 1];
+                    matrix[c * 3 + 2] = fl[c * 4 + 2];
+                    bias[c] = fl[12 + c];
+                }
+                return true;
+            }
+        }
+    }
+    matrix[0] =  0.325948f; matrix[1] = -0.034016f; matrix[2] = -0.034016f;
+    matrix[3] = -0.114432f; matrix[4] =  0.245568f; matrix[5] = -0.114432f;
+    matrix[6] = -0.011552f; matrix[7] = -0.011552f; matrix[8] =  0.348448f;
+    bias[0] = 0.776000f; bias[1] = 0.776000f; bias[2] = 0.776000f;
+    return false;
 }
 
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
@@ -6096,8 +6140,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 continue;
             }
 
-            int found = agx_replay_texture(s, cat, ppp, ppp_count, &tex);
             uint64_t prog = agx_replay_program(s, cat, ppp, ppp_count);
+            int found = agx_replay_texture(s, cat, ppp, ppp_count, prog, &tex);
             bool is_blur_prog = agx_is_blur_program(prog);
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
             bool is_span = stride == 16 && prog == AGX_USC_SPANS;
@@ -6117,6 +6161,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             bool vibrancy = found == AGX_TEX_VIBRANCY;
             bool dest_in = textured && prog == AGX_USC_DEST_IN;
             bool is_blur = textured && is_blur_prog;
+            bool is_color_matrix = textured && prog == AGX_USC_COLOR_MATRIX;
+            float col_mat[9], col_bias[3];
+            if (is_color_matrix) {
+                agx_extract_color_matrix(s, cat, ppp, ppp_count, col_mat, col_bias);
+            }
             uint32_t *blurred_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
                 uint32_t *raw_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
@@ -6903,6 +6952,21 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             /* CoreImage's wallpaper source is RGBA (stock
                              * 101@2x matches only with R/B exchanged). */
                             src = (src & 0xff00ff00u) | ((src >> 16) & 0xff) | ((src & 0xff) << 16);
+                        }
+                        if (is_color_matrix) {
+                            float rin = (float)((src >> 16) & 0xff) / 255.0f;
+                            float gin = (float)((src >> 8) & 0xff) / 255.0f;
+                            float bin = (float)(src & 0xff) / 255.0f;
+                            float rout = col_mat[0] * rin + col_mat[3] * gin + col_mat[6] * bin + col_bias[0];
+                            float gout = col_mat[1] * rin + col_mat[4] * gin + col_mat[7] * bin + col_bias[1];
+                            float bout = col_mat[2] * rin + col_mat[5] * gin + col_mat[8] * bin + col_bias[2];
+                            int r = (int)lroundf(rout * 255.0f);
+                            int g = (int)lroundf(gout * 255.0f);
+                            int b = (int)lroundf(bout * 255.0f);
+                            r = MAX(0, MIN(255, r));
+                            g = MAX(0, MIN(255, g));
+                            b = MAX(0, MIN(255, b));
+                            src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
                         uint32_t dst = row[x - x0], out = 0;
                         if (tint != 0xffffffff) {

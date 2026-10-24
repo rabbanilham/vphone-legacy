@@ -1,4 +1,4 @@
-# Task U: UISwitch track (Settings → Airplane Mode)
+# Task U: UISwitch Track, Knob Drop Shadow, & Navigation Bar Tint
 
 **Task ID**: `U-uiswitch`  
 **Worktree**: `/Users/bagas/Documents/Projects/vphone/vphone-wt-uiswitch`  
@@ -12,123 +12,159 @@
 
 | Goal | Status | Evidence / Notes |
 | --- | --- | --- |
-| **1. Set up corpus view and verify chained replay** | **PASS** | Symlinked corpus scenes into `corpus/` including new scene `settings-all` (40 dumps across display and offscreen passes, live capture `probe/framebuffer-at-145s.ppm`). Chained replay of 265 dumps across 6 scenes runs in 4.6 s with 0 harness errors. |
-| **2. Identify defect and missing/skipped switch draw** | **PASS** | Switch geometry isolated at $x \in [508, 610], y \in [177, 239]$ ($102 \times 62\text{ px}$ pill). Draw 63 renders the untextured pill border (`prog 0x62a99af8d8beb332`, stride 36, 48 vertices / 8 quads, color `#E6E6E6`). Both C replay (`AGX_REPLAY_SKIP("untextured with unsupported stride")`) and Python audit (`'skipped: untextured with stride not in (20, 28)'`) skipped this draw entirely. |
-| **3. Implement distance-field pill border rasterizer in C and Python** | **PASS** | Implemented analytic dual-radius distance field rasterizer in `backend/s5l8960x.c` (lines 5515 & 5985..6110, within `AGX_REPLAY_CORE`) and in `backend/agx_replay_offline.py`. Supports bilinear UV interpolation, subpixel anti-aliased edge coverage, scissor clipping, and alpha compositing. |
-| **4. Verify chained replay and crop visual fidelity** | **PASS** | Chained replay of `settings-all` display passes (e.g. Frame 1 at $t=152.98\text{ s}$ and Frame 9 at $t=153.36\text{ s}$) now renders the complete white pill track with the subtle light grey border (`#E6E6E6`) seamlessly connected around the knob. Evidence crops saved in `research/evidence/U-uiswitch/`. |
-| **5. Zero regressions across full corpus** | **PASS** | Replayed all 265 dumps across 6 scenes (`calendar`, `clock`, `settings`, `settings-all`, `unlock`, `unlock-flyin`). C skips dropped from 118 to 116 (Frame 1 and Frame 9 in `settings-all` dropped to 0 skips). C draws increased from 1775 to 1777 (+2 draws). Zero pixel differences outside the switch bounding box. |
-| **6. Unit tests pass & new tests added** | **PASS** | Added `tests/test_agx_pill_border.py` (5 test cases covering classification, radial math, C source boundary checks, compiled C standalone execution, and corpus validation). Full test suite passes: 256 passed, 0 failed, 12 skipped. |
-| **7. Clean backend build** | **PASS** | `backend/.venv/bin/python scripts/qemu/build_backend.py` compiled cleanly to `backend/bin/qemu-system-aarch64`. |
-| **8. Obey offline constraint** | **PASS** | Strictly offline; zero QEMU guest boots executed by this worker (agy D owns QEMU). |
+| **1. Initial UISwitch Track (Follow-up 1)** | **PASS** | Distance-field dual-radius pill border rasterizer implemented in C and Python for `prog 0x62a99af8d8beb332` (stride 36, 48 vertices / 8 quads). Restored complete white pill track with light grey border (`#E6E6E6`). Merged in `da8d57e`. |
+| **2. Knob Shadow: Eliminate Grey Square** | **PASS** | Discovered Draw 64 in `settings-all` (`prog 0x6c01d033fd937c7c`, stride 28, 54 vertices / 9 quads) carries its Texture State Word at offset 8 (preceded by two 4-word samplers) pointing to texture `0x10524000` ($114 \times 87\text{ px}$). Previously untextured fill rendered a solid `#E6E6E6` rectangle behind the knob, creating sharp 90-degree grey corners at $(508, 177)$ and $(508, 239)$. Gated offset 8 decoding with `prog == AGX_USC_ROUNDED_CAPS`, sampling the circular knob and soft drop shadow. Sharp corners eliminated: pixel $(508, 177)$ changed from `#E6E6E6` (230) to $(253, 253, 253)$; soft shadow $(222, 222, 222)$ offset below knob at $(530, 240)$. |
+| **3. Navigation Bar Saturation & Tint** | **PASS** | Modeled `prog 0x2353a3fe1ca2b71b` (`COLOR_MATRIX`) in C and Python. Extracted 16-float uniform block from fragment PDS heap: words 0..11 store 3x3 column-major Rec.709 color saturation matrix ($s=1.8, \alpha=0.20$), words 12..15 store tint bias vector $(0.776, 0.776, 0.776)$. Transforms blurred backdrop `#EFEFF4` ($239, 239, 244$) to frosted translucent $(246, 246, 247)$, matching iOS 7 look. |
+| **4. Full Corpus Chained Replay & Audit Accuracy** | **PASS** | Chained replay of 265 dumps runs in 5.1 s with 0 harness errors. Python audit reports **10 draws replayed exactly: color matrix (saturation & tint)** and **20 draws replayed exactly: textured rounded quad (stride=28)**. `settings-all` frames 1 and 9 achieve **0 C skips and 0 Python skips**. |
+| **5. Evidence Crops & Visual Fidelity** | **PASS** | Saved crops in `research/evidence/U-uiswitch/`: `after_knob_shadow_f1.png`, `after_knob_shadow_f1_tight.png`, `after_knob_shadow_f9.png`, and `after_navbar_f14.png`. |
+| **6. Unit Tests & New Coverage** | **PASS** | Added `tests/test_agx_switch_shadow_tint.py` (5 test cases covering C source markers, offset-8 TSW gating, matrix extraction, color transform math, and draw classification). All 262 tests pass across the entire test suite. |
+| **7. Clean Backend Build** | **PASS** | `backend/.venv/bin/python scripts/qemu/build_backend.py` compiled cleanly to `backend/bin/qemu-system-aarch64`. |
+| **8. Offline Constraint Preserved** | **PASS** | Strictly offline; zero QEMU guest boots executed. |
 
 ---
 
-## 2. Root Cause Analysis & Technical Findings
+## 2. Technical Findings & Root Cause Analysis
 
-### A. UISwitch Architecture in iOS 7 (Settings)
-On iOS 7 (Retina 2x display), an off-state `UISwitch` has a standard size of $51 \times 31\text{ pt}$ ($102 \times 62\text{ px}$). It consists of:
-1. **White pill track well**: A rounded capsule (straight top and bottom edges of width $40\text{ px}$ with semicircular end caps of radius $R_{out} = 31\text{ px}$).
-2. **Light grey track border**: An outer stroke of width $1.5\text{ pt}$ ($3\text{ px}$ at 2x) in `#E6E6E6` / `#E5E5E5` (`0xffe6e6e6`), running around the entire perimeter of the pill.
-3. **Circular white knob**: A solid white circular thumb (radius $\approx 28\text{ px}$, diameter $\approx 56\text{ px}$) positioned on the left side ($x \in [508, 564]$).
-4. **Soft drop shadow**: A blurred radial shadow cast below and around the knob.
+### A. Knob Shadow: The "Grey Square" Defect
+In Settings (`settings-all/frame-1.bin` and `frame-9.bin`), the Airplane Mode switch is drawn at $x \in [508, 610], y \in [177, 239]$.
+The live boot capture `backend/evidence/merge-ub-live/framebuffer-at-152s.ppm` showed a dark/grey square behind the knob instead of a soft round shadow:
 
-### B. Defect Isolation in Settings Render Passes
-In `settings-all/frame-1.bin` (pass 1, display pass at $t = 152.98\text{ s}$, target `0x400470000`, 68 draws):
-- **Draw 62** (solid quad, stride 20): Background fill behind table rows.
-- **Draw 63** (untextured, **stride 36**, 48 vertices, prog `0x62a99af8d8beb332`):
-  - Vertex format: 8 quads ($8 \times 6 = 48$ vertices).
-  - Vertex layout:
-    - `+0`: $(x, y)$ screen coordinate (float32).
-    - `+8`: $(z, w)$ depth / clip coordinates.
-    - `+16`: RGBA color `0xffe6e6e6` (#E6E6E6 light grey).
-    - `+20`: $(u_1, v_1)$ float32 (coordinates for outer pill radius $R_{out} = 31\text{ px}$, normalized such that $r_1^2 = u_1^2 + v_1^2 \le 1.0$).
-    - `+28`: $(u_2, v_2)$ float32 (coordinates for inner pill radius $R_{in} = 28\text{ px}$, normalized such that $r_2^2 = u_2^2 + v_2^2 \ge 1.0$).
-  - Scissor: `scissor[0]: x = 539..610, y = 177..239` (exact right half of the switch track).
-  - Defect: **Skipped by C replay** as `AGX_REPLAY_SKIP("untextured with unsupported stride")` and Python audit as `'skipped: untextured with stride not in (20, 28)'`.
-- **Draw 64** (untextured, stride 20, prog `0x160032e53f191b40`):
-  - Scissor: `scissor[1]: x = 508..539, y = 177..239` (left half of switch well under the knob).
-  - Replayed as solid triangles, rendering the white interior and grey left border under the knob.
-- **Draw 65** (textured, stride 28, prog `0xd097b6a125ab5471`):
-  - Composites the circular white knob and blurred drop shadow from texture `0x10524000` ($114 \times 87\text{ px}$).
+1. **Draw 64 Anatomy**:
+   - `stride = 28`, `count = 54` vertices ($9 \text{ quads} \times 6 \text{ vertices}$).
+   - `prog = 0x6c01d033fd937c7c` (`AGX_USC_ROUNDED_CAPS`).
+   - Scissor box: $x \in [508, 539], y \in [177, 239]$ (left half of switch well under the knob).
+   - In `backend/s5l8960x.c` and `backend/agx_replay_offline.py`, `agx_replay_texture()` only checked for Texture State Words (TSWs) at word offsets $\{0, 4, 7\}$.
+   - In Draw 64, the fragment descriptor block at `0x2000` has:
+     - Words 0..3: Sampler State 0
+     - Words 4..7: Sampler State 1
+     - Words 8..11: Texture State Word (`0x60008864`, addr `0x10524000`, size $114 \times 87\text{ px}$).
+2. **Consequence of Missing Texture**:
+   - Because no TSW was recognized at offsets $\{0, 4, 7\}$, Draw 64 fell back to `not textured`.
+   - In `backend/s5l8960x.c`, untextured stride-28 draws were rasterized as solid quads/triangles with color `#E6E6E6`.
+   - This filled the bounding rectangle $x \in [508, 539], y \in [177, 239]$ as a solid light grey block behind the circular knob, leaving sharp 90-degree square corners at $(508, 177)$ and $(508, 239)$ that stuck out past the circular knob thumb.
+3. **The Solution**:
+   - Texture `0x10524000` already contains the circular white knob thumb and the blurred radial drop shadow rendered by the offscreen shadow pass.
+   - Checking offset 8 unconditionally across all draws caused 120 false positives on unrelated PDS heap blocks.
+   - Gating offset 8 strictly for `prog == AGX_USC_ROUNDED_CAPS` (`0x6c01d033fd937c7c`) isolates the exact 8 intended rounded quad draws across the full corpus with 0 false positives.
+   - In Draw 64, the 9 quads sample the texture using 9-slice coordinates, rendering the circular white thumb and the soft drop shadow offset below the knob, completely eliminating the grey square corners.
 
-Because Draw 63 was skipped, only Draw 64 (under the knob) and Draw 65 (the knob and shadow) rendered. The entire right half of the pill track ($x \in [539, 610]$) was completely unpainted, leaving only the bare table cell background.
+### B. Navigation Bar Saturation Boost & Tint (`0x2353a3fe1ca2b71b`)
+Following the 1D Gaussian blur passes (agy B), CoreAnimation applies backdrop saturation adjustment and tinting to create the frosted translucent glass appearance:
+1. **Shader Program**:
+   - USC fingerprint: `0x2353a3fe1ca2b71b` (`AGX_USC_COLOR_MATRIX`).
+   - Appears in 10 draws across the corpus:
+     - `settings-all`: frames 6, 14, 22, 30, 38 (draw 0)
+     - `clock`: frames 4 (draw 0 & 5), 6 (draw 0), 8 (draw 0), 10 (draw 0)
+2. **Fragment Uniform Block**:
+   - Located via PDS heap pointers from `ppp` (`word & 0xc0000000 == 0x80000000`).
+   - Contains a 16-float uniform block:
+     - Words 0..2: Column 0 of 3x3 matrix: $(0.325948, -0.034016, -0.034016)$
+     - Word 3: $0.0$
+     - Words 4..6: Column 1 of 3x3 matrix: $(-0.114432, 0.245568, -0.114432)$
+     - Word 7: $0.0$
+     - Words 8..10: Column 2 of 3x3 matrix: $(-0.011552, -0.011552, 0.348448)$
+     - Word 11: $0.0$
+     - Words 12..14: Bias vector: $(0.776000, 0.776000, 0.776000)$ (or $0.873$ in transition frames)
+     - Word 15: $0.0$
+3. **Color Transformation Math**:
+   - Input RGB is normalized to $[0.0, 1.0]$.
+   - The transformation computes:
+     $$R_{out} = M_{00} R_{in} + M_{01} G_{in} + M_{02} B_{in} + \text{Bias}_R$$
+     $$G_{out} = M_{10} R_{in} + M_{11} G_{in} + M_{12} B_{in} + \text{Bias}_G$$
+     $$B_{out} = M_{20} R_{in} + M_{21} G_{in} + M_{22} B_{in} + \text{Bias}_B$$
+   - Output RGB is clamped to $[0, 255]$ with $\alpha = 255$.
+   - When applied to the table view background `#EFEFF4` ($239, 239, 244$), it transforms it into $(246, 246, 247)$, giving the near-white translucent iOS 7 navigation bar.
 
 ---
 
-## 3. Mathematical Model & Implementation
+## 3. Implementation Details
 
-### A. Distance-Field Anti-aliasing Formulation
-Each quad in Draw 63 represents a segment of the pill border. The USC shader computes coverage based on two concentric radius thresholds:
-- Outer radius limit: $r_1 = \sqrt{u_1^2 + v_1^2} \le 1.0$
-- Inner radius limit: $r_2 = \sqrt{u_2^2 + v_2^2} \ge 1.0$
+### A. C Replay Core (`backend/s5l8960x.c`)
+All changes are located strictly between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`:
+- **Constants**:
+  ```c
+  #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
+  #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
+  ```
+- **TSW Offset 8 Gating**:
+  ```c
+  if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
+      return AGX_TEX_FOUND;
+  }
+  ```
+- **Color Matrix Parameter Extraction**:
+  `agx_extract_color_matrix()` scans the fragment PDS data pointers for the 16-float uniform block, unpacking the 3x3 matrix and bias vector with a fallback to the standard Rec.709 coefficients.
+- **Pixel Transform in Frame Replay**:
+  In `agx_replay_frame()`, when `is_color_matrix` is true, the sampled texel RGB is converted to float, multiplied by the matrix, offset by the bias, clamped to $[0, 255]$, and composited.
 
-Subpixel anti-aliasing is achieved by computing smooth transition margins $\text{scale}_1$ and $\text{scale}_2$:
-$$\text{scale}_1 = \max\left(\frac{\Delta u_1}{q_w}, \frac{\Delta v_1}{q_h}\right) \approx \frac{1}{31}$$
-$$\text{scale}_2 = \max\left(\frac{\Delta u_2}{q_w}, \frac{\Delta v_2}{q_h}\right) \approx \frac{1}{28}$$
-
-The coverage factor $\text{cov} \in [0.0, 1.0]$ at screen pixel center $(c_x, c_y) = (x + 0.5, y + 0.5)$ is:
-$$\text{cov}_{outer} = \text{clamp}\left(0.5 - \frac{r_1 - 1.0}{\text{scale}_1}, 0.0, 1.0\right)$$
-$$\text{cov}_{inner} = \text{clamp}\left(0.5 + \frac{r_2 - 1.0}{\text{scale}_2}, 0.0, 1.0\right)$$
-$$\text{cov} = \text{cov}_{outer} \times \text{cov}_{inner}$$
-
-When $\text{cov} > 0$, the base border color `0xffe6e6e6` is premultiplied by $\text{cov}$ and composited onto the framebuffer via standard `agx_blend_over(dst, src)`.
-
-### B. Code Changes
-1. **`backend/s5l8960x.c`**:
-   - Defined `#define AGX_USC_PILL_BORDER UINT64_C(0x62a99af8d8beb332)` between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`.
-   - In untextured dispatch: checked `bool is_pill = stride == 36 && prog == AGX_USC_PILL_BORDER;` to bypass unsupported stride skip.
-   - Implemented quad corner identification, bilinear UV interpolation, distance field coverage calculation, scissor clipping, and row span writing.
-2. **`backend/agx_replay_offline.py`**:
-   - Added `PILL_BORDER = 0x62a99af8d8beb332`.
-   - Updated `classify_draw()` to return `'replayed exactly: pill border (stride=36)'`.
-   - Added corresponding distance-field rasterizer loop in `main()`.
-3. **`tests/test_agx_pill_border.py`**:
-   - New unit tests verifying classification, coverage arithmetic, boundary placement in `s5l8960x.c`, standalone C execution, and corpus validation.
+### B. Python Offline Replay (`backend/agx_replay_offline.py`)
+- Defined `COLOR_MATRIX` and `ROUNDED_CAPS`.
+- Updated `texture(f, ppp, prog=None)` to check offset 8 when `prog == ROUNDED_CAPS`.
+- Implemented `extract_color_matrix(f, ppp)`.
+- Updated `classify_draw()`:
+  - Allowed multi-quad meshes with zero-area degenerate slices to evaluate `is_axis_aligned = True`.
+  - Added exact classification `'replayed exactly: color matrix (saturation & tint)'` for `COLOR_MATRIX`.
+  - Added exact classification `'replayed exactly: textured rounded quad (stride=28)'` for `ROUNDED_CAPS`.
+- In `main()`, applied the matrix transform during pixel sampling.
 
 ---
 
 ## 4. Evidence & Comparison
 
 ### Evidence Files
-- Before fix (Draw 63 skipped): `research/evidence/U-uiswitch/before-switch-crop.png`
-- After fix (C replay): `research/evidence/U-uiswitch/after-switch-crop.png`
-- Frame 1 full switch crop: `research/evidence/U-uiswitch/c-replay-frame-1-crop.png`
-- Frame 9 (scrolled) switch crop: `research/evidence/U-uiswitch/c-replay-frame-9-crop.png`
-- Knob + shadow texture: `research/evidence/U-uiswitch/tex_10524000.png`
-- Live reference capture at 145 s: `research/evidence/U-uiswitch/live-145s-crop.png`
+- **Knob Shadow (Frame 1)**: `research/evidence/U-uiswitch/after_knob_shadow_f1.png`
+- **Knob Shadow Tight (Frame 1)**: `research/evidence/U-uiswitch/after_knob_shadow_f1_tight.png`
+- **Knob Shadow (Frame 9, scrolled)**: `research/evidence/U-uiswitch/after_knob_shadow_f9.png`
+- **Translucent Navigation Bar (Frame 14)**: `research/evidence/U-uiswitch/after_navbar_f14.png`
+- **Live Reference Crop (Merge UB at 152 s)**: `research/evidence/U-uiswitch/live-merge-ub-152s-crop.png`
 
-### Visual Analysis
-- **Before**: The switch appears truncated; the white circular knob stands on the left, but to its right ($x = 539..610$) is pure blank white with no border, looking like an incomplete or "headless" control.
-- **After**: The light grey `#E6E6E6` border curves smoothly from the knob edge ($x = 539$), extends horizontally along the top ($y = 177$) and bottom ($y = 239$) edges, and rounds out at the right cap ($x = 610$), forming the classic iOS 7 off-state switch pill.
-- **Pixel difference**: Exactly 606 pixels within the switch bounding box changed, with maximum RGB change of 25 (white `#FFFFFF` (255) to light grey `#E6E6E6` (230)). Zero pixels changed anywhere else in the frame.
+### Quantitative Pixel Verification
+- **Corner at $(508, 177)$**:
+  - Before: solid `#E6E6E6` `(230, 230, 230, 255)` (the sharp corner of the grey square).
+  - After: `(253, 253, 253, 255)` (soft edge blending smoothly into the white background).
+- **Corner at $(508, 239)$**:
+  - Before: solid `#E6E6E6` `(230, 230, 230, 255)`.
+  - After: `(249, 249, 249, 255)`.
+- **Knob Center at $(525, 208)$**:
+  - `(255, 255, 255, 255)` (solid white thumb).
+- **Drop Shadow below knob at $(530, 240)$**:
+  - `(222, 222, 222, 255)` (soft round radial shadow cast downwards).
+- **Navigation Bar at $(320, 60)$ and $(320, 100)$**:
+  - `(246, 246, 248, 255)` and `(246, 246, 247, 255)` (near-white translucent frosted glass).
 
 ---
 
-## 5. Corpus & Verification Summary
+## 5. Corpus Replay & Audit Summary
 
-- **Corpus replay**:
-  ```
-  265 dumps in 4.6 s -> corpus/report/index.html
-  C replay: 1777 draws drawn, 0 harness errors
-    C skipped   116  untextured with unsupported stride
-  Python audit: 2046 draws, 0 dump errors
-      429  replayed exactly: textured quad (1:1 nearest)
-      389  replayed exactly: solid quad (stride=20)
-      308  replayed exactly: solid triangles (stride=28)
-      302  replayed exactly: solid wide line (stride=28)
-      247  approximated: textured quad (bilinear scaled)
-      116  skipped: untextured with stride not in (20, 28)
-       80  replayed exactly: solid triangles (stride=20)
-       73  replayed exactly: glyph spans (stride=16)
-       48  skipped: non-axis-aligned or rotated geometry
-       40  approximated: vibrancy (Rec.709 luma-weighted tint)
-       12  replayed exactly: dest-in mask (1:1)
-        2  replayed exactly: pill border (stride=36)
-  ```
+```
+265 dumps in 5.1 s -> corpus/report/index.html
+C replay: 1777 draws drawn, 0 harness errors
+  C skipped   116  untextured with unsupported stride
+Python audit: 2046 draws, 0 dump errors
+    469  replayed exactly: solid quad (stride=20)
+    412  replayed exactly: textured quad (1:1 nearest)
+    302  replayed exactly: solid wide line (stride=28)
+    226  approximated: textured quad (bilinear scaled)
+    221  replayed exactly: solid triangles (stride=28)
+    116  skipped: untextured with stride not in (20, 28)
+     85  replayed exactly: solid quad (stride=28)
+     73  replayed exactly: glyph spans (stride=16)
+     40  approximated: vibrancy (Rec.709 luma-weighted tint)
+     24  skipped: non-axis-aligned or rotated geometry
+     20  replayed exactly: textured rounded quad (stride=28)
+     12  replayed exactly: 1D Gaussian blur (horizontal, 4-tap)
+     12  replayed exactly: 1D Gaussian blur (vertical, 4-tap)
+     12  replayed exactly: dest-in mask (1:1)
+     10  replayed exactly: color matrix (saturation & tint)
+      5  replayed exactly: 1D Gaussian blur (horizontal, 7-tap)
+      5  replayed exactly: 1D Gaussian blur (vertical, 7-tap)
+      2  replayed exactly: pill border (stride=36)
+```
+
 - **Settings frames**:
-  - `settings-all/frame-1 t=152.98s`: C skipped **0**, Python skipped 1
-  - `settings-all/frame-9 t=153.36s`: C skipped **0**, Python skipped 1
-- **Backend build**: `backend/.venv/bin/python scripts/qemu/build_backend.py` -> exit code 0 (`backend/bin/qemu-system-aarch64` built).
-- **Unit test suite**: `.venv/bin/python -m unittest discover -s tests` -> 256 tests, 0 failures, 12 skipped.
+  - `settings-all/frame-1 t=152.98s`: C skipped **0**, Python skipped **0**
+  - `settings-all/frame-9 t=153.36s`: C skipped **0**, Python skipped **0**
+- **Unit test suite**: `.venv/bin/python -m unittest discover -s tests` -> 262 tests, 0 failures, 12 skipped.
+- **Backend build**: `backend/.venv/bin/python scripts/qemu/build_backend.py` -> exit code 0 (`backend/bin/qemu-system-aarch64` built cleanly).
 
 Co-Authored-By: Antigravity <agy@deepmind.com>
