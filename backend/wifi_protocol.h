@@ -28,7 +28,7 @@ typedef struct WifiProtocol {
     size_t response_len;
     WifiFrame queue[WIFI_QUEUE];
     unsigned head, count;
-    uint32_t settings[24];
+    uint32_t settings[32];
     uint16_t notification_seq, notification_seq_rx;
     bool scan_pending;
     uint16_t scan_sync;
@@ -211,8 +211,14 @@ static const char *const wifi_knobs[] = {
     "scan_passive_time","bcn_timeout","delta_stats_interval","pm2_md_sleep_ext",
     "mpc","sup_wpa","pfnclear","wsec","auth","wpa_auth","roam_off",
     "roam_trigger","roam_delta","roam_scan_period","pm","infra","allmulti",
-    "promisc","scan_assoc_time"
+    "promisc","scan_assoc_time",
+    /* Firmware build "...-keepalive-...": setASSOCIATE first clears the ARP
+     * keep-alive and aborts the join with EOPNOTSUPP if this is refused. */
+    "keep_alive"
 };
+_Static_assert(sizeof(wifi_knobs)/sizeof(*wifi_knobs) <=
+               sizeof(((WifiProtocol *)0)->settings)/sizeof(uint32_t),
+               "one settings slot per firmware knob");
 static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
                        uint8_t *out, size_t *len)
 {
@@ -308,13 +314,19 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
     case 37: wifi_st32(out,0); outlen=4; break;
     case 38: break;
     case 52: wifi_disconnect(s); break;
-    case 23: wifi_st32(out,s->joined?strlen(s->ssid):0); if(s->joined) memcpy(out+4,s->ssid,strlen(s->ssid)); outlen=36; break;
-    case 25: if(!s->joined) status=-17; else { memcpy(out,wifi_bssid,6); outlen=6; } break;
+    /* wlioctl.h: WLC_GET_BSSID 23, WLC_GET_SSID 25 (the 11D257 driver's
+     * command log confirms the standard numbering, e.g. WLC_SET_PM 86). */
+    case 23: if(!s->joined) status=-17; else { memcpy(out,wifi_bssid,6); outlen=6; } break;
+    case 25: wifi_st32(out,s->joined?strlen(s->ssid):0); if(s->joined) memcpy(out+4,s->ssid,strlen(s->ssid)); outlen=36; break;
     case 127: wifi_st32(out,(uint32_t)-45); outlen=4; break;
     case 29: wifi_st32(out,6); wifi_st32(out+4,6); wifi_st32(out+8,6); outlen=12; break;
     /* Ordinary radio configuration ioctls needed for an open STA. */
     case 20: case 22: case 30: case 45: case 49: case 55: case 56: case 57: case 86:
-    case 118: case 133: case 185: case 187: case 245: case 258: case 268: break;
+    case 118: case 185: case 187: case 245: case 258: case 268: break;
+    /* Open-network join (AppleBCMWLANJoinManager::join): WLC_SET_WSEC 134 and
+     * WLC_SET_WPA_AUTH 165 take 0; their GETs (133, 164) report 0. */
+    case 134: case 165: break;
+    case 133: case 164: wifi_st32(out,0); outlen=4; break;
     default: status=-23; break;
     }
     memcpy(s->response,p,16); wifi_st32(s->response+4,outlen);

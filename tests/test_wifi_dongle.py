@@ -122,6 +122,14 @@ int main(void) {
  var(true,"escan",scan,8); var(true,"escan",abort_scan,8);
  assert(!w.scan_pending && w.count==1 && w.queue[0].data[20+31]==69 && w.queue[0].data[20+35]==4);
  wifi_scan_finish(&w); assert(w.count==1);
+ /* Open join commands from AppleBCMWLANJoinManager::join. */
+ uint8_t zero[4]={0}, ka[8]={0};
+ var(true,"keep_alive",ka,8); assert(!wifi_ld32(w.response+12));
+ cmd(165,2,zero,4); assert(!wifi_ld32(w.response+12));
+ cmd(134,2,zero,4); assert(!wifi_ld32(w.response+12));
+ cmd(164,0,NULL,0); assert(!wifi_ld32(w.response+12) && wifi_ld32(w.response+4)==4);
+ cmd(23,0,NULL,0); assert((int32_t)wifi_ld32(w.response+12)==-17); /* GET_BSSID, unjoined */
+ cmd(25,0,NULL,0); assert(!wifi_ld32(w.response+12) && !wifi_ld32(w.response+16));
  return 0;
 }
 '''
