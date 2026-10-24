@@ -1,6 +1,6 @@
 # T21: finish the hardware transactions behind four busy services
 
-2026-10-22, worktree `/Users/bagas/Downloads/vphone-wt-busy-devices`, branch `wt/busy-devices`.
+2026-10-22, worktree `${WORKTREES_ROOT}/vphone-wt-busy-devices`, branch `wt/busy-devices`.
 
 Implemented CBTL1610/TriStar and LM3534 I2C registers, SPI2 SmartIO DMA completion, and per-hit probe instruction mismatch rejection. **INFERRED / awaiting maintainer boot:** these changes let the four captured matching workers finish, making InterfaceNamer observe quiet before its timer. No QEMU build or execution was performed. Host tests establish the implemented bus contracts, not an early-quiet guest result. No guest software, device tree, RAM plan, firmware image or disk image was changed. Both baseband DT nodes remain present.
 
@@ -8,7 +8,7 @@ Implemented CBTL1610/TriStar and LM3534 I2C registers, SPI2 SmartIO DMA completi
 
 Read CLAUDE_HANDOVER.md §20 and T19/T20. Evidence is the supplied scratchpad `probe137/iokit-state-045s.json`, `serial.log`, and `probe-error.txt`. Registry `complete=true`, `errors=[]`. Times in probe filenames are snapshot labels; the probe clock measures host-running elapsed time, not the ARM virtual counter.
 
-Kernel `/Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/KernelMemory.bin`, SHA256 `bba9a4bace9b505b80c05bc15648b46122c8948f86ac4f0d0625f7804d78d7d8`; runtime DT SHA256 `b75e0054fb52aedc461ecaf88475e93f5b9f6d370c0e0cc040273b4b224d810b`. Used the supplied legacy venv's Capstone. All kernel addresses below are unslid VAs; `fileoff = VA - 0xffffff8000a00000 + 0x1000000`.
+Kernel `${REPO_ROOT}/build/ios712-validated/boot/KernelMemory.bin`, SHA256 `bba9a4bace9b505b80c05bc15648b46122c8948f86ac4f0d0625f7804d78d7d8`; runtime DT SHA256 `b75e0054fb52aedc461ecaf88475e93f5b9f6d370c0e0cc040273b4b224d810b`. Used the supplied legacy venv's Capstone. All kernel addresses below are unslid VAs; `fileoff = VA - 0xffffff8000a00000 + 0x1000000`.
 
 The requested `C1-mesa.md`, `C2-iap.md`, and `C3-backlight.md` were absent when checked during implementation and at report preparation. The analyses below were performed directly against the kernel/DT/capture; no claims are attributed to missing reports.
 

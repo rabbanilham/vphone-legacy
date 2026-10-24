@@ -1,6 +1,6 @@
 # T22: TriStar system-ID forwarding and probe139 discrepancy
 
-2026-10-22. Worktree `/Users/bagas/Downloads/vphone-wt-tristar-id`, branch `wt/tristar-id`.
+2026-10-22. Worktree `${WORKTREES_ROOT}/vphone-wt-tristar-id`, branch `wt/tristar-id`.
 
 **Partial result; the panic is not fixed.** The supplied kernel's provider helper does **not** translate logical register 0x20 to hardware register 0x5d. It requests a direct three-byte read at 0x20 and receives bytes in FIFO order. The existing peripheral payload `74 00 00` already satisfies that static contract. Probe139 contradicts that contract at both the outgoing prefix and the caller's received marker. The trace alone cannot identify the divergence. Changing byte order, inserting a status byte, or inventing an IPC command is unsupported by the recovered code.
 
@@ -8,7 +8,7 @@ Changes: correct the misleading board comment, retain the existing 0x5d compatib
 
 ## Inputs
 
-Kernel `/Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/KernelMemory.bin`, SHA256 `bba9a4bace9b505b80c05bc15648b46122c8948f86ac4f0d0625f7804d78d7d8`. Disassembled with Capstone in `/Users/bagas/Downloads/vphone-legacy/.venv/bin/python`. All addresses are full unslid VAs with `fileoff = VA - 0xffffff8000a00000 + 0x1000000`.
+Kernel `${REPO_ROOT}/build/ios712-validated/boot/KernelMemory.bin`, SHA256 `bba9a4bace9b505b80c05bc15648b46122c8948f86ac4f0d0625f7804d78d7d8`. Disassembled with Capstone in `${REPO_ROOT}/.venv/bin/python`. All addresses are full unslid VAs with `fileoff = VA - 0xffffff8000a00000 + 0x1000000`.
 
 Supplied scratchpad `probe139/i2c0-stream.txt`, SHA256 `c4fc222a44fb5bf4ed4917db77ac1dfe7e74614e1bf8e3dd814a10f5b7c55ca9`; `probe139/serial.log` reports the stated bad IPC message ID panic at caller 0xffffff800088a600. No runtime provider object, vtable, prefix memory, or destination-buffer dump accompanies these files.
 

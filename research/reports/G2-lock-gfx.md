@@ -1,10 +1,10 @@
 # G2-lock-gfx: Lock-screen graphics, clock/date, and live Home screen
 
-**Task ID**: `G2-lock-gfx`  
-**Worktree**: `/Users/bagas/Downloads/vphone-wt-lock-gfx`  
-**Branch**: `wt/lock-gfx`  
-**Worker**: Antigravity (`agy`) continuing Codex WIP (commit `a77b241`)  
-**Base Commit**: `a77b241` ("WIP from Codex: AGX replay snapshot, queue cursor, wallpaper pitch, and stamp waits")  
+**Task ID**: `G2-lock-gfx`
+**Worktree**: `${WORKTREES_ROOT}/vphone-wt-lock-gfx`
+**Branch**: `wt/lock-gfx`
+**Worker**: Antigravity (`agy`) continuing Codex WIP (commit `a77b241`)
+**Base Commit**: `a77b241` ("WIP from Codex: AGX replay snapshot, queue cursor, wallpaper pitch, and stamp waits")
 
 ---
 

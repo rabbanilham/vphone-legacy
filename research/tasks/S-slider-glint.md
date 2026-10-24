@@ -1,6 +1,6 @@
 # Task S: "slide to unlock" glint and the black bar artefact
 
-Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-slider`, branch `wt/slider`. Renderer scope: per-program blend modes and the span primitive in the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Task K (another agy, `wt/clock-hands`) changes vertex colour byte order and adds a triangle rasteriser for untextured draws: do not touch those parts; keep your diff local to blend selection and the span draws so both merge mechanically.
+Worktree `${WORKTREES_ROOT}/vphone-wt-slider`, branch `wt/slider`. Renderer scope: per-program blend modes and the span primitive in the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Task K (another agy, `wt/clock-hands`) changes vertex colour byte order and adds a triangle rasteriser for untextured draws: do not touch those parts; keep your diff local to blend selection and the span draws so both merge mechanically.
 
 ## Work offline. No QEMU boots.
 Set up your own corpus view exactly as task K describes (symlink `build/agx-corpus/*/dumps` and `probe` into `corpus/`, run `.venv/bin/python scripts/agx_corpus.py --corpus corpus`, which writes `corpus/report/index.html` in about 2 s). Never write into `build/`.

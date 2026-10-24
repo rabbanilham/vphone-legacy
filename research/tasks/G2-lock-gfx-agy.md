@@ -1,7 +1,7 @@
 # Task G2 (agy): continue Codex's lock-screen graphics work
-Worktree: /Users/bagas/Downloads/vphone-wt-lock-gfx (branch wt/lock-gfx). Report id: G2-lock-gfx (also update research/reports/G-lock-gfx.md).
+Worktree: ${WORKTREES_ROOT}/vphone-wt-lock-gfx (branch wt/lock-gfx). Report id: G2-lock-gfx (also update research/reports/G-lock-gfx.md).
 
-Codex was stopped mid-task (usage limit). FIRST read `research/reports/G-lock-gfx.md` in this worktree: it lists what Codex changed (all UNCOMMITTED in the working tree: backend/s5l8960x.c, agx_replay_offline.py, agx_frame.py, agx_contract_test.py, display_probe.py, tests), what works, and the evidence in backend/evidence/G-lock-gfx/. Keep Codex's changes; build on them. The full Codex log is /Users/bagas/Downloads/vphone-legacy/research/tasks/G-lock-gfx.log (read the narration, skip the huge outputs).
+Codex was stopped mid-task (usage limit). FIRST read `research/reports/G-lock-gfx.md` in this worktree: it lists what Codex changed (all UNCOMMITTED in the working tree: backend/s5l8960x.c, agx_replay_offline.py, agx_frame.py, agx_contract_test.py, display_probe.py, tests), what works, and the evidence in backend/evidence/G-lock-gfx/. Keep Codex's changes; build on them. The full Codex log is ${REPO_ROOT}/research/tasks/G-lock-gfx.log (read the narration, skip the huge outputs).
 
 ## Current state
 - Live lock screen now shows the star-field wallpaper + "slide to unlock" (final/lock-75.png). Clock and date are still missing.

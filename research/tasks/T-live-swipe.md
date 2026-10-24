@@ -1,5 +1,5 @@
 # Task T (agy): a mouse swipe in the Cocoa window unlocks the lock screen
-Worktree: /Users/bagas/Downloads/vphone-wt-live-swipe (branch wt/live-swipe). Report id: T-live-swipe.
+Worktree: ${WORKTREES_ROOT}/vphone-wt-live-swipe (branch wt/live-swipe). Report id: T-live-swipe.
 
 ## Problem
 Mouse-to-touch forwarding exists (backend/README.md "Mouse input in the Cocoa window"; `a7-touch-display` absolute pointer handler in backend/s5l8960x.c; VPHONE_MOUSE_TOUCH). But an ordinary mouse drag across "slide to unlock" in the live window does NOT unlock. Only the slow scripted swipe works (hold 0.3 s, 3 s drag, hold 1 s, y=1036). Handover section 20 explains why: SBLockScreenScrollView (320 pt pages) needs >50% travel or a flick; SpringBoard's main thread handles HID late and UIKit coalesces events, so a fast pan sees Began -> one Changed -> Ended with velocity 0 and bounces back. MultitouchHID shifts the fingertip ~16 px up.

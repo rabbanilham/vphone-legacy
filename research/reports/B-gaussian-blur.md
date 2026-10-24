@@ -1,9 +1,9 @@
 # B-gaussian-blur: CoreAnimation Gaussian Blur Accuracy and 1D Directional Replay
 
-**Task ID**: `B-gaussian-blur`  
-**Worktree**: `/Users/bagas/Documents/Projects/vphone/vphone-wt-blur`  
-**Branch**: `wt/blur`  
-**Worker**: Antigravity (`agy`)  
+**Task ID**: `B-gaussian-blur`
+**Worktree**: `${WORKTREES_ROOT}/vphone-wt-blur`
+**Branch**: `wt/blur`
+**Worker**: Antigravity (`agy`)
 **Scope**: Blur code in AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`: `AGX_USC_BLUR_*`, `agx_blur_taps_*`, `agx_blur_1d`, `agx_extract_blur_params`, `agx_blur_texture`, and blur branches in `agx_replay_frame`), `backend/agx_replay_offline.py` blur handling and draw classification, and `tests/test_agx_gauss_blur.py`. Decoupled from concurrent work by agy U (`wt/uiswitch`).
 
 ---
@@ -51,7 +51,7 @@ Because neither hash was in `BLUR_PROGRAMS`:
 
 ## 3. Native QuartzCore Architecture & Shader Recovery
 
-By slicing the guest's iOS 7.1.2 `QuartzCore` binary (`/Users/bagas/Documents/Projects/vphone/vphone-wt-blur/build/virtual-activated-profile-v5/system.raw`), we disassembled `CA::OGL::BlurState::narrow_blur` and extracted the native GLSL shaders directly from binary strings (`0x184397c08` through `0x18439c042`):
+By slicing the guest's iOS 7.1.2 `QuartzCore` binary (`${WORKTREES_ROOT}/vphone-wt-blur/build/virtual-activated-profile-v5/system.raw`), we disassembled `CA::OGL::BlurState::narrow_blur` and extracted the native GLSL shaders directly from binary strings (`0x184397c08` through `0x18439c042`):
 
 ### A. The 7-Tap 1D Blur Shader (`0xf82f9a96aff1e034`)
 ```glsl
@@ -204,6 +204,6 @@ OK (skipped=2)
 
 $ backend/.venv/bin/python scripts/qemu/build_backend.py
 [7/7] Generating qemu-system-aarch64 with a custom command
-Built experimental backend: /Users/bagas/Documents/Projects/vphone/vphone-wt-blur/backend/bin/qemu-system-aarch64
+Built experimental backend: ${WORKTREES_ROOT}/vphone-wt-blur/backend/bin/qemu-system-aarch64
 ```
 All unit tests pass and QEMU compiles cleanly.

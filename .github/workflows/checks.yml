@@ -1,0 +1,28 @@
+name: Firmware-free checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install host dependencies
+        run: brew install keystone glib pixman
+      - name: Set up isolated Python environment
+        run: VPHONE_PYTHON="$(command -v python)" make setup
+      - name: Unit and host-C tests (no firmware)
+        run: make test
+      - name: Maintained documentation links
+        run: .venv/bin/python scripts/check_docs.py
+      - name: Script syntax
+        run: |
+          zsh -n scripts/setup_venv.sh scripts/build_app.sh vphone-legacy
+          bash -n research/tasks/merge-live.sh
+          .venv/bin/python -m compileall -q sources/vphone-legacy-cli scripts backend tests

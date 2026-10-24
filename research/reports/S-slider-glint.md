@@ -1,9 +1,9 @@
 # S-slider-glint: "slide to unlock" Glint and Black Bar Artefact Fix
 
-**Task ID**: `S-slider-glint`  
-**Worktree**: `/Users/bagas/Documents/Projects/vphone/vphone-wt-slider`  
-**Branch**: `wt/slider`  
-**Worker**: Antigravity (`agy`)  
+**Task ID**: `S-slider-glint`
+**Worktree**: `${WORKTREES_ROOT}/vphone-wt-slider`
+**Branch**: `wt/slider`
+**Worker**: Antigravity (`agy`)
 **Scope**: Per-program blend modes and horizontal span primitive in the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`), `backend/agx_replay_offline.py`, and `tests/test_agx_slider_spans.py`. Strictly decoupled from Task K (`wt/clock-hands`).
 
 ---

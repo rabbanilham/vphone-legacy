@@ -1,6 +1,6 @@
 # T17 — Scripted gesture timelines
 
-Worktree `/Users/bagas/Downloads/vphone-wt-gesture`, branch `wt/gesture`.
+Worktree `${WORKTREES_ROOT}/vphone-wt-gesture`, branch `wt/gesture`.
 
 ## Result and verification boundary
 
@@ -96,10 +96,10 @@ UIKit gesture completion or a successful QEMU build.
 Read `CLAUDE_HANDOVER.md` section20, T5/T6 from the scratchpad reports directory,
 and the T15 cache-index warning. Cache mappings were read from the supplied
 `cache-index.json`; instructions were independently decoded with Capstone in
-`/Users/bagas/Downloads/vphone-legacy/.venv/bin/python`.
+`${REPO_ROOT}/.venv/bin/python`.
 
 Additional **VERIFIED byte checks** against
-`/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64`:
+`${REPO_ROOT}/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64`:
 
 | Unslid VA | First16 bytes | Checked instruction/evidence scope |
 |---|---|---|
@@ -122,7 +122,7 @@ slide; cache and executable bytes must each be checked against their own file.
 
 ## Exact next probe commands (user runs after rebuilding)
 
-Run from `/Users/bagas/Downloads/vphone-wt-gesture` after making the usual plan,
+Run from `${WORKTREES_ROOT}/vphone-wt-gesture` after making the usual plan,
 binary, evidence, and diagnostic disks available in this worktree. Each command
 starts a fresh boot with the SMP plan and 180 seconds of guest-running capture
 budget. Output directories are separate. The display window uses Cocoa.

@@ -199,10 +199,12 @@ def build_harness(out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'agx_replay_core.inc').write_text(core)
     # Same pkg-config and Homebrew glib as scripts/qemu/build_backend.py.
+    brew = shutil.which('brew')
+    prefix = Path(subprocess.check_output([brew, '--prefix'], text=True).strip()) if brew else None
+    pcs = [prefix / 'opt' / lib / 'lib/pkgconfig' for lib in ('glib', 'pcre2')] if prefix else []
     env = {**os.environ,
            'PATH': str(BACKEND / '.venv/bin') + os.pathsep + os.environ.get('PATH', ''),
-           'PKG_CONFIG_PATH': os.pathsep.join(
-               str(Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig') for lib in ('glib', 'pcre2'))}
+           'PKG_CONFIG_PATH': os.pathsep.join([*(str(p) for p in pcs if p.exists()), os.environ.get('PKG_CONFIG_PATH', '')])}
     flags = subprocess.run(['pkg-config', '--cflags', '--libs', 'glib-2.0'], env=env,
                            capture_output=True, text=True, check=True).stdout.split()
     subprocess.run(['cc', '-O2', '-std=gnu11', '-w', '-I', str(out_dir), str(HARNESS_SRC),

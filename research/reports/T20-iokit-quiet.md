@@ -1,6 +1,6 @@
 # T20: IOKit quiet attribution (incomplete hardware fix)
 
-2026-10-22, branch `wt/iokit-quiet`, worktree `/Users/bagas/Downloads/vphone-wt-iokit-quiet`.
+2026-10-22, branch `wt/iokit-quiet`, worktree `${WORKTREES_ROOT}/vphone-wt-iokit-quiet`.
 
 **Result: the requested early-quiet fix is NOT established.** No device-model change is justified as a fix by the supplied evidence. This commit adds the missing read-only IOService busy-tree/kernel-task capture and records the static audit, so the next permitted boot can identify the actual owner. It does not claim that InterfaceNamer now publishes `*QUIET*`, or that CommCenter/SpringBoard start earlier. No backend build, emulator run, guest modification, disk attachment, or disk write was performed.
 
@@ -81,8 +81,8 @@ VPHONE_SNAPSHOT_PROCS=CommCenter,configd,lockdownd,CommCenterRootHe,CommCenterMo
 python3 backend/display_probe.py \
   --plan backend/evidence/keybag-contract-20261015/boot-plan-smp-nooscar/boot_plan.json \
   --output /tmp/t20-iokit --seconds 100 --stop-condition duration \
-  --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/diagnostic/system-diagnostic-sep.raw \
-  --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/diagnostic/data-diagnostic-systembag.raw \
+  --diagnostic-system ${REPO_ROOT}/build/diagnostic/system-diagnostic-sep.raw \
+  --diagnostic-data ${REPO_ROOT}/build/diagnostic/data-diagnostic-systembag.raw \
   --breakpoint userclient_start=0xffffff8000c5cf18 --max-hits userclient_start=0 \
   --user-hooks backend/boot_wait_hooks.json --max-hits boot_wait_=32 \
   --snapshot-at 45

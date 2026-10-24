@@ -1,11 +1,5 @@
-## Common rules (all workers)
-- Read CLAUDE_HANDOVER.md sections 24-27 first (and backend/README.md for tooling). The project emulates an iPhone 5s (A7, iOS 7) in a patched QEMU (`backend/s5l8960x.c`).
-- Work ONLY in your own worktree and commit only to your own branch. Do not touch the main checkout (on the MBP `/Users/bagas/Documents/Projects/vphone/vphone-legacy`, on the MBA `/Users/bagas/Downloads/vphone-legacy`) or any other worktree, do not merge into other branches, do not push.
-- `build/` is a symlink to the shared image store: never write into it. The default profile is `build/virtual-activated-profile-v5/` (plan `boot/boot_plan.json`, `system.raw`, `data.raw`); `backend/live_run.py` uses it by default with MTTCG and always clones images. For timed probes use `backend/display_probe.py` with `--plan/--diagnostic-system/--diagnostic-data` pointing at those files and a fresh `--output` under your worktree.
-- Build your own QEMU in this worktree: `backend/.venv/bin/python scripts/qemu/build_backend.py` (writes backend/bin/qemu-system-aarch64 here). Rebuild once before blaming a regression; compare `AGX replay target` vs `AGX RT queue` counts in qemu-trace.log.
-- Every QEMU launch must show the Cocoa window: `VPHONE_DISPLAY=cocoa` for display_probe.py; live_run.py always does.
-- Delete disposable image clones (`<output>/images`, ~3 GB) after each probe. Keep evidence small (logs, PNGs, json).
-- macOS mediaanalysisd sometimes loads the CPU; wait for `uptime` load < 5 before timing measurements. Other workers run QEMU in parallel; keep at most one QEMU of your own running at a time.
-- Lock screen timing on this profile: "slide to unlock" around 90 s guest; the display idles off ~30 s after content appears (touches are ignored while dark). Working scripted unlock: `VPHONE_TOUCH_SCRIPT='at=95;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up'`.
-- No guest-binary patching unless your task says so. Fix things in the emulator/board model.
-- Write your report to `research/reports/<task-id>.md` (what you found, what changed, evidence paths, PASS/FAIL per goal, what is still open) and commit code + report with a clear message ending in a `Co-Authored-By:` line for yourself. Do not claim success without evidence.
+# Historical task context
+
+These briefs describe the 2026-10 research work, not instructions for current contributors. Agent launchers and duplicate prompts have been removed. Technical findings remain in the briefs and corresponding reports.
+
+Use [current status](../../docs/status.md), [architecture](../../docs/architecture.md), and [contribution guidelines](../../CONTRIBUTING.md) for maintained information. The shared-image/worktree setup described in older briefs was local to those experiments and is not created by setup. `merge-live.sh` is retained as a historical acceptance helper and requires a prepared local UI profile.

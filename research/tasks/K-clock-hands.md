@@ -1,6 +1,6 @@
 # Task K: Clock icon hands (vertex colour order and triangle rasterisation)
 
-Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-clock-hands`, branch `wt/clock-hands`. You own the AGX replay renderer for this task: `backend/s5l8960x.c` (only the AGX replay core between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Touch nothing else in `s5l8960x.c` (touch, Wi-Fi, USB regions belong to others).
+Worktree `${WORKTREES_ROOT}/vphone-wt-clock-hands`, branch `wt/clock-hands`. You own the AGX replay renderer for this task: `backend/s5l8960x.c` (only the AGX replay core between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Touch nothing else in `s5l8960x.c` (touch, Wi-Fi, USB regions belong to others).
 
 ## Work offline. No QEMU boots.
 The corpus is already recorded in `build/agx-corpus/` (read-only; do not delete or re-capture). One command replays every dump with the exact C renderer QEMU runs plus the Python audit in about 2 s:

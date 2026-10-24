@@ -1,6 +1,6 @@
 # Task U: UISwitch track (Settings → Airplane Mode)
 
-Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-uiswitch`, branch `wt/uiswitch`. Renderer scope: the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Work offline only: no QEMU boots (agy D owns QEMU on this Mac). The lead does one live boot at merge time.
+Worktree `${WORKTREES_ROOT}/vphone-wt-uiswitch`, branch `wt/uiswitch`. Renderer scope: the AGX replay core of `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Work offline only: no QEMU boots (agy D owns QEMU on this Mac). The lead does one live boot at merge time.
 
 ## Defect
 In Settings the Airplane Mode switch (off state) draws only the white knob and part of its shadow. The track is missing. A real iOS 7 off switch is a white rounded track (pill, about 102x62 px at 2x) with a thin light grey border (about #E5E5E5) and a white round knob with a soft shadow on the left. Live evidence: `backend/evidence/merge-ks-live/framebuffer-at-152s.ppm` (switch around x 500..620, y 150..215).

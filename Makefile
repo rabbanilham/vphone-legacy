@@ -2,7 +2,7 @@
 
 PYTHON ?= .venv/bin/python
 
-.PHONY: all setup test backend clean help
+.PHONY: all setup test check-docs backend vphoned gui clean help
 
 all: setup test
 
@@ -13,6 +13,9 @@ setup:
 test:
 	@echo "Running test suite..."
 	$(PYTHON) -m unittest discover -s tests -v
+
+check-docs:
+	$(PYTHON) scripts/check_docs.py
 
 backend:
 	$(PYTHON) scripts/qemu/build_backend.py
@@ -37,6 +40,7 @@ help:
 	@echo "Targets:"
 	@echo "  make setup     - Create Python venv and compile keystone dylib"
 	@echo "  make test      - Run automated test suite"
+	@echo "  make check-docs - Check maintained documentation links"
 	@echo "  make backend   - Build pinned experimental s5l8960x QEMU"
 	@echo "  make vphoned   - Build vphoned-legacy daemon"
 	@echo "  make clean     - Remove build artifacts"

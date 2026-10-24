@@ -1,12 +1,12 @@
 # T23: the next TriStar-enabled fault is EHCI capability MMIO
 
-2026-10-22, `/Users/bagas/Downloads/vphone-wt-tristar-next`, branch `wt/tristar-next`.
+2026-10-22, `${WORKTREES_ROOT}/vphone-wt-tristar-next`, branch `wt/tristar-next`.
 
 Implemented A7 EHCI controller wiring using the pinned QEMU EHCI engine, plus the separate USB complex configuration registers. **Host checks pass; native boot acceptance remains unverified.** No QEMU build or execution was performed. No guest software, kernel, runtime DT, boot plan, firmware, or disk image was changed. TriStar remains opt-in (`VPHONE_TRISTAR=1`); absence of a further panic and completion of baseband/iap matching are not established by these host tests.
 
 ## Fault and call chain
 
-Inputs: T21/T22, supplied `probe142/serial.log` and `trace-tail.txt`, validated `KernelMemory.bin` and `DeviceTree.runtime` in the legacy checkout. Capstone ran with `/Users/bagas/Downloads/vphone-legacy/.venv/bin/python`; kernel file offsets use the supplied `VA - 0xffffff8000a00000 + 0x1000000` formula. Addresses here are unslid kernel VAs, with prefix `0xffffff8000` omitted in abbreviated addresses.
+Inputs: T21/T22, supplied `probe142/serial.log` and `trace-tail.txt`, validated `KernelMemory.bin` and `DeviceTree.runtime` in the legacy checkout. Capstone ran with `${REPO_ROOT}/.venv/bin/python`; kernel file offsets use the supplied `VA - 0xffffff8000a00000 + 0x1000000` formula. Addresses here are unslid kernel VAs, with prefix `0xffffff8000` omitted in abbreviated addresses.
 
 The fault is **AppleUSBEHCI::start**, beginning `eefaac`, not a TriStar register read or an accessory IPC routine. Its superclass vtable pointer at `efa220` resolves to `b8c570`. The subclass start slots establish the full chain:
 
