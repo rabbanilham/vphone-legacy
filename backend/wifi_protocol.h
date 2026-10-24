@@ -142,7 +142,7 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
 {
     size_t sl=strlen(s->ssid), off=128;
     memset(b,0,256); wifi_st32(b,109); memcpy(b+8,wifi_bssid,6);
-    wifi_st16(b+14,100); wifi_st16(b+16,1); b[18]=sl; memcpy(b+19,s->ssid,sl);
+    wifi_st16(b+14,100); wifi_st16(b+16,s->darwin?2:1); b[18]=sl; memcpy(b+19,s->ssid,sl);
     wifi_st32(b+52,sizeof(wifi_rates)); memcpy(b+56,wifi_rates,sizeof(wifi_rates));
     wifi_st16(b+72,0x1006); wifi_st16(b+76,(uint16_t)-45); b[78]=(uint8_t)-92;
     b[84]=6;
@@ -212,7 +212,7 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     }
     if(!strcmp(name,"chanspec")) {
         if(set) { /* ignore */ }
-        else { wifi_st32(out, 0x1006); *len = 16; }
+        else { wifi_st32(out, 0x1006); *len = 4; }
         return 0;
     }
     if(!strcmp(name,"chanspecs")) {
