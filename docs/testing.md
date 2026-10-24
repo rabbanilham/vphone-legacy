@@ -76,6 +76,8 @@ Phase timings are separated and reported in stdout and `summary.json`:
 
 ## Optional integration
 
+`VPHONE_AGX_CORPUS=/absolute/path/to/agx-corpus` enables the recorded unlock-frame blur fallback regression. Without an override, it uses `build/agx-corpus`; the test skips when that optional dump is absent.
+
 `VPHONE_TEST_BUNDLE=/absolute/path/to/bundle` enables lifecycle integration in `test_backend_lifecycle.py`. It launches QEMU and force-stops the guest, modifying runtime/session state: use a disposable prepared bundle. `VPHONE_REAL_FIRMWARE_TEST=1` enables real-firmware tests. `VPHONE_TEST_IPSW` and `VPHONE_TEST_ANS_SOURCE` override the local IPSW and extracted ANS file paths respectively; absent overrides use the historical checkout layout. Inspect `test_firmware_gate.py` and `test_ans_image.py` before enabling it. These tests are not part of firmware-free CI.
 
 See [publication audit](publication-audit.md) for checks actually performed during repository preparation and their limitations.

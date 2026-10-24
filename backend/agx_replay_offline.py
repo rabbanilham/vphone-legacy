@@ -493,23 +493,27 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 ox0 = struct.unpack('<f', struct.pack('<I', p_words[16]))[0]
                 oy0 = struct.unpack('<f', struct.pack('<I', p_words[17]))[0]
                 is_vert = None
-                if abs(ox0) > 0.01 and abs(oy0) < 0.001:
-                    is_vert = False
-                elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
-                    is_vert = True
+                if math.isfinite(ox0) and math.isfinite(oy0):
+                    if abs(ox0) > 0.01 and abs(oy0) < 0.001:
+                        is_vert = False
+                    elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
+                        is_vert = True
 
                 if is_vert is not None:
-                    direction = 'vertical' if is_vert else 'horizontal'
                     read_offs = []
                     for j in range(16, 16 + 4 * max_taps, 4):
                         ox = struct.unpack('<f', struct.pack('<I', p_words[j]))[0]
                         oy = struct.unpack('<f', struct.pack('<I', p_words[j + 1]))[0]
+                        if not math.isfinite(ox) or not math.isfinite(oy):
+                            break
                         val = oy if is_vert else ox
-                        if 0.05 < val < 50.0:
+                        other = ox if is_vert else oy
+                        if abs(other) < 0.005 and 0.05 < val < 50.0:
                             read_offs.append(val)
                         else:
                             break
                     if len(read_offs) >= 3:
+                        direction = 'vertical' if is_vert else 'horizontal'
                         offsets = read_offs
                         n_taps = len(read_offs)
         except Exception:
@@ -524,7 +528,7 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 for i in range(len(fl)):
                     if i + n_taps <= len(fl):
                         sub = fl[i:i + n_taps]
-                        if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                        if all(math.isfinite(x) and 0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
                             weights = list(sub)
                             break
                 if len(weights) == n_taps and weights != [t[1] for t in taps]:

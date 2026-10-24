@@ -1,5 +1,6 @@
 """Offline tests for CoreAnimation Gaussian blur replay in AGX HLE."""
 from pathlib import Path
+import os
 import shutil
 import struct
 import subprocess
@@ -329,6 +330,257 @@ int main(int argc, char **argv) {{
         self.assertEqual(params_v['n_taps'], 4)
         for i in range(4):
             self.assertAlmostEqual(params_v['offsets'][i], BLUR_TAPS_4[i][0], places=5)
+
+    def test_partial_tap_rejection_and_fallback_python(self):
+        """Verify atomic validation of blur taps in Python: 0/1/2 partial taps preserve defaults."""
+        import sys
+        sys.path.insert(0, str(ROOT / 'backend'))
+        import agx_replay_offline as aro
+
+        class MockFrame:
+            def __init__(self, vs_words):
+                self.pages = {}
+                self.vs_ptr = 0x1000
+                self.vs_data = 0x2000
+                vsd_bytes = bytearray(64)
+                struct.pack_into('<Q', vsd_bytes, 48, self.vs_ptr)
+                self.pages[self.vs_data] = bytes(vsd_bytes)
+                u_bytes = bytearray(4096)
+                for i, w in enumerate(vs_words):
+                    struct.pack_into('<I', u_bytes, 4 * i, w)
+                self.pages[self.vs_ptr] = bytes(u_bytes)
+
+            def u32(self, gva):
+                base = (gva // 4096) * 4096
+                off = gva % 4096
+                return struct.unpack_from('<I', self.pages[base], off)[0]
+
+        # 0 taps: all zeros
+        mf_0 = MockFrame([0] * 64)
+        p0 = aro.extract_blur_params(mf_0, mf_0.vs_data, [], 0)
+        self.assertEqual(p0['direction'], 'both')
+        self.assertEqual(p0['n_taps'], 6)
+        self.assertEqual(p0['offsets'], [t[0] for t in aro.BLUR_TAPS])
+
+        # 1 partial tap: word 16 is 5.925f, oy0 = 0.0f, but subsequent words are 0
+        vs_1 = [0] * 16
+        vs_1.extend([struct.unpack('<I', struct.pack('<f', 5.925))[0], 0, 0, 0])
+        vs_1.extend([0] * 32)
+        mf_1 = MockFrame(vs_1)
+        p1 = aro.extract_blur_params(mf_1, mf_1.vs_data, [], 0)
+        self.assertEqual(p1['direction'], 'both', '1 partial tap must not mutate direction to horizontal')
+        self.assertEqual(p1['n_taps'], 6)
+        self.assertEqual(p1['offsets'], [t[0] for t in aro.BLUR_TAPS])
+
+        # 2 partial taps: word 16 is 5.925f, word 20 is 0.7857f, word 24 has orthogonal component != 0
+        vs_2 = [0] * 16
+        vs_2.extend([struct.unpack('<I', struct.pack('<f', 5.925))[0], 0, 0, 0])
+        vs_2.extend([struct.unpack('<I', struct.pack('<f', 0.7857))[0], 0, 0, 0])
+        vs_2.extend([0, struct.unpack('<I', struct.pack('<f', 1.0))[0], 0, 0])  # ox=0, oy=1 violates horiz
+        vs_2.extend([0] * 16)
+        mf_2 = MockFrame(vs_2)
+        p2 = aro.extract_blur_params(mf_2, mf_2.vs_data, [], 0)
+        self.assertEqual(p2['direction'], 'both', '2 partial taps must not mutate direction to horizontal')
+        self.assertEqual(p2['n_taps'], 6)
+        self.assertEqual(p2['offsets'], [t[0] for t in aro.BLUR_TAPS])
+
+        # Non-finite values (NaN / Inf)
+        vs_nan = [0] * 16
+        vs_nan.extend([struct.unpack('<I', struct.pack('<f', float('nan')))[0], 0, 0, 0])
+        vs_nan.extend([0] * 32)
+        mf_nan = MockFrame(vs_nan)
+        p_nan = aro.extract_blur_params(mf_nan, mf_nan.vs_data, [], 0)
+        self.assertEqual(p_nan['direction'], 'both')
+        self.assertEqual(p_nan['n_taps'], 6)
+
+        # Valid 3 taps: atomic update succeeds
+        vs_3 = [0] * 16
+        for off in [1.5, 3.2, 5.0]:
+            vs_3.extend([struct.unpack('<I', struct.pack('<f', off))[0], 0, 0, 0])
+        vs_3.extend([0] * 16)
+        mf_3 = MockFrame(vs_3)
+        p3 = aro.extract_blur_params(mf_3, mf_3.vs_data, [], 0)
+        self.assertEqual(p3['direction'], 'horizontal')
+        self.assertEqual(p3['n_taps'], 3)
+        self.assertAlmostEqual(p3['offsets'][0], 1.5, places=5)
+        self.assertAlmostEqual(p3['offsets'][1], 3.2, places=5)
+        self.assertAlmostEqual(p3['offsets'][2], 5.0, places=5)
+
+        vs_7 = [0] * 16
+        for off, _ in aro.BLUR_TAPS_7:
+            vs_7.extend([0, struct.unpack('<I', struct.pack('<f', off))[0], 0, 0])
+        vs_7.extend([0] * 4)
+        mf_7 = MockFrame(vs_7)
+        p7 = aro.extract_blur_params(mf_7, mf_7.vs_data, [], aro.BLUR_7TAP)
+        self.assertEqual(p7['direction'], 'vertical')
+        self.assertEqual(p7['n_taps'], 7)
+        for actual, (expected, _) in zip(p7['offsets'], aro.BLUR_TAPS_7):
+            self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_c_blur_param_extraction(self):
+        """Verify atomic validation of blur taps in compiled C helper from s5l8960x.c."""
+        compiler = shutil.which('cc')
+        if not compiler:
+            self.skipTest('host C compiler unavailable')
+
+        source = SOURCE.read_text()
+        start_taps = source.index('static const struct {\n    float offset;\n    float weight;\n} agx_blur_taps[]')
+        end_taps = source.index('static void agx_blur_1d(')
+        taps_src = source[start_taps:end_taps]
+
+        start_fn = source.index('static void agx_extract_blur_params(')
+        end_fn = source.index('static bool agx_extract_color_matrix(')
+        fn_src = source[start_fn:end_fn]
+
+        harness = f"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+
+typedef struct A7State A7State;
+#define AGX_PDS_HEAP UINT64_C(0x600000000)
+#define AGX_USC_BLUR_4TAP UINT64_C(0x0cda5e479d40815f)
+#define AGX_USC_BLUR_7TAP UINT64_C(0xf82f9a96aff1e034)
+
+static uint8_t mock_mem[65536];
+static uint64_t mock_base = 0x1000;
+
+static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t size) {{
+    if (gva >= mock_base && gva + size <= mock_base + sizeof(mock_mem)) {{
+        memcpy(buf, mock_mem + (gva - mock_base), size);
+        return true;
+    }}
+    return false;
+}}
+
+{taps_src}
+
+{fn_src}
+
+int main(int argc, char **argv) {{
+    if (argc < 2) return 1;
+    const char *test = argv[1];
+
+    /* Setup mock vs_data header at 0x2000 pointing to 0x3000 */
+    uint64_t vs_data = 0x2000;
+    uint64_t u_ptr = 0x3000;
+    memset(mock_mem, 0, sizeof(mock_mem));
+    memcpy(mock_mem + (vs_data - mock_base) + 48, &u_ptr, 8);
+
+    if (!strcmp(test, "fallback_zero")) {{
+        float offsets[8], weights[8];
+        unsigned n_taps = 99;
+        bool is_vertical = true;
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, 0, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != 6 || is_vertical != false) return 1;
+        if (fabsf(offsets[0] - 0.6575f) > 1e-4f) return 2;
+        printf("FALLBACK_ZERO_OK\\n");
+        return 0;
+    }} else if (!strcmp(test, "partial_1tap")) {{
+        /* 1 tap at word 16 */
+        float *u = (float *)(mock_mem + (u_ptr - mock_base));
+        u[16] = 5.925f;
+        u[17] = 0.0f;
+        float offsets[8], weights[8];
+        unsigned n_taps = 99;
+        bool is_vertical = true;
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, 0, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != 6 || is_vertical != false) return 3;
+        if (fabsf(offsets[0] - 0.6575f) > 1e-4f) return 4;
+        printf("PARTIAL_1TAP_OK\\n");
+        return 0;
+    }} else if (!strcmp(test, "partial_2tap")) {{
+        /* 2 taps at words 16 and 20, word 24 invalid */
+        float *u = (float *)(mock_mem + (u_ptr - mock_base));
+        u[16] = 5.925f; u[17] = 0.0f;
+        u[20] = 0.7857f; u[21] = 0.0f;
+        u[24] = 0.0f; u[25] = 1.0f; /* violates horizontal */
+        float offsets[8], weights[8];
+        unsigned n_taps = 99;
+        bool is_vertical = true;
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, 0, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != 6 || is_vertical != false) return 5;
+        if (fabsf(offsets[0] - 0.6575f) > 1e-4f) return 6;
+        printf("PARTIAL_2TAP_OK\\n");
+        return 0;
+    }} else if (!strcmp(test, "valid_3tap")) {{
+        /* 3 valid horizontal taps */
+        float *u = (float *)(mock_mem + (u_ptr - mock_base));
+        u[16] = 1.2f; u[17] = 0.0f;
+        u[20] = 2.4f; u[21] = 0.0f;
+        u[24] = 3.6f; u[25] = 0.0f;
+        float offsets[8], weights[8];
+        unsigned n_taps = 99;
+        bool is_vertical = true;
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, 0, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != 3 || is_vertical != false) return 7;
+        if (fabsf(offsets[0] - 1.2f) > 1e-4f || fabsf(offsets[1] - 2.4f) > 1e-4f) return 8;
+        printf("VALID_3TAP_OK\\n");
+        return 0;
+    }} else if (!strcmp(test, "valid_4tap_prog") || !strcmp(test, "valid_7tap_prog")) {{
+        bool seven = !strcmp(test, "valid_7tap_prog");
+        unsigned expected_taps = seven ? 7 : 4;
+        float *u = (float *)(mock_mem + (u_ptr - mock_base));
+        for (unsigned i = 0; i < expected_taps; i++) {{
+            u[16 + 4 * i] = 0.0f;
+            u[16 + 4 * i + 1] = seven ? agx_blur_taps_7[i].offset : agx_blur_taps_4[i].offset;
+        }}
+        float offsets[8], weights[8];
+        unsigned n_taps = 0;
+        bool is_vertical = false;
+        agx_extract_blur_params(NULL, 0, vs_data, NULL, 0, seven ? AGX_USC_BLUR_7TAP : AGX_USC_BLUR_4TAP, offsets, weights, &n_taps, &is_vertical);
+        if (n_taps != expected_taps || is_vertical != true) return 9;
+        for (unsigned i = 0; i < expected_taps; i++) {{
+            float expected = seven ? agx_blur_taps_7[i].offset : agx_blur_taps_4[i].offset;
+            if (fabsf(offsets[i] - expected) > 1e-4f) return 10;
+        }}
+        printf("VALID_%uTAP_PROG_OK\\n", expected_taps);
+        return 0;
+    }}
+    return 100;
+}}
+"""
+        with tempfile.TemporaryDirectory() as td:
+            src_path = Path(td) / 'test_extract.c'
+            bin_path = Path(td) / 'test_extract'
+            src_path.write_text(harness)
+
+            res = subprocess.run([compiler, '-O2', str(src_path), '-o', str(bin_path), '-lm'],
+                                 capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f'Compilation failed:\n{res.stderr}')
+
+            for subtest in ['fallback_zero', 'partial_1tap', 'partial_2tap', 'valid_3tap', 'valid_4tap_prog', 'valid_7tap_prog']:
+                sub_res = subprocess.run([str(bin_path), subtest], capture_output=True, text=True)
+                self.assertEqual(sub_res.returncode, 0, f'C subtest {subtest} failed:\n{sub_res.stderr}')
+                self.assertIn(f'{subtest.upper()}_OK', sub_res.stdout)
+
+    def test_real_unlock_frame9_fallback_evidence(self):
+        """Verify real unlock frame 9 preserves two-axis fallback (direction='both')."""
+        import sys
+        sys.path.insert(0, str(ROOT / 'backend'))
+        import agx_replay_offline as aro
+
+        corpus = Path(os.environ.get('VPHONE_AGX_CORPUS', ROOT / 'build/agx-corpus'))
+        dump_path = corpus / 'unlock/dumps/frame-9.bin'
+        if not dump_path.exists():
+            self.skipTest(f'{dump_path} does not exist')
+
+        f = aro.Frame(dump_path)
+        draws = list(aro.walk(f))
+        self.assertGreater(len(draws), 0)
+        vs_data, ppp, draw, vp = draws[0]
+        prog = aro.program(f, ppp)
+        params = aro.extract_blur_params(f, vs_data, ppp, prog)
+
+        # Before fix: direction was wrongly 'horizontal' due to word 16 == 5.925f, oy0 == 0.0f
+        # After fix: atomic validation preserves 'both'
+        self.assertEqual(params['direction'], 'both', 'Real unlock frame 9 must preserve two-axis fallback')
+        self.assertEqual(params['n_taps'], 6)
+        self.assertEqual(params['offsets'], [t[0] for t in aro.BLUR_TAPS])
+        self.assertEqual(params['weights'], [t[1] for t in aro.BLUR_TAPS])
 
     def test_contract_replay_blob_gauss_blur(self):
         """Verify that agx_contract_test.py's gauss-blur case builds cleanly and sets oracle."""

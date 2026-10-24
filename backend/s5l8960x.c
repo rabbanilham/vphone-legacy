@@ -6038,24 +6038,41 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                 if (agx_ctx_read(s, cat, u_ptr, u_words, sizeof(u_words))) {
                     float ox0 = *(float *)&u_words[16];
                     float oy0 = *(float *)&u_words[17];
-                    if (fabsf(ox0) > 0.01f && fabsf(oy0) < 0.001f) {
-                        *is_vertical = false;
-                    } else if (fabsf(oy0) > 0.01f && fabsf(ox0) < 0.001f) {
-                        *is_vertical = true;
-                    }
-                    unsigned read_taps = 0;
-                    for (unsigned i = 0; i < max_taps; i++) {
-                        float off = *is_vertical ? *(float *)&u_words[16 + 4 * i + 1]
-                                                 : *(float *)&u_words[16 + 4 * i];
-                        if (off > 0.05f && off < 50.0f) {
-                            offsets[i] = off;
-                            read_taps++;
-                        } else {
-                            break;
+                    bool vert = def_vert;
+                    bool vert_valid = false;
+                    if (isfinite(ox0) && isfinite(oy0)) {
+                        if (fabsf(ox0) > 0.01f && fabsf(oy0) < 0.001f) {
+                            vert = false;
+                            vert_valid = true;
+                        } else if (fabsf(oy0) > 0.01f && fabsf(ox0) < 0.001f) {
+                            vert = true;
+                            vert_valid = true;
                         }
                     }
-                    if (read_taps >= 3) {
-                        *n_taps = read_taps;
+                    if (vert_valid) {
+                        float read_offs[8];
+                        unsigned read_taps = 0;
+                        for (unsigned i = 0; i < max_taps; i++) {
+                            float ox = *(float *)&u_words[16 + 4 * i];
+                            float oy = *(float *)&u_words[16 + 4 * i + 1];
+                            if (!isfinite(ox) || !isfinite(oy)) {
+                                break;
+                            }
+                            float off = vert ? oy : ox;
+                            float other = vert ? ox : oy;
+                            if (fabsf(other) < 0.005f && off > 0.05f && off < 50.0f) {
+                                read_offs[read_taps++] = off;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (read_taps >= 3) {
+                            *n_taps = read_taps;
+                            *is_vertical = vert;
+                            for (unsigned i = 0; i < read_taps; i++) {
+                                offsets[i] = read_offs[i];
+                            }
+                        }
                     }
                 }
             }
@@ -6077,7 +6094,7 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                     bool ok = true;
                     for (unsigned t = 0; t < *n_taps; t++) {
                         float w = *(float *)&f_words[s_idx + t];
-                        if (w < 0.0005f || w > 0.6f) { ok = false; break; }
+                        if (!isfinite(w) || w < 0.0005f || w > 0.6f) { ok = false; break; }
                         sum += w;
                     }
                     if (ok && fabsf(sum - 0.5f) < 0.01f) {
