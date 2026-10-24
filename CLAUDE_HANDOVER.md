@@ -901,3 +901,14 @@ Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local 
   - The knob and its drop shadow are one texture (0x10524000), drawn as a 9-slice by prog 0x6c01d033fd937c7c through a TSW at fragment-descriptor word 8; the replay had been filling it as a solid quad.
   - New AGX_USC_COLOR_MATRIX (0x2353a3fe1ca2b71b): a 3x3 matrix plus bias read from the fragment uniforms. It gives the navigation bar its near-white look, and the Clock app tab bar uses it too (slightly greyer now).
   - Live boot `backend/evidence/merge-u2-live/` has no panic, and the grey square behind the knob is gone. A thin straight grey band remains along the shadow's left edge (9-slice edge sampling, open).
+
+### Time dilation result (agy D, branch `exp/time-dilation`, not merged, local only)
+- Report: `research/reports/D-time-dilation.md` on that branch (worktree `../vphone-wt-dilation`, evidence `research/evidence/D-time-dilation/`).
+- Measured:
+  - lock screen 20 s sooner at k=2 and 23 s sooner at k=3;
+  - no panics;
+  - display sleep after 30 guest seconds (about 107 s of wall time at k=2).
+- **The unlock never completes at k>1.** The slider tracks the finger to x=565 (touch and pan work), but SpringBoard never dismisses the lock screen, so Home and any fly-in are never rendered. Tried and ruled out: timestamp units, swipe speed and steps, scaled settle frames, keep-awake.
+- D's explanation (inter-daemon unlock transaction timing) is a **hypothesis without traces**.
+- **Decision: keep k=1** (default unchanged). The missing icon fly-in at k=1 stays open. Its cause is guest CPU speed (SpringBoard commits Home after the animation's begin time). Real fixes are emulation speed or tracing why SpringBoard is slow during the unlock.
+- Not taken: D's `4ce8d1e`, which drops the `frame_count >= 2` guard from the GPIO22 re-latch. The current guard has drained normally in 5+ k=1 boots; pulsing on single frames may add spurious interrupts while the driver is reading.
