@@ -238,15 +238,9 @@ static void wifi_data(USBDevice *dev, USBPacket *p)
         WifiFrame *f=&w->queue[w->head];
         size_t ev_off = w->darwin ? 20 : 4;
         if(!f->pos && f->len>=72+ev_off && f->data[12+ev_off]==0x88 && f->data[13+ev_off]==0x6c) {
-            if(w->darwin) {
-                qemu_log_mask(LOG_UNIMP,"WIFI RX event=%u status=%u flags=%x\n",
-                              lduw_be_p(f->data+30+ev_off),ldl_be_p(f->data+32+ev_off),
-                              ldl_be_p(f->data+44+ev_off));
-            } else {
-                qemu_log_mask(LOG_UNIMP,"WIFI RX event=%u status=%u flags=%x\n",
-                              ldl_be_p(f->data+28+ev_off),ldl_be_p(f->data+32+ev_off),
-                              lduw_be_p(f->data+26+ev_off));
-            }
+            qemu_log_mask(LOG_UNIMP,"WIFI RX event=%u status=%u flags=%x\n",
+                          ldl_be_p(f->data+28+ev_off),ldl_be_p(f->data+32+ev_off),
+                          lduw_be_p(f->data+26+ev_off));
         }
         size_t n=MIN(p->iov.size,f->len-f->pos);
         usb_packet_copy(p,f->data+f->pos,n); f->pos+=n;

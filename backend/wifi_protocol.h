@@ -125,53 +125,28 @@ static bool wifi_event(WifiProtocol *s, unsigned type, unsigned status,
     uint8_t buf[WIFI_FRAME_MAX]={0};
     if(type>=128) return false;
     if(!s->darwin && !(s->events[type/8] & (1u<<(type%8)))) return true;
-    if(s->darwin) {
-        if(n>sizeof(buf)-76) return false;
-        memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
-        wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
-        wifi_be16(buf+16,48+n);
-        /* Broadcom OUI at +23, usr_subtype=1 at +26 */
-        memcpy(buf+23,"\x00\x10\x18",3);
-        wifi_be16(buf+26,1);
-        /* wl_event_msg_t is 48 bytes at +28:
-         * version(+28), event_type(+30), status(+32), reason(+36),
-         * auth_type(+40), flags(+44), datalen(+48), addr(+52),
-         * ifname(+58, "en0"), ifidx(+74), bsscfgidx(+75). */
-        wifi_be16(buf+28,0);
-        wifi_be16(buf+30,type);
-        wifi_be32(buf+32,status);
-        wifi_be32(buf+36,0);
-        wifi_be32(buf+40,0);
-        wifi_be32(buf+44,flags);
-        wifi_be32(buf+48,n);
-        memcpy(buf+52,wifi_bssid,6);
-        memcpy(buf+58,"en0",4);
-        buf[74]=0; buf[75]=0;
-        if(n) memcpy(buf+76,payload,n);
-        return wifi_enqueue(s,buf,76+n);
-    } else {
-        if(n>sizeof(buf)-72) return false;
-        memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
-        wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
-        wifi_be16(buf+16,48+n); buf[18]=0; memcpy(buf+19,"\x00\x10\x18",3);
-        wifi_be16(buf+22,1);
-        /* wl_event_msg is 48 bytes: IFNAMSIZ=16, then ifidx/bsscfgidx. */
-        wifi_be16(buf+24,2); wifi_be16(buf+26,flags);
-        wifi_be32(buf+28,type); wifi_be32(buf+32,status);
-        wifi_be32(buf+44,n); memcpy(buf+48,wifi_bssid,6); memcpy(buf+54,"en0",4);
-        if(n) memcpy(buf+72,payload,n);
-        return wifi_enqueue(s,buf,72+n);
-    }
+    if(n>sizeof(buf)-72) return false;
+    memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
+    wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
+    wifi_be16(buf+16,48+n); buf[18]=0; memcpy(buf+19,"\x00\x10\x18",3);
+    wifi_be16(buf+22,1);
+    /* wl_event_msg is 48 bytes at +24 */
+    wifi_be16(buf+24,2); wifi_be16(buf+26,flags);
+    wifi_be32(buf+28,type); wifi_be32(buf+32,status);
+    wifi_be32(buf+44,n); memcpy(buf+48,wifi_bssid,6); memcpy(buf+54,"en0",4);
+    if(n) memcpy(buf+72,payload,n);
+    return wifi_enqueue(s,buf,72+n);
 }
 /* wl_bss_info v109, followed by ordinary 802.11 IEs. */
 static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
 {
     size_t sl=strlen(s->ssid), off=128;
     memset(b,0,256); wifi_st32(b,109); memcpy(b+8,wifi_bssid,6);
-    wifi_st16(b+14,100); wifi_st16(b+16,s->darwin?2:1); b[18]=sl; memcpy(b+19,s->ssid,sl);
+    wifi_st16(b+14,100); wifi_st16(b+16,1); b[18]=sl; memcpy(b+19,s->ssid,sl);
     wifi_st32(b+52,sizeof(wifi_rates)); memcpy(b+56,wifi_rates,sizeof(wifi_rates));
     wifi_st16(b+72,0x1006); wifi_st16(b+76,(uint16_t)-45); b[78]=(uint8_t)-92;
     b[84]=6;
+    b[88]=6;
     b[off++]=0; b[off++]=sl; memcpy(b+off,s->ssid,sl); off+=sl;
     b[off++]=1; b[off++]=8; memcpy(b+off,wifi_rates,8); off+=8;
     b[off++]=50; b[off++]=4; memcpy(b+off,wifi_rates+8,4); off+=4;
@@ -182,6 +157,9 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
     if(s->darwin) {
         wifi_st16(b+78,(uint16_t)-45);
         b[80]=30;
+        b[81]=0;
+        b[84]=6;
+        b[88]=6;
         wifi_st16(b+116,128); wifi_st32(b+120,off-128);
         wifi_st16(b+124,(uint16_t)-92);
     } else {
