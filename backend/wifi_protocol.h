@@ -30,6 +30,8 @@ typedef struct WifiProtocol {
     unsigned head, count;
     uint32_t settings[24];
     uint16_t notification_seq, notification_seq_rx;
+    bool scan_pending;
+    uint16_t scan_sync;
 } WifiProtocol;
 static uint16_t wifi_ld16(const uint8_t *p) { return p[0] | p[1] << 8; }
 static uint32_t wifi_ld32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
@@ -43,7 +45,7 @@ static const uint8_t wifi_device_descriptor[] = {
     18,1,0,2,0,0,0,64,0x5c,0x0a,0x34,0x43,0,1,1,2,3,1
 };
 static const uint8_t wifi_config_descriptor[] = {
-    9,2,39,0,1,1,0,0xc0,0,
+    9,2,39,0,1,1,0,0xe0,0,
     9,4,0,0,3,0xff,0xff,0xff,0,
     7,5,0x81,3,64,0,1, 7,5,0x82,2,0,2,0, 7,5,2,2,0,2,0
 };
@@ -187,6 +189,17 @@ static void wifi_scan(WifiProtocol *s, uint16_t sync)
     wifi_event(s,ev,8,0,p,n+12);
     wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,ev,0,0,p,12);
 }
+/* Darwin defers escan results: IO80211ScanManager::startScan marks its request
+ * busy only after the driver's scan call returns (a6f400 -> a6f410), and
+ * scanDone(1) (msg 10) clears only a busy request (a6f908). A same-instant
+ * SCAN_DONE leaves the request busy, and getScanResult then fails with
+ * 0xe0820445 forever. The board completes the scan from a timer. */
+static void wifi_scan_finish(WifiProtocol *s)
+{
+    if(!s->scan_pending) return;
+    s->scan_pending=false;
+    wifi_scan(s,s->scan_sync);
+}
 static void wifi_disconnect(WifiProtocol *s)
 {
     if(s->joined) { s->joined=false; wifi_event(s,12,0,0,NULL,0); wifi_event(s,16,0,0,NULL,0); }
@@ -223,8 +236,13 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
     if(!strcmp(name,"escan") && set) {
         if(n<8 || wifi_ld32(p)!=1) return -2;
         if(s->count>WIFI_QUEUE-2) return -22;
-        if(wifi_ld16(p+4)==1) wifi_scan(s,wifi_ld16(p+6));
-        else if(wifi_ld16(p+4)==2) wifi_event(s,67,4,0,NULL,0);
+        if(wifi_ld16(p+4)==1 && s->darwin) { s->scan_pending=true; s->scan_sync=wifi_ld16(p+6); }
+        else if(wifi_ld16(p+4)==1) wifi_scan(s,wifi_ld16(p+6));
+        else if(wifi_ld16(p+4)==3 && s->darwin) {
+            /* WL_SCAN_ACTION_ABORT: the driver expects ESCAN_RESULT ABORT. */
+            if(s->scan_pending) { s->scan_pending=false; wifi_event(s,69,4,0,NULL,0); }
+        }
+        else if(wifi_ld16(p+4)==2) { s->scan_pending=false; wifi_event(s,67,4,0,NULL,0); }
         else return -2;
         return 0;
     }
@@ -306,7 +324,10 @@ static bool wifi_ioctl(WifiProtocol *s, const uint8_t *p, size_t n)
 }
 /* HSIC extended interrupt header (f66324/f689b8): valid bit15,
  * channel1 (0x9001, CDC) or channel2 (0xa001, RX) in bits14:12,
- * one's-complement checksum, sequence at +6. */
+ * one's-complement checksum, sequence at +6. Bulk RX headers share the
+ * channel 2 sequence (+0x366); completeInterruptRead (f5d224) accepts only
+ * channel 1 on the interrupt pipe; queued RX resumes a suspended port by
+ * USB remote wakeup instead. */
 static void wifi_notification_channel(WifiProtocol *s, uint8_t out[16], int channel)
 {
     memset(out,0,16);

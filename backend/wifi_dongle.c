@@ -16,7 +16,7 @@ struct WifiDongle {
     NICState *nic;
     char *ssid;
     WifiProtocol proto;
-    QEMUTimer *reenumerate;
+    QEMUTimer *reenumerate, *scan_done;
     bool detached_for_go, host_ready, rom_mode, resp_notified;
     uint8_t tx[WIFI_FRAME_MAX];
     size_t tx_len;
@@ -26,8 +26,11 @@ static const USBDescStrings wifi_strings = {
 };
 static const USBDescDevice wifi_usb_device = {
     .bcdUSB=0x0200, .bMaxPacketSize0=64, .bNumConfigurations=1,
+    /* Remote wakeup (0x20): the host selectively suspends the idle HSIC
+     * port, and only a device resume brings queued RX (escan results) to
+     * the host before the driver's 20 s scan watchdog fires. */
     .confs=(USBDescConfig[]) {{
-        .bNumInterfaces=1, .bConfigurationValue=1, .bmAttributes=0xc0,
+        .bNumInterfaces=1, .bConfigurationValue=1, .bmAttributes=0xe0,
         .nif=1, .ifs=(USBDescIface[]) {{
             .bInterfaceNumber=0, .bNumEndpoints=3,
             .bInterfaceClass=0xff, .bInterfaceSubClass=0xff, .bInterfaceProtocol=0xff,
@@ -49,11 +52,23 @@ static const USBDesc wifi_runtime_desc = {
          .iManufacturer=1,.iProduct=2,.iSerialNumber=3},
     .high=&wifi_usb_device,.str=wifi_strings,
 };
+/* usb_wakeup also signals remote wakeup on a selectively suspended port. */
 static void wifi_wake(WifiDongle *s)
 {
     if (!s->host_ready || !USB_DEVICE(s)->attached) return;
     usb_wakeup(usb_ep_get(USB_DEVICE(s),USB_TOKEN_IN,1),0);
     usb_wakeup(usb_ep_get(USB_DEVICE(s),USB_TOKEN_IN,2),0);
+}
+/* Real escan of the 11 2.4 GHz channels takes about a second; see
+ * wifi_scan_finish() for why Darwin needs the results to arrive later. */
+#define WIFI_ESCAN_NS (800LL * 1000 * 1000)
+static void wifi_scan_done(void *opaque)
+{
+    WifiDongle *s=opaque;
+    wifi_scan_finish(&s->proto);
+    qemu_log_mask(LOG_UNIMP,"WIFI escan done queued=%u host_ready=%u ns=%" PRId64 "\n",
+                  s->proto.count,s->host_ready,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    wifi_wake(s);
 }
 static void wifi_host_ready(WifiDongle *s, bool ready)
 {
@@ -179,6 +194,8 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
             const uint8_t *cmd_data = rpc ? data + 16 : data;
             size_t cmd_len = rpc ? length - 16 : length;
             if(!wifi_ioctl(w, cmd_data, cmd_len)) goto stall;
+            if(w->scan_pending && !timer_pending(s->scan_done))
+                timer_mod(s->scan_done,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+WIFI_ESCAN_NS);
             if(rpc) {
                 uint8_t rpc_hdr[16] = {0};
                 memcpy(rpc_hdr, data, 16);
@@ -205,9 +222,10 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
                           (int32_t)(rpc ? wifi_ld32(w->response + 28) : wifi_ld32(w->response + 12)),
                           w->response_len, w->count);
             if(cmd_len > 16 && (wifi_ld32(cmd_data)==262 || wifi_ld32(cmd_data)==263)) {
-                qemu_log_mask(LOG_UNIMP,"WIFI iovar=%.*s status=%d\n",
+                qemu_log_mask(LOG_UNIMP,"WIFI iovar=%.*s status=%d ns=%" PRId64 "\n",
                               (int)MIN(cmd_len-16,(size_t)64), cmd_data+16,
-                              (int32_t)(rpc ? wifi_ld32(w->response + 28) : wifi_ld32(w->response + 12)));
+                              (int32_t)(rpc ? wifi_ld32(w->response + 28) : wifi_ld32(w->response + 12)),
+                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
             }
             qemu_format_nic_info_str(qemu_get_queue(s->nic),w->mac);
             wifi_wake(s); return;
@@ -317,6 +335,7 @@ static void wifi_realize(USBDevice *dev, Error **errp)
     }
     usb_desc_init(dev);
     s->reenumerate=timer_new_ns(QEMU_CLOCK_VIRTUAL,wifi_reenumerate,s);
+    s->scan_done=timer_new_ns(QEMU_CLOCK_VIRTUAL,wifi_scan_done,s);
     s->nic=qemu_new_nic(&wifi_net_info,&s->conf,TYPE_WIFI_DONGLE,
                         dev->qdev.id,&dev->qdev.mem_reentrancy_guard,s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic),s->proto.mac);
@@ -324,7 +343,7 @@ static void wifi_realize(USBDevice *dev, Error **errp)
 static void wifi_unrealize(USBDevice *dev)
 {
     WifiDongle *s=WIFI_DONGLE(dev);
-    timer_free(s->reenumerate); if(s->nic) qemu_del_nic(s->nic);
+    timer_free(s->reenumerate); timer_free(s->scan_done); if(s->nic) qemu_del_nic(s->nic);
 }
 /* A whole-board power reset starts the ROM again. A USB bus reset above
  * deliberately preserves firmware RAM, as required during re-enumeration. */
@@ -332,7 +351,7 @@ static void wifi_power_reset(WifiDongle *s)
 {
     USBDevice *dev=USB_DEVICE(s);
     char ssid[33]; memcpy(ssid,s->proto.ssid,sizeof(ssid));
-    timer_del(s->reenumerate);
+    timer_del(s->reenumerate); timer_del(s->scan_done);
     if(dev->attached) usb_device_detach(dev);
     wifi_protocol_init(&s->proto,ssid);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);

@@ -145,7 +145,7 @@ def runtime_fixture(enumeration_only=False):
     for length in (4,9,39):
         control(0x80,6,0x200,length)
         read(ram+buf,0x00270209)
-    read_bytes(ram+buf+4,bytes([1,1,0,0xc0,0]))
+    read_bytes(ram+buf+4,bytes([1,1,0,0xe0,0]))
     read_bytes(ram+buf+18,bytes([7,5,0x81,3,64,0,1]))
     read_bytes(ram+buf+25,bytes([7,5,0x82,2,0,2,0]))
     read_bytes(ram+buf+32,bytes([7,5,2,2,0,2,0]))

@@ -107,13 +107,21 @@ int main(void) {
  var(false,"chanspec",NULL,0); assert(wifi_ld32(w.response+16)==0x2b06);
  var(false,"chanspecs",NULL,0);
  assert(wifi_ld32(w.response+16)==11 && wifi_ld32(w.response+20)==0x2b01 && wifi_ld32(w.response+60)==0x2b0b);
- var(true,"escan",scan,8); assert(w.count==2);
+ var(true,"escan",scan,8); assert(w.count==0 && w.scan_pending); /* deferred */
+ wifi_scan_finish(&w); assert(w.count==2 && !w.scan_pending);
+ wifi_scan_finish(&w); assert(w.count==2);
  f=w.queue[0].data; assert(wifi_ld16(f)==0xa001 && f[16]==0x20 && f[20+31]==69);
  esc=f+20+72; b=esc+12;
  assert(wifi_ld32(esc+4)==109 && wifi_ld16(esc+8)==0x1234 && wifi_ld16(esc+10)==1);
  assert(wifi_ld16(b+72)==0x2b06 && b[76]==1 && (int16_t)wifi_ld16(b+78)==-45);
  assert((int8_t)b[80]==-92 && !wifi_ld32(b+84) && b[88]==6 && wifi_ld16(b+124)==47);
  assert(wifi_ld16(b+116)==128 && 128+wifi_ld32(b+120)==wifi_ld32(b+4) && b[128]==0 && b[129]==12);
+ w.count=w.head=0;
+ uint8_t abort_scan[8]={1,0,0,0,3,0,0x35,0x12};
+ var(true,"escan",abort_scan,8); assert(!wifi_ld32(w.response+12) && w.count==0); /* idle abort */
+ var(true,"escan",scan,8); var(true,"escan",abort_scan,8);
+ assert(!w.scan_pending && w.count==1 && w.queue[0].data[20+31]==69 && w.queue[0].data[20+35]==4);
+ wifi_scan_finish(&w); assert(w.count==1);
  return 0;
 }
 '''
