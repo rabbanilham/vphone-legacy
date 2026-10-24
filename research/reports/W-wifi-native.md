@@ -4,25 +4,46 @@
 
 This report covers the native acceptance validation and model corrections for the BCM43342 FullMAC USB Wi-Fi emulation on the HSIC/EHCI1 port in worktree `/Users/bagas/Downloads/vphone-wt-wifi` (`wt/wifi` branch), booting an iPhone 5s (`s5l8960x`) on iOS 7.1.2 (`11D257`) with the `build/virtual-activated-profile-v5` profile.
 
-### Results Matrix
+### Results Matrix (updated 2026-10-24, wt/wifi `ac80495`)
 
-| Stage | Goal | Synthetic Contract | Native iOS Boot | Evidence Paths | Status |
-|---|---|---|---|---|---|
-| **1** | HSIC enumeration (`0a5c:4334` -> TRX download -> DL_GO -> `0a5c:bd21`) | **PASS** | **PASS** (adapted for Darwin) | `backend/wifi_contract_test.py`, `research/acceptance-wifi-native-1/`, `research/acceptance-wifi-native-7/qemu-trace.log` | **PASS (Model Fixed)** |
-| **2** | AppleBCMWLAN driver attaches without ~22s retry loop | N/A | **PASS** | `research/acceptance-wifi-native-7/serial.log` (L260-285) | **PASS** |
-| **3** | Scan returns synthetic AP (`vphone-wifi` or host SSID) | **PASS** | **UNREACHABLE (UI-gated)** | `backend/wifi_contract_test.py`, `research/acceptance-wifi-native-7/` | **PASS (Contract) / UNREACHABLE (UI)** |
-| **4** | Join / Association succeeds | **PASS** | **UNREACHABLE (UI-gated)** | `backend/wifi_contract_test.py`, `research/acceptance-wifi-native-7/` | **PASS (Contract) / UNREACHABLE (UI)** |
-| **5** | DHCP Lease via slirp (`wifi.pcap`) | **PASS** | **UNREACHABLE (UI-gated)** | `backend/wifi_contract_test.py`, `research/acceptance-wifi-native-7/wifi.pcap` | **PASS (Contract) / UNREACHABLE (UI)** |
-| **6** | Unlock swipe & open Settings -> Wi-Fi | N/A | **BLOCKED (Profile State)** | `research/acceptance-wifi-native-7/framebuffer-at-*.png` | **BLOCKED (SpringBoard Setup Mode)** |
+| Stage | Goal | Native iOS 7.1.2 boot | Evidence | Status |
+|---|---|---|---|---|
+| **1** | HSIC enumeration, TRX download, re-enumeration as `0a5c:bd21` | Passes | `research/acceptance-wifi-native-7/qemu-trace.log` | **PASS** |
+| **2** | AppleBCMWLAN attaches without the ~22 s retry loop | Passes | `research/acceptance-wifi-native-7/serial.log` | **PASS** |
+| **3** | Scan returns `vphone-wifi` | Driver caches the BSS (ch 6, RSSI -45, SNR 47); wifid logs `Auto join scan found: vphone-wifi` and `discovered 1 networks` on every scan; scans finish in ~0.8 s | `research/acceptance-wifi-native-41/wifi-logs/wifiManager.log`, `-48/wifi-logs/`, `-55/serial.log` | **PASS (wifid)**; Settings list not re-verified (touch, see section 7) |
+| **4** | Join / association | wifid `Joined: vphone-wifi`; driver `WLC_SET_SSID` -> `WLC_E_JOIN/ASSOC/LINK(flags 1)` -> `APPLE80211_M_ASSOC_DONE` | `research/acceptance-wifi-native-55/serial.log`, `-55/wifi-logs/wifiManager.log` | **PASS (auto-join of a known network)** |
+| **5** | DHCP lease via slirp | DISCOVER/OFFER/REQUEST/ACK, lease 10.0.2.15, router 10.0.2.2, ARP probe/announce, IPv6 RS/RA | `research/acceptance-wifi-native-55/wifi.pcap` (536 packets) | **PASS** |
+| **6** | Connected | wifid: `IPv4 Primary interface is en0`; DNS (`captive.apple.com`, `init.itunes.apple.com`) answered; captive check HTTP 200 `Success`; HTTPS sessions to Apple | `research/acceptance-wifi-native-55/wifi.pcap`, `-55/wifi-logs/wifiManager.log` | **PASS (system)**; status-bar icon not visually verified (display asleep, touch) |
 
-All synthetic unit tests and contract suites pass:
-- `backend/wifi_contract_test.py`: 100% PASS (both `fixture` and `runtime_fixture`).
-- `backend/ehci_contract_test.py`: 100% PASS.
-- `.venv/bin/python -m unittest discover -s tests`: 229 tests, 0 failures, 7 skipped.
+Tests at `ac80495`: 238 unit tests OK (7 skipped); `wifi_contract_test.py` and `ehci_contract_test.py` PASS.
 
 ---
 
-## 2. Background and Root Cause Analysis
+## 2. Round 2026-10-24: stages 3-6 (root causes)
+
+Earlier rounds changed struct offsets by trial and error without ground truth. This round used three sources of ground truth instead:
+the real firmware in the image (`/usr/share/firmware/wifi/43342a0/cabernet.trx`, **6.25.87.120**), the 11D257 kernel disassembly, and
+the guest's own logs. Driver logs are switched on with boot-args `wlan.debug.enable=1 wlan.log.level=0xff wlan.log.flags=0xffffffff`;
+wifid logs with `/private/var/Managed Preferences/mobile/com.apple.MobileWiFi.debug.plist` (`LoggingEnabled`, `LoggingFileEnabled`,
+`DriverLoggingEnabled`, `WiFiManagerLoggingEnabled`), written to `/var/logs/CrashReporter/WiFi/wifiManager-*.log`.
+
+1. **Chanspec format** (`bb2be88`). Firmware 6.25 and the driver use the pre-11ac encoding; the driver tests `(cs & 0xf000) == 0x2000`
+   for 2.4 GHz (`0xffffff8000acc67c`). `0x1006` read as an invalid 5 GHz channel 6. Channel 6 is now `0x2b06` everywhere.
+   The Darwin `wl_bss_info` uses the naturally aligned wlioctl.h v109 layout (RSSI +78, phy_noise +80, ie_offset +116, ie_length +120, SNR +124).
+2. **Scan-done race** (`d59e672`). `IO80211ScanManager::startScan` marks its request busy only after the driver call returns
+   (`a6f400` -> `a6f410`); `scanDone(1)` (msg 10) clears only a busy request (`a6f908`). Results queued together with the escan
+   response made SCAN_DONE arrive first, and every `getScanResult` then failed with `0xe0820445` (the only producer is `a6f68c`).
+   Darwin escans now complete from an 800 ms virtual-clock timer.
+3. **Selective suspend** (`d59e672`). The host suspends the idle HSIC port (`usb_ehci_port_suspend`). Without remote wakeup in
+   `bmAttributes`, queued results waited 10-20 s for unrelated traffic and the driver's 20 s scan watchdog reset the chip.
+   Advertising remote wakeup (`0xe0`) makes the host send `SET_FEATURE(DEVICE_REMOTE_WAKEUP)`; results now reach the driver ~30 ms
+   after they are queued. (Channel-2 interrupts are not an alternative: `completeInterruptRead` `f5d224` drops every channel but 1.)
+4. **Scan abort** (`d59e672`). `WL_SCAN_ACTION_ABORT` (3) gets an `ESCAN_RESULT` ABORT event instead of `BCME_BADARG`.
+5. **Join commands** (`ac80495`). `setASSOCIATE` aborted with EOPNOTSUPP (wifid error 45) on `keep_alive`, then on
+   `WLC_SET_WPA_AUTH`. The model now accepts `keep_alive`, `WLC_SET_WSEC` 134, `WLC_SET_WPA_AUTH` 165 (GETs 133/164 return 0), and
+   `WLC_GET_BSSID`/`WLC_GET_SSID` use the standard numbers 23/25 (they were swapped).
+
+## 3. Background and Root Cause Analysis (earlier rounds)
 
 ### A. Broadcom Descriptor & Mode Personality Conflict
 The initial worktree implementation defaulted the USB dongle to `0a5c:4334` (ROM bootloader mode).
@@ -55,7 +76,7 @@ During `AppleBCMWLANCore::start()`, the driver invokes `AppleBCMWLANProvisioning
 
 ---
 
-## 3. Detailed Verification per Stage
+## 4. Detailed Verification per Stage (earlier rounds)
 
 ### Stage 1: HSIC Enumeration & Firmware Loading
 - **Contract Evidence**: `backend/wifi_contract_test.py`
@@ -107,7 +128,7 @@ During `AppleBCMWLANCore::start()`, the driver invokes `AppleBCMWLANProvisioning
 
 ---
 
-## 4. Code Changes Summary
+## 5. Code Changes Summary (earlier rounds)
 
 1. `backend/wifi_dongle.c`:
    - Set default descriptor to `0a5c:bd21` (runtime mode) to allow native Darwin kernel attachment without entering CPULess crash dump.
@@ -126,31 +147,37 @@ During `AppleBCMWLANCore::start()`, the driver invokes `AppleBCMWLANProvisioning
 
 ---
 
-## 5. Verification Commands
+## 6. Verification Commands
 
 ```bash
-# 1. Run synthetic contracts
+# Tests (worktree root)
+.venv/bin/python -m unittest discover -s tests
 .venv/bin/python backend/wifi_contract_test.py
 .venv/bin/python backend/ehci_contract_test.py
 
-# 2. Run unit tests
-.venv/bin/python -m unittest discover -s tests
-
-# 3. Reproduce native acceptance run
-VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi \
-VPHONE_TOUCH_SCRIPT='at=95;down 40,1036;hold 0.3;move 600,1036 dur=3 steps=180;hold 1.0;up' \
-backend/.venv/bin/python backend/display_probe.py \
-  --plan build/virtual-activated-profile-v5/boot/boot_plan.json \
-  --diagnostic-system build/virtual-activated-profile-v5/system.raw \
-  --diagnostic-data build/virtual-activated-profile-v5/data.raw \
-  --stop-condition duration --seconds 130 --wifi \
-  --framebuffer-at 90 --framebuffer-at 95 --framebuffer-at 100 --framebuffer-at 125 \
-  --output research/acceptance-wifi-native-7 \
-  --qemu-arg=-object --qemu-arg=filter-dump,id=f0,netdev=wifi0,file=$(pwd)/research/acceptance-wifi-native-7/wifi.pcap
+# Native auto-join run (no touch needed). Inputs, built from the stock profile on the MBA:
+#  build/virtual-activated-profile-v5-wlanlog/boot/boot_plan.json : stock plan, KernelMemory.bin boot-args extended with
+#      "wlan.debug.enable=1 wlan.log.level=0xff wlan.log.flags=0xffffffff io8log=0xffffffff" (CommandLine at file offset
+#      0x18b806c, 256 bytes), image_sha256 updated
+#  build/virtual-activated-profile-v5-wlanlog/data-wifiknown.raw : APFS clone of data.raw plus
+#      "Managed Preferences/mobile/com.apple.MobileWiFi.debug.plist" (wifid logging) and
+#      "preferences/SystemConfiguration/com.apple.wifi.plist" = {AllowEnable: 1, "List of known networks":
+#      [{SSID_STR: vphone-wifi, SSID: <data>, AP_MODE: 2, HIDDEN_NETWORK: false}]}
+VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi backend/.venv/bin/python backend/display_probe.py \
+  --plan /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5-wlanlog/boot/boot_plan.json \
+  --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5/system.raw \
+  --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5-wlanlog/data-wifiknown.raw \
+  --output research/acceptance-wifi-native-N --stop-condition duration --seconds 160 --wifi \
+  --qemu-arg=-object --qemu-arg=filter-dump,id=f0,netdev=wifi0,file=$PWD/research/acceptance-wifi-native-N/wifi.pcap
+# wifid log: mount <output>/images/data.raw read-only, copy logs/CrashReporter/WiFi/*, then delete <output>/images.
 ```
 
----
+## 7. Open Items
 
-## 6. Open Items / Upstream Work
-- **Activation & Home Screen Reachability**: SpringBoard enters SetupAssistant buddy mode because Lockdown reports unactivated state on this diagnostic profile (`setup-done-validation-20261023.md`). Reaching the Home screen icon grid to interact with the Settings app requires a profile with fully persistent activation state.
-- **Pre-seeded Wi-Fi Profile**: Alternatively, injecting a pre-configured `com.apple.wifi.plist` with SSID `vphone-wifi` into `/private/var/preferences/SystemConfiguration/` would allow `wifid` to auto-join upon boot without manual touch interaction in the Settings app.
+- **Touch (MBP).** From run 48 on, the guest never fetches touch frames (`A7 TOUCH ... queued` keeps rising from the first tap at 78 s),
+  even in run 52 **without** `--wifi`, where no Wi-Fi code runs; runs 41-43 with the same board code worked. So it is not a Wi-Fi
+  regression; the Settings list (stage 3 in the UI) and the status-bar icon (stage 6) need a working touch/keep-awake timeline to re-verify.
+- **Status-bar icon** and the Settings checkmark: re-run the Settings timeline once touch is stable
+  (`research/tasks/W2-wifi-ui.txt` timeline, tap row 1 at about 300,440).
+- `WIFI escan done` and the `ns=` field on `WIFI iovar` lines are deliberate trace aids; drop them if the trace gets too noisy.
+- Still refused (tolerated by the driver): `pfn_set`, `btc_params`, `event_log_tag_control`, `awdl_*`, `mpc_dur`, `pwrstats`, `tlv`, `rssi_event` and a few PM knobs.
