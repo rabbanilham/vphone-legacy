@@ -764,7 +764,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
         if not tex:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
-        uv_off = 4 if stride in (28, 36) else 0
+        uv_off = 4 if stride == 28 else 0
         uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
         xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
         ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
@@ -784,7 +784,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
     is_dest_in = prog == DEST_IN
     is_vibrancy = tex.get('vibrancy', False)
 
-    uv_off = 4 if stride in (28, 36) else 0
+    uv_off = 4 if stride == 28 else 0
     uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
     u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
     v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
@@ -1240,7 +1240,7 @@ def main():
             if tex and (stride >= 24 or (stride == 16 and prog == WALLPAPER) or prog == ROUNDED_CAPS):
                 # stride 24: float u,v (normalised) at +16; stride 28/36: BGRA tint at +16,
                 # then u,v in texels at +20.
-                uv_off = 4 if stride in (28, 36) else 0
+                uv_off = 4 if stride == 28 else 0
                 uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER)
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
@@ -1248,7 +1248,7 @@ def main():
                 su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
-                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
+                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su

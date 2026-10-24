@@ -6914,10 +6914,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 uint32_t colour = 0xff000000;
                 if (stride == 20 || (stride == 28 && !textured)) {
                     agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &colour, 4);
-                } else if (stride == 24 || stride == 28 || stride == 36 || clip_space) {
-                    unsigned uv = clip_space ? 8 : (stride >= 28 ? 20 : 16);
+                } else if (stride == 24 || stride == 28 || clip_space) {
+                    /* stride 36 (two UV sets, grabber/camera mask + backdrop) is not decoded */
+                    unsigned uv = clip_space ? 8 : (stride == 28 ? 20 : 16);
                     u0 = v0 = 1e9; u1 = v1 = -1e9;
-                    if (stride == 28 || stride == 36) {
+                    if (stride == 28) {
                         agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &tint, 4);
                     }
                     for (unsigned i = q_start; i < q_start + step; i++) {
