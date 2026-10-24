@@ -195,13 +195,17 @@ def decode_tsw(f, tsw):
     return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=not strip and (tsw[0] & 0x8007) == 0x8001, tsw=tsw)
 
 
-def texture(f, ppp):
+def texture(f, ppp, prog=None):
     """Decode a texture and only the luma prefix of its selected descriptor."""
+    if prog is None:
+        prog = program(f, ppp)
     words = fragment_words(f, ppp)
     for _, ws in words:
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
-        for k in (0, 4, 7):
+        # Word 8 is used by ROUNDED_CAPS (two 4-word samplers followed by TSW).
+        offsets = (0, 4, 7, 8) if prog == ROUNDED_CAPS else (0, 4, 7)
+        for k in offsets:
             if k == 7 and tuple(ws[:3]) != LUMA:
                 continue
             if len(ws) >= k + 4:
@@ -232,6 +236,46 @@ PLUS_L = 0x5b133ef7e0c3428c  # CoreAnimation plus-lighter compositing filter
 PLUS_L2 = 0xa225a18725e48d5c  # CoreAnimation plus-lighter gradient variant
 SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
 PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
+COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
+ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
+
+
+def extract_color_matrix(f, ppp):
+    """Extract 3x3 color matrix and 3-element bias vector from fragment uniforms."""
+    for word in ppp:
+        if word & 0xc0000000 != 0x80000000:
+            continue
+        base = PDS_HEAP | word
+        try:
+            data = [f.u32(base + 4 * i) for i in range(8)]
+        except (KeyError, ValueError):
+            continue
+        for k in range(0, 8, 2):
+            ptr = data[k] | (data[k + 1] << 32)
+            if not 0x1000 <= ptr < (1 << 40):
+                break
+            try:
+                raw_bytes = f.read(ptr, 64)
+                fl = struct.unpack('<16f', raw_bytes)
+                if (fl[3] == 0.0 and fl[7] == 0.0 and fl[11] == 0.0 and fl[15] == 0.0 and
+                    abs(fl[0]) > 0.01 and abs(fl[12]) > 0.01):
+                    matrix = (
+                        fl[0], fl[1], fl[2],
+                        fl[4], fl[5], fl[6],
+                        fl[8], fl[9], fl[10],
+                    )
+                    bias = (fl[12], fl[13], fl[14])
+                    return {'matrix': matrix, 'bias': bias}
+            except (KeyError, ValueError):
+                break
+    return {
+        'matrix': (
+            0.325948, -0.034016, -0.034016,
+            -0.114432, 0.245568, -0.114432,
+            -0.011552, -0.011552, 0.348448,
+        ),
+        'bias': (0.776000, 0.776000, 0.776000),
+    }
 
 
 def is_clear_pass(type1_command):
@@ -497,8 +541,11 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if stride is None or stride < 12 or stride > 64:
         return 'skipped: unmapped memory', {'stride': stride}
 
-    tex = texture(f, ppp)
     prog = program(f, ppp)
+    try:
+        tex = texture(f, ppp, prog=prog)
+    except TypeError:
+        tex = texture(f, ppp)
 
     if not tex and stride not in (20, 28):
         if stride == 16 and prog == SPANS:
@@ -535,7 +582,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if is_line:
         return f'replayed exactly: solid wide line (stride={stride})', {'count': count}
 
-    is_axis_aligned = count in (4, 6, 12)
+    is_axis_aligned = count in (4, 6, 12) or (count % step == 0)
     if is_axis_aligned:
         for q_start in range(0, count, step):
             q_vs = vs[q_start:q_start + step]
@@ -550,6 +597,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
                 ys = [v[1] for v in q_vs]
             minx, maxx = min(xs), max(xs)
             miny, maxy = min(ys), max(ys)
+            if (maxx - minx) < 1e-3 or (maxy - miny) < 1e-3:
+                continue
             for x, y in zip(xs, ys):
                 if not ((abs(x - minx) < 1e-3 or abs(x - maxx) < 1e-3) and
                         (abs(y - miny) < 1e-3 or abs(y - maxy) < 1e-3)):
@@ -614,6 +663,10 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
         return 'approximated: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
+    elif prog == COLOR_MATRIX:
+        return 'replayed exactly: color matrix (saturation & tint)', {'prog': hex(prog)}
+    elif prog == ROUNDED_CAPS:
+        return 'replayed exactly: textured rounded quad (stride=28)', {'count': count, 'prog': hex(prog)}
     elif is_scaled:
         return 'approximated: textured quad (bilinear scaled)', {'prog': hex(prog)}
     else:
@@ -725,7 +778,11 @@ def main():
             elif stride == 16 and prog == SPANS and last_m:
                 m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
-        tex = texture(f, ppp)
+        tex = texture(f, ppp, prog)
+        is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)
+        if is_color_matrix:
+            cm = extract_color_matrix(f, ppp)
+            col_mat, col_bias = cm['matrix'], cm['bias']
         if stride == 16:
             if prog == WALLPAPER:
                 m = (1, 1, 0, 0)
@@ -1066,6 +1123,17 @@ def main():
                             b, g, r, a = row0[tx]
                         if stride == 16 and prog == WALLPAPER:
                             b, r = r, b     # CoreImage wallpaper source is RGBA
+                        if is_color_matrix:
+                            rin = r / 255.0
+                            gin = g / 255.0
+                            bin = b / 255.0
+                            rout = col_mat[0] * rin + col_mat[3] * gin + col_mat[6] * bin + col_bias[0]
+                            gout = col_mat[1] * rin + col_mat[4] * gin + col_mat[7] * bin + col_bias[1]
+                            bout = col_mat[2] * rin + col_mat[5] * gin + col_mat[8] * bin + col_bias[2]
+                            r = max(0, min(255, int(round(rout * 255.0))))
+                            g = max(0, min(255, int(round(gout * 255.0))))
+                            b = max(0, min(255, int(round(bout * 255.0))))
+                            a = 255
                         if tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
