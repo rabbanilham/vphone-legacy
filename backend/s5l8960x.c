@@ -5555,15 +5555,69 @@ static uint32_t agx_blend_plus_darker(uint32_t dst, uint32_t src)
 #define AGX_USC_BLUR_7 UINT64_C(0xf0c17d1e30ec2393)
 #define AGX_USC_BLUR_8 UINT64_C(0x69f1605719a006b2)
 #define AGX_USC_BLUR_9 UINT64_C(0xa4c025e0be54470a)
+#define AGX_USC_BLUR_10 UINT64_C(0x13a51b8bc1b85b4c)
+#define AGX_USC_BLUR_11 UINT64_C(0x23e324c0933a2344)
+#define AGX_USC_BLUR_12 UINT64_C(0x28463bd14bffa040)
+#define AGX_USC_BLUR_13 UINT64_C(0x3568dc9c7476346b)
+#define AGX_USC_BLUR_14 UINT64_C(0x4251b7edb10c7be4)
+#define AGX_USC_BLUR_15 UINT64_C(0x48870313e0aa10e8)
+#define AGX_USC_BLUR_16 UINT64_C(0x604b25e32d1eca5c)
+#define AGX_USC_BLUR_17 UINT64_C(0x66287bbe34a68c71)
+#define AGX_USC_BLUR_18 UINT64_C(0x664855a92cde7229)
+#define AGX_USC_BLUR_19 UINT64_C(0x6a2a1d789db87995)
+#define AGX_USC_BLUR_20 UINT64_C(0x6af3b793cd19efb3)
+#define AGX_USC_BLUR_21 UINT64_C(0x95450769f4fd347b)
+#define AGX_USC_BLUR_22 UINT64_C(0x9606b672a1c89485)
+#define AGX_USC_BLUR_23 UINT64_C(0xa112190af2d46c9e)
+#define AGX_USC_BLUR_24 UINT64_C(0xa7d834f91cf06600)
+#define AGX_USC_BLUR_25 UINT64_C(0xa82d25f9c6abcf1f)
+#define AGX_USC_BLUR_26 UINT64_C(0xc449a4cb19584ccf)
+#define AGX_USC_BLUR_27 UINT64_C(0xc8fbd825d2fea18d)
+#define AGX_USC_BLUR_28 UINT64_C(0xcbf57b156b6423ec)
+#define AGX_USC_BLUR_29 UINT64_C(0xe8b7f35f72f5737f)
+#define AGX_USC_BLUR_30 UINT64_C(0xefc984709b59caeb)
+#define AGX_USC_BLUR_31 UINT64_C(0xf5f55b3c7127e3f3)
 
 static inline bool agx_is_blur_program(uint64_t prog)
 {
-    return prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP ||
-           prog == AGX_USC_BLUR_1 || prog == AGX_USC_BLUR_2 ||
-           prog == AGX_USC_BLUR_3 || prog == AGX_USC_BLUR_4 ||
-           prog == AGX_USC_BLUR_5 || prog == AGX_USC_BLUR_6 ||
-           prog == AGX_USC_BLUR_7 || prog == AGX_USC_BLUR_8 ||
-           prog == AGX_USC_BLUR_9;
+    switch (prog) {
+    case AGX_USC_BLUR_4TAP:
+    case AGX_USC_BLUR_7TAP:
+    case AGX_USC_BLUR_1:
+    case AGX_USC_BLUR_2:
+    case AGX_USC_BLUR_3:
+    case AGX_USC_BLUR_4:
+    case AGX_USC_BLUR_5:
+    case AGX_USC_BLUR_6:
+    case AGX_USC_BLUR_7:
+    case AGX_USC_BLUR_8:
+    case AGX_USC_BLUR_9:
+    case AGX_USC_BLUR_10:
+    case AGX_USC_BLUR_11:
+    case AGX_USC_BLUR_12:
+    case AGX_USC_BLUR_13:
+    case AGX_USC_BLUR_14:
+    case AGX_USC_BLUR_15:
+    case AGX_USC_BLUR_16:
+    case AGX_USC_BLUR_17:
+    case AGX_USC_BLUR_18:
+    case AGX_USC_BLUR_19:
+    case AGX_USC_BLUR_20:
+    case AGX_USC_BLUR_21:
+    case AGX_USC_BLUR_22:
+    case AGX_USC_BLUR_23:
+    case AGX_USC_BLUR_24:
+    case AGX_USC_BLUR_25:
+    case AGX_USC_BLUR_26:
+    case AGX_USC_BLUR_27:
+    case AGX_USC_BLUR_28:
+    case AGX_USC_BLUR_29:
+    case AGX_USC_BLUR_30:
+    case AGX_USC_BLUR_31:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static const struct {
@@ -6150,7 +6204,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 (found == AGX_TEX_NONE && !is_span && !is_pill && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
-                                found == AGX_TEX_NONE ? "untextured with unsupported stride" :
+                                found == AGX_TEX_NONE ? (stride == 24 && prog == 0 ? "stride 24 untextured with program 0x0" : "untextured with unsupported stride") :
                                 "texture wider than texrow");
                 continue;
             }

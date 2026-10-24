@@ -307,7 +307,33 @@ BLUR_PROGRAMS = {
 
 BLUR_4TAP = 0x0cda5e479d40815f
 BLUR_7TAP = 0xf82f9a96aff1e034
-ALL_BLUR_PROGRAMS = BLUR_PROGRAMS | {BLUR_4TAP, BLUR_7TAP}
+
+BLUR_PROGRAMS_12 = {
+    0x13a51b8bc1b85b4c,
+    0x23e324c0933a2344,
+    0x28463bd14bffa040,
+    0x3568dc9c7476346b,
+    0x4251b7edb10c7be4,
+    0x48870313e0aa10e8,
+    0x604b25e32d1eca5c,
+    0x66287bbe34a68c71,
+    0x664855a92cde7229,
+    0x6a2a1d789db87995,
+    0x6af3b793cd19efb3,
+    0x95450769f4fd347b,
+    0x9606b672a1c89485,
+    0xa112190af2d46c9e,
+    0xa7d834f91cf06600,
+    0xa82d25f9c6abcf1f,
+    0xc449a4cb19584ccf,
+    0xc8fbd825d2fea18d,
+    0xcbf57b156b6423ec,
+    0xe8b7f35f72f5737f,
+    0xefc984709b59caeb,
+    0xf5f55b3c7127e3f3,
+}
+
+ALL_BLUR_PROGRAMS = BLUR_PROGRAMS | {BLUR_4TAP, BLUR_7TAP} | BLUR_PROGRAMS_12
 
 BLUR_TAPS_4 = [
     (0.638336, 0.275844),
@@ -559,6 +585,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
                 n = params['n_taps']
                 return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
             return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
+        if stride == 24 and prog == 0:
+            return 'skipped: stride 24 untextured with program 0x0', {'stride': stride, 'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
 
     if tex and tex['w'] * 4 > 0x10000:
