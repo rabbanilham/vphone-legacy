@@ -137,6 +137,14 @@ static bool wifi_event(WifiProtocol *s, unsigned type, unsigned status,
     if(n) memcpy(buf+72,payload,n);
     return wifi_enqueue(s,buf,72+n);
 }
+/* Firmware 6.25.87 and the 11D257 driver use the pre-11ac chanspec layout:
+ * band 0xf000 (2G=0x2000), bandwidth 0x0c00 (20=0x0800), sideband 0x0300
+ * (none=0x0300). The driver tests (cs & 0xf000) == 0x2000 for 2.4 GHz, so
+ * the 11ac encoding 0x1006 reads as an invalid 5 GHz channel 6. */
+static uint16_t wifi_chanspec(const WifiProtocol *s, unsigned ch)
+{
+    return s->darwin ? 0x2b00 | ch : 0x1000 | ch;
+}
 /* wl_bss_info v109, followed by ordinary 802.11 IEs. */
 static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
 {
@@ -144,24 +152,26 @@ static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
     memset(b,0,256); wifi_st32(b,109); memcpy(b+8,wifi_bssid,6);
     wifi_st16(b+14,100); wifi_st16(b+16,1); b[18]=sl; memcpy(b+19,s->ssid,sl);
     wifi_st32(b+52,sizeof(wifi_rates)); memcpy(b+56,wifi_rates,sizeof(wifi_rates));
-    wifi_st16(b+72,0x1006); wifi_st16(b+76,(uint16_t)-45); b[78]=(uint8_t)-92;
+    wifi_st16(b+72,wifi_chanspec(s,6)); wifi_st16(b+76,(uint16_t)-45); b[78]=(uint8_t)-92;
     b[84]=6;
     b[88]=6;
     b[off++]=0; b[off++]=sl; memcpy(b+off,s->ssid,sl); off+=sl;
     b[off++]=1; b[off++]=8; memcpy(b+off,wifi_rates,8); off+=8;
     b[off++]=50; b[off++]=4; memcpy(b+off,wifi_rates+8,4); off+=4;
     b[off++]=3; b[off++]=1; b[off++]=6;
-    /* Apple's 11D257 layout differs from Linux brcmfmac v109:
-     * ae9dc0 loads ie_offset as u16 at +0x74 (116) (must be >= 0x7c);
-     * ae9dd8 loads ie_length as u32 at +0x78 (120). */
+    /* Darwin uses the naturally aligned wlioctl.h v109 layout: dtim_period
+     * u8 +76, RSSI s16 +78, phy_noise s8 +80, n_cap +81, nbss_cap u32 +84,
+     * ctl_ch +88, ie_offset u16 +116 (ae9dc0: 0 or >= 0x7c), ie_length u32
+     * +120 (ae9dd8), SNR s16 +124. */
     if(s->darwin) {
-        wifi_st16(b+78,30);
-        b[80]=(uint8_t)-45;
+        b[76]=1; b[77]=0;
+        wifi_st16(b+78,(uint16_t)-45);
+        b[80]=(uint8_t)-92;
         b[81]=0;
-        b[84]=6;
+        wifi_st32(b+84,0);
         b[88]=6;
         wifi_st16(b+116,128); wifi_st32(b+120,off-128);
-        wifi_st16(b+124,(uint16_t)-92);
+        wifi_st16(b+124,47);
     } else {
         wifi_st16(b+116,off-128); wifi_st32(b+120,128);
     }
@@ -172,7 +182,8 @@ static void wifi_scan(WifiProtocol *s, uint16_t sync)
     uint8_t p[320]={0};
     size_t n=wifi_bss(s,p+12);
     unsigned ev = s->darwin ? 69 : 67;
-    wifi_st32(p,12+n); wifi_st32(p+4,1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
+    /* wl_escan_result_t.version: firmware stores WL_BSS_INFO_VERSION. */
+    wifi_st32(p,12+n); wifi_st32(p+4,s->darwin?109:1); wifi_st16(p+8,sync); wifi_st16(p+10,1);
     wifi_event(s,ev,8,0,p,n+12);
     wifi_st32(p,12); wifi_st16(p+10,0); wifi_event(s,ev,0,0,p,12);
 }
@@ -221,20 +232,16 @@ static int wifi_iovar(WifiProtocol *s, bool set, const uint8_t *p, size_t n,
         if(set) { /* ignore */ }
         else {
             memset(out, 0, 16);
-            wifi_st32(out, 0x1006);
+            wifi_st32(out, wifi_chanspec(s,6));
             *len = s->darwin ? 9 : 4;
         }
         return 0;
     }
     if(!strcmp(name,"chanspecs")) {
         if(!set) {
-            static const uint32_t chs[] = {
-                11,
-                0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006,
-                0x1007, 0x1008, 0x1009, 0x100a, 0x100b
-            };
-            memcpy(out, chs, sizeof(chs));
-            *len = sizeof(chs);
+            wifi_st32(out, 11);
+            for(unsigned ch = 1; ch <= 11; ch++) wifi_st32(out + 4*ch, wifi_chanspec(s,ch));
+            *len = 48;
             return 0;
         }
     }
