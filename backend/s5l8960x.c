@@ -6567,12 +6567,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             width = (L > 40.0f) ? (L / 17.0f) * 3.0f : 3.0f;
                         }
                         float half_w = width * 0.5f;
-                        float half_w2 = half_w * half_w;
+                        float inv_L = 1.0f / L;
 
-                        int x0 = MAX(clip_x0, (int)floorf(MIN(lp0[0], lp1[0]) - width));
-                        int x1 = MIN(clip_x1, (int)ceilf(MAX(lp0[0], lp1[0]) + width));
-                        int y0 = MAX(clip_y0, (int)floorf(MIN(lp0[1], lp1[1]) - width));
-                        int y1 = MIN(clip_y1, (int)ceilf(MAX(lp0[1], lp1[1]) + width));
+                        int x0 = MAX(clip_x0, (int)floorf(MIN(lp0[0], lp1[0]) - half_w - 1.0f));
+                        int x1 = MIN(clip_x1, (int)ceilf(MAX(lp0[0], lp1[0]) + half_w + 1.0f));
+                        int y0 = MAX(clip_y0, (int)floorf(MIN(lp0[1], lp1[1]) - half_w - 1.0f));
+                        int y1 = MIN(clip_y1, (int)ceilf(MAX(lp0[1], lp1[1]) + half_w + 1.0f));
 
                         if (x0 < x1 && y0 < y1) {
                             for (int y = y0; y < y1; y++) {
@@ -6583,11 +6583,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                     float cx = (float)x + 0.5f;
                                     float px = cx - lp0[0];
                                     float dot = px * dx + py * dy;
-                                    if (dot < 0.0f || dot > L2) {
+                                    float t = dot * inv_L;
+                                    float min_end = (t < (L - t)) ? t : (L - t);
+                                    float cov_par = min_end + 0.5f;
+                                    if (cov_par <= 0.0f) {
                                         continue;
                                     }
                                     float cross = dx * py - dy * px;
-                                    if (cross * cross <= half_w2 * L2) {
+                                    float dist_perp = fabsf(cross) * inv_L;
+                                    float cov_perp = half_w + 0.5f - dist_perp;
+                                    if (cov_perp > 0.0f) {
                                         if (first_in < 0) first_in = x;
                                         last_in = x;
                                     }
@@ -6600,16 +6605,31 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
                                     continue;
                                 }
+                                uint32_t a = colour >> 24;
+                                uint32_t r = (colour >> 16) & 0xff;
+                                uint32_t g = (colour >> 8) & 0xff;
+                                uint32_t b = colour & 0xff;
                                 for (int x = first_in; x <= last_in; x++) {
                                     float cx = (float)x + 0.5f;
                                     float px = cx - lp0[0];
                                     float dot = px * dx + py * dy;
-                                    if (dot >= 0.0f && dot <= L2) {
-                                        float cross = dx * py - dy * px;
-                                        if (cross * cross <= half_w2 * L2) {
-                                            row[x - first_in] = (prog == AGX_USC_COPY) ? colour
-                                                                                        : agx_blend_over(row[x - first_in], colour);
-                                        }
+                                    float t = dot * inv_L;
+                                    float min_end = (t < (L - t)) ? t : (L - t);
+                                    float cov_par = min_end + 0.5f;
+                                    cov_par = (cov_par < 0.0f) ? 0.0f : ((cov_par > 1.0f) ? 1.0f : cov_par);
+                                    float cross = dx * py - dy * px;
+                                    float dist_perp = fabsf(cross) * inv_L;
+                                    float cov_perp = half_w + 0.5f - dist_perp;
+                                    cov_perp = (cov_perp < 0.0f) ? 0.0f : ((cov_perp > 1.0f) ? 1.0f : cov_perp);
+                                    float cov = cov_perp * cov_par;
+                                    if (cov > 0.0f) {
+                                        uint32_t ca = (uint32_t)lroundf((float)a * cov);
+                                        uint32_t cr = (uint32_t)lroundf((float)r * cov);
+                                        uint32_t cg = (uint32_t)lroundf((float)g * cov);
+                                        uint32_t cb = (uint32_t)lroundf((float)b * cov);
+                                        uint32_t src = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                                        row[x - first_in] = (prog == AGX_USC_COPY) ? src
+                                                                                    : agx_blend_over(row[x - first_in], src);
                                     }
                                 }
                                 agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
@@ -6661,10 +6681,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         float tminy = MIN(p0[1], MIN(p1[1], p2[1]));
                         float tmaxy = MAX(p0[1], MAX(p1[1], p2[1]));
 
-                        int x0 = MAX(clip_x0, (int)floorf(tminx));
-                        int x1 = MIN(clip_x1, (int)ceilf(tmaxx));
-                        int y0 = MAX(clip_y0, (int)floorf(tminy));
-                        int y1 = MIN(clip_y1, (int)ceilf(tmaxy));
+                        int x0 = MAX(clip_x0, (int)floorf(tminx - 0.5f));
+                        int x1 = MIN(clip_x1, (int)ceilf(tmaxx + 0.5f));
+                        int y0 = MAX(clip_y0, (int)floorf(tminy - 0.5f));
+                        int y1 = MIN(clip_y1, (int)ceilf(tmaxy + 0.5f));
                         if (x0 >= x1 || y0 >= y1) {
                             continue;
                         }
@@ -6673,16 +6693,24 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             tri_colour = (tri_colour & 0xff00ff00u) | ((tri_colour >> 16) & 0xff) | ((tri_colour & 0xff) << 16);
                         }
                         for (int y = y0; y < y1; y++) {
-                            float cy = (float)y + 0.5f;
                             int first_in = -1, last_in = -1;
                             for (int x = x0; x < x1; x++) {
-                                float cx = (float)x + 0.5f;
-                                float e0 = (p1[0] - p0[0]) * (cy - p0[1]) - (p1[1] - p0[1]) * (cx - p0[0]);
-                                float e1 = (p2[0] - p1[0]) * (cy - p1[1]) - (p2[1] - p1[1]) * (cx - p1[0]);
-                                float e2 = (p0[0] - p2[0]) * (cy - p2[1]) - (p0[1] - p2[1]) * (cx - p2[0]);
-                                bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
-                                                           : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
-                                if (inside) {
+                                unsigned cnt = 0;
+                                for (unsigned si = 0; si < 4; si++) {
+                                    float sx = (float)x + (float)(2 * si + 1) * 0.125f;
+                                    for (unsigned sj = 0; sj < 4; sj++) {
+                                        float sy = (float)y + (float)(2 * sj + 1) * 0.125f;
+                                        float e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0]);
+                                        float e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0]);
+                                        float e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0]);
+                                        bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                                                   : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+                                        if (inside) {
+                                            cnt++;
+                                        }
+                                    }
+                                }
+                                if (cnt > 0) {
                                     if (first_in < 0) first_in = x;
                                     last_in = x;
                                 }
@@ -6695,16 +6723,35 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
                                 continue;
                             }
+                            uint32_t a = tri_colour >> 24;
+                            uint32_t r = (tri_colour >> 16) & 0xff;
+                            uint32_t g = (tri_colour >> 8) & 0xff;
+                            uint32_t b = tri_colour & 0xff;
                             for (int x = first_in; x <= last_in; x++) {
-                                float cx = (float)x + 0.5f;
-                                float e0 = (p1[0] - p0[0]) * (cy - p0[1]) - (p1[1] - p0[1]) * (cx - p0[0]);
-                                float e1 = (p2[0] - p1[0]) * (cy - p1[1]) - (p2[1] - p1[1]) * (cx - p1[0]);
-                                float e2 = (p0[0] - p2[0]) * (cy - p2[1]) - (p0[1] - p2[1]) * (cx - p2[0]);
-                                bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
-                                                           : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
-                                if (inside) {
-                                    row[x - first_in] = (prog == AGX_USC_COPY) ? tri_colour
-                                                                                : agx_blend_over(row[x - first_in], tri_colour);
+                                unsigned cnt = 0;
+                                for (unsigned si = 0; si < 4; si++) {
+                                    float sx = (float)x + (float)(2 * si + 1) * 0.125f;
+                                    for (unsigned sj = 0; sj < 4; sj++) {
+                                        float sy = (float)y + (float)(2 * sj + 1) * 0.125f;
+                                        float e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0]);
+                                        float e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0]);
+                                        float e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0]);
+                                        bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                                                   : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+                                        if (inside) {
+                                            cnt++;
+                                        }
+                                    }
+                                }
+                                if (cnt > 0) {
+                                    float cov = (float)cnt * 0.0625f;
+                                    uint32_t ca = (uint32_t)lroundf((float)a * cov);
+                                    uint32_t cr = (uint32_t)lroundf((float)r * cov);
+                                    uint32_t cg = (uint32_t)lroundf((float)g * cov);
+                                    uint32_t cb = (uint32_t)lroundf((float)b * cov);
+                                    uint32_t src = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                                    row[x - first_in] = (prog == AGX_USC_COPY) ? src
+                                                                                : agx_blend_over(row[x - first_in], src);
                                 }
                             }
                             agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);

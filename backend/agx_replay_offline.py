@@ -619,7 +619,15 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if not is_axis_aligned:
         if not tex and stride in (20, 28):
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
-        return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
+        if not tex:
+            return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
+        uv_off = 4 if stride == 28 else 0
+        uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
+        xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
+        ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
+        uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
+        if not uv_map:
+            return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
 
     if not tex and stride == 20:
         if count == 12:
@@ -645,6 +653,11 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     sub_w = (u1 - u0) * su
     sub_h = (v1 - v0) * sv
     is_scaled = abs((x1 - x0) - sub_w) > 0.1 or abs((y1 - y0) - sub_h) > 0.1
+    uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
+    if uv_map:
+        step_x = math.hypot(uv_map[0] * su, uv_map[3] * sv)
+        step_y = math.hypot(uv_map[1] * su, uv_map[4] * sv)
+        is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
 
     if is_blur:
         if prog in (BLUR_4TAP, BLUR_7TAP):
@@ -935,11 +948,12 @@ def main():
                             width = (L / 30.0) * 2.0 if L > 40.0 else 2.0
                         else:
                             width = (L / 17.0) * 3.0 if L > 40.0 else 3.0
-                        half_w2 = (width * 0.5) ** 2
-                        x0 = max(clip_x0, int(math.floor(min(p0[0], p1[0]) - width)))
-                        x1 = min(clip_x1, target_w, pw, int(math.ceil(max(p0[0], p1[0]) + width)))
-                        y0 = max(clip_y0, int(math.floor(min(p0[1], p1[1]) - width)))
-                        y1 = min(clip_y1, target_h, ph, int(math.ceil(max(p0[1], p1[1]) + width)))
+                        half_w = width * 0.5
+                        inv_L = 1.0 / L
+                        x0 = max(clip_x0, int(math.floor(min(p0[0], p1[0]) - half_w - 1.0)))
+                        x1 = min(clip_x1, target_w, pw, int(math.ceil(max(p0[0], p1[0]) + half_w + 1.0)))
+                        y0 = max(clip_y0, int(math.floor(min(p0[1], p1[1]) - half_w - 1.0)))
+                        y1 = min(clip_y1, target_h, ph, int(math.ceil(max(p0[1], p1[1]) + half_w + 1.0)))
                         if x0 < x1 and y0 < y1:
                             for y in range(y0, y1):
                                 cy = y + 0.5
@@ -948,12 +962,29 @@ def main():
                                     cx = x + 0.5
                                     px = cx - p0[0]
                                     dot = px * dx + py * dy
-                                    if 0.0 <= dot <= L2:
-                                        cross = dx * py - dy * px
-                                        if cross * cross <= half_w2 * L2:
-                                            d = (y * target_w + x) * 4
-                                            for c, src in enumerate((r, g, b, a)):
-                                                fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - a) // 255)
+                                    t = dot * inv_L
+                                    min_end = t if t < (L - t) else (L - t)
+                                    cov_par = min_end + 0.5
+                                    if cov_par <= 0.0:
+                                        continue
+                                    if cov_par > 1.0:
+                                        cov_par = 1.0
+                                    cross = dx * py - dy * px
+                                    dist_perp = abs(cross) * inv_L
+                                    cov_perp = half_w + 0.5 - dist_perp
+                                    if cov_perp <= 0.0:
+                                        continue
+                                    if cov_perp > 1.0:
+                                        cov_perp = 1.0
+                                    cov = cov_perp * cov_par
+                                    if cov > 0.0:
+                                        ca = int(round(a * cov))
+                                        cr = int(round(r * cov))
+                                        cg = int(round(g * cov))
+                                        cb = int(round(b * cov))
+                                        d = (y * target_w + x) * 4
+                                        for c, src in enumerate((cr, cg, cb, ca)):
+                                            fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - ca) // 255)
                 continue
 
             is_aa = count in (4, 6, 12)
@@ -1007,24 +1038,34 @@ def main():
                         continue
                     t_col = vs[t][2][:4]
                     tr, tg, tb, ta = t_col[0], t_col[1], t_col[2], t_col[3]
-                    x0 = max(clip_x0, int(math.floor(min(p0[0], p1[0], p2[0]))))
-                    x1 = min(clip_x1, target_w, pw, int(math.ceil(max(p0[0], p1[0], p2[0]))))
-                    y0 = max(clip_y0, int(math.floor(min(p0[1], p1[1], p2[1]))))
-                    y1 = min(clip_y1, target_h, ph, int(math.ceil(max(p0[1], p1[1], p2[1]))))
+                    x0 = max(clip_x0, int(math.floor(min(p0[0], p1[0], p2[0]) - 0.5)))
+                    x1 = min(clip_x1, target_w, pw, int(math.ceil(max(p0[0], p1[0], p2[0]) + 0.5)))
+                    y0 = max(clip_y0, int(math.floor(min(p0[1], p1[1], p2[1]) - 0.5)))
+                    y1 = min(clip_y1, target_h, ph, int(math.ceil(max(p0[1], p1[1], p2[1]) + 0.5)))
                     if x0 >= x1 or y0 >= y1:
                         continue
                     for y in range(y0, y1):
-                        cy = y + 0.5
                         for x in range(x0, x1):
-                            cx = x + 0.5
-                            e0 = (p1[0] - p0[0]) * (cy - p0[1]) - (p1[1] - p0[1]) * (cx - p0[0])
-                            e1 = (p2[0] - p1[0]) * (cy - p1[1]) - (p2[1] - p1[1]) * (cx - p1[0])
-                            e2 = (p0[0] - p2[0]) * (cy - p2[1]) - (p0[1] - p2[1]) * (cx - p2[0])
-                            inside = (e0 >= 0 and e1 >= 0 and e2 >= 0) if det > 0 else (e0 <= 0 and e1 <= 0 and e2 <= 0)
-                            if inside:
+                            cnt = 0
+                            for si in range(4):
+                                sx = x + (2 * si + 1) * 0.125
+                                for sj in range(4):
+                                    sy = y + (2 * sj + 1) * 0.125
+                                    e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0])
+                                    e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0])
+                                    e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0])
+                                    inside = (e0 >= 0 and e1 >= 0 and e2 >= 0) if det > 0 else (e0 <= 0 and e1 <= 0 and e2 <= 0)
+                                    if inside:
+                                        cnt += 1
+                            if cnt > 0:
+                                cov = cnt * 0.0625
+                                ca = int(round(ta * cov))
+                                cr = int(round(tr * cov))
+                                cg = int(round(tg * cov))
+                                cb = int(round(tb * cov))
                                 d = (y * target_w + x) * 4
-                                for c, src in enumerate((tr, tg, tb, ta)):
-                                    fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - ta) // 255)
+                                for c, src in enumerate((cr, cg, cb, ca)):
+                                    fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - ca) // 255)
             continue
 
         step = 4 if count == 4 else 6
