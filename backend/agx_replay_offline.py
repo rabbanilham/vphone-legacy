@@ -671,6 +671,17 @@ def quad_affine(xy, uv):
     return tuple(out) if all(math.isfinite(v) for v in out) else None
 
 
+def apply_mask_tint(cov, tint):
+    """Format 3 coverage mask: vertex tint is already premultiplied.
+    Modulate alpha and apply coverage once to RGB."""
+    tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
+    out_a = ta * cov // 255
+    r = tr * cov // 255
+    g = tg * cov // 255
+    b = tb * cov // 255
+    return (out_a << 24) | (r << 16) | (g << 8) | b
+
+
 def is_axis_aligned_quad_mesh(vs_xy, count):
     if count not in (4, 6, 54):
         return False
@@ -695,7 +706,7 @@ def is_axis_aligned_quad_mesh(vs_xy, count):
             if abs(x - maxx) < 1e-2 and abs(y - miny) < 1e-2: has_tr = True
             if abs(x - minx) < 1e-2 and abs(y - maxy) < 1e-2: has_bl = True
             if abs(x - maxx) < 1e-2 and abs(y - maxy) < 1e-2: has_br = True
-        if (has_tl + has_tr + has_bl + has_br) < 3:
+        if not (has_tl and has_tr and has_bl and has_br):
             return False
         had_valid = True
     return had_valid
@@ -1388,12 +1399,11 @@ def main():
                             a = 255
                         if tex.get('format') == 3:
                             cov = a
-                            tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
-                            out_a = ta * cov // 255
-                            r = tr * out_a // 255
-                            g = tg * out_a // 255
-                            b = tb * out_a // 255
-                            a = out_a
+                            src_val = apply_mask_tint(cov, tint)
+                            b = src_val & 0xff
+                            g = (src_val >> 8) & 0xff
+                            r = (src_val >> 16) & 0xff
+                            a = src_val >> 24
                         elif tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255

@@ -5574,6 +5574,23 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
     return out;
 }
 
+/* Format 3 coverage mask: vertex tint is already premultiplied, as in the
+ * untextured AA path: modulate alpha and apply coverage once to RGB. */
+static inline uint32_t agx_apply_mask_tint(uint32_t cov, uint32_t tint)
+{
+    uint32_t ta = tint >> 24;
+    uint32_t tr = (tint >> 16) & 0xff;
+    uint32_t tg = (tint >> 8) & 0xff;
+    uint32_t tb = tint & 0xff;
+    uint32_t out_a = ta * cov / 255;
+    /* Vertex tint is already premultiplied, as in the
+     * untextured AA path: apply coverage once. */
+    uint32_t out_r = tr * cov / 255;
+    uint32_t out_g = tg * cov / 255;
+    uint32_t out_b = tb * cov / 255;
+    return (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
+}
+
 /* CA fragment shaders recognised by an FNV-1a hash of the first 64 bytes of
  * their USC code (PPP word 7 -> state at 0x6_0000_0000 -> USC offset in the
  * 0x7_0000_0000 heap). The compiled code is identical across boots of this
@@ -5987,7 +6004,7 @@ static bool agx_is_axis_aligned_quad_mesh(A7State *s, uint64_t cat, uint64_t buf
             if (fabsf(x - qminx) < 1e-2f && fabsf(y - qmaxy) < 1e-2f) has_bl = true;
             if (fabsf(x - qmaxx) < 1e-2f && fabsf(y - qmaxy) < 1e-2f) has_br = true;
         }
-        if ((has_tl + has_tr + has_bl + has_br) < 3) {
+        if (!(has_tl && has_tr && has_bl && has_br)) {
             return false;
         }
         had_valid = true;
@@ -7256,15 +7273,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         uint32_t dst = row[x - x0], out = 0;
                         if (tex.format == 3) {
                             uint32_t cov = src >> 24;
-                            uint32_t ta = tint >> 24;
-                            uint32_t tr = (tint >> 16) & 0xff;
-                            uint32_t tg = (tint >> 8) & 0xff;
-                            uint32_t tb = tint & 0xff;
-                            uint32_t out_a = ta * cov / 255;
-                            uint32_t out_r = tr * out_a / 255;
-                            uint32_t out_g = tg * out_a / 255;
-                            uint32_t out_b = tb * out_a / 255;
-                            src = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
+                            src = agx_apply_mask_tint(cov, tint);
                         } else if (tint != 0xffffffff) {
                             uint32_t m = 0;
                             for (unsigned c = 0; c < 32; c += 8) {

@@ -1,12 +1,12 @@
-"""Unit tests for UISwitch knob shadow and navigation bar color matrix tint (Task U Follow-up 2).
+"""Unit tests for UISwitch knob shadow and format-3 coverage mask fidelity.
 
 Verifies:
-- Detection of TSW at offset 8 for ROUNDED_CAPS (prog 0x6c01d033fd937c7c).
-- Multi-quad axis-aligned mesh handling in classify_draw (9-slice UISwitch knob quads).
-- Classification of textured rounded quad (stride=28) and color matrix (saturation & tint).
-- Decoding of 3x3 Rec.709 color matrix and bias vector from fragment uniform memory.
-- Mathematical correctness of color matrix transformation and clamping.
-- Verification that AGX replay core in backend/s5l8960x.c implements color matrix and offset-8 TSW.
+- Rejection of artificial offset-8 adjacent-descriptor borrow for ROUNDED_CAPS and generic programs.
+- Decoding of Format-3 (single-channel 8-bit coverage mask, 1 bpp) TSW in linear and Morton-twiddled addressing.
+- Applying coverage once to premultiplied tint RGB and alpha (including nonopaque premultiplied tints).
+- Axis-aligned quad mesh gating: requiring all 4 corners for quad and rejecting repeated 3-corner triangles.
+- 1-byte mask reading (linear and twiddled) and scissor clipping without hand-copied blend math.
+- Verification that AGX replay core in backend/s5l8960x.c implements color matrix and format-3 mask tint helpers.
 """
 
 import ctypes
@@ -63,6 +63,7 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
         self.assertIn('AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)', core)
         self.assertIn('agx_extract_color_matrix', core)
         self.assertIn('agx_is_axis_aligned_quad_mesh', core)
+        self.assertIn('agx_apply_mask_tint', core)
         # Offset 8 adjacent-allocation borrow MUST be eliminated
         self.assertNotIn('blocks[b] + 8', core)
         self.assertIn('is_color_matrix', core)
@@ -135,39 +136,54 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
         self.assertEqual(tex_lin['stride'], 128)
 
     def test_format_3_channel_routing_and_premultiplied_tint(self):
-        """Format 3 coverage mask texel modulates alpha and premultiplies RGB tint."""
+        """Format 3 coverage mask texel modulates alpha and applies coverage once to premultiplied RGB tint."""
         # Coverage = 255: full tint #E6E6E6 (230, 230, 230)
-        cov = 255
-        tint = 0xffe6e6e6
-        ta = tint >> 24
-        tr = (tint >> 16) & 0xff
-        tg = (tint >> 8) & 0xff
-        tb = tint & 0xff
-        out_a = ta * cov // 255
-        r = tr * out_a // 255
-        g = tg * out_a // 255
-        b = tb * out_a // 255
-        self.assertEqual((r, g, b, out_a), (230, 230, 230, 255))
+        res = aro.apply_mask_tint(255, 0xffe6e6e6)
+        b, g, r, a = res & 0xff, (res >> 8) & 0xff, (res >> 16) & 0xff, res >> 24
+        self.assertEqual((r, g, b, a), (230, 230, 230, 255))
 
         # Coverage = 0: zero alpha, zero color
-        cov = 0
-        out_a = ta * cov // 255
-        r = tr * out_a // 255
-        g = tg * out_a // 255
-        b = tb * out_a // 255
-        self.assertEqual((r, g, b, out_a), (0, 0, 0, 0))
+        res = aro.apply_mask_tint(0, 0xffe6e6e6)
+        b, g, r, a = res & 0xff, (res >> 8) & 0xff, (res >> 16) & 0xff, res >> 24
+        self.assertEqual((r, g, b, a), (0, 0, 0, 0))
 
         # Coverage = 128: 50% antialiased edge
-        cov = 128
-        out_a = ta * cov // 255
-        r = tr * out_a // 255
-        g = tg * out_a // 255
-        b = tb * out_a // 255
-        self.assertEqual(out_a, 128)
+        res = aro.apply_mask_tint(128, 0xffe6e6e6)
+        b, g, r, a = res & 0xff, (res >> 8) & 0xff, (res >> 16) & 0xff, res >> 24
+        self.assertEqual(a, 128)
         self.assertEqual(r, 230 * 128 // 255)
 
+        # Nonopaque premultiplied tint: tint=0x80800000 (A=128, R=128, G=0, B=0), coverage=128
+        # Coverage must be applied once to premultiplied R: R = 128 * 128 // 255 = 64, A = 128 * 128 // 255 = 64
+        # (NOT R = 32 which resulted from multiplying tint alpha twice)
+        res_premul = aro.apply_mask_tint(128, 0x80800000)
+        pb, pg, pr, pa = res_premul & 0xff, (res_premul >> 8) & 0xff, (res_premul >> 16) & 0xff, res_premul >> 24
+        self.assertEqual((pr, pg, pb, pa), (64, 0, 0, 64))
+
     def test_axis_aligned_quad_mesh_discrimination(self):
-        """Recognize 9-slice (54 verts) and single quads (4/6 verts), reject non-quads (48 verts)."""
+        """Recognize 9-slice (54 verts) and single quads (4/6 verts), reject repeated 3-corner triangles and non-quads (48 verts)."""
+        # 4-corner valid quad
+        verts_4 = [(10.0, 20.0), (50.0, 20.0), (10.0, 80.0), (50.0, 80.0)]
+        self.assertTrue(aro.is_axis_aligned_quad_mesh(verts_4, 4))
+
+        # 6-vertex valid quad (two triangles with 4 distinct bounding corners)
+        verts_6 = [
+            (10.0, 20.0), (50.0, 20.0), (10.0, 80.0),
+            (50.0, 20.0), (50.0, 80.0), (10.0, 80.0)
+        ]
+        self.assertTrue(aro.is_axis_aligned_quad_mesh(verts_6, 6))
+
+        # Repeated 3-corner triangle with count=4 (TL, TR, BL, TL; missing BR) - MUST BE REJECTED
+        tri_4 = [(10.0, 20.0), (50.0, 20.0), (10.0, 80.0), (10.0, 20.0)]
+        self.assertFalse(aro.is_axis_aligned_quad_mesh(tri_4, 4))
+
+        # Repeated 3-corner triangle with count=6 (two triangles sharing only 3 corners) - MUST BE REJECTED
+        tri_6 = [
+            (10.0, 20.0), (50.0, 20.0), (10.0, 80.0),
+            (10.0, 20.0), (50.0, 20.0), (10.0, 80.0)
+        ]
+        self.assertFalse(aro.is_axis_aligned_quad_mesh(tri_6, 6))
+
         # 54-vertex 9-slice grid
         verts_9slice = []
         for gx in [508, 539, 579]:
@@ -275,12 +291,32 @@ class CompiledCSwitchMaskTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         src = SOURCE.read_text()
         start_gva = src.index('static uint64_t agx_texel_gva(')
-        end_gva = src.index('/* A Morton row')
-        fn_gva = src[start_gva:end_gva]
+        end_row = src.index('static uint32_t agx_blend_vibrancy(')
+        fn_gva_and_row = src[start_gva:end_row]
+
+        start_blend = src.index('/* Premultiplied BGRA src-over')
+        end_tint = src.index('static inline uint32_t agx_blend_plus_lighter(')
+        fn_blend_and_tint = src[start_blend:end_tint]
+
+        start_quad = src.index('static bool agx_is_axis_aligned_quad_mesh(')
+        end_quad = src.index('static AGXReplaySnapshot *agx_capture_ta(')
+        fn_quad = src[start_quad:end_quad]
 
         harness = Path(cls.tmp.name) / 'switch_mask.c'
         harness.write_text(f'''#include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+static inline uint32_t ldl_le_p(const void *p) {{
+    uint32_t val;
+    memcpy(&val, p, sizeof(val));
+    return val;
+}}
 
 typedef struct {{
     uint64_t addr;
@@ -294,7 +330,24 @@ typedef struct {{
     uint32_t sampler_words[4];
 }} AGXTexture;
 
-{fn_gva}
+typedef void A7State;
+
+static const uint8_t *g_test_mem = NULL;
+static uint64_t g_test_mem_sz = 0;
+
+static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size_t n) {{
+    if (gva + n > g_test_mem_sz || !g_test_mem) return false;
+    memcpy(buf, g_test_mem + gva, n);
+    return true;
+}}
+
+static bool agx_replay_matrix(A7State *s, uint64_t cat, uint64_t vs_data, float m4[4]) {{
+    return false;
+}}
+
+{fn_gva_and_row}
+{fn_blend_and_tint}
+{fn_quad}
 
 uint64_t c_texel_gva(uint64_t addr, uint32_t w, uint32_t h, uint32_t stride,
                      uint32_t bpp, bool twiddled, uint32_t x, uint32_t y) {{
@@ -310,34 +363,64 @@ uint64_t c_texel_gva(uint64_t addr, uint32_t w, uint32_t h, uint32_t stride,
     return agx_texel_gva(&tex, x, y);
 }}
 
-void c_blend_coverage_scissor(uint32_t *fb, int fb_w, int fb_h,
-                             const uint8_t *mask, int mask_w, int mask_h,
-                             uint32_t tint,
-                             int sx0, int sy0, int sx1, int sy1) {{
+void c_set_test_memory(const uint8_t *mem, uint64_t sz) {{
+    g_test_mem = mem;
+    g_test_mem_sz = sz;
+}}
+
+bool c_texture_row(uint64_t addr, uint32_t w, uint32_t h, uint32_t stride,
+                   uint32_t format, uint32_t bpp, bool twiddled,
+                   unsigned y, uint32_t *out) {{
+    AGXTexture tex = {{
+        .addr = addr,
+        .w = w,
+        .h = h,
+        .stride = stride,
+        .format = format,
+        .bpp = bpp,
+        .twiddled = twiddled,
+        .strip = false
+    }};
+    return agx_texture_row(NULL, 0, &tex, y, out);
+}}
+
+uint32_t c_apply_mask_tint(uint32_t cov, uint32_t tint) {{
+    return agx_apply_mask_tint(cov, tint);
+}}
+
+uint32_t c_blend_over(uint32_t dst, uint32_t src) {{
+    return agx_blend_over(dst, src);
+}}
+
+bool c_is_quad_mesh(uint64_t buf, unsigned count, unsigned stride, bool clip_space) {{
+    float vp[4] = {{1.0f, 0.0f, 1.0f, 0.0f}};
+    return agx_is_axis_aligned_quad_mesh(NULL, 0, buf, count, stride, 0, vp, clip_space);
+}}
+
+void c_render_mask_quad(uint32_t *fb, int fb_w, int fb_h,
+                        uint64_t mask_addr, int mask_w, int mask_h, int mask_stride,
+                        bool twiddled, uint32_t tint,
+                        int sx0, int sy0, int sx1, int sy1) {{
+    AGXTexture tex = {{
+        .addr = mask_addr,
+        .w = (uint32_t)mask_w,
+        .h = (uint32_t)mask_h,
+        .stride = (uint32_t)mask_stride,
+        .format = 3,
+        .bpp = 1,
+        .twiddled = twiddled,
+        .strip = false
+    }};
     for (int y = 0; y < mask_h && y < fb_h; y++) {{
         if (y < sy0 || y >= sy1) continue;
+        uint32_t texrow[4096];
+        if (!agx_texture_row(NULL, 0, &tex, y, texrow)) continue;
         for (int x = 0; x < mask_w && x < fb_w; x++) {{
             if (x < sx0 || x >= sx1) continue;
-            uint32_t cov = mask[y * mask_w + x];
-            uint32_t ta = tint >> 24;
-            uint32_t tr = (tint >> 16) & 0xff;
-            uint32_t tg = (tint >> 8) & 0xff;
-            uint32_t tb = tint & 0xff;
-            uint32_t out_a = ta * cov / 255;
-            uint32_t out_r = tr * out_a / 255;
-            uint32_t out_g = tg * out_a / 255;
-            uint32_t out_b = tb * out_a / 255;
-            uint32_t src = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
-
-            // agx_blend_over (premultiplied src-over)
+            uint32_t cov = texrow[x] >> 24;
+            uint32_t src = agx_apply_mask_tint(cov, tint);
             uint32_t dst = fb[y * fb_w + x];
-            uint32_t db = dst & 0xff, dg = (dst >> 8) & 0xff, dr = (dst >> 16) & 0xff, da = dst >> 24;
-            uint32_t inv_a = 255 - out_a;
-            uint32_t rb = out_b + (db * inv_a) / 255;
-            uint32_t rg = out_g + (dg * inv_a) / 255;
-            uint32_t rr = out_r + (dr * inv_a) / 255;
-            uint32_t ra = out_a + (da * inv_a) / 255;
-            fb[y * fb_w + x] = (ra << 24) | (rr << 16) | (rg << 8) | rb;
+            fb[y * fb_w + x] = agx_blend_over(dst, src);
         }}
     }}
 }}
@@ -346,6 +429,10 @@ void c_blend_coverage_scissor(uint32_t *fb, int fb_w, int fb_h,
         subprocess.run([compiler, '-shared', '-fPIC', str(harness), '-o', str(binary)], check=True)
         cls.lib = ctypes.CDLL(str(binary))
         cls.lib.c_texel_gva.restype = ctypes.c_uint64
+        cls.lib.c_apply_mask_tint.restype = ctypes.c_uint32
+        cls.lib.c_blend_over.restype = ctypes.c_uint32
+        cls.lib.c_is_quad_mesh.restype = ctypes.c_bool
+        cls.lib.c_texture_row.restype = ctypes.c_bool
 
     @classmethod
     def tearDownClass(cls):
@@ -370,23 +457,120 @@ void c_blend_coverage_scissor(uint32_t *fb, int fb_w, int fb_h,
         gva_lin6 = self.lib.c_texel_gva(addr, 4, 4, 16, 4, False, 2, 3)
         self.assertEqual(gva_lin6, addr + 3 * 16 + 2 * 4)
 
-    def test_c_coverage_tint_blend_and_scissor(self):
-        """Render a 16x16 circular mask with scissor [0, 8] x [0, 16] into a white framebuffer."""
+    def test_c_apply_mask_tint_premultiplied_coverage(self):
+        """Production agx_apply_mask_tint applies coverage once to premultiplied RGB tint."""
+        # Nonopaque premultiplied tint: tint=0x80800000 (A=128, R=128, G=0, B=0), coverage=128
+        # R = 128 * 128 / 255 = 64, A = 128 * 128 / 255 = 64 (NOT R = 32)
+        res = self.lib.c_apply_mask_tint(128, 0x80800000)
+        ta = (res >> 24) & 0xff
+        tr = (res >> 16) & 0xff
+        tg = (res >> 8) & 0xff
+        tb = res & 0xff
+        self.assertEqual((tr, tg, tb, ta), (64, 0, 0, 64))
+
+        # Opaque tint #E6E6E6 with full coverage
+        res_full = self.lib.c_apply_mask_tint(255, 0xffe6e6e6)
+        self.assertEqual(res_full, 0xffe6e6e6)
+
+        # Zero coverage -> transparent black
+        res_zero = self.lib.c_apply_mask_tint(0, 0xffe6e6e6)
+        self.assertEqual(res_zero, 0)
+
+        # Half coverage on #E6E6E6
+        res_half = self.lib.c_apply_mask_tint(128, 0xffe6e6e6)
+        self.assertEqual((res_half >> 24) & 0xff, 128)
+        self.assertEqual((res_half >> 16) & 0xff, 230 * 128 // 255)
+
+    def test_c_blend_over_production_helper(self):
+        """Production agx_blend_over blends premultiplied source over destination."""
+        # White background (0xffffffff)
+        dst = 0xffffffff
+        # Full opaque #E6E6E6 over white
+        out = self.lib.c_blend_over(dst, 0xffe6e6e6)
+        self.assertEqual(out, 0xffe6e6e6)
+
+        # 50% premultiplied red (0x80800000) over white
+        # out = src + dst * (255 - a) / 255
+        # r = 128 + 255 * 127 / 255 = 128 + 127 = 255 (byte 2)
+        # g = 0 + 255 * 127 / 255 = 127 (byte 1)
+        # b = 0 + 255 * 127 / 255 = 127 (byte 0)
+        # a = 128 + 255 * 127 / 255 = 255 (byte 3)
+        # Word: (255 << 24) | (255 << 16) | (127 << 8) | 127 = 0xffff7f7f
+        out_red = self.lib.c_blend_over(dst, 0x80800000)
+        self.assertEqual(out_red, 0xffff7f7f)
+
+    def test_c_quad_mesh_rejection_of_repeated_3corner_triangle(self):
+        """Production agx_is_axis_aligned_quad_mesh requires all 4 corners and rejects repeated triangles."""
+        # 4-corner valid quad: [(0, 0), (10, 0), (0, 10), (10, 10)]
+        verts_4 = struct.pack('<8f', 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 10.0)
+        self.lib.c_set_test_memory(verts_4, len(verts_4))
+        self.assertTrue(self.lib.c_is_quad_mesh(0, 4, 8, True))
+
+        # 6-vertex valid quad (2 triangles forming quad with 4 corners)
+        verts_6 = struct.pack('<12f',
+                              0.0, 0.0, 10.0, 0.0, 0.0, 10.0,
+                              10.0, 0.0, 10.0, 10.0, 0.0, 10.0)
+        self.lib.c_set_test_memory(verts_6, len(verts_6))
+        self.assertTrue(self.lib.c_is_quad_mesh(0, 6, 8, True))
+
+        # Repeated 3-corner triangle with count=4 (TL, TR, BL, TL; missing BR) - MUST BE REJECTED
+        tri_4 = struct.pack('<8f', 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 0.0, 0.0)
+        self.lib.c_set_test_memory(tri_4, len(tri_4))
+        self.assertFalse(self.lib.c_is_quad_mesh(0, 4, 8, True))
+
+        # Repeated 3-corner triangle with count=6 (two identical triangles sharing only 3 corners)
+        tri_6 = struct.pack('<12f',
+                            0.0, 0.0, 10.0, 0.0, 0.0, 10.0,
+                            0.0, 0.0, 10.0, 0.0, 0.0, 10.0)
+        self.lib.c_set_test_memory(tri_6, len(tri_6))
+        self.assertFalse(self.lib.c_is_quad_mesh(0, 6, 8, True))
+
+        # Count not 4, 6, or 54 (e.g. 48 clock hand / glint fans)
+        self.assertFalse(self.lib.c_is_quad_mesh(0, 48, 8, True))
+
+    def test_c_texture_row_1byte_linear_and_twiddled(self):
+        """Production agx_texture_row reads 1-byte Format 3 mask into alpha with 0x00ffffff RGB."""
+        # Linear 1-byte texture: 8x4 at addr 0, stride 8
+        linear_data = bytes([y * 8 + x for y in range(4) for x in range(8)])
+        self.lib.c_set_test_memory(linear_data, len(linear_data))
+        out_row = (ctypes.c_uint32 * 8)()
+        ok = self.lib.c_texture_row(0, 8, 4, 8, 3, 1, False, 2, out_row)
+        self.assertTrue(ok)
+        for x in range(8):
+            expected_cov = 2 * 8 + x
+            expected_val = (expected_cov << 24) | 0x00ffffff
+            self.assertEqual(out_row[x], expected_val)
+
+        # Twiddled 1-byte texture: 4x4 at addr 0, stride 4
+        # Coordinate (1, 1) has Morton index: bit 0 = Y & 1 = 1, bit 1 = X & 1 = 1 -> offset 3
+        # GPU page caching reads 4096 bytes per page
+        twiddled_data = bytearray(4096)
+        twiddled_data[3] = 0xdd  # value at (1, 1)
+        self.lib.c_set_test_memory(bytes(twiddled_data), 4096)
+        out_row_tw = (ctypes.c_uint32 * 4)()
+        ok_tw = self.lib.c_texture_row(0, 4, 4, 4, 3, 1, True, 1, out_row_tw)
+        self.assertTrue(ok_tw)
+        self.assertEqual(out_row_tw[1], (0xdd << 24) | 0x00ffffff)
+
+    def test_c_render_mask_quad_and_scissor(self):
+        """Render a 16x16 circular mask with scissor [0, 8] x [0, 16] using production C pipeline."""
         fb_w, fb_h = 16, 16
         # Background is white (0xffffffff)
         fb = (ctypes.c_uint32 * (fb_w * fb_h))(*([0xffffffff] * (fb_w * fb_h)))
 
-        # Create a 16x16 mask: 255 for radius < 6, 0 for radius >= 6
-        mask = (ctypes.c_uint8 * (16 * 16))()
+        # Create a 16x16 linear mask: 255 for radius < 6, 0 for radius >= 6
+        mask_bytes = bytearray(16 * 16)
         for y in range(16):
             for x in range(16):
                 r2 = (x - 7.5)**2 + (y - 7.5)**2
-                mask[y * 16 + x] = 255 if r2 <= 36 else 0
+                mask_bytes[y * 16 + x] = 255 if r2 <= 36 else 0
+
+        self.lib.c_set_test_memory(bytes(mask_bytes), len(mask_bytes))
 
         # Scissor only left half: [0, 8] x [0, 16]
         tint = 0xffe6e6e6  # #E6E6E6
-        self.lib.c_blend_coverage_scissor(
-            fb, fb_w, fb_h, mask, 16, 16, tint, 0, 0, 8, 16)
+        self.lib.c_render_mask_quad(
+            fb, fb_w, fb_h, 0, 16, 16, 16, False, tint, 0, 0, 8, 16)
 
         # Pixels in left half inside mask must be #E6E6E6 (0xffe6e6e6)
         self.assertEqual(fb[7 * 16 + 4], 0xffe6e6e6)
