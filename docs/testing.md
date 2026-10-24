@@ -35,7 +35,7 @@ These execute synthetic guest contracts. UART/framebuffer success is not native 
 ### Common CLI workflows
 
 ```sh
-# 1. Fast C-only replay on a single frame (sub-100ms turnaround)
+# 1. Fast C-only replay on a single frame
 .venv/bin/python scripts/agx_corpus.py replay \
   --corpus build/agx-corpus --scene clock --frames 5 --c-only --output /tmp/clock-f5
 
@@ -57,16 +57,16 @@ In chained replay mode (the default), GPU memory is stateful: later passes frequ
 - All earlier passes in scene order (passes 1..4) execute as a **dependency prefix** through `agx_replay_host --chain`.
 - Carried dirty memory pages are propagated forward into selected frames so rendered pixels match full-chain replays bit-for-bit.
 - Unselected prerequisite passes release intermediate RGBA buffers immediately without encoding PNGs.
-- If any prerequisite pass encounters an error, dependent selected frames are marked invalid and execution exits with code 1.
+- If any prerequisite pass encounters an error or skips a draw, dependent selected frames are marked invalid and execution exits with code 1.
 
 ### Stage timing boundaries
 
 Phase timings are separated and reported in stdout and `summary.json`:
 - `build_s`: harness core extraction, SHA-256 hash check, and compiler invocation (cached check takes ~0.0s).
-- `c_replay_s`: harness subprocess wall-clock execution time (`agx_replay_host`).
+- `c_replay_s`: elapsed replay stage, including harness subprocesses and their result processing, before PNG conversion.
 - `py_audit_s`: Python offline audit (`agx_replay_offline.py` / `audit_frame`); exactly 0.0s when `--c-only` is passed.
-- `export_s`: image conversions (selected RGBA to PNG, live PPM to PNG), summary metrics calculation, and writing `summary.json` and `index.html`.
-- `total_s`: total elapsed wall-clock duration from CLI invocation to completion.
+- `export_s`: image conversions (selected RGBA to PNG, live PPM to PNG) and summary metrics calculation.
+- `total_s`: elapsed time from replay entry through image export. Final JSON/HTML serialization and console output are excluded from these timings.
 
 ### Report preservation and output directories
 

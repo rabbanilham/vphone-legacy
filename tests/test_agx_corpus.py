@@ -361,6 +361,19 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
                 self.assertEqual(summary2['totals']['prefix_errors'], 1)
                 self.assertIn('Dependency prerequisite error', summary2['frames'][0]['c']['error'])
 
+            # A skipped prerequisite draw also invalidates dependent pixels.
+            shutil.rmtree(report_dir)
+            mock_proc_fail.stdout = (
+                '{"draws": 0, "skips": {"unsupported blend": 1}}\n'
+                '{"draws": 5, "skips": {}}\n'
+            )
+            with patch('subprocess.run', side_effect=fake_run), \
+                 patch('agx_corpus.build_harness', return_value=Path('/bin/true')):
+                self.assertEqual(agx_corpus.replay(args2), 1)
+                summary3 = json.loads((report_dir / 'summary.json').read_text())
+                self.assertEqual(summary3['totals']['prefix_skips'], {'unsupported blend': 1})
+                self.assertIn('skipped 1 prerequisite draw', summary3['frames'][0]['c']['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -554,6 +554,10 @@ def replay(args):
                         first_fail_msg = f"{pf['frame']} failed ({c_info['error']})"
                 for reason, n in c_info.get('skips', {}).items():
                     prefix_skips[reason] = prefix_skips.get(reason, 0) + n
+                    if n:
+                        scene_prefix_failed = True
+                        if not first_fail_msg:
+                            first_fail_msg = f"{pf['frame']} skipped {n} prerequisite draw(s): {reason}"
 
             dependency_prefix[scene_name] = {
                 'frames': prefix_names,
