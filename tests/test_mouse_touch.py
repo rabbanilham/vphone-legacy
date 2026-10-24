@@ -20,6 +20,8 @@ class MouseTouchTests(unittest.TestCase):
 
         harness = r'''
 #include <assert.h>
+#include <stdio.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -36,6 +38,8 @@ class MouseTouchTests(unittest.TestCase):
 #define INPUT_BUTTON_LEFT 0
 #define INPUT_EVENT_MASK_ABS 1
 #define INPUT_EVENT_MASK_BTN 2
+#define LOG_UNIMP 0
+#define qemu_log_mask(mask, ...) do {} while (0)
 static int64_t now, deadline;
 static int64_t qemu_clock_get_ns(int clock) { (void)clock; return now; }
 static void timer_mod(void *timer, int64_t ns) { (void)timer; deadline=ns; }
@@ -48,6 +52,7 @@ typedef struct A7Touch {
     uint8_t sequence, reporting, input_control[4];
     uint8_t frames[64][56];
     unsigned frame_count;
+    uint32_t last_timestamp_us;
 } A7Touch;
 typedef void QemuConsole;
 typedef void DeviceState;
@@ -125,40 +130,56 @@ int main(void) {
     packet(32767,32767,true); frame(0,1,640,1136);
     assert(s.touch.frame_count==1 && deadline==TOUCH_TICK_NS);
     tick(); frame(1,3,640,1136);
-    assert(deadline==-1); /* stationary hold does not flood the FIFO */
+    assert(deadline==TOUCH_TICK_NS*2); /* continuous 60 Hz hold */
+    tick(); frame(2,4,640,1136);
     now+=100;
     packet(1000,2000,true);
     int64_t due=deadline;
     for (int i=1;i<=50;i++) {
         now++; packet(2000+i,3000+i,true);
-        assert(deadline==due && s.touch.frame_count==2);
+        assert(deadline==due && s.touch.frame_count==3);
     }
-    tick(); frame(2,4,mouse_touch_scale(2050,32767,640),
-                 mouse_touch_scale(3050,32767,1136));
+    tick(); frame(3,4,mouse_touch_scale(2050,32767,640),
+                 MIN(1136, mouse_touch_scale(3050,32767,1136)+16));
     now++; packet(32767,0,false);
-    assert(s.touch.frame_count==3);
+    assert(s.touch.frame_count==4);
     /* Hover after release cannot alter final move/up coordinates. */
     packet(0,32767,false);
-    tick(); frame(3,4,640,0); tick(); frame(4,7,640,0);
+    for (int i=0; i<18; i++) {
+        tick(); frame(4+i,4,640,16);
+    }
+    tick(); frame(22,4,640,16);
+    tick(); frame(23,7,640,16);
     assert(!s.mouse_touch.phase && deadline==-1);
-    /* A quick click still preserves all four transitions. */
+    /* A quick click still preserves all transitions with settle delay. */
     reset(); packet(0,0,true); packet(0,0,false);
-    tick(); tick(); tick();
-    frame(0,1,0,0); frame(1,3,0,0); frame(2,4,0,0); frame(3,7,0,0);
+    frame(0,1,0,16);
+    tick(); frame(1,3,0,16);
+    tick(); frame(2,4,0,16);
+    tick(); frame(3,4,0,16);
+    tick(); frame(4,4,0,16);
+    tick(); frame(5,4,0,16);
+    tick(); frame(6,7,0,16);
+    assert(!s.mouse_touch.phase && deadline==-1);
     /* FIFO pressure preserves transitions and coalesces the latest position. */
     reset(); s.touch.frame_count=64; packet(0,0,true);
     assert(s.mouse_touch.phase==1); tick(); assert(s.mouse_touch.phase==1);
-    s.touch.frame_count=0; tick(); frame(0,1,0,0);
+    s.touch.frame_count=0; tick(); frame(0,1,0,16);
     tick(); s.touch.frame_count=64;
     packet(32767,32767,true); tick(); assert(s.mouse_touch.phase==3);
     packet(32767,32767,false); s.touch.frame_count=0;
-    tick(); frame(0,4,640,1136); tick(); frame(1,7,640,1136);
+    for (int i=0; i<18; i++) {
+        tick(); frame(i,4,640,1136);
+    }
+    tick(); frame(18,4,640,1136);
+    tick(); frame(19,7,640,1136);
+    assert(!s.mouse_touch.phase && deadline==-1);
     /* Script ownership includes future scheduled gestures; no late start
      * from an ignored held button once the script finishes. */
     reset(); s.touch_script.count=5; packet(0,0,true);
     assert(!s.touch.frame_count);
     s.touch_step=5; packet(32767,0,true); assert(!s.touch.frame_count);
-    packet(32767,0,false); packet(32767,0,true); frame(0,1,640,0);
+    packet(32767,0,false); packet(32767,0,true); frame(0,1,640,16);
     /* BF detectable, UI lock, force, disabled input. */
     reset(); s.touch.input_control[0]=0; packet(0,0,true);
     assert(!s.touch.frame_count);
@@ -166,16 +187,21 @@ int main(void) {
     packet(0,0,false); s.touch.reporting=1; packet(0,0,true);
     assert(!s.touch.frame_count);
     packet(0,0,false); s.touch_force=true; packet(0,0,true);
-    frame(0,1,0,0); tick(); frame(1,3,0,0);
+    frame(0,1,0,16); tick(); frame(1,3,0,16);
     reset(); s.mouse_touch_enabled=false; packet(0,0,true);
     assert(!s.touch.frame_count);
     /* Gate/FIFO waits don't advance the state machine or burst on resume. */
     reset(); packet(0,0,true); s.touch.input_control[0]=0;
     tick(); assert(s.touch.frame_count==1 && s.mouse_touch.phase==2);
     now+=10*TOUCH_TICK_NS; s.touch.input_control[0]=4;
-    mouse_touch_timer_cb(&s); frame(1,3,0,0);
+    mouse_touch_timer_cb(&s); frame(1,3,0,16);
     packet(32767,0,false); assert(s.touch.frame_count==2);
-    tick(); tick(); frame(2,4,640,0); frame(3,7,640,0);
+    for (int i=0; i<18; i++) {
+        tick(); frame(2+i,4,640,16);
+    }
+    tick(); frame(20,4,640,16);
+    tick(); frame(21,7,640,16);
+    assert(!s.mouse_touch.phase && deadline==-1);
     /* Other buttons and other consoles cannot start a finger contact. */
     reset(); event(INPUT_EVENT_KIND_BTN,1,true);
     mouse_touch_handler.sync(&display); assert(!s.touch.frame_count);
@@ -185,13 +211,20 @@ int main(void) {
     mouse_touch_handler.sync(&display); assert(!s.touch.frame_count);
     /* A fresh click while the preceding release drains is ignored. */
     reset(); packet(0,0,true); packet(32767,0,false);
-    packet(0,32767,true); tick(); tick(); tick();
-    frame(2,4,640,0); frame(3,7,640,0);
-    packet(0,32767,true); assert(s.touch.frame_count==4);
-    packet(0,32767,false); packet(0,32767,true); frame(4,1,0,1136);
+    packet(0,32767,true);
+    tick(); frame(1,3,0,16);
+    tick(); frame(2,4,640,16);
+    for (int i=1; i<18; i++) {
+        tick(); frame(2+i,4,640,16);
+    }
+    tick(); frame(20,4,640,16);
+    tick(); frame(21,7,640,16);
+    assert(!s.mouse_touch.phase && deadline==-1);
+    packet(0,32767,true); assert(s.touch.frame_count==22);
+    packet(0,32767,false); packet(0,32767,true); frame(22,1,0,1136);
     /* Motion before the down timer preserves the original start/down point. */
     reset(); packet(0,0,true); packet(32767,32767,true);
-    tick(); frame(1,3,0,0); tick(); frame(2,4,640,1136);
+    tick(); frame(1,3,0,16); tick(); frame(2,4,640,1136);
     return 0;
 }
 '''

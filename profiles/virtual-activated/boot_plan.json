@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "image": "${REPO_ROOT}/build/virtual-activated-profile-v5/boot/KernelMemory.bin",
+  "image_sha256": "98d34e7517e4ba89dee3125af2c921fe59281b9ebd9335517888f5aee5837add",
+  "dram_base": 34359738368,
+  "memory_size": 1073741824,
+  "virt_base": 18446743523955834880,
+  "usable_memory_size": 1056944128,
+  "entry_va": 18446743523955990616,
+  "entry_pa": 34368282712,
+  "kernel_phys_base": 34368126976,
+  "boot_el": 3,
+  "initial_entry_pa": 34366079264,
+  "initial_boot_args_pa": 34368126928,
+  "monitor": {
+    "physical_base": 34366029824,
+    "virtual_base": 279172874240,
+    "reserved_size": 2097152,
+    "segments": [
+      {
+        "name": "__TEXT",
+        "vmaddr": 279172874240,
+        "vmsize": 61440,
+        "fileoff": 0,
+        "filesize": 61440,
+        "initprot": 5,
+        "maxprot": 5
+      },
+      {
+        "name": "__DATA",
+        "vmaddr": 279172935680,
+        "vmsize": 73728,
+        "fileoff": 61440,
+        "filesize": 20480,
+        "initprot": 3,
+        "maxprot": 3
+      },
+      {
+        "name": "__IMAGEEND",
+        "vmaddr": 279173009408,
+        "vmsize": 0,
+        "fileoff": 81920,
+        "filesize": 0,
+        "initprot": 3,
+        "maxprot": 3
+      },
+      {
+        "name": "__LINKEDIT",
+        "vmaddr": 279173009408,
+        "vmsize": 0,
+        "fileoff": 81920,
+        "filesize": 0,
+        "initprot": 1,
+        "maxprot": 1
+      }
+    ]
+  },
+  "boot_args_pa": 34385657856,
+  "devicetree_pa": 34385674240,
+  "top_of_kernel_data": 34388738048,
+  "framebuffer_pa": 34385821696,
+  "pram": {
+    "address": 35425054720,
+    "size": 16384,
+    "persistent": false
+  },
+  "stram": {
+    "address": 35425071104,
+    "size": 4096
+  },
+  "timebase_frequency": 24000000,
+  "ans_reserved": {
+    "address": 35425091584,
+    "size": 8388608,
+    "runtime_image_prepared": true,
+    "execution_verified": false
+  },
+  "auxiliary_images": [
+    {
+      "path": "${REPO_ROOT}/backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin",
+      "address": 35425091584,
+      "size": 8388608,
+      "sha256": "e45348cd0fad38abc3c7918b620d5ac97d30330e64f5ec6e5d930807aadef7b8",
+      "source_sha256": "c066bf9d1edef96e59fe618eb30933847ba00ac82bff2b8a7b3ef0b7a32c9b7e",
+      "firmware_memory_size": 623344,
+      "shared_offset": 626688,
+      "shared_size": 4194304,
+      "fixups": [
+        {
+          "offset": 222688,
+          "width": 4,
+          "meaning": "chip-id",
+          "before": "00000000",
+          "after": "60890000"
+        },
+        {
+          "offset": 222692,
+          "width": 4,
+          "meaning": "chip-revision A0 emulator profile",
+          "before": "ffffffff",
+          "after": "00000000"
+        },
+        {
+          "offset": 222696,
+          "width": 4,
+          "meaning": "clock table entry 0",
+          "before": "00000000",
+          "after": "00366e01"
+        },
+        {
+          "offset": 222700,
+          "width": 4,
+          "meaning": "clock table entry 41",
+          "before": "00000000",
+          "after": "5581f207"
+        },
+        {
+          "offset": 222656,
+          "width": 8,
+          "meaning": "first shared region offset",
+          "before": "0000000000000000",
+          "after": "0090090000000000"
+        },
+        {
+          "offset": 222664,
+          "width": 4,
+          "meaning": "first shared region size",
+          "before": "00000000",
+          "after": "00004000"
+        },
+        {
+          "offset": 222672,
+          "width": 8,
+          "meaning": "second shared region offset",
+          "before": "0000000000000000",
+          "after": "0000000000000000"
+        },
+        {
+          "offset": 222680,
+          "width": 4,
+          "meaning": "second shared region size",
+          "before": "00000000",
+          "after": "00000000"
+        },
+        {
+          "offset": 222704,
+          "width": 4,
+          "meaning": "production debug policy emulator profile",
+          "before": "00000000",
+          "after": "00000000"
+        }
+      ],
+      "runtime_fixups_applied": true,
+      "execution_verified": false,
+      "source_contract": "research/native-ans-firmware.md; iBoot-1940.10.58"
+    }
+  ],
+  "framebuffer": {
+    "width": 640,
+    "height": 1136,
+    "stride": 2560,
+    "depth": 32
+  },
+  "segments": [
+    {
+      "name": "__TEXT",
+      "vmaddr": 18446743523955843072,
+      "vmsize": 4108288,
+      "fileoff": 0,
+      "filesize": 4108288,
+      "initprot": 5,
+      "maxprot": 5
+    },
+    {
+      "name": "__DATA",
+      "vmaddr": 18446743523959951360,
+      "vmsize": 692224,
+      "fileoff": 4108288,
+      "filesize": 278528,
+      "initprot": 3,
+      "maxprot": 3
+    },
+    {
+      "name": "__KLD",
+      "vmaddr": 18446743523960643584,
+      "vmsize": 8192,
+      "fileoff": 4390912,
+      "filesize": 8192,
+      "initprot": 3,
+      "maxprot": 3
+    },
+    {
+      "name": "__LAST",
+      "vmaddr": 18446743523960651776,
+      "vmsize": 4096,
+      "fileoff": 4399104,
+      "filesize": 4096,
+      "initprot": 3,
+      "maxprot": 3
+    },
+    {
+      "name": "__PRELINK_TEXT",
+      "vmaddr": 18446743523960995840,
+      "vmsize": 11829248,
+      "fileoff": 4743168,
+      "filesize": 11829248,
+      "initprot": 3,
+      "maxprot": 3
+    },
+    {
+      "name": "__PRELINK_INFO",
+      "vmaddr": 18446743523972825088,
+      "vmsize": 528384,
+      "fileoff": 16572416,
+      "filesize": 525444,
+      "initprot": 3,
+      "maxprot": 3
+    },
+    {
+      "name": "__LINKEDIT",
+      "vmaddr": 18446743523960655872,
+      "vmsize": 337864,
+      "fileoff": 4403200,
+      "filesize": 337864,
+      "initprot": 1,
+      "maxprot": 1
+    }
+  ],
+  "boot_args": "-v serial=3 debug=0x14e cpus=2 csi_disable_watchdog=1 amfi_allow_any_signature=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1",
+  "validation": "virtual-activated diagnostic profile; runtime verification pending",
+  "cpu_count": 2
+}

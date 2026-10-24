@@ -678,3 +678,237 @@ Extract activation evidence only after stopping the image:
 - **51 tests passed**: `test_virtual_activation.py` (8), `test_prepare_diagnostic_disks.py` (7), `test_probe_state.py` (18), `test_crashlogs.py` (18), each via `.venv/bin/python -m unittest discover -s tests -p NAME`. Python compilation and scoped `git diff --check` also passed.
 - Next: investigate the native Home offscreen output through live composition/scanout using fresh retained-state clones and a tracked renderer build. After a fix, repeat native service/storage checks and ordinary unlock, document an interactive live Home screen and crash/panic results, then update manifest/report acceptance. **Do not mark the full plan complete from API success or offline rendering alone.**
 - The user permits delegation through agy CLI (preferred, multiple terminals allowed) and Claude CLI with `--dangerously-skip-permissions`. Earlier activation audits were refused by those agents; the completed agy graphics audit is retained above. No worker is left running for this handover.
+
+## Graphics worktree checkpoint — Codex, 2026-10-23
+
+Active graphics work is isolated in `/Users/bagas/.codex/worktrees/graphics-quality/vphone-legacy`, branch `codex/graphics-quality`, based on main `788e3a4`. See **section 24 of that worktree’s CLAUDE_HANDOVER.md** for the current implementation, independent QEMU binaries, tests, audit caveats and remaining validation. Evidence is in that worktree’s `backend/evidence/graphics-quality-20261023/`. The shared renderer and build here were not changed. User requires visible Cocoa windows for future QEMU launches. Graphics-quality acceptance remains incomplete; do not mistake existing main’s newly reproduced live Home for a result solely caused by the new patches.
+
+
+### Graphics work stopped by user — 2026-10-23
+
+Graphics work is stopped; this task’s QEMU, probe, cold-boot orchestrator and audit CLIs are no longer running. The complete latest handover is section24, including **“Stopped by explicit user request”**, in `/Users/bagas/.codex/worktrees/graphics-quality/vphone-legacy/CLAUDE_HANDOVER.md`. Branch `codex/graphics-quality` has uncommitted C/offline interpolation corrections and regression tests; no graphics commit/push/merge was made.
+
+Final checks: 207 unit tests OK (3 skipped), complete AGX pixel contracts pass, Setup control/candidate each completed160 seconds without panic and reached the language list. The three sequential final Home boots were interrupted during boot1; app launch and full UI quality remain unverified. The QMP stop timed out, so only this task’s remaining processes were terminated; preserve its diagnostic disk as a power-cut clone. Read `backend/evidence/graphics-quality-20261023/stopped-status.json` in the graphics worktree for status and the full handover for resumption steps. Do not stage the worktree’s untracked Python-runtime symlinks or touch the shared Claude renderer/build. Resume only upon user instruction, with visible Cocoa QEMU windows.
+
+
+### Interactive default changed by user request — 2026-10-23
+
+`backend/live_run.py` now defaults to the complete `build/virtual-activated-profile-v5/` plan/System/Data tuple and MTTCG (`VPHONE_TCG_THREAD` still overrides). Explicit image/plan flags remain available. Missing inputs fail before disk cloning; no baseline fallback. This supersedes earlier notes that baseline is the interactive default. Source images remain protected by disposable clones. The user requested an immediate visible run: Cocoa window `iOS 7 - virtual-activated`, work directory `/tmp/vphone-live-xm3br8zx`; images retained on exit. These launcher changes are not yet committed. The stopped graphics worktree remains stopped.
+
+## 24. Live lock screen, Home after unlock, mouse/short swipe (Claude + Codex + agy, 2026-10-23)
+
+Merged into `agx-meta-hle`: `wt/live-swipe` (556d24b) and `wt/lock-gfx` (fba5381). Reports: `research/reports/T-live-swipe.md`, `G-lock-gfx.md`, `G2-lock-gfx.md`.
+
+- **Touch (agy T + Claude):** releasing a drag now sends 18 stationary move frames (about 300 ms) before up7, so SpringBoard's slow run loop sees more than 50 % travel before touchesEnded. This applies to the mouse path and to `VPHONE_TOUCH_SCRIPT`, with travel measured per gesture, so taps are unaffected. While the button is held, mouse frames stay at 60 Hz, mouse Y gets +16 px for the MultitouchHID fingertip offset, and contact timestamps always increase. A short swipe `at=95;down 40,1036;move 600,1036 dur=0.7 steps=42;up` unlocked in 3/3 scripted boots plus one QMP mouse drag. A real hand-drag in the window is still untested. `display_probe.py --mouse-swipe at,x0,y0,x1,y1,dur,steps` drives the mouse path through QMP.
+- **Graphics (Codex G, then agy G2):**
+  - The TA history per context went from 8 to 256 entries. With 8, 3D passes lost their TA.
+  - TA-time geometry snapshots; type-3 stamp waits are honoured; a queue-cursor fix.
+  - Stride-16 clip-space wallpaper path with a Morton-tiled source and the PBE pitch: the wallpaper now renders.
+  - The 3D command's scissor table (+0x50), ISP scenable/scindex and the region clip rc0/rc1. A full-screen wallpaper redraw had been erasing the clock.
+  - Untextured stride-28 draws: clock digits.
+  - `VPHONE_AGX_REPLAY_AUDIT` gates the clock-audit tracing.
+- **Verified after the merge** (rebuilt main binary, `backend/evidence/merge-20261023-live/`, Cocoa window, 150 s, no panic, 22532 `AGX replay target` = `AGX RT queue`):
+  - At 90 s the lock screen shows wallpaper, clock, date and "slide to unlock".
+  - The short swipe at 95 s unlocks.
+  - At 105 s and 140 s Home is live: icons, labels, dock and status bar.
+  - Tests: 227 unit tests OK; the agx, touch_input, spi_touch and smp contracts pass.
+- **Open:**
+  - Home has ghosting: doubled or offset translucent icons and labels, apparently stale frames of the icon fly-in animation that are not cleared or composited correctly.
+  - A thin black bar with dashes shows near the slider on the lock screen.
+  - Home appeared live in only 1 of 4 boots before G2. Reliability after the merge has been checked on one boot only.
+  - Codex task H (`wt/home-live`, based on `wt/live-swipe` without G2) is investigating that intermittency. It should rebase on `agx-meta-hle` before its results are judged.
+  - agy W continues native Wi-Fi acceptance on `wt/wifi`. Its current lead is that the iOS driver rejects the DT `local-mac-address`.
+
+## 25. Moving to another Mac: state, strategy, how to resume (Claude, 2026-10-23 evening)
+
+The user is moving this work to a more powerful Mac. Read this section first, then section 24.
+
+### Branch state (local; push status is in the table)
+
+| Branch | Head | What it contains | On origin? |
+| --- | --- | --- | --- |
+| `agx-meta-hle` | this commit | Integration branch: section 24 merges (live lock screen and Home, short swipe). Main checkout `/Users/bagas/Downloads/vphone-legacy`. | origin is at e63a591; push needed |
+| `wt/home-live` | a132fa4 (+ uncommitted edits while Codex H runs) | Codex H, rebased on `agx-meta-hle`. Fixes Home icon ghosting: an opaque wallpaper draw was misclassified as vibrancy because the next allocation's luma constants followed its texture descriptor. Also fixes a glyph texture mistaken for a display surface (corrupt Compass/Phone labels, dashed bar by the slider). Adds keep-awake taps for probes and a Home dirty-redraw contract. One fresh boot passed: Home without ghosts at 105/140 s, and a tap opened Settings. The final 3-boot series was still running. **Next: check its report `research/reports/H-home-live.md`, then merge.** | no |
+| `wt/wifi` | 064c653 | agy W: BCM43342 HSIC Wi-Fi, merged with `agx-meta-hle` at e63a591. The latest commit emulates the runtime descriptor and patches the DT `local-mac-address`, which the iOS driver had rejected as invalid. Native acceptance runs are `research/acceptance-wifi-native-1..7/` (untracked). Stages 1–6 (enumeration, driver attach, scan, join, DHCP, Settings) are not all proven. **Next: read the W report (when written) and the latest acceptance run, then continue from the first failing stage.** | no |
+| `wt/lock-gfx`, `wt/live-swipe` | 8ca7caa, d096333 | Already merged into `agx-meta-hle`. Can be deleted. | no |
+
+The worktrees on the old Mac are `/Users/bagas/Downloads/vphone-wt-<name>`. On the new Mac, recreate only what is needed with `git worktree add ../vphone-wt-<name> <branch>`, plus the per-worktree setup below.
+
+### Workers (all were on the old Mac; none carry over)
+- Codex CLI: `codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" --dangerously-bypass-approvals-and-sandbox -C <worktree> "<prompt>" < /dev/null`. Resume with `codex exec resume -m gpt-6.1-sol ... <session-id> "<msg>"`. Session ids are local to the old Mac. On the new Mac start fresh: give the worker the branch's report plus the relevant handover section.
+- agy: `agy --model gemini-3.8-flash-high --dangerously-skip-permissions -p="<prompt>"`, launched in a script that `cd`s to the worktree. `--conversation <id> -i "..."` resumes only on the same machine. On the first run in a folder agy asks "trust this folder", and only the user can press Enter.
+- Failure modes seen today: Codex usage limit, agy "Individual quota reached" (fix with `/logout` and a new account), and Codex "Selected model is at capacity" (retry later; the user chose to keep gpt-6.1-sol).
+- Task prompts and launch scripts are in `research/tasks/` (committed): `_common.md` holds the shared rules, plus `G-`, `G2-`, `T-`, `W-` and `H-*.md` and the `run-*`/`resume-*` scripts. **The scripts hard-code `/Users/bagas/Downloads/...` paths.**
+
+### Strategy agreed with the user (fast and effective)
+The user judged graphics progress over half a day too slow. Root causes:
+- Every fix was validated with 150 s live boots, three of them per fix, while three workers shared the CPU (load 7–8).
+- Two workers fixed the same scissor bug separately (G2 on the lock clock, H on Home).
+- Restarts from worker limits and capacity errors, and broad prompts.
+
+From now on:
+1. **Offline first.** Record one frame-dump corpus from the merged build: lock screen, Home, Settings, one app. Use `VPHONE_AGX_FRAME_DUMP=<dir>`, `_COUNT`, `_SKIP`/`_EVERY`, and `_OFFSCREEN=1`. Then add one command (to build) that replays every dump through the C replay and through `backend/agx_replay_offline.py` (`--audit`), producing a contact sheet and a list of failed or skipped draws in under a minute. Develop fixes against that corpus. Run a live boot only at merge time.
+2. **One renderer owner at a time.** Only one worker edits the AGX replay (`backend/s5l8960x.c` replay, `agx_replay_offline.py`). Give it a measurable offline target, for example "failed draws in the Home dump: N → 0". Other workers analyse or decode only.
+3. **One live boot per merge**, not three per fix. Use three boots only for intermittent problems.
+4. **CPU budget.** Wi-Fi boots must not overlap graphics boots. Wait for load < 5 before any timing measurement.
+5. **Claude integrates.** Merge, rebuild, one boot, a short report, and short single-target prompts for workers.
+
+**Immediate next steps:**
+1. Merge `wt/home-live` after reviewing it (rebuild, tests, one boot).
+2. Build the corpus and the offline command.
+3. Take the next graphics target from the corpus audit (Settings/app screens).
+4. Resume Wi-Fi without overlapping graphics boots.
+
+### Setting up the new Mac
+- **Keep the same path if possible: `/Users/bagas/Downloads/vphone-legacy`.** Boot plans store absolute paths. `build/virtual-activated-profile-v5/boot/boot_plan.json` points to `build/virtual-activated-profile-v5/boot/KernelMemory.bin` and `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin`. The noisp/nooscar plans point into their own directories. With a different user or path, rewrite them: `grep -rl /Users/bagas/Downloads/vphone-legacy build backend/evidence | xargs sed -i '' 's|/Users/bagas/Downloads/vphone-legacy|<new root>|g'`.
+- **Code:** `git clone https://github.com/rabbanilham/vphone-legacy.git` and `git checkout agx-meta-hle`, after the branches above are pushed.
+- **Large untracked inputs to copy** (git ignores them). The old repo folder is 87 GB, mostly evidence; the minimum set is about 3.3 GB:
+  - `build/virtual-activated-profile-v5/` (3.1 GB, the default `live_run.py` profile: system.raw, data.raw, boot/, pinned QEMU).
+  - `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/`, `boot-plan-smp-nooscar/`, `boot-plan-smp-noisp/` (36 MB each) and the hook JSONs in that directory (`sb-scroll-hooks.json` and others, `*.json` at its top level).
+  - Optional: `backend/evidence/merge-20261023-live/` (the last merged live run) and `backend/evidence/virtual-activated-20261023/render-dumps/` (Home frame dumps for offline replay).
+  - Optional, for baseline/setup work: `build/diagnostic/` (8 GB).
+  - Copy with `rsync -a --progress <old>:/Users/bagas/Downloads/vphone-legacy/<path> <same path>`, or an external disk. APFS clones are not preserved over rsync; that's fine.
+- **Host tools:** Homebrew `glib pixman libslirp` (installed on the old Mac). Python venvs:
+  ```bash
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+  python3 scripts/qemu/build_backend.py --fetch --install-build-deps
+  ```
+  This creates `backend/.venv` with meson/ninja, clones pinned QEMU into `backend/upstream`, and builds `backend/bin/qemu-system-aarch64`. Then run `.venv/bin/python -m unittest discover -s tests` (227 tests pass on `agx-meta-hle`) and `VPHONE_DISPLAY=cocoa .venv/bin/python backend/agx_contract_test.py`.
+- **Per worktree:** symlink `build`, `.venv` and `backend/.venv` to the main checkout. Copy `backend/upstream` with `cp -cR` so each worktree builds its own QEMU, then run `backend/.venv/bin/python scripts/qemu/build_backend.py`.
+- **Smoke test:** `.venv/bin/python backend/live_run.py` opens the Cocoa window. Lock screen at about 90 s; unlock with a drag across "slide to unlock"; the display sleeps about 30 s after the lock screen appears. For a timed check use `research/tasks/merge-live.sh`: short swipe at 95 s, captures at 90/105/140 s, clones deleted afterwards.
+- **Also install:** Codex CLI and agy (Antigravity CLI), logged in, if workers will be used.
+
+## 26. Two Macs working in parallel (Claude, 2026-10-23 night)
+
+Section 25's setup notes still apply. This section replaces its "Immediate next steps".
+
+### Machines
+| Machine | Hardware | Role | Load budget |
+| --- | --- | --- | --- |
+| **MBP** | MacBook Pro M4 Pro, 24 GB | **Graphics plus integration** (about 2/3 of the work). The only machine that merges into `agx-meta-hle` and edits `CLAUDE_HANDOVER.md`. | Up to 2 QEMU at once, at most one of them a graphics boot |
+| **MBA** | MacBook Air M2, 8 GB (`Bagass-MacBook-Air`, the original machine with all images and evidence) | **Wi-Fi/network** (about 1/3). agy W already runs here (conversation `cbc997fa-cdd7-4d46-bd37-3f67b1dc2b98`, worktree `/Users/bagas/Downloads/vphone-wt-wifi`). | One QEMU at a time, no other heavy jobs |
+
+### State at the split (all on origin)
+- `agx-meta-hle` (c916c7e-plus, this commit): live lock screen and Home, short swipe.
+- `wt/home-live` **6c1f927**: Codex H, done, **not merged yet**.
+  - 3/3 fresh boots: Home without ghosting at 105/140 s, slider bar gone at 90 s, and a tap opens Settings by 152 s (`research/evidence/H-home-live/accept-boot*`, report `research/reports/H-home-live.md`).
+  - Fixes: the vibrancy misclassification (the next allocation's luma constants), glyph vs display-surface layout, and the slider mask padding source-copy clear.
+  - Probes use keep-awake taps; settle stays at 18 frames.
+  - Tests: 232 unit tests OK; the AGX and touch contracts pass.
+  - Remaining artefacts: the Clock icon's hands draw as square blocks, and the UISwitch (Airplane Mode) has no track.
+- `wt/wifi` **064c653**: agy W (report `research/reports/W-wifi-native.md`).
+  - Stage 1 (HSIC enumeration, TRX, re-enumeration) passes natively, and so does stage 2 (AppleBCMWLAN attaches, no 22 s retry loop).
+  - Stages 3–5 (scan, join, DHCP) pass only in the synthetic contract. Natively they were "UI-gated": Settings was unreachable before `wt/home-live`.
+  - Settings now opens and shows **Wi-Fi: Off**.
+
+### File ownership (no overlap)
+| Area | Owner | Files / regions |
+| --- | --- | --- |
+| AGX replay, display, frame dumps, offline replay | MBP | AGX/display parts of `backend/s5l8960x.c`, `backend/agx_*.py`, `tests/test_agx_*`, `backend/display_probe.py` |
+| Touch and buttons (input) | MBP (second worker) | touch/mouse/GPIO-button parts of `s5l8960x.c`, `tests/test_touch_script.py`, `test_mouse_touch.py`, `test_spi_dma.py` |
+| Wi-Fi, HSIC/EHCI, slirp | MBA | `backend/wifi_dongle.c`, `wifi_protocol.h`, `host_wifi.py`, `wifi_contract_test.py`, `ehci_contract_test.py`, the EHCI/HSIC/Wi-Fi parts of `s5l8960x.c`, `live_run.py --wifi` |
+| `CLAUDE_HANDOVER.md`, merges into `agx-meta-hle`, pushes of `agx-meta-hle` | MBP | MBA writes only `research/reports/W-*.md` and pushes only `wt/wifi`/`wt/net-*` |
+
+Both machines touch `s5l8960x.c`, but in separate regions. Keep the diffs local to your region so merges stay mechanical. If a change has to cross regions, write it in your report and let the MBP do it.
+
+### MBP queue (graphics and integration)
+1. **Setup** per section 25. Copy from the MBA (same path `/Users/bagas/Downloads/vphone-legacy`):
+   - `build/virtual-activated-profile-v5/`
+   - `backend/evidence/keybag-contract-20261015/boot-plan-{noeffaceable,smp-nooscar,smp-noisp}/` and that directory's top-level `*.json`
+   - optionally `backend/evidence/virtual-activated-20261023/render-dumps/`
+   Then build and run the tests.
+2. **Merge `wt/home-live` → `agx-meta-hle`.** Rebuild, run the unit tests and the AGX/touch contracts, do one live boot with `research/tasks/merge-live.sh` plus keep-awake taps (see `research/evidence/H-home-live/awake-touch-script.txt`), then push. **Tell the MBA once it is pushed:** Wi-Fi stages 3–6 depend on it.
+3. **Frame-dump corpus plus a one-command offline replay** (strategy section 25). Capture lock, Home, Settings, Settings → General, Clock, Calendar and one app-launch transition. Add a script (e.g. `scripts/agx_corpus.py`) that replays everything in C and in Python and produces a contact sheet and a list of failed/skipped draws in under a minute. Commit the small dumps or the capture recipe, not the GB clones.
+4. **Graphics targets from the corpus audit, in order:**
+   - Clock icon hands (square blocks);
+   - the UISwitch track;
+   - each app screen's failed draws;
+   - app-open and close transitions.
+   One renderer worker (Codex or agy) with a measurable offline target, and one live boot per merge.
+5. **Input (second worker, parallel with 3–4, input files only):**
+   - The **Home button**: map a host key to the A7 menu-button GPIO so apps can be closed. Today nothing exits an app.
+   - A real hand-drag in the window: check that the 18-frame settle unlocks.
+   - Taps in apps.
+6. **Merge `wt/wifi`** when the MBA reports stages 3–6. Integration happens only on the MBP.
+
+### MBA queue (Wi-Fi/network)
+1. Leave agy W running (it was mid-task at the split). Do no new boots until the MBP has pushed the `wt/home-live` merge (MBP step 2). Meanwhile do synthetic contract and analysis work only.
+2. After that push: `git -C ../vphone-wt-wifi fetch && git merge origin/agx-meta-hle`, rebuild, rerun the Wi-Fi/EHCI contracts.
+3. Native stages 3–6 through the UI:
+   - unlock, then tap Settings → Wi-Fi → switch on;
+   - scan shows the host SSID; join;
+   - DHCP ACK in `wifi.pcap` (`filter-dump`);
+   - the Wi-Fi icon in the status bar.
+   Evidence goes in `research/acceptance-wifi-native-N/`. Keep it out of git except for summary JSON/PNG.
+4. Then a short network check: DNS and HTTP in the pcap. Opening Safari to a page is optional; its rendering defects belong to the MBP.
+5. Push `wt/wifi` and report in `research/reports/W-wifi-native.md`. **Do not merge into `agx-meta-hle`.**
+6. If Wi-Fi is blocked, MBA side work must use no QEMU (decoding and analysis from existing evidence). No graphics renderer edits.
+
+### Rules for both machines
+- The QEMU Cocoa window must always be visible (`VPHONE_DISPLAY=cocoa`; `live_run.py` always does). Delete disposable `<output>/images` clones (about 3 GB) after each probe. Wait for load < 5 before timing measurements.
+- Workers:
+  - Codex: `-m gpt-6.1-sol -c model_reasoning_effort="medium" --dangerously-bypass-approvals-and-sandbox`, stdin `/dev/null`.
+  - agy: `--model gemini-3.8-flash-high --dangerously-skip-permissions -p="..."`, one visible terminal tab per worker.
+  - On agy quota: `/logout` and switch accounts. On a Codex limit: stop. On Codex capacity errors: retry later with the same model.
+- These rules were Claude memories on the MBA. A fresh Claude on the MBP must take them from here.
+- Sync through origin only: `git fetch` before starting work, small commits, push branches often. No force-push on shared branches.
+
+## 27. MBP set up; `wt/home-live` merged and verified (Claude, 2026-10-23)
+
+- **MBP checkout is `/Users/bagas/Documents/Projects/vphone/vphone-legacy`**, not `~/Downloads/...`. `build/virtual-activated-profile-v5/` was copied from the MBA (system/data/plan/profile hashes match `profiles/virtual-activated/`). Its `boot/boot_plan.json` was rewritten to this root; the MBA original is kept as `boot_plan.json.orig-mba`. The plan's `ANSRegion.bin` (sha256 `e45348cd…`) was cloned from `build/ios712-validated/boot/` into `backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/`. No other keybag evidence or render dumps are on the MBP yet.
+- `wt/home-live` merged into `agx-meta-hle`. 232 unit tests OK (3 pass-load tests now skip when the probe-164 dumps are absent); agx, touch_input, spi_touch and smp contracts pass.
+- `research/tasks/merge-live.sh` now runs from any checkout, uses H's keep-awake touch script and captures 90/105/140/152 s. One live boot (`backend/evidence/merge-20261023-mbp-live/`, 160 s, MTTCG, no panic): lock screen at 90 s, swipe unlocks, Home without ghosting at 105/140 s, Settings open at 152 s (Wi-Fi: Off).
+- Still visible: the Clock icon hands are square blocks, and the Airplane Mode UISwitch has no track.
+- **MBA:** this push is the go-ahead for MBA queue step 2 (merge `origin/agx-meta-hle` into `wt/wifi`).
+- Next on the MBP: section 26 step 3 (frame-dump corpus and one-command offline replay). `codex` is not installed on the MBP; `agy` is.
+
+## 28. Offline AGX corpus, wallpaper colours, touch IRQ, unlock analysis (Claude, MBP, 2026-10-23)
+
+### Offline corpus (section 26 step 3: done)
+- `scripts/agx_corpus.py capture [--scene …]` boots once per scene (`settings`, `clock`, `calendar`, `unlock`, `unlock-home`, `unlock-flyin`) with `VPHONE_AGX_FRAME_DUMP_AT` windows (new: `_AT`, `_PER_AT`, `_DISPLAY=1`; the JSON sidecar has `vclock_ns` and `dump_window`). Dumps live in `build/agx-corpus/<scene>/dumps` (about 21 MiB each, gitignored).
+- `scripts/agx_corpus.py` (no arguments) compiles the AGX replay core of `s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN`/`END`) into `backend/agx_replay_host.c`, replays every scene **chained** (each pass sees the pages earlier passes wrote; a dump is taken at submission, before the live render thread drew the passes queued ahead of it), runs the Python audit, and writes `build/agx-corpus/report/index.html` + `summary.json`. 225–335 dumps take about 4 s. `AGX_REPLAY_SKIP(reason)` counts the draws the C replay leaves out.
+- **Caveat:** dumping every pass stalls the guest (21 MiB written per pass on the QEMU thread), so scenes with `display_only: False` are right frame by frame but slow the animation itself. To judge animation timing, capture framebuffers without dumps (`--framebuffer-at` every 0.25 s).
+
+### Fixed
+- **Wallpaper colours** (verified live): the CoreImage clip-space wallpaper source is RGBA. The stock `/Library/Wallpaper/iPhone/101@2x~iphone.png` (blue nebula) matched the yellow live render exactly with R/B exchanged. Fixed in C and Python.
+- **Touch IRQ** (`1cbb103`): in the boots where the unlock swipe never arrived (2 of about 7), the guest read no touch frame at all: `queued=1,2,3,…` from the first tap at 78 s. GPIO22 is edge-triggered and, configured while the line was already low, latched nothing. `touch_enqueue` now pulses the line when frames wait with no status pending. Three boots since then drained normally; not yet a reliability measurement.
+
+### Open, with owners
+- **K, Clock icon hands** (agy brief `research/tasks/K-clock-hands.md`, worktree `../vphone-wt-clock-hands`, branch `wt/clock-hands`): untextured vertex colours are RGBA, not BGRA (second hand 0xff1c3edc = #DC3E1C renders blue; the Clock app's grouped background renders #F4EFEF instead of #EFEFF4), and rotated hands / n=48 path fans are drawn as bounding boxes.
+- **S, slide-to-unlock glint and black bar** (agy brief `S-slider-glint.md`, `../vphone-wt-slider`, branch `wt/slider`): the glyph mask is drawn as 1-pixel spans (prog 0x1a20cc29e8fcc15b, stride 16) that the replay skips, and the label layer's blends are probably plus-lighter/plus-darker, not src-over. The black line and dashes are draw 1 of the 640x416 pass, outside the dest-in rectangle.
+- Both agy workers must be launched by the user in a terminal (the auto-mode classifier blocks Claude from starting `agy --dangerously-skip-permissions`).
+- **Unlock → Home transition:** a no-dump boot at 0.25 s resolution (`build/agx-corpus/transition-live/`) shows the lock content vanishing at about 98 s, about 3 s of bare wallpaper, then a complete Home at 101 s with no icon fly-in. During that gap the GPU is only asked for the wallpaper and the slider; SpringBoard commits Home late and CoreAnimation, whose begin time has already passed, jumps to the end state. This is guest speed (TCG), not the replay. A real fix is time dilation (virtual clock slower than wall time, e.g. `-icount`), which changes all boot timing: **user decision pending.**
+
+### Update: K and S merged (Claude, MBP, 2026-10-23 night)
+- `wt/clock-hands` (agy K, f6b18c0 + d81099f) and `wt/slider` (agy S, 9f7d467) are merged (5df6884). The conflict was two blocks inserted before the quad loop: kept K's clip clamps, then S's span block (spans are untextured, so they must run before K's untextured path), then K's triangle/wide-line block.
+  - **K:** untextured vertex colours are RGBA. Triangle rasteriser. Clock hands (prog 0xba8c50a79810e866) are wide lines: pairs of identical vertices, u = cross-width.
+  - **S:** plus-lighter blends (0x5b133ef7e0c3428c, 0xa225a18725e48d5c, 0xf137b90c25ab5471) and 1-pixel glyph spans (0x1a20cc29e8fcc15b).
+- Verified: unit tests OK (13 skipped), AGX contract passes, chained corpus has 0 harness errors. One live boot (`backend/evidence/merge-ks-live/`, no panic):
+  - "slide to unlock" is light and translucent, with no black line or dashes;
+  - the Clock icon has thin hour and minute hands and a thin red second hand;
+  - the Settings background is neutral grey;
+  - unlock, Home and Settings work.
+- Offline caveat: chained replays still show grey dashes around the Clock icon and a light outline left of the slider. Neither appears live; both come from passes that were not dumped (the icon face and earlier label passes).
+- Still open: D (time dilation, `exp/time-dilation`, agy running), the glint sweep not yet checked live, and hands without antialiasing (jagged edges).
+
+### Update: U and B merged (Claude, MBP, 2026-10-24)
+- `wt/uiswitch` (agy U): the UISwitch track border is draw prog 0x62a99af8d8beb332 (stride 36, 48 vertices, #E6E6E6), which was skipped before. It is now rasterised as a distance-field pill. New corpus scene `settings-all` holds every Settings pass, including the 128x64 knob-shadow passes.
+- `wt/blur` (agy B): CoreAnimation blurs are 1-D passes. Direction and offsets come from the vertex uniforms (`vs_data + 48`), weights from the fragment uniforms, and the 4- and 7-tap programs are replayed exactly, including downsampled sources. The 2-D fallback is kept for the legacy 6-tap and stride-12 backdrops. Identified but not implemented: the navigation bar saturation/tint colour matrix (prog 0x2353a3fe1ca2b71b, 3x3 matrix).
+- The only conflict was the Python audit classification: kept both branches.
+- Verified: 14 tests skipped, all others OK; AGX contract passes; 265 dumps replayed chained with 0 errors. Live boot `backend/evidence/merge-ub-live/` (no panic): lock, Home, Settings normal, and the switch track border shows. **Open:** the knob shadow renders as a grey square behind the knob instead of a soft round shadow (the 128x64 shadow-shape and blur passes).
+- U follow-up 2 merged (f5779b1):
+  - The knob and its drop shadow are one texture (0x10524000), drawn as a 9-slice by prog 0x6c01d033fd937c7c through a TSW at fragment-descriptor word 8; the replay had been filling it as a solid quad.
+  - New AGX_USC_COLOR_MATRIX (0x2353a3fe1ca2b71b): a 3x3 matrix plus bias read from the fragment uniforms. It gives the navigation bar its near-white look, and the Clock app tab bar uses it too (slightly greyer now).
+  - Live boot `backend/evidence/merge-u2-live/` has no panic, and the grey square behind the knob is gone. A thin straight grey band remains along the shadow's left edge (9-slice edge sampling, open).
+
+### Time dilation result (agy D, branch `exp/time-dilation`, not merged, local only)
+- Report: `research/reports/D-time-dilation.md` on that branch (worktree `../vphone-wt-dilation`, evidence `research/evidence/D-time-dilation/`).
+- Measured:
+  - lock screen 20 s sooner at k=2 and 23 s sooner at k=3;
+  - no panics;
+  - display sleep after 30 guest seconds (about 107 s of wall time at k=2).
+- **The unlock never completes at k>1.** The slider tracks the finger to x=565 (touch and pan work), but SpringBoard never dismisses the lock screen, so Home and any fly-in are never rendered. Tried and ruled out: timestamp units, swipe speed and steps, scaled settle frames, keep-awake.
+- D's explanation (inter-daemon unlock transaction timing) is a **hypothesis without traces**.
+- **Decision: keep k=1** (default unchanged). The missing icon fly-in at k=1 stays open. Its cause is guest CPU speed (SpringBoard commits Home after the animation's begin time). Real fixes are emulation speed or tracing why SpringBoard is slow during the unlock.
+- Not taken: D's `4ce8d1e`, which drops the `frame_count >= 2` guard from the GPIO22 re-latch. The current guard has drained normally in 5+ k=1 boots; pulsing on single frames may add spurious interrupts while the driver is reading.
