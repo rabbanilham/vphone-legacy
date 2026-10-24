@@ -26,7 +26,7 @@ class ANSImageTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("VPHONE_REAL_FIRMWARE_TEST"), "opt-in native ANS firmware")
     def test_real_fixups_bss_and_guest_tree_stay_consistent(self):
-        source = Path(__file__).resolve().parents[1] / "build/ios712-validated/ans-firmware.bin"
+        source = Path(os.environ.get("VPHONE_TEST_ANS_SOURCE", str(Path(__file__).resolve().parents[1] / "build/ios712-validated/ans-firmware.bin"))).expanduser()
         original = source.read_bytes()
         clocks = [0] * 61
         clocks[0], clocks[41] = 24000000, 133333333

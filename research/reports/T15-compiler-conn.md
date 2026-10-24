@@ -1,6 +1,6 @@
 # T15: AGX compiler connection lifetime investigation
 
-2026-10-22; worktree `/Users/bagas/Downloads/vphone-wt-compiler-conn`, branch `wt/compiler-conn`.
+2026-10-22; worktree `${WORKTREES_ROOT}/vphone-wt-compiler-conn`, branch `wt/compiler-conn`.
 
 ## Result
 
@@ -128,9 +128,9 @@ Run from this worktree with the maintainer's usual built backend/assets:
 python3 backend/display_probe.py \
   --output /tmp/t15-compiler-lifetime \
   --seconds 90 --stop-condition duration \
-  --plan /Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/boot_plan.json \
-  --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/diagnostic/system-diagnostic-sep.raw \
-  --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/diagnostic/data-diagnostic-systembag.raw \
+  --plan ${REPO_ROOT}/build/ios712-validated/boot/boot_plan.json \
+  --diagnostic-system ${REPO_ROOT}/build/diagnostic/system-diagnostic-sep.raw \
+  --diagnostic-data ${REPO_ROOT}/build/diagnostic/data-diagnostic-systembag.raw \
   --breakpoint userclient_start=0xffffff8000c5cf18 \
   --max-hits userclient_start=0 \
   --user-hooks backend/compiler_connection_hooks.json \

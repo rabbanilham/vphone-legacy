@@ -1,0 +1,31 @@
+{
+  "run": "merge-u2-live",
+  "date": "2026-10-24",
+  "source_revision": "f5779b1",
+  "machine_source_sha256": "c527e638ead14bc401c6c369e2ad277eed07c3ff2ae773c227a994b14eade229",
+  "binary_sha256": "ea2ca0ea45de14b2bd833f09ade4d98024be9fa1bafbfb495bb0da390fe6f39b",
+  "plan_sha256": "c1a848b8373653359a20c7f3a0ded14563a4898e609b265c10554ced24847ef9",
+  "process_exit": {
+    "exit_code": 0,
+    "reaped": true
+  },
+  "conversion": "Original 640x1136 QMP PPM captures converted losslessly to PNG with sips; no visual edits.",
+  "captures": [
+    {
+      "scene": "home",
+      "image": "home.png",
+      "capture": "backend/evidence/merge-u2-live/framebuffer-at-140s.ppm",
+      "requested_seconds": 140,
+      "original_ppm_sha256": "cad204b32b95e21536a35e985f5027a8727b341ad68a28aca976c3d5bda06928",
+      "png_sha256": "fcd5d026978cfb1e8d138b71175fb5834d0611e995a1ccfd0f438b852cb0fde9"
+    },
+    {
+      "scene": "settings",
+      "image": "settings.png",
+      "capture": "backend/evidence/merge-u2-live/framebuffer-at-152s.ppm",
+      "requested_seconds": 152,
+      "original_ppm_sha256": "95f84da5589012252efca86e327bcff3918e1693957fec85101e02b658afd7c6",
+      "png_sha256": "1bcddbf1c7975ead578b75eb3b77fe6c0cca436a88330c43a436f30a2c1c2809"
+    }
+  ]
+}

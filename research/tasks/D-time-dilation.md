@@ -1,6 +1,6 @@
 # Task D: time dilation for the unlock → Home animation
 
-Worktree `/Users/bagas/Documents/Projects/vphone/vphone-wt-dilation`, branch `exp/time-dilation`. You are the **only** worker allowed to boot QEMU on the MBP right now (one boot at a time; K and S work offline). Build your own QEMU here first: `backend/.venv/bin/python scripts/qemu/build_backend.py`.
+Worktree `${WORKTREES_ROOT}/vphone-wt-dilation`, branch `exp/time-dilation`. You are the **only** worker allowed to boot QEMU on the MBP right now (one boot at a time; K and S work offline). Build your own QEMU here first: `backend/.venv/bin/python scripts/qemu/build_backend.py`.
 
 ## Why
 At normal speed (k=1) the unlock looks wrong: a no-dump boot captured every 0.25 s (`build/agx-corpus/transition-live/`) shows the lock content vanishing at about 98 s, about 3 s of bare wallpaper, then a complete Home at 101 s with no icon fly-in. The GPU is never asked to draw the icons in between: SpringBoard (TCG-emulated, slow) commits Home late, and CoreAnimation, whose animation begin time has already passed, jumps to the end state. The fix being tested is to slow guest time relative to the wall clock so each guest second gets more emulated instructions.

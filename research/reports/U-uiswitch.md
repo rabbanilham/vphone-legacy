@@ -1,9 +1,9 @@
 # Task U: UISwitch Track, Knob Drop Shadow, & Navigation Bar Tint
 
-**Task ID**: `U-uiswitch`  
-**Worktree**: `/Users/bagas/Documents/Projects/vphone/vphone-wt-uiswitch`  
-**Branch**: `wt/uiswitch`  
-**Author / Worker**: Antigravity (`agy`)  
+**Task ID**: `U-uiswitch`
+**Worktree**: `${WORKTREES_ROOT}/vphone-wt-uiswitch`
+**Branch**: `wt/uiswitch`
+**Author / Worker**: Antigravity (`agy`)
 **Scope**: AGX replay core in `backend/s5l8960x.c` (strictly between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`), `backend/agx_replay_offline.py`, `tests/test_agx_*`. Strictly offline (no QEMU boots).
 
 ---

@@ -1,5 +1,6 @@
 #!/bin/zsh
 # vphone-legacy — CLI wrapper running with the project virtualenv
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_PY="${SCRIPT_DIR}/.venv/bin/python"

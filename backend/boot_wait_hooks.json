@@ -1,6 +1,6 @@
 {
-  "cache_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
-  "index_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "cache_path": "backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "backend/evidence/ca-surface-20261014-214745/cache-index.json",
   "symbols": {
     "boot_wait_interfaces_begin": "0x18461e028",
     "boot_wait_interfaces_done": "0x1846198cc"

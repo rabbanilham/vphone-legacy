@@ -7,6 +7,7 @@
 """
 from collections import Counter
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -16,9 +17,7 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'backend/s5l8960x.c'
 ROOT = Path(__file__).resolve().parents[1]
-DUMPS_DIR = Path('/Users/bagas/Downloads/vphone-legacy/backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps')
-if not DUMPS_DIR.exists():
-    DUMPS_DIR = ROOT / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'
+DUMPS_DIR = Path(os.environ.get('VPHONE_AGX_DUMPS', str(ROOT / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'))).expanduser()
 
 REPLAY_SPEC = importlib.util.spec_from_file_location(
     'agx_replay_offline', ROOT / 'backend/agx_replay_offline.py')

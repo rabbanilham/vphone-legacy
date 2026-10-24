@@ -7,6 +7,7 @@ Verifies:
 - C hardware model (backend/s5l8960x.c) implements display surface strip detection.
 """
 
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -15,11 +16,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / 'backend'
-CANDIDATE_DUMPS = [
-    BACKEND / 'evidence/keybag-contract-20261015/probe-164-gfxdump/dumps',
-    Path('/Users/bagas/Downloads/vphone-legacy/backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'),
-]
-DUMPS_DIR = next((p for p in CANDIDATE_DUMPS if p.is_dir()), None)
+DUMPS_PATH = Path(os.environ.get('VPHONE_AGX_DUMPS', str(BACKEND / 'evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'))).expanduser()
+DUMPS_DIR = DUMPS_PATH if DUMPS_PATH.is_dir() else None
 S5L8960X_C = BACKEND / 's5l8960x.c'
 
 import sys

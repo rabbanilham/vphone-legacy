@@ -1,8 +1,8 @@
 # Experimental A7 QEMU backend
 
-This is a bring-up machine, **not a bootable iOS emulator**. It loads actual
-kernel memory, exposes a real guest framebuffer and records unsupported
-operations. It does not print Darwin/SpringBoard messages or draw iOS UI.
+For current capabilities and acceptance evidence, read [status](../docs/status.md) and [architecture](../docs/architecture.md). Recorded local research profiles reach original iOS Home/Settings through modeled peripherals and partial AGX command replay; the baseline IPSW pipeline does not yet reproduce that profile.
+
+The contract notes below were accumulated during bring-up. Dated negative results describe those historical configurations, not the current aggregate feature set. Missing `evidence/` links refer to local uncommitted artifacts. Use the maintained [firmware guide](../docs/firmware.md) for setup.
 
 Upstream QEMU is pinned in `source.lock.json`. `s5l8960x.c` is the project's
 source overlay; `scripts/qemu/build_backend.py` installs that overlay into an
@@ -224,11 +224,11 @@ ABI model; it does not supply factory identity, calibration or analog behavior.
 Unknown I2C addresses/registers remain errors. Native physical UserClient swaps
 are observed, but non-zero iOS framebuffer pixels are still unverified.
 `display-trace=1 -d unimp -D FILE` logs display regions and I2C0 with guest
-PC/value/width and host/guest origin. See the current handover for exact evidence.
+PC/value/width and host/guest origin. See the research archive for historical evidence.
 
 Native SEP readiness remains blocked (2026-10-15): publication and EP7 creation
 are proven, but endpoint enable waits on manager +0xc0=2 while requiring >=5,
-holding the KeyStore gate upstream of CA. See the latest handover; no native SEP
+holding the KeyStore gate upstream of CA. See the current status page; no native SEP
 execution or CA UI success is claimed by synthetic mailbox tests.
 
 `display_probe.py --stop-condition first-pixel` is the default and retains the

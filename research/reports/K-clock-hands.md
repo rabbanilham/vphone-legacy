@@ -1,9 +1,9 @@
 # Task K: Clock icon hands (vertex colour order, triangle and wide line rasterisation)
 
-**Task ID**: `K-clock-hands`  
-**Worktree**: `/Users/bagas/Documents/Projects/vphone/vphone-wt-clock-hands`  
-**Branch**: `wt/clock-hands`  
-**Author / Worker**: Antigravity (`agy`)  
+**Task ID**: `K-clock-hands`
+**Worktree**: `${WORKTREES_ROOT}/vphone-wt-clock-hands`
+**Branch**: `wt/clock-hands`
+**Author / Worker**: Antigravity (`agy`)
 **Scope**: AGX replay core in `backend/s5l8960x.c` (between `AGX_REPLAY_CORE_BEGIN` and `AGX_REPLAY_CORE_END`), `backend/agx_replay_offline.py`, `backend/agx_contract_test.py`, and `tests/test_agx_*`.
 
 ---
@@ -130,7 +130,7 @@ The second hand pixel count remains invariant at $96.8 \pm 1.2\text{ px}$ across
 
 ## 5. Corpus & Regression Verification
 
-Command: `.venv/bin/python scripts/agx_corpus.py --corpus corpus`  
+Command: `.venv/bin/python scripts/agx_corpus.py --corpus corpus`
 Output: 225 dumps replayed chained in **3.5 s** -> `corpus/report/index.html`.
 
 ### Draw Classification Breakdown:

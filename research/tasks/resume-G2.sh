@@ -1,3 +1,0 @@
-#!/bin/bash
-cd /Users/bagas/Downloads/vphone-wt-lock-gfx
-agy --model gemini-3.8-flash-high --dangerously-skip-permissions --conversation 707629fd-b13b-4504-9c61-468119a87f4f -i "You were interrupted by an account usage limit (now switched). Your uncommitted edits in agx_contract_test.py, agx_replay_offline.py, s5l8960x.c and tests/test_agx_pass_load.py are still in the tree: review them with git diff and continue Task G2 where you left off (step 2: decode the one-draw wallpaper pass that overwrites the clock, implement its clipping live and offline, then the live probe with the Cocoa window. Delete any leftover <output>/images clones first)."

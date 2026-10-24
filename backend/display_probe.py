@@ -22,7 +22,6 @@ from breakpoint_probe import rsp, receive_rsp
 from probe_state import RunClock, ReturnRegistry, ScanoutTracker, pixel_present, instruction_mapped
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRATCH = Path('/Users/bagas/.gemini/antigravity/brain/4f2c8eb8-288b-4247-84a2-e745314f5c38/scratch')
 PLAN = ROOT / 'build/ios712-validated/boot/boot_plan.json'
 FB = 0x8018e0000
 FB_SIZE = 2560 * 1136
@@ -336,18 +335,21 @@ def main():
     if any(not 0 < at < args.seconds for at in args.framebuffer_at):
         p.error('--framebuffer-at must be positive and less than --seconds')
     assert 1 <= args.step_count <= 64
-    out = args.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
-    images = out / 'images'; images.mkdir()
-    save_json(out/'probe-invocation.json',[sys.executable,*sys.argv])
     plan_path = args.plan.resolve() if args.plan else PLAN
     storage = plan_path.parent.parent / 'storage-before'
     if not storage.exists():
         storage = ROOT / 'build/ios712-validated'
     system_src = args.diagnostic_system.resolve() if args.diagnostic_system else storage / 'system.raw'
-    data_src = args.diagnostic_data.resolve() if args.diagnostic_data else SCRATCH / 'data-seeded-clean.raw'
+    data_src = args.diagnostic_data.resolve() if args.diagnostic_data else ROOT / 'build/diagnostic/data-diagnostic-systembag.raw'
     sources = dict(system=system_src, data=data_src,
                    utility=storage / 'utility.raw')
+    for source in (plan_path, *sources.values()):
+        if not source.is_file():
+            p.error(f'Missing input: {source}. See docs/firmware.md; supply --plan, --diagnostic-system and --diagnostic-data for local artifacts.')
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    images = out / 'images'; images.mkdir()
+    save_json(out/'probe-invocation.json',[sys.executable,*sys.argv])
     provenance = dict(plan=str(plan_path), plan_sha256=digest(plan_path), inputs={})
     def clone_or_copy(src, dst):
         try:
@@ -391,6 +393,11 @@ def main():
             if name.startswith(prefix):return max_hits[prefix]
         return 24 if pc in user_expected else 8
     user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
+    if user_hooks:
+        for key in ('cache_path', 'index_path'):
+            if key in user_hooks:
+                value = Path(user_hooks[key]).expanduser()
+                user_hooks[key] = str(value if value.is_absolute() else ROOT / value)
     user_installed = False
     user_expected = {}
     exe_installed = {}

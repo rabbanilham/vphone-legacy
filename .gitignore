@@ -20,3 +20,16 @@ scripts/vphoned-legacy/vphoned_ios
 __pycache__/
 *.pyc
 
+
+# Local tools, SDK aliases, credentials and guest captures
+backend/macos-sdk
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pcap
+*.pcapng
+*.im4p
+*.img4
+*.a7dump

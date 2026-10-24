@@ -2,7 +2,7 @@
 """Decode VPHONE_AGX_DUMP and AGX RT lines; all command words are little endian.
 
 Address labels are heuristics, not recovered field definitions. META candidates
-map to GPU VA 0xe1c0000000 + (address & 0x3fffffff), per CLAUDE_HANDOVER.md.
+map to GPU VA 0xe1c0000000 + (address & 0x3fffffff), as documented in docs/architecture.md.
 Malformed dump lines are rejected with their source line number.
 """
 

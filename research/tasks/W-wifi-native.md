@@ -1,5 +1,5 @@
 # Task W (agy): native Wi-Fi acceptance on branch wt/wifi
-Worktree: /Users/bagas/Downloads/vphone-wt-wifi (branch wt/wifi). Report id: W-wifi-native.
+Worktree: ${WORKTREES_ROOT}/vphone-wt-wifi (branch wt/wifi). Report id: W-wifi-native.
 
 ## Background
 wt/wifi (4 Codex commits up to 46aa62a) emulates a BCM43342 FullMAC USB Wi-Fi on the HSIC/EHCI1 port with slirp networking (backend/wifi_dongle.c, wifi_protocol.h, host_wifi.py; README section "Optional BCM43342 HSIC Wi-Fi"). Synthetic contracts pass (`backend/wifi_contract_test.py`), but the native iOS boot acceptance has never been run.
