@@ -125,17 +125,43 @@ static bool wifi_event(WifiProtocol *s, unsigned type, unsigned status,
     uint8_t buf[WIFI_FRAME_MAX]={0};
     if(type>=128) return false;
     if(!s->darwin && !(s->events[type/8] & (1u<<(type%8)))) return true;
-    if(n>sizeof(buf)-72) return false;
-    memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
-    wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
-    wifi_be16(buf+16,48+n); buf[18]=0; memcpy(buf+19,"\x00\x10\x18",3);
-    wifi_be16(buf+22,1);
-    /* wl_event_msg is 48 bytes: IFNAMSIZ=16, then ifidx/bsscfgidx. */
-    wifi_be16(buf+24,2); wifi_be16(buf+26,flags);
-    wifi_be32(buf+28,type); wifi_be32(buf+32,status);
-    wifi_be32(buf+44,n); memcpy(buf+48,wifi_bssid,6); memcpy(buf+54,"en0",4);
-    if(n) memcpy(buf+72,payload,n);
-    return wifi_enqueue(s,buf,72+n);
+    if(s->darwin) {
+        if(n>sizeof(buf)-76) return false;
+        memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
+        wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
+        wifi_be16(buf+16,48+n);
+        /* Broadcom OUI at +23, usr_subtype=1 at +26 */
+        memcpy(buf+23,"\x00\x10\x18",3);
+        wifi_be16(buf+26,1);
+        /* wl_event_msg_t is 48 bytes at +28:
+         * version(+28), event_type(+30), status(+32), reason(+36),
+         * auth_type(+40), flags(+44), datalen(+48), addr(+52),
+         * ifname(+58, "en0"), ifidx(+74), bsscfgidx(+75). */
+        wifi_be16(buf+28,0);
+        wifi_be16(buf+30,type);
+        wifi_be32(buf+32,status);
+        wifi_be32(buf+36,0);
+        wifi_be32(buf+40,0);
+        wifi_be32(buf+44,flags);
+        wifi_be32(buf+48,n);
+        memcpy(buf+52,wifi_bssid,6);
+        memcpy(buf+58,"en0",4);
+        buf[74]=0; buf[75]=0;
+        if(n) memcpy(buf+76,payload,n);
+        return wifi_enqueue(s,buf,76+n);
+    } else {
+        if(n>sizeof(buf)-72) return false;
+        memcpy(buf,s->mac,6); memcpy(buf+6,wifi_bssid,6);
+        wifi_be16(buf+12,0x886c); wifi_be16(buf+14,0x8001);
+        wifi_be16(buf+16,48+n); buf[18]=0; memcpy(buf+19,"\x00\x10\x18",3);
+        wifi_be16(buf+22,1);
+        /* wl_event_msg is 48 bytes: IFNAMSIZ=16, then ifidx/bsscfgidx. */
+        wifi_be16(buf+24,2); wifi_be16(buf+26,flags);
+        wifi_be32(buf+28,type); wifi_be32(buf+32,status);
+        wifi_be32(buf+44,n); memcpy(buf+48,wifi_bssid,6); memcpy(buf+54,"en0",4);
+        if(n) memcpy(buf+72,payload,n);
+        return wifi_enqueue(s,buf,72+n);
+    }
 }
 /* wl_bss_info v109, followed by ordinary 802.11 IEs. */
 static size_t wifi_bss(WifiProtocol *s, uint8_t *b)
