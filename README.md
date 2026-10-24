@@ -1,5 +1,7 @@
 # vphone-legacy
 
+Inspired by [vphone-cli](https://github.com/Lakr233/vphone-cli)
+
 An experimental iPhone 5s emulator for **iPhone6,2 / n53ap / iOS 7.1.2 (11D257)** on Apple Silicon Macs. It combines a pinned QEMU backend, firmware preparation tools, and a software model of selected A7 peripherals and AGX rendering commands.
 
 **Research software:** recorded local runs reach the original lock screen, Home, and Settings with guest touch input. A fresh IPSW preparation does **not** yet reproduce that configuration: the latest UI profile depends on additional local boot/keybag artifacts. See [current status](docs/status.md) and [firmware preparation](docs/firmware.md) before attempting a boot.
