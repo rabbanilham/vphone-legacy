@@ -97,6 +97,38 @@ def find_matrix(f, vs_data):
     return None
 
 
+PPP_BIT_SIZES = {
+    0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1,
+    6: 4, 7: 1, 8: 1, 9: 1, 10: 2, 11: 6,
+    16: 1, 17: 1, 18: 1, 19: 1, 20: 1, 21: 1, 22: 1,
+    23: 2, 25: 2
+}
+
+
+def update_ppp_state(retained, packet):
+    if not packet:
+        return
+    if len(packet) == 1:
+        if (packet[0] & 0xc0000000) == 0x80000000:
+            retained[12] = packet[0]
+        elif packet[0] == 0:
+            retained[12] = 0
+        return
+    hdr = packet[0]
+    idx = 1
+    slot = 0
+    for b in range(32):
+        sz = PPP_BIT_SIZES.get(b, 0)
+        if not sz:
+            continue
+        if hdr & (1 << b):
+            for s in range(sz):
+                if idx < len(packet) and slot + s < len(retained):
+                    retained[slot + s] = packet[idx]
+                    idx += 1
+        slot += sz
+
+
 def walk(f):
     """Yield (vertex_pds_data, ppp_words, draw_words, viewport) per draw."""
     pc = struct.unpack_from('<Q', f.ta_command, 0x68)[0]
@@ -335,6 +367,38 @@ BLUR_PROGRAMS_12 = {
 
 ALL_BLUR_PROGRAMS = BLUR_PROGRAMS | {BLUR_4TAP, BLUR_7TAP} | BLUR_PROGRAMS_12
 
+# 41-byte USC machine code preamble common to all CoreAnimation separable Gaussian blur shaders.
+BLUR_PREAMBLE = bytes([
+    0x2a, 0x0a, 0x94, 0x99, 0x99, 0xaf, 0x1b, 0x80,
+    0x00, 0x33, 0x00, 0x00, 0x80, 0x40, 0x80, 0x01,
+    0x88, 0x00, 0x20, 0xff, 0x3a, 0x8a, 0x80, 0x94,
+    0x99, 0x99, 0xaf, 0x1b, 0x80, 0x00, 0x33, 0x00,
+    0x00, 0x82, 0x40, 0x80, 0x03, 0x88, 0x00, 0x21,
+    0x00
+])
+
+_blur_cache = set()
+
+
+def is_blur_program(f, ppp, prog):
+    """Signature-based detection for CoreAnimation separable Gaussian blur shaders."""
+    if prog in (BLUR_4TAP, BLUR_7TAP) or prog in BLUR_PROGRAMS or prog in _blur_cache:
+        return True
+    pds_ptr = ppp[6] if len(ppp) == 32 else (ppp[7] if len(ppp) > 7 else (ppp[6] if len(ppp) > 6 else 0))
+    if not pds_ptr and len(ppp) > 7:
+        pds_ptr = ppp[7]
+    if not pds_ptr:
+        return False
+    try:
+        off = f.u32(0x600000000 | pds_ptr)
+        code = f.read(0x700000000 | off, len(BLUR_PREAMBLE))
+        if code == BLUR_PREAMBLE:
+            _blur_cache.add(prog)
+            return True
+    except Exception:
+        pass
+    return False
+
 BLUR_TAPS_4 = [
     (0.638336, 0.275844),
     (2.348645, 0.185744),
@@ -498,8 +562,11 @@ def gaussian_blur_texture(buf, w, h, taps=None, offsets=None, weights=None, dire
 
 def program(f, ppp):
     """FNV-1a of the first 64 bytes of the draw's USC fragment code."""
+    pds_ptr = ppp[6] if len(ppp) == 32 else (ppp[7] if len(ppp) > 7 else (ppp[6] if len(ppp) > 6 else 0))
+    if not pds_ptr and len(ppp) > 7:
+        pds_ptr = ppp[7]
     try:
-        off = f.u32(0x600000000 | ppp[7])
+        off = f.u32(0x600000000 | pds_ptr)
         code = f.read(0x700000000 | off, 64)
     except (KeyError, ValueError, IndexError):
         return 0
@@ -551,7 +618,7 @@ def quad_affine(xy, uv):
     return tuple(out) if all(math.isfinite(v) for v in out) else None
 
 
-def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
+def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None):
     """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
     count = draw[1]
     w0 = draw[0]
@@ -567,18 +634,24 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
     if stride is None or stride < 12 or stride > 64:
         return 'skipped: unmapped memory', {'stride': stride}
 
-    prog = program(f, ppp)
+    prog = program(f, ppp) or (program(f, retained_ppp) if retained_ppp else 0)
     try:
-        tex = texture(f, ppp, prog=prog)
+        tex = texture(f, ppp, prog=prog) or (texture(f, retained_ppp, prog=prog) if retained_ppp else None)
     except TypeError:
-        tex = texture(f, ppp)
+        tex = texture(f, ppp) or (texture(f, retained_ppp) if retained_ppp else None)
+    if not tex:
+        try:
+            tex = texture(f, ppp) or (texture(f, retained_ppp) if retained_ppp else None)
+        except TypeError:
+            pass
 
+    is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
     if not tex and stride not in (20, 28):
         if stride == 16 and prog == SPANS:
             return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
         if stride == 36 and prog == PILL_BORDER:
             return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
-        if stride == 12 and prog in ALL_BLUR_PROGRAMS:
+        if stride == 12 and is_blur_prog:
             if prog in (BLUR_4TAP, BLUR_7TAP):
                 params = extract_blur_params(f, vs_data, ppp, prog)
                 d_name = params['direction']
@@ -665,7 +738,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph):
         # Untextured glyphs (clock digits): RGBA colour at +16, like stride 20.
         return 'replayed exactly: solid quad (stride=28)', {'count': count}
 
-    is_blur = prog in ALL_BLUR_PROGRAMS
+    is_blur = is_blur_program(f, ppp, prog)
     is_dest_in = prog == DEST_IN
     is_vibrancy = tex.get('vibrancy', False)
 
@@ -721,8 +794,10 @@ def audit_frame(f):
     target_w, target_h = (pw, ph) if (pw != 640 or ph != 1136) else (W, H)
     outcomes = []
     did = 0
+    retained_ppp = [0] * 32
     for vs_data, ppp, draw, viewport in walk(f):
-        res, details = classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph)
+        update_ppp_state(retained_ppp, ppp)
+        res, details = classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=retained_ppp)
         outcomes.append((did, res, details))
         did += 1
     return outcomes
@@ -787,8 +862,10 @@ def main():
     scissor_base = struct.unpack_from('<I', f.type1_command, 0x50)[0]
     clip_state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
     last_m = None
+    retained_ppp = [0] * 32
     for vs_data, ppp, draw, viewport in walk(f):
         clip_state = decode_ppp_clipping(ppp, clip_state)
+        update_ppp_state(retained_ppp, ppp)
         clip_x0, clip_y0 = 0, 0
         clip_x1, clip_y1 = target_w, target_h
         if clip_state['scenable'] and scissor_base:
@@ -810,7 +887,7 @@ def main():
 
         count = draw[1]
         stride, vs = vertices(f, vs_data, count)
-        prog = program(f, ppp)
+        prog = program(f, ppp) or program(f, retained_ppp)
         m = None
         if stride != 12:
             m = find_matrix(f, vs_data)
@@ -819,7 +896,9 @@ def main():
             elif stride == 16 and prog == SPANS and last_m:
                 m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
-        tex = texture(f, ppp, prog)
+        tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)
+        if not tex:
+            tex = texture(f, ppp) or texture(f, retained_ppp)
         is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)
         if is_color_matrix:
             cm = extract_color_matrix(f, ppp)
@@ -856,7 +935,7 @@ def main():
                 continue
             else:
                 continue
-        is_blur = prog in ALL_BLUR_PROGRAMS
+        is_blur = is_blur_program(f, ppp, prog) or is_blur_program(f, retained_ppp, prog)
         blurred_tex = None
         if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
             params = extract_blur_params(f, vs_data, ppp, prog)
@@ -1218,12 +1297,17 @@ def main():
                         else:
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
-            elif stride == 12 and prog in ALL_BLUR_PROGRAMS:
+            elif stride == 12 and (is_blur or is_blur_program(f, ppp, prog)):
                 params = extract_blur_params(f, vs_data, ppp, prog)
-                bw, bh = x1 - x0, y1 - y0
+                pad = 16
+                bx0 = max(0, x0 - pad)
+                by0 = max(0, y0 - pad)
+                bx1 = min(target_w, x1 + pad)
+                by1 = min(target_h, y1 + pad)
+                bw, bh = bx1 - bx0, by1 - by0
                 raw_pixels = []
-                for y in range(y0, y1):
-                    for x in range(x0, x1):
+                for y in range(by0, by1):
+                    for x in range(bx0, bx1):
                         d = (y * target_w + x) * 4
                         r, g, b, a = fb[d:d + 4]
                         raw_pixels.append((b, g, r, a))
@@ -1235,7 +1319,7 @@ def main():
                 )
                 for y in range(y0, y1):
                     for x in range(x0, x1):
-                        b, g, r, a = blurred[(y - y0) * bw + (x - x0)]
+                        b, g, r, a = blurred[(y - by0) * bw + (x - bx0)]
                         d = (y * target_w + x) * 4
                         fb[d:d + 4] = bytes((r, g, b, a))
             elif stride in (20, 28):
