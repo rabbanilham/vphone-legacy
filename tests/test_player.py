@@ -129,11 +129,11 @@ assert(frames.last!.0 == "end" && g.center == nil)
 frames.removeAll()
 assert(g.beginControlCenter())
 assert(!g.beginControlCenter())
-assert(frames[0].0 == "begin" && frames[0].1 == [NSPoint(x:320,y:1118)])
+assert(frames[0].0 == "begin" && frames[0].1 == [NSPoint(x:320,y:1135)])
 g.advanceControlCenter(0.5)
-assert(frames[1].1 == [NSPoint(x:320,y:769)])
+assert(frames[1].1 == [NSPoint(x:320,y:617.5)])
 g.advanceControlCenter(1)
-assert(frames[2].1 == [NSPoint(x:320,y:420)])
+assert(frames[2].1 == [NSPoint(x:320,y:100)])
 g.end();assert(frames.last!.0 == "end" && g.kind == .none)
 g.advanceControlCenter(0.3);assert(frames.count == 4)
 g.pinch(NSPoint(x:160,y:568),begin:true)
@@ -156,6 +156,49 @@ print("PASS: wt/touch scroll, wheel, mirrored pinch, shifted pan, magnify, cance
             tmp = Path(tmp);(tmp/'main.swift').write_text(source+harness)
             subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test')],check=True,timeout=20)
+
+    def test_control_center_waits_for_digitizer_and_preserves_active_app(self):
+        source = (ROOT/'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let qmp = QMPInput(CommandLine.arguments[1])
+let done = DispatchSemaphore(value:0)
+for _ in 0..<2 {
+    qmp.prepareControlCenter {error in assert(error == nil);done.signal()}
+    assert(done.wait(timeout:.now()+5) == .success)
+}
+print("PASS: ready guest keeps app context; gated digitizer gets Home wake and readiness retry")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-ready-') as tmp:
+            tmp=Path(tmp);(tmp/'main.swift').write_text(source+harness)
+            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            server=socket.socket(socket.AF_UNIX);server.bind(str(tmp/'qmp'));server.listen()
+            errors=[];downs=[]
+            def serve():
+                try:
+                    with server.accept()[0] as conn:
+                        conn.settimeout(5)
+                        conn.sendall(b'{"QMP":{}}\n')
+                        with conn.makefile('rwb',buffering=0) as stream:
+                            queries=0
+                            while True:
+                                line=stream.readline()
+                                if not line:break
+                                request=__import__('json').loads(line);result={}
+                                if request['execute']=='qom-get':
+                                    self.assertEqual(request['arguments'],{'path':'/machine','property':'touch-reporting-enabled'})
+                                    queries+=1;result=queries!=2
+                                if request['execute']=='input-send-event':
+                                    data=request['arguments']['events'][0]['data']
+                                    self.assertEqual(data['key'],{'type':'qcode','data':'home'})
+                                    downs.append(data['down'])
+                                response={'return':result,'id':request['id']}
+                                stream.write(__import__('json').dumps(response).encode()+b'\n')
+                except BaseException as error:errors.append(error)
+            thread=threading.Thread(target=serve);thread.start()
+            try:subprocess.run([str(tmp/'test'),str(tmp/'qmp')],check=True,timeout=12)
+            finally:thread.join(timeout=6);server.close()
+            if errors:raise errors[0]
+            self.assertEqual(downs,[True,False])
 
     def test_fragmented_rfb_and_geometry(self):
         source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]

@@ -116,7 +116,7 @@ final class QMPInput {
         }
         throw NSError(domain:"QMP response too large",code:1)
     }
-    func execute(_ command: String, _ arguments: [String:Any] = [:]) throws {
+    @discardableResult func execute(_ command: String, _ arguments: [String:Any] = [:]) throws -> Any? {
         let id = UUID().uuidString
         let data = try JSONSerialization.data(withJSONObject:["execute":command,"arguments":arguments,"id":id])
         try io.send(Array(data)+[10])
@@ -124,7 +124,7 @@ final class QMPInput {
             let response = try line()
             if response["id"] as? String != id { continue }
             if let error = response["error"] { throw NSError(domain:"QMP: \(error)",code:1) }
-            return
+            return response["return"]
         }
     }
     func connect() throws {
@@ -143,6 +143,33 @@ final class QMPInput {
         guard result == 0 else { throw NSError(domain:"Koneksi input QMP gagal",code:Int(errno)) }
         guard try line()["QMP"] != nil else {throw NSError(domain:"QMP greeting tidak valid",code:1)}
         try execute("qmp_capabilities"); connected = true
+    }
+    func prepareControlCenter(_ completion: @escaping (String?)->Void) {
+        queue.async {
+            do {
+                if !self.connected {try self.connect()}
+                var woke = false
+                for _ in 0..<100 {
+                    guard let ready = try self.execute("qom-get",["path":"/machine","property":"touch-reporting-enabled"]) as? Bool else {
+                        throw NSError(domain:"Backend perlu dibangun ulang untuk memeriksa digitizer",code:1)
+                    }
+                    if ready {completion(nil);return}
+                    if !woke {
+                        // Only wake a gated digitizer. Do not leave an active app.
+                        for down in [true,false] {
+                            try self.execute("input-send-event",["device":"a7-touch-display","events":[["type":"key","data":["down":down,"key":["type":"qcode","data":"home"]]]]])
+                            if down {usleep(100000)}
+                        }
+                        woke = true
+                    }
+                    usleep(100000)
+                }
+                completion("Digitizer belum siap. Tunggu boot selesai lalu coba lagi.")
+            } catch {
+                if self.io.fd >= 0 {close(self.io.fd);self.io.fd = -1}
+                self.connected = false;completion(error.localizedDescription)
+            }
+        }
     }
     static func events(_ type: String, _ points: [NSPoint]) -> [[String:Any]] {
         var events: [[String:Any]] = []
@@ -222,11 +249,11 @@ final class TouchGestures {
         kind = .controlCenter
         // The board adds the existing 16px Y correction once. This lands
         // within the bottom edge without emitting an out-of-range contact.
-        fingers = [NSPoint(x:320,y:1118)];emit("begin");return true
+        fingers = [NSPoint(x:320,y:1135)];emit("begin");return true
     }
     func advanceControlCenter(_ progress:CGFloat) {
         guard kind == .controlCenter else {return}
-        fingers = [NSPoint(x:320,y:1118-698*max(0,min(1,progress)))];emit("update")
+        fingers = [NSPoint(x:320,y:1135-1035*max(0,min(1,progress)))];emit("update")
     }
     func magnify(_ point:NSPoint?, delta:CGFloat, begin:Bool, end:Bool) {
         if begin {
@@ -259,10 +286,12 @@ final class Screen: NSView {
     var wheelTimer: Timer?
     var controlCenterTimer: Timer?
     var tracking: NSTrackingArea?
+    var touchEpoch = 0
     var held = false
     var lastPoint = (0,0)
     var trace: ((String)->Void)?
     func cancelTouch() {
+        touchEpoch += 1
         wheelTimer?.invalidate();wheelTimer = nil
         controlCenterTimer?.invalidate();controlCenterTimer = nil
         gestures.end();gestures.hint(nil,option:false);needsDisplay = true
@@ -310,17 +339,18 @@ final class Screen: NSView {
     func openControlCenter() {
         guard !held,gestures.beginControlCenter() else {return}
         var tick = 0
-        // Hold the edge for 0.2s, drag for 3s, settle for 1s, then lift.
-        // The slower pacing matches the existing emulated UIKit touch path.
+        // Begin moving promptly so this is an edge pan, not a long press.
+        // Drag for 0.8s and settle briefly; QEMU adds its own release frames.
         let timer = Timer(timeInterval:1.0/30,repeats:true) {[weak self] timer in
             guard let self,self.gestures.kind == .controlCenter else {timer.invalidate();return}
             tick += 1
-            if tick >= 6 && tick <= 96 {self.gestures.advanceControlCenter(CGFloat(tick-6)/90)}
-            if tick >= 126 {self.gestures.end();timer.invalidate();self.controlCenterTimer = nil}
+            if tick >= 1 && tick <= 25 {self.gestures.advanceControlCenter(CGFloat(tick-1)/24)}
+            if tick >= 28 {self.gestures.end();timer.invalidate();self.controlCenterTimer = nil}
         }
         controlCenterTimer = timer;RunLoop.main.add(timer,forMode:.common)
     }
     override func mouseDown(with event:NSEvent) {
+        touchEpoch += 1
         window?.makeFirstResponder(self)
         // A fresh physical press takes ownership. A lost scroll/magnify end
         // or a pending toolbar swipe must never swallow subsequent clicks.
@@ -374,6 +404,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var activity: NSObjectProtocol?
     var inputFailed = false
     var gestureError: String?
+    var controlCenterPending = false
     var inputLog: FileHandle?
     var window: NSWindow!
     var buttons: [NSButton] = []
@@ -414,7 +445,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         qmp.failed = {[weak self] message in DispatchQueue.main.async {self?.handleGestureFailure(message)}}
         screen.input = { [weak self] x,y,down in self?.rfb.pointer(x,y,down) }
-        rfb.frame = { [weak self] image in DispatchQueue.main.async { guard let self else {return}; self.screen.image = image; if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}; self.buttons.forEach {$0.isEnabled = !self.inputFailed} } }
+        rfb.frame = { [weak self] image in DispatchQueue.main.async { guard let self else {return}; self.screen.image = image; if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}; self.buttons.enumerated().forEach {i,button in button.isEnabled = !self.inputFailed && !(i == 1 && self.controlCenterPending)} } }
         rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
         let path = CommandLine.arguments[1]
@@ -435,7 +466,19 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
     @objc func home() { screen.cancelTouch();rfb.home() }
-    @objc func controlCenter() { screen.openControlCenter() }
+    @objc func controlCenter() {
+        guard !controlCenterPending,!screen.held,screen.gestures.kind == .none,let touchInput else {return}
+        controlCenterPending = true;buttons[1].isEnabled = false
+        let epoch = screen.touchEpoch
+        touchInput.prepareControlCenter {[weak self] error in DispatchQueue.main.async {
+            guard let self else {return}
+            self.controlCenterPending = false;self.buttons[1].isEnabled = !self.inputFailed
+            guard self.screen.touchEpoch == epoch else {return}
+            if let error {self.handleGestureFailure(error);return}
+            self.gestureError = nil;self.status.isHidden = true
+            self.screen.openControlCenter()
+        }}
+    }
     @objc func capture() {
         guard let image = screen.image else {return}
         let png = NSBitmapImageRep(cgImage:image).representation(using:.png,properties:[:])

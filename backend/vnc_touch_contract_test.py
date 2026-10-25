@@ -17,6 +17,7 @@ def main():
 let client = RFB()
 let qmp = QMPInput(CommandLine.arguments[2])
 let gestures = TouchGestures()
+let ready = DispatchSemaphore(value:0)
 var inputError = false
 qmp.failed = { message in print(message);inputError = true }
 gestures.send = {type,points in qmp.touch(type,points)}
@@ -28,6 +29,8 @@ client.frame = { _ in
   DispatchQueue.global().asyncAfter(deadline:.now()+0.06) {client.pointer(321,654,true)}
   DispatchQueue.global().asyncAfter(deadline:.now()+0.12) {client.pointer(321,654,false)}
   DispatchQueue.global().asyncAfter(deadline:.now()+0.8) {
+    qmp.prepareControlCenter {error in assert(error == nil);ready.signal()}
+    assert(ready.wait(timeout:.now()+5) == .success)
     gestures.pinch(NSPoint(x:160,y:568),begin:true)
     DispatchQueue.global().asyncAfter(deadline:.now()+0.08) {gestures.pinch(NSPoint(x:120,y:568),begin:false)}
     DispatchQueue.global().asyncAfter(deadline:.now()+0.16) {gestures.end()}

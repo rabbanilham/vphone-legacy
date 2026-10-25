@@ -31,6 +31,7 @@ def main():
                 sock.settimeout(5);sock.connect(str(root/'qmp'))
                 with sock.makefile('rwb') as fp:
                     json.loads(fp.readline());command(fp,'qmp_capabilities')
+                    assert command(fp,'qom-get',{'path':'/machine','property':'touch-reporting-enabled'}) is False
                     def read(address):
                         output=command(fp,'human-monitor-command',{'command-line':f'xp /1wx {address:#x}'})
                         return int(re.search(r': 0x([0-9a-f]+)',output)[1],16)

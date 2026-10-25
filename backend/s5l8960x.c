@@ -9097,9 +9097,18 @@ static void a7_finalize(Object *o)
     g_free(s->data_image);
     g_free(s->utility_image);
 }
+/* Read-only readiness for host gestures; this never forces the digitizer gate. */
+static bool a7_touch_reporting(Object *o, Error **errp)
+{
+    A7State *s = A7(o);
+    A7Touch *t = touch_device(s);
+    return t && (s->touch_force || touch_reporting_enabled(t));
+}
+
 static void a7_instance_init(Object *o)
 {
     A7State *s = A7(o);
+    object_property_add_bool(o, "touch-reporting-enabled", a7_touch_reporting, NULL);
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;

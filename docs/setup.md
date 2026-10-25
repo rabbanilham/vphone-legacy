@@ -86,3 +86,9 @@ A session's `qemu.log` confirms activation, and `player-input.log` records point
 press/drag/release and multitouch begin/end events for diagnosis. A new physical
 click cancels a stale gesture; a QMP gesture error leaves VNC click/drag available
 and lets a later gesture reconnect.
+
+Control Center checks the read-only `/machine/touch-reporting-enabled` QMP
+property before swiping. If the digitizer is gated, it sends a Home wake press
+and waits up to ten seconds for reporting to resume. When reporting is already enabled, no Home press is sent, preserving the
+current app. A click, focus change, or
+Home action cancels a pending request. Rebuild QEMU after updating this property.
