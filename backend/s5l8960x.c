@@ -5734,6 +5734,26 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
+/* Blur samples land exactly on texel centres along the other axis. Reduce
+ * bilinear's 8-bit fixed-point interpolation to two pixels, preserving its
+ * rounding. Each packed lane stays below 65536, so channels cannot carry. */
+static inline uint32_t agx_sample_linear_axis(const uint32_t *buf, uint32_t length,
+                                             uint32_t stride, float coordinate)
+{
+    float f = coordinate - 0.5f;
+    if (f < 0.0f) f = 0.0f;
+    if (f > (float)(length - 1)) f = (float)(length - 1);
+    uint32_t i = (uint32_t)f;
+    uint32_t j = i + 1 < length ? i + 1 : i;
+    uint32_t weight = (uint32_t)((f - (float)i) * 256.0f + 0.5f);
+    uint32_t a = buf[(size_t)i * stride], b = buf[(size_t)j * stride];
+    uint32_t rb = (((a & 0x00ff00ffu) * (256 - weight) +
+                    (b & 0x00ff00ffu) * weight + 0x00800080u) >> 8) & 0x00ff00ffu;
+    uint32_t ga = ((((a >> 8) & 0x00ff00ffu) * (256 - weight) +
+                    ((b >> 8) & 0x00ff00ffu) * weight + 0x00800080u) >> 8) & 0x00ff00ffu;
+    return rb | (ga << 8);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
@@ -5747,11 +5767,11 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                 float weight = weights[t];
                 uint32_t s_pos, s_neg;
                 if (is_vertical) {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
+                    s_pos = agx_sample_linear_axis(buf_in + x, h, w, (float)y + 0.5f + off);
+                    s_neg = agx_sample_linear_axis(buf_in + x, h, w, (float)y + 0.5f - off);
                 } else {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
+                    s_pos = agx_sample_linear_axis(buf_in + (size_t)y * w, w, 1, (float)x + 0.5f + off);
+                    s_neg = agx_sample_linear_axis(buf_in + (size_t)y * w, w, 1, (float)x + 0.5f - off);
                 }
                 for (unsigned c = 0; c < 4; c++) {
                     float cp = (float)((s_pos >> (c * 8)) & 0xff);
