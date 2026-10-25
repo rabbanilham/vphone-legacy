@@ -45,6 +45,7 @@ class SPIDMAContractTests(unittest.TestCase):
 static int64_t virtual_ns, timer_deadline;
 static int64_t qemu_clock_get_ns(int clock) { (void)clock; return virtual_ns; }
 static void timer_mod(void *t, int64_t n) { (void)t; timer_deadline=n; }
+#define NANOSECONDS_PER_SECOND 1000000000LL
 static void timer_del(void *t) { (void)t; timer_deadline=0; }
 #define LOG_UNIMP 0
 #define LOG_GUEST_ERROR 0
@@ -98,7 +99,7 @@ static void wifi_host_ready(void *wifi, bool ready) { assert(wifi); wifi_ready=r
 struct A7State {
     void *wifi;
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
-    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low, home_pressed; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch; MultiTouch multi_touch;
+    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low, home_pressed, hold_pressed; int64_t hold_down_ns; QEMUTimer *hold_timer; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch; MultiTouch multi_touch;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
     bool touch_force;
@@ -175,6 +176,8 @@ int main(void) {
     p->base=UINT64_C(0x20a084000); p->regs=regs;
     static uint8_t gpio[GPIO_SIZE]; state.gpio_regs=gpio;
     home_release(&state); assert(!state.home_pressed);
+    hold_key(&state, true); assert(state.hold_pressed);
+    hold_key(&state, false); hold_release(&state); assert(!state.hold_pressed);
     p->spi.touch.owner=&state;
     uint8_t probe[16]={0x1a,0xa1}, reply[128];
     for (unsigned i=2;i<16;i+=2) { probe[i]=0x18;probe[i+1]=0xe1; }

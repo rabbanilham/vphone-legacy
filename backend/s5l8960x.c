@@ -653,6 +653,10 @@ struct A7State {
     bool touch_irq_low;
     bool home_pressed;
     QEMUTimer *home_timer;
+    bool hold_pressed;          /* sleep/wake ("hold") button, GPIO3 */
+    bool backlight_off;         /* LM3534 disabled: the guest display sleeps */
+    int64_t hold_down_ns;
+    QEMUTimer *hold_timer;
     QEMUTimer *touch_timer;
     QEMUTimer *mouse_touch_timer;
     MouseTouch mouse_touch;
@@ -1211,13 +1215,16 @@ static void touch_gpio_update(A7State *s)
             stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
         }
     }
-    config = ldl_le_p(s->gpio_regs + 2 * 4);
-    group = (config >> 16) & 0xff;
-    type = config & 0xe;
-    if (group < 7 && ((type == 6 && s->home_pressed) ||
-                      (type == 4 && !s->home_pressed))) {
-        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
-        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+    /* Level-triggered push buttons: Home (GPIO2) and hold (GPIO3). */
+    for (unsigned pin = 2; pin <= 3; pin++) {
+        bool pressed = pin == 2 ? s->home_pressed : s->hold_pressed;
+        config = ldl_le_p(s->gpio_regs + pin * 4);
+        group = (config >> 16) & 0xff;
+        type = config & 0xe;
+        if (group < 7 && ((type == 6 && pressed) || (type == 4 && !pressed))) {
+            uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+            stl_le_p(status, ldl_le_p(status) | (1u << pin));
+        }
     }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
@@ -1245,24 +1252,53 @@ static void touch_gpio_level(A7State *s, bool low)
     touch_gpio_update(s);
 }
 
-/* Home is active-low GPIO2. Respect the guest's edge/level selection. */
-static void home_level(A7State *s, bool pressed)
+/* Push buttons are active-low: Home on GPIO2, hold (sleep/wake) on GPIO3.
+ * Respect the guest's edge/level selection. */
+static void button_level(A7State *s, unsigned pin, bool *state, bool pressed)
 {
-    uint32_t config = ldl_le_p(s->gpio_regs + 2 * 4);
+    uint32_t config = ldl_le_p(s->gpio_regs + pin * 4);
     unsigned group = (config >> 16) & 0xff, type = config & 0xe;
-    bool edge = s->home_pressed != pressed &&
+    bool edge = *state != pressed &&
         (type == 0xc || (type == 0xa && pressed) || (type == 8 && !pressed));
     if (group < 7 && edge) {
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
-        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+        stl_le_p(status, ldl_le_p(status) | (1u << pin));
     }
-    s->home_pressed = pressed;
+    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d\n",
+                  pin, pressed, config, edge);
+    *state = pressed;
     touch_gpio_update(s);
+}
+
+static void home_level(A7State *s, bool pressed)
+{
+    button_level(s, 2, &s->home_pressed, pressed);
 }
 
 static void home_release(void *opaque)
 {
     home_level(opaque, false);
+}
+
+static void hold_release(void *opaque)
+{
+    A7State *s = opaque;
+    button_level(s, 3, &s->hold_pressed, false);
+}
+
+/* Sleep/wake key from the host. A click is a 100 ms press (lock or wake);
+ * holding the key holds the button (slide to power off), with a 10 s guard
+ * against a lost key-up. */
+static void hold_key(A7State *s, bool down)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (down && !s->hold_pressed) {
+        button_level(s, 3, &s->hold_pressed, true);
+        s->hold_down_ns = now;
+        timer_mod(s->hold_timer, now + NANOSECONDS_PER_SECOND * 10);
+    } else if (!down && s->hold_pressed) {
+        timer_mod(s->hold_timer, MAX(now, s->hold_down_ns + 100000000));
+    }
 }
 
 static bool touch_irq_latched(A7State *s)
@@ -1317,7 +1353,8 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                     uint32_t config = ldl_le_p(s->gpio_regs + off + i);
                     bool driven = !(config & 0x200) && (config & 0xe) == 2;
                     bool sample = !driven || (config & 1);
-                    byte = (byte & ~1) | (pin == 2 ? !s->home_pressed : sample);
+                    byte = (byte & ~1) | (pin == 2 ? !s->home_pressed :
+                                          pin == 3 ? !s->hold_pressed : sample);
                 }
             }
             val |= (uint64_t)byte << (i * 8);
@@ -1883,6 +1920,8 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
                 timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);
             }
             /* Release is timer-owned: a stalled host must not create a long press. */
+        } else if (qemu_input_linux_to_qcode(evt->key.key) == Q_KEY_CODE_POWER) {
+            hold_key(s, evt->key.down);
         }
     } else if (evt->type == INPUT_EVENT_KIND_ABS) {
         if (evt->abs.axis == INPUT_AXIS_X) {
@@ -2569,6 +2608,13 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
             unsigned reg = d->pointer++;
             if (!tristar) {
                 d->regs[reg & 3] = value;
+                qemu_log_mask(LOG_UNIMP, "LM3534 reg 0x%x = 0x%02x\n", reg, value & 0xff);
+                /* Control register bit 0 enables the backlight. iOS clears it
+                 * (after the DWI fade) when the display sleeps and sets it on
+                 * wake; the player shows a locked screen meanwhile. */
+                if ((reg & 3) == 0) {
+                    p->owner->backlight_off = !(value & 1);
+                }
             } else if (reg < 0xc || reg == 0xe) {
                 d->regs[reg] = value;
             }
@@ -4508,6 +4554,8 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
              * AppleS5L8940DWI::_waitTransaction (10ea5a4) polls for. Nothing
              * is attached to the wire, so the transfer completes at once. */
             val &= ~UINT64_C(1);
+            qemu_log_mask(LOG_UNIMP, "DWI go off=0x%" HWADDR_PRIx " word=0x%08x\n",
+                          off, ldl_le_p(p->regs + off + 4));
         }
         if (p->base == UINT64_C(0x208040000) && !p->owner->iop_diagnostic && p->owner->sys_fd >= 0) {
             A7State *s = p->owner;
@@ -9238,6 +9286,9 @@ static void a7_reset(void *opaque)
     memset(&s->multi_touch, 0, sizeof(s->multi_touch));
     timer_del(s->home_timer);
     s->home_pressed = false;
+    timer_del(s->hold_timer);
+    s->hold_pressed = false;
+    s->backlight_off = false;
     touch_script_reset(s);
     s->chestnut_control = 0;
     a7_otg_reset(s);
@@ -9736,6 +9787,7 @@ static void a7_init(MachineState *ms)
     s->pmu.adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d2045_adc_done, s);
     s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
     s->home_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, home_release, s);
+    s->hold_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, hold_release, s);
     s->mouse_touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mouse_touch_timer_cb, s);
     const char *mouse_touch = getenv("VPHONE_MOUSE_TOUCH");
     s->mouse_touch_enabled = !mouse_touch || strcmp(mouse_touch, "0");
@@ -9841,10 +9893,16 @@ static bool a7_touch_reporting(Object *o, Error **errp)
     return t && (s->touch_force || touch_reporting_enabled(t));
 }
 
+static bool a7_display_on(Object *o, Error **errp)
+{
+    return !A7(o)->backlight_off;
+}
+
 static void a7_instance_init(Object *o)
 {
     A7State *s = A7(o);
     object_property_add_bool(o, "touch-reporting-enabled", a7_touch_reporting, NULL);
+    object_property_add_bool(o, "display-on", a7_display_on, NULL);
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;

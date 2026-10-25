@@ -34,6 +34,7 @@ class MouseTouchTests(unittest.TestCase):
 #define INPUT_EVENT_KIND_KEY 3
 #define INPUT_EVENT_MASK_KEY 8
 #define Q_KEY_CODE_HOME 1
+#define Q_KEY_CODE_POWER 2
 #define INPUT_EVENT_KIND_ABS 0
 #define INPUT_EVENT_KIND_BTN 1
 #define INPUT_EVENT_KIND_MTT 2
@@ -103,7 +104,7 @@ static void touch_enqueue(A7Touch *t, const uint8_t *f, unsigned len) {
 }
 static A7Touch *touch_device(A7State *s) { return &s->touch; }
 '''
-        harness += 'static int qemu_input_linux_to_qcode(int key) { return key; }\nstatic void home_level(A7State *s, bool pressed) {s->home_pressed=pressed;}\n'
+        harness += 'static int qemu_input_linux_to_qcode(int key) { return key; }\nstatic void home_level(A7State *s, bool pressed) {s->home_pressed=pressed;}\nstatic void hold_key(A7State *s, bool down) {(void)s; (void)down;}\n'
         harness += extract('static void touch_contacts(', 'static A7Touch *touch_device(')
         harness += extract('static bool touch_reporting_enabled(', 'static void touch_boot_complete(')
         harness += extract('/* Board-owned display device', 'static uint32_t touch_word(')
