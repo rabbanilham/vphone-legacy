@@ -1,4 +1,5 @@
 """Compile the actual Swift client and exercise fragmented RFB over a Unix socket."""
+import os
 import socket
 import struct
 import subprocess
@@ -10,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 class PlayerTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('VPHONE_NATIVE_UI_TESTS') == '1',
+                         'Interactive macOS desktop required; set VPHONE_NATIVE_UI_TESTS=1')
     def test_native_window_dispatches_initial_touch(self):
         source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
         harness = r"""

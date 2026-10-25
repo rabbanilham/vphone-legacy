@@ -488,6 +488,10 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do {try png.write(to:url,options:.atomic)} catch {NSAlert(error:error).runModal()}
         }
     }
+    func windowDidResize(_ notification: Notification) {
+        guard let window else {return}
+        logInput("window frame=\(window.frame) screen=\(String(describing:window.screen?.frame))")
+    }
     func windowDidResignKey(_ notification: Notification) { screen.cancelTouch() }
     func windowWillClose(_ notification:Notification) {
         screen.cancelTouch()

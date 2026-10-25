@@ -92,3 +92,9 @@ property before swiping. If the digitizer is gated, it sends a Home wake press
 and waits up to ten seconds for reporting to resume. When reporting is already enabled, no Home press is sent, preserving the
 current app. A click, focus change, or
 Home action cancels a pending request. Rebuild QEMU after updating this property.
+
+Native window-dispatch tests require an interactive macOS desktop. Run them with
+`VPHONE_NATIVE_UI_TESTS=1 make test`. The default suite keeps the RFB, QMP, gesture,
+and coordinate tests enabled and skips only native window dispatch, so headless
+CI does not block waiting for WindowServer/activation. Player window geometry
+changes are included in `player-input.log` alongside touch diagnostics.
