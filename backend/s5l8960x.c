@@ -637,6 +637,12 @@ struct A7State {
     uint64_t boot_entry, boot_args, framebuffer, boot_el, iop_diagnostic, system_writable, display_trace;
     uint64_t disp_mmu_table;          /* DPU0MMUPGADDR0 << 4, 0 = linear scanout */
     uint32_t disp_stride, disp_offset;
+    uint64_t disp_cached_mmu_table;
+    uint32_t disp_cached_offset;
+    uint64_t disp_cached_pa_base;
+    uint32_t disp_page_ram_offset[2048];
+    bool disp_mapping_valid;
+    bool disp_mapping_contiguous;
     bool iop_started, secondary_started;
     unsigned iop_unknown_count;
     uint64_t apple_c15[2][8][16][8]; /* Storage only: hardware effects are NOT emulated. */
@@ -4723,6 +4729,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                         val, p->owner->disp_pending_token);
                 *(uint32_t *)(p->regs + 0x1044) = 0;
                 p->owner->disp_swap_pending = true;
+                p->owner->disp_mapping_valid = false;
                 if (p->owner->disp_pending_token != 0) {
                     p->owner->disp_token = p->owner->disp_pending_token;
                 } else {
@@ -4733,6 +4740,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
             if (off == 0x4044) {
                 fprintf(stderr, "[DISP0] layer0 base off=0x4044 val=0x%" PRIx64 "\n", val);
                 *(uint32_t *)(p->regs + off) = (uint32_t)val;
+                p->owner->disp_mapping_valid = false;
                 if (val != 0) {
                     p->owner->framebuffer = RAM_BASE | (uint32_t)val;
                 }
@@ -4750,6 +4758,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 s->disp_mmu_table = (uint64_t)(uint32_t)val << 4;
                 s->disp_stride = *(uint32_t *)(p->regs + 0x4040);
                 s->disp_offset = *(uint32_t *)(p->regs + 0x4044);
+                s->disp_mapping_valid = false;
                 if (val != 0) {
                     MemTxResult r;
                     uint32_t page0 = address_space_ldl_le(&address_space_memory, s->disp_mmu_table,
@@ -8635,6 +8644,7 @@ static void a7_reset(void *opaque)
     }
     s->agx_cat_base = 0;
     s->disp_mmu_table = 0;
+    s->disp_mapping_valid = false;
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     memset(s->agx_last_ta, 0, sizeof(s->agx_last_ta));
     memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
@@ -8758,37 +8768,93 @@ static bool display_update(void *opaque)
 {
     A7State *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
+    if (!surface) {
+        return false;
+    }
     uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
-    uint8_t *src = ram + s->framebuffer - RAM_BASE;
+    uint32_t dst_stride = surface_stride(surface);
+    uint8_t *dst_base = surface_data(surface);
+
     if (s->disp_mmu_table) {
-        /* Gather the plane through the display MMU page table. */
-        /* Display surfaces are linear 640 * 4-byte rows (the /vram carveout
-         * is exactly 2560 * 1136); 0x4040 (0x1000) is not the row pitch. */
-        uint32_t stride = 2560;
-        for (unsigned y = 0; y < 1136; y++) {
-            uint8_t *dst = surface_data(surface) + y * surface_stride(surface);
-            uint64_t o = s->disp_offset + (uint64_t)y * stride;
-            for (unsigned x = 0; x < 2560;) {
-                unsigned chunk = MIN(2560 - x, 0x1000 - ((o + x) & 0xfff));
+        if (!s->disp_mapping_valid || s->disp_cached_mmu_table != s->disp_mmu_table ||
+            s->disp_cached_offset != s->disp_offset) {
+            uint32_t start_page = s->disp_offset >> 12;
+            uint32_t end_page = (s->disp_offset + 2560 * 1136 + 0xfff) >> 12;
+            bool contiguous = true;
+            bool all_valid = true;
+            uint64_t prev_pa = 0;
+
+            for (uint32_t p = start_page; p < end_page && p < ARRAY_SIZE(s->disp_page_ram_offset); p++) {
                 MemTxResult r;
                 uint32_t e = address_space_ldl_le(&address_space_memory,
-                                                  s->disp_mmu_table + ((o + x) >> 12) * 4,
+                                                  s->disp_mmu_table + p * 4,
                                                   MEMTXATTRS_UNSPECIFIED, &r);
-                uint64_t pa = ((uint64_t)(e & ~0xfU) << 4) + ((o + x) & 0xfff);
-                if (r == MEMTX_OK && (e & 1) && pa >= RAM_BASE && pa + chunk <= RAM_BASE + GiB) {
-                    memcpy(dst + x, ram + pa - RAM_BASE, chunk);
+                uint64_t pa = (uint64_t)(e & ~0xfU) << 4;
+                if (r == MEMTX_OK && (e & 1) && pa >= RAM_BASE && pa + 0x1000 <= RAM_BASE + GiB) {
+                    s->disp_page_ram_offset[p] = (uint32_t)(pa - RAM_BASE);
                 } else {
-                    memset(dst + x, 0, chunk);
+                    s->disp_page_ram_offset[p] = 0;
+                    all_valid = false;
+                }
+                if (p == start_page) {
+                    prev_pa = pa;
+                } else {
+                    if (pa != prev_pa + 0x1000) {
+                        contiguous = false;
+                    }
+                    prev_pa = pa;
+                }
+            }
+            s->disp_mapping_contiguous = (all_valid && contiguous);
+            s->disp_cached_pa_base = (all_valid && contiguous) ?
+                (uint64_t)s->disp_page_ram_offset[start_page] + (s->disp_offset & 0xfff) : 0;
+            s->disp_cached_mmu_table = s->disp_mmu_table;
+            s->disp_cached_offset = s->disp_offset;
+            s->disp_mapping_valid = all_valid;
+        }
+    }
+
+    uint8_t temp_row[2560];
+    int dirty_start = -1;
+
+    for (unsigned y = 0; y < 1136; y++) {
+        const uint8_t *src_row;
+        if (!s->disp_mmu_table) {
+            src_row = ram + s->framebuffer - RAM_BASE + y * 2560;
+        } else if (s->disp_mapping_contiguous) {
+            src_row = ram + s->disp_cached_pa_base + y * 2560;
+        } else {
+            uint64_t o = s->disp_offset + (uint64_t)y * 2560;
+            for (unsigned x = 0; x < 2560;) {
+                uint32_t p = (uint32_t)((o + x) >> 12);
+                uint32_t poff = (uint32_t)((o + x) & 0xfff);
+                unsigned chunk = MIN(2560 - x, 0x1000 - poff);
+                if (p < ARRAY_SIZE(s->disp_page_ram_offset) && s->disp_page_ram_offset[p]) {
+                    memcpy(temp_row + x, ram + s->disp_page_ram_offset[p] + poff, chunk);
+                } else {
+                    memset(temp_row + x, 0, chunk);
                 }
                 x += chunk;
             }
+            src_row = temp_row;
         }
-    } else {
-        for (unsigned y = 0; y < 1136; y++) {
-            memcpy(surface_data(surface) + y * surface_stride(surface), src + y * 2560, 2560);
+
+        uint8_t *dst_row = dst_base + y * dst_stride;
+        if (memcmp(dst_row, src_row, 2560) != 0) {
+            memcpy(dst_row, src_row, 2560);
+            if (dirty_start < 0) {
+                dirty_start = (int)y;
+            }
+        } else {
+            if (dirty_start >= 0) {
+                qemu_console_update(s->con, 0, dirty_start, 640, (int)y - dirty_start);
+                dirty_start = -1;
+            }
         }
     }
-    qemu_console_update(s->con, 0, 0, 640, 1136);
+    if (dirty_start >= 0) {
+        qemu_console_update(s->con, 0, dirty_start, 640, 1136 - dirty_start);
+    }
     return true;
 }
 static const GraphicHwOps display_ops = { .gfx_update = display_update };
