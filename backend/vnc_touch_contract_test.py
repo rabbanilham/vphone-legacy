@@ -64,6 +64,7 @@ assert(sent && !inputError)
             proc.terminate()
             assert client.wait(timeout=5)==0
             assert proc.wait(timeout=5) == 0
+            assert '[vphone] emulator App Nap protection active' in proc.stderr.read().decode(), 'Headless QEMU lost App Nap protection; rebuild backend'
         finally:
             if client and client.poll() is None:client.kill();client.wait()
             if proc.poll() is None:proc.kill();proc.wait()

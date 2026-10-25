@@ -78,3 +78,11 @@ trackpad magnify spreads two fingers around the pointer. Option shows the two
 finger positions. Host momentum is ignored because iOS supplies deceleration.
 These gestures use the private QMP socket and the existing A7 multitouch slots;
 plain click/drag uses VNC. Losing window focus releases active contacts.
+
+The emulator process retains App Nap protection even with `-display none`, via
+`0005-keep-headless-emulator-awake.patch`. Rebuild the backend after updating this
+patch; keeping only the player awake does not protect the separate QEMU process.
+A session's `qemu.log` confirms activation, and `player-input.log` records pointer
+press/drag/release and multitouch begin/end events for diagnosis. A new physical
+click cancels a stale gesture; a QMP gesture error leaves VNC click/drag available
+and lets a later gesture reconnect.

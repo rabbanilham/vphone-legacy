@@ -1,0 +1,36 @@
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1485,17 +1485,6 @@
+ {
+     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
+     allow_events = true;
+-    /*
+-     * Guest time follows the host clock, so App Nap and timer coalescing
+-     * of a background or display-off QEMU slow the guest relative to its
+-     * own deadlines (vphone: lock-screen idle fires before scripted touch,
+-     * touch frames are never fetched). Keep the emulator at full speed;
+-     * idle system sleep stays allowed. The activity lasts for the process.
+-     */
+-    [[[NSProcessInfo processInfo]
+-        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
+-                                 NSActivityLatencyCritical
+-                          reason:@"Emulated machine runs in real time"] retain];
+ }
+ 
+ - (void)applicationWillTerminate:(NSNotification *)aNotification
+@@ -2342,6 +2331,15 @@
+ 
+ static void register_cocoa(void)
+ {
++    /* The native player uses -display none and VNC. Keep the QEMU process
++     * itself awake even when Cocoa's NSApplication is never started. */
++    @autoreleasepool {
++        [[[NSProcessInfo processInfo]
++            beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
++                                     NSActivityLatencyCritical
++                              reason:@"Emulated machine runs in real time"] retain];
++    }
++    fprintf(stderr, "[vphone] emulator App Nap protection active\n");
+     qemu_display_register(&qemu_display_cocoa);
+ }
+ 

@@ -52,6 +52,23 @@ player.screen.cancelTouch()
 assert(captured.count == 2 && !captured[1].2)
 dispatch(.leftMouseUp,resizedCenter)
 assert(captured.count == 2)
+// A stale scroll, magnify or scripted toolbar gesture cannot swallow a fresh click.
+for stale in [TouchGestures.Kind.scroll,.magnify,.controlCenter] {
+    captured.removeAll()
+    player.screen.gestures.kind = stale
+    player.screen.gestures.fingers = [NSPoint(x:320,y:568)]
+    dispatch(.leftMouseDown,resizedCenter)
+    dispatch(.leftMouseUp,resizedCenter)
+    assert(captured.count == 2 && captured[0].2 && !captured[1].2)
+    assert(player.screen.gestures.kind == .none)
+}
+// A failed QMP gesture must leave the native click path and retry callback alive.
+player.handleGestureFailure("synthetic disconnected QMP")
+assert(player.screen.input != nil && player.screen.gestures.send != nil && !player.inputFailed)
+captured.removeAll()
+dispatch(.leftMouseDown,resizedCenter)
+dispatch(.leftMouseUp,resizedCenter)
+assert(captured.count == 2)
 // Native Option events must use MTT instead of also sending a VNC click.
 captured.removeAll()
 var multi: [(String,[NSPoint])] = []

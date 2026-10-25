@@ -261,6 +261,7 @@ final class Screen: NSView {
     var tracking: NSTrackingArea?
     var held = false
     var lastPoint = (0,0)
+    var trace: ((String)->Void)?
     func cancelTouch() {
         wheelTimer?.invalidate();wheelTimer = nil
         controlCenterTimer?.invalidate();controlCenterTimer = nil
@@ -303,6 +304,7 @@ final class Screen: NSView {
         held = down
         let (x,y) = ScreenGeometry.point(point,in:r)
         lastPoint = (x,y)
+        trace?("pointer x=\(x) y=\(y) down=\(down)")
         input?(x,y,down)
     }
     func openControlCenter() {
@@ -320,7 +322,9 @@ final class Screen: NSView {
     }
     override func mouseDown(with event:NSEvent) {
         window?.makeFirstResponder(self)
-        guard gestures.kind == .none else {return}
+        // A fresh physical press takes ownership. A lost scroll/magnify end
+        // or a pending toolbar swipe must never swallow subsequent clicks.
+        if gestures.kind != .none {cancelTouch()}
         if event.modifierFlags.contains(.option),let point = guestPoint(event) {
             gestures.pinch(point,begin:true);needsDisplay = true
         } else {pointer(event,true)}
@@ -369,6 +373,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var touchInput: QMPInput?
     var activity: NSObjectProtocol?
     var inputFailed = false
+    var gestureError: String?
+    var inputLog: FileHandle?
     var window: NSWindow!
     var buttons: [NSButton] = []
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -396,18 +402,37 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             screen.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),screen.leadingAnchor.constraint(equalTo:root.leadingAnchor),screen.trailingAnchor.constraint(equalTo:root.trailingAnchor),screen.bottomAnchor.constraint(equalTo:root.bottomAnchor),
             status.centerXAnchor.constraint(equalTo:screen.centerXAnchor),status.centerYAnchor.constraint(equalTo:screen.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:screen.widthAnchor,constant:-24)])
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiatedAllowingIdleSystemSleep,.latencyCritical],reason:"Interactive emulator input")
+        let logURL = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("player-input.log")
+        _ = FileManager.default.createFile(atPath:logURL.path,contents:nil)
+        inputLog = try? FileHandle(forWritingTo:logURL)
+        screen.trace = {[weak self] text in self?.logInput(text)}
+        logInput("player started; VNC pointer and QMP gesture input configured")
         let qmp = QMPInput(CommandLine.arguments[2]);touchInput = qmp
-        screen.gestures.send = {[weak qmp] type,points in qmp?.touch(type,points)}
-        qmp.failed = {[weak self] message in DispatchQueue.main.async {
-            guard let self else {return};self.inputFailed = true;self.status.stringValue = "Input gagal: \(message)";self.status.isHidden = false
-            self.screen.cancelTouch();self.screen.input = nil;self.screen.gestures.send = nil
-        }}
+        screen.gestures.send = {[weak self,weak qmp] type,points in
+            if type != "update" {self?.logInput("mtt \(type) points=\(points)")}
+            qmp?.touch(type,points)
+        }
+        qmp.failed = {[weak self] message in DispatchQueue.main.async {self?.handleGestureFailure(message)}}
         screen.input = { [weak self] x,y,down in self?.rfb.pointer(x,y,down) }
-        rfb.frame = { [weak self] image in DispatchQueue.main.async { guard let self else {return}; self.screen.image = image; if !self.inputFailed {self.status.isHidden = true}; self.buttons.forEach {$0.isEnabled = !self.inputFailed} } }
+        rfb.frame = { [weak self] image in DispatchQueue.main.async { guard let self else {return}; self.screen.image = image; if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}; self.buttons.forEach {$0.isEnabled = !self.inputFailed} } }
         rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
         let path = CommandLine.arguments[1]
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
+    }
+    func handleGestureFailure(_ message:String) {
+        // A gesture transport failure must not disable the independent pointer.
+        logInput("QMP failure: \(message)")
+        gestureError = message
+        status.stringValue = "Gesture gagal: \(message). Klik/drag tetap tersedia."
+        status.isHidden = false
+        let send = screen.gestures.send
+        screen.gestures.send = nil
+        screen.cancelTouch()
+        screen.gestures.send = send
+    }
+    func logInput(_ text:String) {
+        try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
     @objc func home() { screen.cancelTouch();rfb.home() }
     @objc func controlCenter() { screen.openControlCenter() }
