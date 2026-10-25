@@ -5331,6 +5331,8 @@ static uint64_t agx_surface_gva(const AGXSurface *sf, unsigned x, unsigned y)
 typedef struct AGXTexture {
     uint64_t addr;
     uint32_t w, h, stride;
+    uint32_t format;            /* 3 = single-channel coverage mask, 6 = RGBA */
+    uint32_t bpp;               /* bytes per texel: 1 for format 3, 4 for format 6 */
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
     bool twiddled;              /* uploaded 2D texture, Y-first Morton order */
     bool linear_filter;         /* sampler word 1 bits [5:4] or [7:6] == 1 */
@@ -5345,31 +5347,48 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 {
     uint64_t q = tsw[2] | ((uint64_t)tsw[3] << 32);
     hwaddr pa;
+    uint32_t fmt = tsw[0] >> 28;
 
-    if (tsw[0] >> 28 != 6) {
+    if (fmt != 3 && fmt != 6) {
         return false;
     }
+    tex->format = fmt;
+    tex->bpp = (fmt == 3) ? 1 : 4;
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
     tex->linear_filter = false;
     tex->clamp_to_edge = true;
     memset(tex->sampler_words, 0, sizeof(tex->sampler_words));
-    /* Layout 1 or display surfaces with hole at +0xa000 (agx_surface_layout);
-     * otherwise uploaded linear textures. */
-    AGXSurface sf;
-    agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
-    tex->strip = sf.strip;
-    tex->twiddled = !sf.strip && (tsw[0] & 0x8007) == 0x8001;
-    if (sf.strip) {
-        tex->stride = sf.pitch;
-    } else if ((tsw[0] & 7) == 1) {
-        tex->stride = ((tex->w + 15) & ~15u) * 4;
-    } else {
-        /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
-        tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
-        if (tex->stride < tex->w * 4) {
+    if (fmt == 6) {
+        /* Layout 1 or display surfaces with hole at +0xa000 (agx_surface_layout);
+         * otherwise uploaded linear textures. */
+        AGXSurface sf;
+        agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
+        tex->strip = sf.strip;
+        tex->twiddled = !sf.strip && (tsw[0] & 0x8007) == 0x8001;
+        if (sf.strip) {
+            tex->stride = sf.pitch;
+        } else if ((tsw[0] & 7) == 1) {
             tex->stride = ((tex->w + 15) & ~15u) * 4;
+        } else {
+            /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
+            tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
+            if (tex->stride < tex->w * 4) {
+                tex->stride = ((tex->w + 15) & ~15u) * 4;
+            }
+        }
+    } else {
+        /* Format 3: 8-bit coverage mask (1 bpp) */
+        tex->strip = false;
+        tex->twiddled = (tsw[0] & 7) == 1;
+        if (tex->twiddled) {
+            tex->stride = ((tex->w + 15) & ~15u) * 1;
+        } else {
+            tex->stride = ((tsw[2] & 0xffff) + 1) * 1;
+            if (tex->stride < tex->w * 1) {
+                tex->stride = ((tex->w + 15) & ~15u) * 1;
+            }
         }
     }
     return tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa);
@@ -5454,20 +5473,13 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
-        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
-            const uint32_t *sw = blocks[b] + 4;
-            memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
-            tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
-            tex->clamp_to_edge = ((sw[1] >> 9) & 7) == 2 || ((sw[1] >> 12) & 7) == 2 ||
-                                 ((sw[1] >> 16) & 0xff) == 2 || ((sw[1] >> 24) & 0xff) == 2;
-            return AGX_TEX_FOUND;
-        }
     }
     return AGX_TEX_NONE;
 }
 
 static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
 {
+    uint32_t bpp = tex->bpp ? tex->bpp : 4;
     if (tex->twiddled) {
         uint64_t offset = 0;
         unsigned bit = 0;
@@ -5477,12 +5489,12 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
             if (mask < tex->h) { offset |= (uint64_t)!!(y & mask) << bit++; }
             if (mask < tex->w) { offset |= (uint64_t)!!(x & mask) << bit++; }
         }
-        return tex->addr + offset * 4;
+        return tex->addr + offset * bpp;
     }
     if (tex->strip) {
-        return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * 4;
+        return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * bpp;
     }
-    return tex->addr + (uint64_t)y * tex->stride + x * 4;
+    return tex->addr + (uint64_t)y * tex->stride + x * bpp;
 }
 
 /* A Morton row is scattered within 4 KiB tiles. Cache one tile while
@@ -5490,6 +5502,31 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
 static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
                             unsigned y, uint32_t *out)
 {
+    if (tex->format == 3) {
+        if (!tex->twiddled) {
+            uint8_t row_bytes[4096];
+            if (tex->w > sizeof(row_bytes) ||
+                !agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), row_bytes, tex->w)) {
+                return false;
+            }
+            for (unsigned x = 0; x < tex->w; x++) {
+                out[x] = ((uint32_t)row_bytes[x] << 24) | 0x00ffffffu;
+            }
+            return true;
+        }
+        uint8_t page[4096];
+        uint64_t cached = UINT64_MAX;
+        for (unsigned x = 0; x < tex->w; x++) {
+            uint64_t gva = agx_texel_gva(tex, x, y), base = gva & ~UINT64_C(0xfff);
+            if (base != cached) {
+                if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+                cached = base;
+            }
+            uint8_t cov = page[gva & 0xfff];
+            out[x] = ((uint32_t)cov << 24) | 0x00ffffffu;
+        }
+        return true;
+    }
     if (!tex->twiddled) {
         return agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), out, tex->w * 4);
     }
@@ -5535,6 +5572,23 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
         out |= MIN(v, 255u) << c;
     }
     return out;
+}
+
+/* Format 3 coverage mask: vertex tint is already premultiplied, as in the
+ * untextured AA path: modulate alpha and apply coverage once to RGB. */
+static inline uint32_t agx_apply_mask_tint(uint32_t cov, uint32_t tint)
+{
+    uint32_t ta = tint >> 24;
+    uint32_t tr = (tint >> 16) & 0xff;
+    uint32_t tg = (tint >> 8) & 0xff;
+    uint32_t tb = tint & 0xff;
+    uint32_t out_a = ta * cov / 255;
+    /* Vertex tint is already premultiplied, as in the
+     * untextured AA path: apply coverage once. */
+    uint32_t out_r = tr * cov / 255;
+    uint32_t out_g = tg * cov / 255;
+    uint32_t out_b = tb * cov / 255;
+    return (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
 }
 
 /* CA fragment shaders recognised by an FNV-1a hash of the first 64 bytes of
@@ -5680,6 +5734,26 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
+/* Blur samples land exactly on texel centres along the other axis. Reduce
+ * bilinear's 8-bit fixed-point interpolation to two pixels, preserving its
+ * rounding. Each packed lane stays below 65536, so channels cannot carry. */
+static inline uint32_t agx_sample_linear_axis(const uint32_t *buf, uint32_t length,
+                                             uint32_t stride, float coordinate)
+{
+    float f = coordinate - 0.5f;
+    if (f < 0.0f) f = 0.0f;
+    if (f > (float)(length - 1)) f = (float)(length - 1);
+    uint32_t i = (uint32_t)f;
+    uint32_t j = i + 1 < length ? i + 1 : i;
+    uint32_t weight = (uint32_t)((f - (float)i) * 256.0f + 0.5f);
+    uint32_t a = buf[(size_t)i * stride], b = buf[(size_t)j * stride];
+    uint32_t rb = (((a & 0x00ff00ffu) * (256 - weight) +
+                    (b & 0x00ff00ffu) * weight + 0x00800080u) >> 8) & 0x00ff00ffu;
+    uint32_t ga = ((((a >> 8) & 0x00ff00ffu) * (256 - weight) +
+                    ((b >> 8) & 0x00ff00ffu) * weight + 0x00800080u) >> 8) & 0x00ff00ffu;
+    return rb | (ga << 8);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
@@ -5693,11 +5767,11 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                 float weight = weights[t];
                 uint32_t s_pos, s_neg;
                 if (is_vertical) {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
+                    s_pos = agx_sample_linear_axis(buf_in + x, h, w, (float)y + 0.5f + off);
+                    s_neg = agx_sample_linear_axis(buf_in + x, h, w, (float)y + 0.5f - off);
                 } else {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
+                    s_pos = agx_sample_linear_axis(buf_in + (size_t)y * w, w, 1, (float)x + 0.5f + off);
+                    s_neg = agx_sample_linear_axis(buf_in + (size_t)y * w, w, 1, (float)x + 0.5f - off);
                 }
                 for (unsigned c = 0; c < 4; c++) {
                     float cp = (float)((s_pos >> (c * 8)) & 0xff);
@@ -5901,6 +5975,63 @@ static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float ou
     return true;
 }
 
+static bool agx_is_axis_aligned_quad_mesh(A7State *s, uint64_t cat, uint64_t buf,
+                                          unsigned count, unsigned stride,
+                                          uint64_t vs_data, const float vp[4],
+                                          bool clip_space)
+{
+    if (count != 4 && count != 6 && count != 54) {
+        return false;
+    }
+    float m4[4];
+    bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
+    unsigned step = (count == 4) ? 4 : 6;
+    bool had_valid = false;
+    for (unsigned q = 0; q + step <= count; q += step) {
+        float qminx = 1e9f, qmaxx = -1e9f, qminy = 1e9f, qmaxy = -1e9f;
+        float xs[6], ys[6];
+        for (unsigned k = 0; k < step; k++) {
+            float xy[2];
+            if (!agx_ctx_read(s, cat, buf + (uint64_t)(q + k) * stride, xy, 8)) {
+                return false;
+            }
+            if (clip_space) {
+                xy[0] = xy[0] * vp[0] + vp[1];
+                xy[1] = xy[1] * vp[2] + vp[3];
+            } else if (transformed) {
+                xy[0] = (m4[0] * xy[0] + m4[2]) * vp[0] + vp[1];
+                xy[1] = (m4[1] * xy[1] + m4[3]) * vp[2] + vp[3];
+            }
+            xs[k] = xy[0];
+            ys[k] = xy[1];
+            qminx = MIN(qminx, xy[0]);
+            qmaxx = MAX(qmaxx, xy[0]);
+            qminy = MIN(qminy, xy[1]);
+            qmaxy = MAX(qmaxy, xy[1]);
+        }
+        if (qmaxx - qminx < 1e-3f || qmaxy - qminy < 1e-3f) {
+            continue;
+        }
+        bool has_tl = false, has_tr = false, has_bl = false, has_br = false;
+        for (unsigned k = 0; k < step; k++) {
+            float x = xs[k], y = ys[k];
+            if (!((fabsf(x - qminx) < 1e-2f || fabsf(x - qmaxx) < 1e-2f) &&
+                  (fabsf(y - qminy) < 1e-2f || fabsf(y - qmaxy) < 1e-2f))) {
+                return false;
+            }
+            if (fabsf(x - qminx) < 1e-2f && fabsf(y - qminy) < 1e-2f) has_tl = true;
+            if (fabsf(x - qmaxx) < 1e-2f && fabsf(y - qminy) < 1e-2f) has_tr = true;
+            if (fabsf(x - qminx) < 1e-2f && fabsf(y - qmaxy) < 1e-2f) has_bl = true;
+            if (fabsf(x - qmaxx) < 1e-2f && fabsf(y - qmaxy) < 1e-2f) has_br = true;
+        }
+        if (!(has_tl && has_tr && has_bl && has_br)) {
+            return false;
+        }
+        had_valid = true;
+    }
+    return had_valid;
+}
+
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
     AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
@@ -6038,24 +6169,41 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                 if (agx_ctx_read(s, cat, u_ptr, u_words, sizeof(u_words))) {
                     float ox0 = *(float *)&u_words[16];
                     float oy0 = *(float *)&u_words[17];
-                    if (fabsf(ox0) > 0.01f && fabsf(oy0) < 0.001f) {
-                        *is_vertical = false;
-                    } else if (fabsf(oy0) > 0.01f && fabsf(ox0) < 0.001f) {
-                        *is_vertical = true;
-                    }
-                    unsigned read_taps = 0;
-                    for (unsigned i = 0; i < max_taps; i++) {
-                        float off = *is_vertical ? *(float *)&u_words[16 + 4 * i + 1]
-                                                 : *(float *)&u_words[16 + 4 * i];
-                        if (off > 0.05f && off < 50.0f) {
-                            offsets[i] = off;
-                            read_taps++;
-                        } else {
-                            break;
+                    bool vert = def_vert;
+                    bool vert_valid = false;
+                    if (isfinite(ox0) && isfinite(oy0)) {
+                        if (fabsf(ox0) > 0.01f && fabsf(oy0) < 0.001f) {
+                            vert = false;
+                            vert_valid = true;
+                        } else if (fabsf(oy0) > 0.01f && fabsf(ox0) < 0.001f) {
+                            vert = true;
+                            vert_valid = true;
                         }
                     }
-                    if (read_taps >= 3) {
-                        *n_taps = read_taps;
+                    if (vert_valid) {
+                        float read_offs[8];
+                        unsigned read_taps = 0;
+                        for (unsigned i = 0; i < max_taps; i++) {
+                            float ox = *(float *)&u_words[16 + 4 * i];
+                            float oy = *(float *)&u_words[16 + 4 * i + 1];
+                            if (!isfinite(ox) || !isfinite(oy)) {
+                                break;
+                            }
+                            float off = vert ? oy : ox;
+                            float other = vert ? ox : oy;
+                            if (fabsf(other) < 0.005f && off > 0.05f && off < 50.0f) {
+                                read_offs[read_taps++] = off;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (read_taps >= 3) {
+                            *n_taps = read_taps;
+                            *is_vertical = vert;
+                            for (unsigned i = 0; i < read_taps; i++) {
+                                offsets[i] = read_offs[i];
+                            }
+                        }
                     }
                 }
             }
@@ -6077,7 +6225,7 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                     bool ok = true;
                     for (unsigned t = 0; t < *n_taps; t++) {
                         float w = *(float *)&f_words[s_idx + t];
-                        if (w < 0.0005f || w > 0.6f) { ok = false; break; }
+                        if (!isfinite(w) || w < 0.0005f || w > 0.6f) { ok = false; break; }
                         sum += w;
                     }
                     if (ok && fabsf(sum - 0.5f) < 0.01f) {
@@ -6273,6 +6421,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 count = MIN(w[1], 1024u);
             }
             bool textured = found != AGX_TEX_NONE && (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
+            if (textured && tex.format == 3) {
+                if (!agx_is_axis_aligned_quad_mesh(s, cat, buf, count, stride, vs_data, vp, clip_space)) {
+                    textured = false;
+                }
+            }
             bool vibrancy = found == AGX_TEX_VIBRANCY;
             bool dest_in = textured && prog == AGX_USC_DEST_IN;
             bool is_blur = textured && is_blur_prog;
@@ -7138,7 +7291,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
                         uint32_t dst = row[x - x0], out = 0;
-                        if (tint != 0xffffffff) {
+                        if (tex.format == 3) {
+                            uint32_t cov = src >> 24;
+                            src = agx_apply_mask_tint(cov, tint);
+                        } else if (tint != 0xffffffff) {
                             uint32_t m = 0;
                             for (unsigned c = 0; c < 32; c += 8) {
                                 m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;

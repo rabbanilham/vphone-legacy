@@ -205,7 +205,8 @@ def is_strip_surface(f, base, width):
 
 
 def decode_tsw(f, tsw):
-    if tsw[0] >> 28 != 6:
+    fmt = tsw[0] >> 28
+    if fmt not in (3, 6):
         return None
     w = ((tsw[1] >> 2) & 0x3fff) + 1
     h = (tsw[1] >> 16) + 1
@@ -213,18 +214,20 @@ def decode_tsw(f, tsw):
     addr = ((q >> 16) & 0x3ffffffff) << 2
     if not addr or (addr & ~0xfff) not in f.pages:
         return None
+    bpp = 1 if fmt == 3 else 4
     # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
     # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
-    strip = is_strip_surface(f, addr, w)
+    strip = is_strip_surface(f, addr, w) if fmt == 6 else False
+    twiddled = (fmt == 3 and (tsw[0] & 7) == 1) or (not strip and (tsw[0] & 0x8007) == 0x8001)
     if strip:
         stride = 2560
     elif (tsw[0] & 7) == 1:
-        stride = ((w + 15) & ~15) * 4
+        stride = ((w + 15) & ~15) * bpp
     else:
-        pitch = ((tsw[2] & 0xffff) + 1) * 4
-        stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=not strip and (tsw[0] & 0x8007) == 0x8001, tsw=tsw)
+        pitch = ((tsw[2] & 0xffff) + 1) * bpp
+        stride = pitch if pitch >= w * bpp else ((w + 15) & ~15) * bpp
+    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=twiddled, tsw=tsw, format=fmt, bpp=bpp)
 
 
 def decode_sampler(words):
@@ -263,8 +266,7 @@ def texture(f, ppp, prog=None):
     for _, ws in words:
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
-        # Word 8 is used by ROUNDED_CAPS (two 4-word samplers followed by TSW).
-        offsets = (0, 4, 7, 8) if prog == ROUNDED_CAPS else (0, 4, 7)
+        offsets = (0, 4, 7)
         for k in offsets:
             if k == 7 and tuple(ws[:3]) != LUMA:
                 continue
@@ -493,23 +495,27 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 ox0 = struct.unpack('<f', struct.pack('<I', p_words[16]))[0]
                 oy0 = struct.unpack('<f', struct.pack('<I', p_words[17]))[0]
                 is_vert = None
-                if abs(ox0) > 0.01 and abs(oy0) < 0.001:
-                    is_vert = False
-                elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
-                    is_vert = True
+                if math.isfinite(ox0) and math.isfinite(oy0):
+                    if abs(ox0) > 0.01 and abs(oy0) < 0.001:
+                        is_vert = False
+                    elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
+                        is_vert = True
 
                 if is_vert is not None:
-                    direction = 'vertical' if is_vert else 'horizontal'
                     read_offs = []
                     for j in range(16, 16 + 4 * max_taps, 4):
                         ox = struct.unpack('<f', struct.pack('<I', p_words[j]))[0]
                         oy = struct.unpack('<f', struct.pack('<I', p_words[j + 1]))[0]
+                        if not math.isfinite(ox) or not math.isfinite(oy):
+                            break
                         val = oy if is_vert else ox
-                        if 0.05 < val < 50.0:
+                        other = ox if is_vert else oy
+                        if abs(other) < 0.005 and 0.05 < val < 50.0:
                             read_offs.append(val)
                         else:
                             break
                     if len(read_offs) >= 3:
+                        direction = 'vertical' if is_vert else 'horizontal'
                         offsets = read_offs
                         n_taps = len(read_offs)
         except Exception:
@@ -524,7 +530,7 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 for i in range(len(fl)):
                     if i + n_taps <= len(fl):
                         sub = fl[i:i + n_taps]
-                        if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                        if all(math.isfinite(x) and 0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
                             weights = list(sub)
                             break
                 if len(weights) == n_taps and weights != [t[1] for t in taps]:
@@ -619,6 +625,7 @@ def program(f, ppp):
 
 
 def texel(f, tex, x, y):
+    bpp = tex.get('bpp', 4)
     if tex.get('twiddled', False):
         offset, bit, mask = 0, 0, 1
         while mask < tex['w'] or mask < tex['h']:
@@ -629,13 +636,17 @@ def texel(f, tex, x, y):
                 offset |= bool(x & mask) << bit
                 bit += 1
             mask <<= 1
-        gva = tex['addr'] + offset * 4
+        gva = tex['addr'] + offset * bpp
     elif tex['strip']:
-        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * 4
+        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * bpp
     else:
-        gva = tex['addr'] + y * tex['stride'] + x * 4
+        gva = tex['addr'] + y * tex['stride'] + x * bpp
     try:
-        return f.read(gva, 4)
+        raw = f.read(gva, bpp)
+        if bpp == 1:
+            cov = raw[0]
+            return bytes((255, 255, 255, cov))
+        return raw
     except KeyError:
         return b'\0\0\0\0'
 
@@ -658,6 +669,47 @@ def quad_affine(xy, uv):
         a, b = (d1 * dy2 - d2 * dy1) / det, (dx1 * d2 - dx2 * d1) / det
         out.extend((a, b, uv[0][c] - a * xy[0][0] - b * xy[0][1]))
     return tuple(out) if all(math.isfinite(v) for v in out) else None
+
+
+def apply_mask_tint(cov, tint):
+    """Format 3 coverage mask: vertex tint is already premultiplied.
+    Modulate alpha and apply coverage once to RGB."""
+    tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
+    out_a = ta * cov // 255
+    r = tr * cov // 255
+    g = tg * cov // 255
+    b = tb * cov // 255
+    return (out_a << 24) | (r << 16) | (g << 8) | b
+
+
+def is_axis_aligned_quad_mesh(vs_xy, count):
+    if count not in (4, 6, 54):
+        return False
+    step = 4 if count == 4 else 6
+    had_valid = False
+    for q in range(0, count, step):
+        q_coords = vs_xy[q:q + step]
+        if len(q_coords) < step:
+            return False
+        xs = [p[0] for p in q_coords]
+        ys = [p[1] for p in q_coords]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        if (maxx - minx) < 1e-3 or (maxy - miny) < 1e-3:
+            continue
+        has_tl = has_tr = has_bl = has_br = False
+        for x, y in q_coords:
+            if not ((abs(x - minx) < 1e-2 or abs(x - maxx) < 1e-2) and
+                    (abs(y - miny) < 1e-2 or abs(y - maxy) < 1e-2)):
+                return False
+            if abs(x - minx) < 1e-2 and abs(y - miny) < 1e-2: has_tl = True
+            if abs(x - maxx) < 1e-2 and abs(y - miny) < 1e-2: has_tr = True
+            if abs(x - minx) < 1e-2 and abs(y - maxy) < 1e-2: has_bl = True
+            if abs(x - maxx) < 1e-2 and abs(y - maxy) < 1e-2: has_br = True
+        if not (has_tl and has_tr and has_bl and has_br):
+            return False
+        had_valid = True
+    return had_valid
 
 
 def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None):
@@ -687,6 +739,19 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         except TypeError:
             pass
 
+    m = ((1, 1, 0, 0) if stride == 16 and prog == WALLPAPER else
+         find_matrix(f, vs_data) if stride != 12 else None)
+    vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
+
+    if tex and tex.get('format') == 3:
+        vs_coords = []
+        for v in vs:
+            x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
+            y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
+            vs_coords.append((x, y))
+        if not is_axis_aligned_quad_mesh(vs_coords, count):
+            tex = None
+
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
     if not tex and stride not in (20, 28):
         if stride == 16 and prog == SPANS:
@@ -706,10 +771,6 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
 
     if tex and tex['w'] * 4 > 0x10000:
         return 'skipped: texture wider than texrow', {'width': tex['w']}
-
-    m = ((1, 1, 0, 0) if stride == 16 and prog == WALLPAPER else
-         find_matrix(f, vs_data) if stride != 12 else None)
-    vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
 
     step = 4 if count == 4 else 6
     is_line = False
@@ -941,6 +1002,14 @@ def main():
         tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)
         if not tex:
             tex = texture(f, ppp) or texture(f, retained_ppp)
+        if tex and tex.get('format') == 3:
+            vs_coords = []
+            for v in vs:
+                x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
+                y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
+                vs_coords.append((x, y))
+            if not is_axis_aligned_quad_mesh(vs_coords, count):
+                tex = None
         is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)
         if is_color_matrix:
             cm = extract_color_matrix(f, ppp)
@@ -1328,7 +1397,14 @@ def main():
                             g = max(0, min(255, int(round(gout * 255.0))))
                             b = max(0, min(255, int(round(bout * 255.0))))
                             a = 255
-                        if tint != 0xffffffff:
+                        if tex.get('format') == 3:
+                            cov = a
+                            src_val = apply_mask_tint(cov, tint)
+                            b = src_val & 0xff
+                            g = (src_val >> 8) & 0xff
+                            r = (src_val >> 16) & 0xff
+                            a = src_val >> 24
+                        elif tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4

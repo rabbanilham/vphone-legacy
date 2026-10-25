@@ -236,8 +236,26 @@ legacy any-nonzero-byte stop. `--stop-condition ca-scanout` archives transient
 pixels and gates a candidate on CA/surface/physical-swap/scanout milestones;
 manual surface-ID/commit attribution and visible RGB verification are required.
 `--seconds` budgets guest-running wall time (paused inspection excluded), defaults
-to 45 and allows up to 180 for an explicitly justified targeted probe. Cleanup
-with `backend/probe_cleanup.py OUTPUT` only after its process-exit record confirms
+to 45 and allows up to 180 for an explicitly justified targeted probe.
+For extended continuous sessions (such as a 15-minute / 900s UI acceptance run),
+pass `--long-run` with `--stop-condition duration`, which permits finite positive
+`--seconds` up to 1200:
+
+```sh
+.venv/bin/python backend/display_probe.py \
+  --output /path/to/output \
+  --long-run \
+  --stop-condition duration \
+  --seconds 900
+```
+
+Validation is performed via parser error (`parser.error`) rather than assert so
+behavior does not depend on Python optimization flags (`-O`).
+Note that `RunClock` active seconds (`guest_running_seconds` in `observations.json`)
+are host elapsed monotonic seconds excluding pauses (debugger and monitor freeze
+intervals); they are not proof of the emulated virtual clock rate or guest Mach
+absolute time scaling.
+Cleanup with `backend/probe_cleanup.py OUTPUT` only after its process-exit record confirms
 reaping. The helper preserves original-media hashes and removes owned copies.
 
 ## 2026-10-15 contract-driven keybag probes

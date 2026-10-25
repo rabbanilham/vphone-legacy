@@ -164,8 +164,9 @@ class AGXCorpusIterationFastTests(unittest.TestCase):
                 'output': None,
                 'unique_output': False,
             })()
-            exit_code = agx_corpus.replay(args)
-            self.assertEqual(exit_code, 1, 'Replay must reject unknown scenes even when one matches')
+            with patch('agx_corpus.build_harness', side_effect=AssertionError('invalid filters must not compile')):
+                exit_code = agx_corpus.replay(args)
+                self.assertEqual(exit_code, 1, 'Replay must reject unknown scenes even when one matches')
 
     def test_c_only_and_report_fields_integration(self):
         sibling_corpus = ROOT.parent / 'vphone-legacy/build/agx-corpus'

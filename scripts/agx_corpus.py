@@ -426,10 +426,6 @@ def replay(args):
         print(f'error: {e}', file=sys.stderr)
         return 1
 
-    t0_build = time.monotonic()
-    binary = build_harness(args.corpus / '.harness')
-    t_build = time.monotonic() - t0_build
-
     scene_filter = parse_scenes_arg(args.scene)
     all_scene_dirs = {p.name: p for p in sorted(args.corpus.iterdir()) if (p / 'dumps').is_dir()}
     if scene_filter:
@@ -500,6 +496,10 @@ def replay(args):
     if not selected_frames:
         print(f'error: no dumps matched the specified filter (scenes: {args.scene}, frames: {getattr(args, "frames", None)})', file=sys.stderr)
         return 1
+
+    t0_build = time.monotonic()
+    binary = build_harness(args.corpus / '.harness')
+    t_build = time.monotonic() - t0_build
 
     t0_c = time.monotonic()
     with futures.ThreadPoolExecutor(args.jobs) as threads:
