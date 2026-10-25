@@ -272,7 +272,9 @@ def texture(f, ppp, prog=None):
                 tex = decode_tsw(f, ws[k:k + 4])
                 if tex:
                     # Trailing constants may be the next draw's allocation.
-                    tex['vibrancy'] = tuple(ws[:3]) == LUMA
+                    tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog == STRIDE36_DUAL_TEX
+                    if prog == STRIDE36_DUAL_TEX and len(ws) >= 8:
+                        tex['mask_tex'] = decode_tsw(f, ws[4:8])
                     sampler = None
                     if k >= 4:
                         sampler = decode_sampler(ws[k - 4:k])
@@ -309,6 +311,8 @@ SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
 PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
+STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
+
 
 
 def extract_color_matrix(f, ppp):
@@ -764,7 +768,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
         if not tex:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
-        uv_off = 4 if stride == 28 else 0
+        uv_off = 4 if stride in (28, 36) else 0
         uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
         xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
         ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
@@ -818,6 +822,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
+        if stride == 36 and prog == STRIDE36_DUAL_TEX:
+            return 'replayed exactly: dual-texture vibrancy (stride=36)', {'prog': hex(prog)}
         return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
     elif prog == COLOR_MATRIX:
         return 'replayed exactly: color matrix (saturation & tint)', {'prog': hex(prog)}
@@ -1240,7 +1246,7 @@ def main():
             if tex and (stride >= 24 or (stride == 16 and prog == WALLPAPER) or prog == ROUNDED_CAPS):
                 # stride 24: float u,v (normalised) at +16; stride 28/36: BGRA tint at +16,
                 # then u,v in texels at +20.
-                uv_off = 4 if stride == 28 else 0
+                uv_off = 4 if stride in (28, 36) else 0
                 uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER)
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
@@ -1248,7 +1254,7 @@ def main():
                 su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
-                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
+                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su
@@ -1260,6 +1266,22 @@ def main():
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
                 if tex.get('sampler') and tex['sampler']['linear_filter']:
                     is_scaled = True
+                if stride == 36 and prog == STRIDE36_DUAL_TEX:
+                    complete = True
+                    for y in range(y0, y1):
+                        fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
+                              quad_coordinate(y, min(ys), max(ys), v0, v1)) * sv
+                        ty = max(0, min(tex['h'] - 1, int(fv)))
+                        try:
+                            gva = tex['addr'] + ty * tex['stride']
+                            if (gva & ~0xfff) not in f.pages:
+                                complete = False
+                                break
+                        except Exception:
+                            complete = False
+                            break
+                    if not complete:
+                        continue
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
@@ -1336,7 +1358,19 @@ def main():
                             fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                             continue
                         if tex.get('vibrancy'):
-                            fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
+                            if stride == 36 and prog == STRIDE36_DUAL_TEX and tex.get('mask_tex'):
+                                mask_tex = tex['mask_tex']
+                                m_b, m_g, m_r, m_a = texel(f, mask_tex, tx, ty)
+                                if m_a == 0:
+                                    continue
+                                vib = blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a))
+                                if m_a == 255:
+                                    fb[d:d + 4] = bytes(vib)
+                                else:
+                                    inv = 255 - m_a
+                                    fb[d:d + 4] = bytes(((vib[i] * m_a + fb[d + i] * inv) // 255) for i in range(4))
+                            else:
+                                fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
                         elif prog in (PLUS_L, PLUS_L2):
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c])
