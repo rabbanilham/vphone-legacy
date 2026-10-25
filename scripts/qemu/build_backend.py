@@ -67,7 +67,7 @@ def main():
     env['PKG_CONFIG_PATH'] = os.pathsep.join(str(p) for p in pcs if p.exists()) + os.pathsep + env.get('PKG_CONFIG_PATH', '')
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
         '--disable-user', '--disable-tools', '--disable-werror', '--enable-slirp',
-        '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--disable-vnc',
+        '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--enable-vnc',
         '--disable-hvf', '--enable-tcg', '--disable-plugins', '--disable-pvg']
     sdk = args.sdk or (BACKEND / 'macos-sdk' if (BACKEND / 'macos-sdk').exists() else None)
     if sdk:

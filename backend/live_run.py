@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the guest interactively in a Cocoa window (no debugger, no hooks).
+"""Run the guest interactively in the native vphone player (no debugger, no hooks).
 
 Defaults to the virtual-activated testing profile and disposable disk clones,
 so the source images are never written. Clones are removed on exit unless
@@ -13,6 +13,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import platform
+import plistlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
@@ -31,6 +34,53 @@ def clone_or_copy(src, dst):
     except Exception:
         pass
     shutil.copyfile(src, dst)
+
+
+def build_player():
+    sources = sorted((ROOT / 'sources/vphone-player').glob('*.swift'))
+    app = ROOT / 'build/player/vphone-player.app'
+    binary = app / 'Contents/MacOS/vphone-player'
+    if not binary.exists() or any(p.stat().st_mtime > binary.stat().st_mtime for p in sources):
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+            'CFBundleExecutable': 'vphone-player', 'CFBundleIdentifier': 'com.vphone.legacy.player',
+            'CFBundleName': 'vphone', 'CFBundlePackageType': 'APPL',
+            'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '14.0',
+        }))
+        subprocess.run(['swiftc', '-O', '-target', f'{platform.machine()}-apple-macosx14.0',
+                        '-module-cache-path', str(ROOT / 'build/player/module-cache'),
+                        *map(str, sources), '-o', str(binary)], check=True)
+        subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
+    return binary
+
+
+def run_player(cmd, env, work, player):
+    with (work / 'qemu.log').open('wb') as log:
+        qemu = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        viewer = None
+        try:
+            deadline = time.monotonic() + 20
+            while not (work / 'vnc').exists():
+                if qemu.poll() is not None:
+                    raise RuntimeError(f'QEMU gagal: {(work / "qemu.log").read_text()}')
+                if time.monotonic() > deadline:
+                    raise RuntimeError('QEMU tidak membuka socket layar dalam 20 detik')
+                time.sleep(0.05)
+            viewer = subprocess.Popen([str(player), str(work / 'vnc'), str(work / 'qmp')])
+            return viewer.wait()
+        finally:
+            if viewer is not None and viewer.poll() is None:
+                viewer.terminate()
+                viewer.wait(timeout=5)
+            if qemu.poll() is None:
+                qemu.terminate()
+                try:
+                    qemu.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    qemu.kill()
+                    qemu.wait()
+            for name in ('vnc', 'qmp'):
+                (work / name).unlink(missing_ok=True)
 
 
 def main():
@@ -63,29 +113,33 @@ def main():
     for path in required:
         if not path.is_file():
             p.error(f'Missing input: {path}. See docs/firmware.md for the required profile artifacts and backend build.')
+    help_text = subprocess.run([str(binary), '-help'], capture_output=True, text=True, check=True).stdout
+    if '-vnc ' not in help_text:
+        p.error('Backend belum mendukung VNC. Rebuild: .venv/bin/python scripts/qemu/build_backend.py')
+    player = build_player()
     work = Path(tempfile.mkdtemp(prefix='vphone-live-', dir='/tmp'))
     images = work / 'images'
     images.mkdir()
-    for kind, src in (('system', args.system), ('data', args.data),
-                      ('utility', storage / 'utility.raw')):
-        clone_or_copy(src.resolve(), images / f'{kind}.raw')
-
     machine = (f"s5l8960x,boot-el=3,boot-entry={plan['initial_entry_pa']:#x},"
                f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},"
                f"system-image={images}/system.raw,data-image={images}/data.raw,"
                f"utility-image={images}/utility.raw,system-writable=1")
-    cmd = [str(binary), '-machine', machine,
+    cmd = [str(binary), '-L', str(ROOT / 'backend/upstream/pc-bios'), '-machine', machine,
            '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'multi'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
-           '-kernel', plan['image'], '-display', 'cocoa',
+           '-kernel', plan['image'], '-display', 'none',
+           '-vnc', f'unix:{work}/vnc',
            '-serial', f'file:{work}/serial.log',
            '-qmp', f'unix:{work}/qmp,server=on,wait=off'] + args.qemu_arg
     for image in plan.get('auxiliary_images', []):
         cmd += ['-device', f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
     env = configure_wifi(cmd, args.wifi)
     print(f'[live] work dir {work} (serial log: {work}/serial.log)')
-    print('[live] close the QEMU window or press Ctrl-C here to stop')
+    print('[live] close the vphone window or press Ctrl-C here to stop')
     try:
-        return subprocess.call(cmd, env=env)
+        for kind, src in (('system', args.system), ('data', args.data),
+                          ('utility', storage / 'utility.raw')):
+            clone_or_copy(src.resolve(), images / f'{kind}.raw')
+        return run_player(cmd, env, work, player)
     except KeyboardInterrupt:
         return 130
     finally:

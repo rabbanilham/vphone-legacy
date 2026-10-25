@@ -645,6 +645,8 @@ struct A7State {
     uint32_t pmgr_ext_reg[PMGR_EXT_SIZE / 4];
     uint8_t *gpio_regs;
     bool touch_irq_low;
+    bool home_pressed;
+    QEMUTimer *home_timer;
     QEMUTimer *touch_timer;
     QEMUTimer *mouse_touch_timer;
     MouseTouch mouse_touch;
@@ -1177,6 +1179,14 @@ static void touch_gpio_update(A7State *s)
             stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
         }
     }
+    config = ldl_le_p(s->gpio_regs + 2 * 4);
+    group = (config >> 16) & 0xff;
+    type = config & 0xe;
+    if (group < 7 && ((type == 6 && s->home_pressed) ||
+                      (type == 4 && !s->home_pressed))) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+    }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
         for (unsigned w = 0; w < 7; w++) {
@@ -1201,6 +1211,26 @@ static void touch_gpio_level(A7State *s, bool low)
     }
     s->touch_irq_low = low;
     touch_gpio_update(s);
+}
+
+/* Home is active-low GPIO2. Respect the guest's edge/level selection. */
+static void home_level(A7State *s, bool pressed)
+{
+    uint32_t config = ldl_le_p(s->gpio_regs + 2 * 4);
+    unsigned group = (config >> 16) & 0xff, type = config & 0xe;
+    bool edge = s->home_pressed != pressed &&
+        (type == 0xc || (type == 0xa && pressed) || (type == 8 && !pressed));
+    if (group < 7 && edge) {
+        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+    }
+    s->home_pressed = pressed;
+    touch_gpio_update(s);
+}
+
+static void home_release(void *opaque)
+{
+    home_level(opaque, false);
 }
 
 static bool touch_irq_latched(A7State *s)
@@ -1255,7 +1285,7 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                     uint32_t config = ldl_le_p(s->gpio_regs + off + i);
                     bool driven = !(config & 0x200) && (config & 0xe) == 2;
                     bool sample = !driven || (config & 1);
-                    byte = (byte & ~1) | sample;
+                    byte = (byte & ~1) | (pin == 2 ? !s->home_pressed : sample);
                 }
             }
             val |= (uint64_t)byte << (i * 8);
@@ -1813,7 +1843,16 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
     A7State *s = A7_TOUCH_DISPLAY(dev)->board;
     MouseTouch *m = &s->mouse_touch;
     if (src != s->con) { return; }
-    if (evt->type == INPUT_EVENT_KIND_ABS) {
+    if (evt->type == INPUT_EVENT_KIND_KEY) {
+        if (qemu_input_linux_to_qcode(evt->key.key) == Q_KEY_CODE_HOME) {
+            if (evt->key.down && !s->home_pressed) {
+                home_level(s, true);
+                /* Guest-time release also protects against lost host key-up. */
+                timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);
+            }
+            /* Release is timer-owned: a stalled host must not create a long press. */
+        }
+    } else if (evt->type == INPUT_EVENT_KIND_ABS) {
         if (evt->abs.axis == INPUT_AXIS_X) {
             m->host_x = mouse_touch_scale(evt->abs.value, INPUT_EVENT_ABS_MAX, 640);
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
@@ -1861,7 +1900,7 @@ static void mouse_touch_input_sync(DeviceState *dev)
 
 static const QemuInputHandler mouse_touch_handler = {
     .name = "A7 touchscreen mouse",
-    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_MTT,
+    .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_MTT,
     .event = mouse_touch_event,
     .sync = mouse_touch_input_sync,
 };
@@ -8535,6 +8574,8 @@ static void a7_reset(void *opaque)
     timer_del(s->mouse_touch_timer);
     memset(&s->mouse_touch, 0, sizeof(s->mouse_touch));
     memset(&s->multi_touch, 0, sizeof(s->multi_touch));
+    timer_del(s->home_timer);
+    s->home_pressed = false;
     touch_script_reset(s);
     s->chestnut_control = 0;
     a7_otg_reset(s);
@@ -8976,6 +9017,7 @@ static void a7_init(MachineState *ms)
                                          sep_os_active_timer_cb, s);
     s->pmu.adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d2045_adc_done, s);
     s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
+    s->home_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, home_release, s);
     s->mouse_touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mouse_touch_timer_cb, s);
     const char *mouse_touch = getenv("VPHONE_MOUSE_TOUCH");
     s->mouse_touch_enabled = !mouse_touch || strcmp(mouse_touch, "0");
@@ -9055,9 +9097,18 @@ static void a7_finalize(Object *o)
     g_free(s->data_image);
     g_free(s->utility_image);
 }
+/* Read-only readiness for host gestures; this never forces the digitizer gate. */
+static bool a7_touch_reporting(Object *o, Error **errp)
+{
+    A7State *s = A7(o);
+    A7Touch *t = touch_device(s);
+    return t && (s->touch_force || touch_reporting_enabled(t));
+}
+
 static void a7_instance_init(Object *o)
 {
     A7State *s = A7(o);
+    object_property_add_bool(o, "touch-reporting-enabled", a7_touch_reporting, NULL);
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;

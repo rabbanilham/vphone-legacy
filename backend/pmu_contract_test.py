@@ -115,7 +115,7 @@ static void aic_update(A7State *s) { (void)s; }
     gpio = source[source.index('static void touch_gpio_update('):
                   source.index('static void touch_gpio_level(')]
     types = types.replace('uint8_t chestnut_control;',
-                          'uint8_t chestnut_control; bool touch_irq_low;')
+                          'uint8_t chestnut_control; bool touch_irq_low, home_pressed;')
     main = r'''
 static void send(A7Peripheral *p, uint32_t v) { i2c_write(p, 0, v); }
 static void prefix(A7Peripheral *p, unsigned reg) {
