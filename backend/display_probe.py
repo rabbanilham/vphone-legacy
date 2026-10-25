@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded native display evidence on independent disks; never synthesizes pixels."""
 import argparse
+from host_wifi import configure_wifi
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -25,6 +26,43 @@ ROOT = Path(__file__).resolve().parents[1]
 PLAN = ROOT / 'build/ios712-validated/boot/boot_plan.json'
 FB = 0x8018e0000
 FB_SIZE = 2560 * 1136
+
+
+def primary_checkout():
+    """The primary worktree, which holds the gitignored evidence."""
+    try:
+        common = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'rev-parse', '--path-format=absolute',
+             '--git-common-dir'], text=True, stderr=subprocess.DEVNULL).strip()
+        return Path(common).parent
+    except (OSError, subprocess.CalledProcessError):
+        return ROOT
+
+
+MAIN_CHECKOUT = primary_checkout()
+
+
+def resolve_hook_path(value):
+    """Hook JSON uses repository-relative evidence paths; prefer this tree."""
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    local = ROOT / path
+    if local.exists():
+        return local
+    main = MAIN_CHECKOUT / path
+    return main if main.exists() else local
+
+
+def load_user_hooks(path):
+    hooks = json.loads(resolve_hook_path(path).read_text())
+    for key in ('cache_path', 'index_path'):
+        if key in hooks:
+            hooks[key] = str(resolve_hook_path(hooks[key]))
+    if 'exe_paths' in hooks:
+        hooks['exe_paths'] = {name: str(resolve_hook_path(value))
+                              for name, value in hooks['exe_paths'].items()}
+    return hooks
 
 
 def digest(path):
@@ -323,6 +361,7 @@ def main():
     p.add_argument('--display-state', action='store_true', help='Save display plane registers and MMU tables beside timed QMP captures')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
+    p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     p.add_argument('--mouse-swipe', help='Simulate mouse drag via QMP: at,x0,y0,x1,y1,dur,steps')
@@ -331,7 +370,7 @@ def main():
         hook_dumps = parse_hook_dumps(args.hook_dump)
     except ValueError as exc:
         p.error(str(exc))
-    assert 0 < args.seconds <= 180
+    assert 0 < args.seconds <= 300
     if any(not 0 < at < args.seconds for at in args.framebuffer_at):
         p.error('--framebuffer-at must be positive and less than --seconds')
     assert 1 <= args.step_count <= 64
@@ -392,12 +431,7 @@ def main():
         for prefix in sorted(max_hits, key=len, reverse=True):
             if name.startswith(prefix):return max_hits[prefix]
         return 24 if pc in user_expected else 8
-    user_hooks = json.loads(args.user_hooks.read_text()) if args.user_hooks else None
-    if user_hooks:
-        for key in ('cache_path', 'index_path'):
-            if key in user_hooks:
-                value = Path(user_hooks[key]).expanduser()
-                user_hooks[key] = str(value if value.is_absolute() else ROOT / value)
+    user_hooks = load_user_hooks(args.user_hooks) if args.user_hooks else None
     user_installed = False
     user_expected = {}
     exe_installed = {}
@@ -428,9 +462,10 @@ def main():
             cmd += ['-gdb', f'unix:{gdb},server=on,wait=off']
         for image in plan.get('auxiliary_images', []):
             cmd += ['-device', f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
+        env = configure_wifi(cmd, args.wifi)
         save_json(out / 'command.json', cmd)
         with (out / 'stdout.log').open('wb') as stdout, (out / 'stderr.log').open('wb') as stderr:
-            proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+            proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, env=env)
             save_json(out / 'process.json', dict(pid=proc.pid))
             qs = gs = None
             try:

@@ -405,3 +405,48 @@ actual source with host stubs and exercises a complete gesture under ASan/UBSan.
 For a live screen probe, use `backend/display_probe.py --stop-condition duration`
 with `--seconds 90` so it continues through the scheduled gesture; this mode
 still captures the final framebuffer and stops on a kernel panic.
+
+### Optional BCM43342 HSIC Wi-Fi
+
+Build in this checkout with `python3 scripts/qemu/build_backend.py` (requires
+libslirp). `backend/live_run.py --wifi` and `backend/display_probe.py --wifi`
+add `-netdev user,id=wifi0` and `-machine wifi-netdev=wifi0`. Wi-Fi remains
+absent when this option is omitted. Use a visible Cocoa window for iOS runs:
+`live_run.py` always does; use `VPHONE_DISPLAY=cocoa` with `display_probe.py`.
+
+The launcher resolves the Mac's SSID using networksetup, wdutil without sudo,
+and system_profiler, with bounded timeouts. `VPHONE_WIFI_SSID` overrides discovery;
+`vphone-wifi` is the fallback. An explicit `-machine wifi-ssid=NAME` overrides
+the environment. SSIDs contain 1–32 UTF-8 bytes. The single synthetic AP is open,
+channel 6, BSSID `02:43:34:20:00:01`; its name does not imply authentication to
+the physical AP. QEMU uses the Mac's existing routed connection through slirp,
+with DHCP/DNS/NAT supplied by `-netdev user`. No guest network state is seeded.
+
+The device starts as `0a5c:4334`, validates a streamed TRX length/CRC, and
+re-enumerates as `0a5c:bd21` after DL_GO. Runtime CDC ioctls, subscribed scan/join
+notifications and BDC Ethernet are modeled without executing Broadcom firmware.
+WPA, AP mode, P2P, AWDL and firmware execution are outside this model.
+
+Run `python3 backend/wifi_contract_test.py` for bare-metal EHCI descriptor,
+ROM, re-enumeration, CDC, scan, join, slirp ARP and DHCP-offer coverage. This is
+synthetic validation; the native iOS driver/Setup/DHCP acceptance is a separate
+maintainer run. With `-d unimp`, `WIFI RDL`, `WIFI runtime attach`, `WIFI CDC`,
+`WIFI iovar` and `WIFI RX event` messages identify protocol progress. A QEMU
+`filter-dump` object on `wifi0` can capture Ethernet/DHCP without instrumenting
+the guest.
+
+Probe180 follow-up: the configured module asserts sideband DEVICE_READY first,
+then waits for GPIO166 HOST_READY before advertising its initial USB connection.
+Later HOST_READY lows retain the connection (`idle-disconnect=0`); a whole-board
+reset requires a fresh handshake. Standard EP0 requests, lengths, USB address,
+speed, reset and configuration results are now logged under `-d unimp`, alongside
+RDL/CDC messages. The Wi-Fi contract includes nonzero USB addressing, the native
+four-byte configuration header probe, full/short string reads, device/interface/
+endpoint GET_STATUS and SET_CONFIGURATION(1). Native acceptance after this
+lifecycle correction still requires a maintainer boot.
+
+User-hook JSON paths (`cache_path`, `index_path`, `exe_paths`) in display_probe
+resolve relative to this checkout first. If absent here, they fall back to the
+primary worktree (the parent of `git rev-parse --git-common-dir`). Explicit
+absolute paths
+are preserved.

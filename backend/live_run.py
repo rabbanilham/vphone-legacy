@@ -6,6 +6,7 @@ so the source images are never written. Clones are removed on exit unless
 --keep-images is given. Explicit --plan/--system/--data override the defaults.
 """
 import argparse
+from host_wifi import configure_wifi
 import os
 from pathlib import Path
 import shutil
@@ -41,6 +42,7 @@ def main():
     p.add_argument('--keep-images', action='store_true')
     p.add_argument('--collect-crashlogs', action='store_true',
                    help='Collect guest crash reports from data clone before cleanup')
+    p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[])
     args = p.parse_args()
     for path in (args.plan, args.system, args.data):
@@ -79,10 +81,11 @@ def main():
            '-qmp', f'unix:{work}/qmp,server=on,wait=off'] + args.qemu_arg
     for image in plan.get('auxiliary_images', []):
         cmd += ['-device', f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
+    env = configure_wifi(cmd, args.wifi)
     print(f'[live] work dir {work} (serial log: {work}/serial.log)')
     print('[live] close the QEMU window or press Ctrl-C here to stop')
     try:
-        return subprocess.call(cmd)
+        return subprocess.call(cmd, env=env)
     except KeyboardInterrupt:
         return 130
     finally:

@@ -37,6 +37,9 @@ typedef ObjectClass SysBusEHCIClass;
 typedef struct { uint64_t size, base, offset; void *target; } MemoryRegion;
 typedef struct { MemoryRegion *root; } AddressSpace;
 #define GiB UINT64_C(0x40000000)
+#define RAM_BASE UINT64_C(0x800000000)
+static MemoryRegion system_memory;
+static MemoryRegion *get_system_memory(void) { return &system_memory; }
 #define OBJECT(x) (x)
 typedef struct {
  uint32_t device_irq[32]; unsigned updates;
@@ -81,6 +84,7 @@ static void sysbus_mmio_map(SysBusDevice *d, unsigned slot, uint64_t pa) {
  assert(d->realized && slot==0 && d->index==mapped);
  assert(pa==(mapped ? UINT64_C(0x20c400000) : UINT64_C(0x20c200000))); mapped++;
 }
+static void a7_wifi_init(A7State *s, DeviceState *d) { assert(s && d->index==1); }
 static A7State *owner;
 static void (*irqfn)(void *,int,int);
 static unsigned qemu_allocate_irq(void (*fn)(void *,int,int), void *s, unsigned irq) {
@@ -104,7 +108,7 @@ int main(void) {
  assert(s.usb_dma_as.root==&s.usb_dma_memory);
  assert(s.usb_dma_memory.size==UINT64_C(0x100000000));
  assert(s.usb_dma_memory.target==&s.usb_dma_ram);
- assert(s.usb_dma_ram.target==&ram && s.usb_dma_ram.offset==0);
+ assert(s.usb_dma_ram.target==&system_memory && s.usb_dma_ram.offset==RAM_BASE);
  assert(s.usb_dma_ram.size==GiB && s.usb_dma_ram.base==0);
  for(unsigned i=0;i<2;i++) assert(devices[i].ehci.as==&s.usb_dma_as);
  assert(created==2 && mapped==2 && connected==2);

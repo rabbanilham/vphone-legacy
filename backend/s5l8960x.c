@@ -39,6 +39,8 @@
 #include <sys/file.h>
 #include <math.h>
 
+#include "wifi_dongle.c"
+
 #define TYPE_A7 MACHINE_TYPE_NAME("s5l8960x")
 OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define RAM_BASE UINT64_C(0x800000000)
@@ -622,6 +624,10 @@ struct A7State {
     A7Bridge bridges[NUM_BRIDGES];
     MemoryRegion usb_dma_memory, usb_dma_ram;
     AddressSpace usb_dma_as;
+    WifiDongle *wifi;
+    char *wifi_netdev, *wifi_ssid;
+    uint64_t wifi_rom;
+    bool wifi_mac_patched;
     MemoryRegion usb_otg;
     uint32_t usb_regs[0x10000 / 4];
     A7Bridge usb_aux[4];
@@ -1163,6 +1169,14 @@ static void touch_gpio_update(A7State *s)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 15));
     }
+    if (s->wifi) {
+        config = ldl_le_p(s->gpio_regs + 167 * 4);
+        group = (config >> 16) & 0xff;
+        if (group < 7 && (config & 0xe) == 4) {
+            uint8_t *status = s->gpio_regs + 0x800 + group * 0x40 + (167 / 32) * 4;
+            stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
+        }
+    }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
         for (unsigned w = 0; w < 7; w++) {
@@ -1204,6 +1218,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
             uint8_t byte = s->gpio_regs[off + i];
             if (off + i == 15 * 4) {
                 byte = (byte & ~1) | !s->pmu.irq_low;
+            }
+            if (off + i == 167 * 4 && s->wifi) {
+                byte = (byte & ~1) | 1;
             }
             if (off + i == 22 * 4) {
                 byte = (byte & ~1) | !s->touch_irq_low;
@@ -1263,6 +1280,9 @@ static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             } else {
                 s->gpio_regs[a] = byte;
             }
+        }
+        if (s->wifi && off < 167 * 4 && off + size > 166 * 4) {
+            wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
         }
         touch_gpio_update(s);
         for (unsigned pin = 80; pin <= 83; pin++) {
@@ -8290,6 +8310,52 @@ static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t v
     }
 }
 
+static void a7_wifi_patch_mac(A7State *s)
+{
+    if (!s->wifi) {
+        return;
+    }
+    char name[32];
+    /* devicetree_pa is 0x8018d4000. local-mac-address is at 0x8018d48d8 */
+    address_space_read(&address_space_memory, 0x8018d48d8, MEMTXATTRS_UNSPECIFIED, name, 18);
+    if (!memcmp(name, "local-mac-address\0", 18)) {
+        address_space_write(&address_space_memory, 0x8018d48fc, MEMTXATTRS_UNSPECIFIED,
+                            s->wifi->conf.macaddr.a, 6);
+        fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x8018d48fc\n",
+                s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                      s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                      s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                      s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        return;
+    }
+    /* Fallback search in devicetree area */
+    for (uint64_t pa = 0x8018d0000; pa < 0x8018e0000 - 48; pa += 4) {
+        address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, name, 18);
+        if (!memcmp(name, "local-mac-address\0", 18)) {
+            uint32_t len = 0;
+            address_space_read(&address_space_memory, pa + 32, MEMTXATTRS_UNSPECIFIED, &len, 4);
+            if (len == 6) {
+                address_space_write(&address_space_memory, pa + 36, MEMTXATTRS_UNSPECIFIED,
+                                    s->wifi->conf.macaddr.a, 6);
+                fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x%" PRIx64 "\n",
+                        s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                        s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                        s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5],
+                        pa + 36);
+                qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                              s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                              s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                              s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "WIFI DeviceTree: local-mac-address not found in PA 0x8018d0000..0x8018e0000\n");
+}
+
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
@@ -8330,12 +8396,17 @@ static void vblank_timer_cb(void *opaque)
             break;
         }
     }
+    if (s->wifi && !s->wifi_mac_patched) {
+        a7_wifi_patch_mac(s);
+        s->wifi_mac_patched = true;
+    }
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
 }
 
 static void a7_reset(void *opaque)
 {
     A7State *s = opaque;
+    s->wifi_mac_patched = false;
     if (s->iop_cpu) {
         cpu_reset(CPU(s->iop_cpu));
         s->iop_started = false;
@@ -8438,6 +8509,7 @@ static void a7_reset(void *opaque)
     if (s->gpio_regs) {
         memset(s->gpio_regs, 0, GPIO_SIZE);
     }
+    if (s->wifi) wifi_power_reset(s->wifi);
     s->touch_irq_low = false;
     for (int i = 0; i < NUM_BRIDGES; i++) {
         if (s->bridges[i].regs) {
@@ -8545,10 +8617,23 @@ static const GraphicHwOps display_ops = { .gfx_update = display_update };
 
 /* USB complex DT ranges: arm-io +0xc000000, EHCI +0x200000/+0x400000.
  * Use the EHCI engine, including real reset/run/halt, frame clock, W1C,
- * schedule and IRQ semantics. No USB device is attached by this board.
+ * schedule and IRQ semantics. Optional WLAN attaches to EHCI1 port 1.
  * The root-port counts cover the DT's EHCI0 ports 1/3 and EHCI1 port 1;
  * these are a modeled topology, not recovered capability/OTP dumps.
  */
+static void a7_wifi_init(A7State *s, DeviceState *ehci)
+{
+    if (!s->wifi_netdev) return;
+    USBDevice *dev = USB_DEVICE(qdev_new(TYPE_WIFI_DONGLE));
+    qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
+    if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
+    qdev_prop_set_string(DEVICE(dev), "port", "1");
+    if (s->wifi_rom) qdev_prop_set_bit(DEVICE(dev), "rom", true);
+    usb_realize_and_unref(dev, &SYS_BUS_EHCI(ehci)->ehci.bus, &error_fatal);
+    s->wifi = WIFI_DONGLE(dev);
+    wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
+}
+
 static void a7_ehci_class_init(ObjectClass *oc, const void *data)
 {
     SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(oc);
@@ -8577,8 +8662,11 @@ static void a7_usb_init(A7State *s)
      * low alias to system memory would also change CPU and other DMA views.
      * No USB iommu-parent/DART exists in the N53 DT. */
     memory_region_init(&s->usb_dma_memory, OBJECT(s), "a7.usb-dma", UINT64_C(0x100000000));
+    /* Alias the bounded system DRAM aperture, not the entire RAM leaf.
+     * QEMU 11 flattens a full-leaf, zero-offset alias to the RAM region;
+     * that loses the relocation when the leaf lives at RAM_BASE. */
     memory_region_init_alias(&s->usb_dma_ram, OBJECT(s), "a7.usb-dram",
-                             MACHINE(s)->ram, 0, GiB);
+                             get_system_memory(), RAM_BASE, GiB);
     memory_region_add_subregion(&s->usb_dma_memory, 0, &s->usb_dma_ram);
     address_space_init(&s->usb_dma_as, &s->usb_dma_memory, "a7.usb-dma");
     static const char *const types[] = { "a7.ehci0", "a7.ehci1" };
@@ -8587,6 +8675,7 @@ static void a7_usb_init(A7State *s)
         SysBusDevice *bus = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(bus, &error_fatal);
         SYS_BUS_EHCI(dev)->ehci.as = &s->usb_dma_as;
+        if (i == 1) a7_wifi_init(s, dev);
         sysbus_mmio_map(bus, 0, UINT64_C(0x20c200000) + i * 0x200000);
         sysbus_connect_irq(bus, 0, qemu_allocate_irq(a7_usb_irq, s, 163 + i * 2));
     }
@@ -8960,6 +9049,8 @@ static void a7_finalize(Object *o)
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
+    g_free(s->wifi_netdev);
+    g_free(s->wifi_ssid);
     g_free(s->system_image);
     g_free(s->data_image);
     g_free(s->utility_image);
@@ -8970,6 +9061,12 @@ static void a7_instance_init(Object *o)
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;
+    object_property_add(o, "wifi-netdev", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_netdev));
+    object_property_add(o, "wifi-ssid", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_ssid));
+    object_property_add(o, "wifi-rom", "uint64", get_address, set_address, NULL,
+                        (void *)offsetof(A7State, wifi_rom));
     s->boot_el = 1;
     s->framebuffer = RAM_BASE + GiB - 4 * MiB;
     object_property_add(o, "utility-image", "str", get_image, set_image, NULL,
@@ -9015,6 +9112,7 @@ static const TypeInfo a7_touch_display_type = {
 };
 static void a7_register(void)
 {
+    type_register_static(&wifi_type);
     static const unsigned ports[] = { 3, 1 };
     static const TypeInfo ehci_types[] = {
         { .name = "a7.ehci0", .parent = TYPE_SYS_BUS_EHCI,
