@@ -51,7 +51,8 @@ window and serves raw framebuffer updates over a private Unix VNC socket; no TCP
 listener is opened. The player preserves the guest aspect ratio when resized.
 Click and drag on the guest display to use its touchscreen.
 
-The toolbar has Home (a short hardware menu-button press) and Screen Capture
+The toolbar has Home (a short hardware menu-button press), Control Center
+(a paced swipe upward from the bottom edge), and Screen Capture
 (a PNG of the current guest frame, saved using Save As). Captures exclude window
 chrome and keep the guest's 640×1136 resolution. Closing the player stops QEMU and
 removes temporary disk clones and sockets. Serial and QEMU logs remain in the

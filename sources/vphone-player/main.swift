@@ -173,7 +173,7 @@ final class QMPInput {
 
 // Coordinates and gesture semantics match 0004-cocoa-trackpad-touch-gestures.patch.
 final class TouchGestures {
-    enum Kind { case none, scroll, wheel, pinch, magnify }
+    enum Kind { case none, scroll, wheel, pinch, magnify, controlCenter }
     var kind: Kind = .none
     var fingers: [NSPoint] = []
     var center: NSPoint?
@@ -217,6 +217,17 @@ final class TouchGestures {
         if dx != 0 || dy != 0 {fingers[0].x += dx;fingers[0].y += dy;emit("update")}
         if end {emit("end")}
     }
+    @discardableResult func beginControlCenter() -> Bool {
+        guard kind == .none else {return false}
+        kind = .controlCenter
+        // The board adds the existing 16px Y correction once. This lands
+        // within the bottom edge without emitting an out-of-range contact.
+        fingers = [NSPoint(x:320,y:1118)];emit("begin");return true
+    }
+    func advanceControlCenter(_ progress:CGFloat) {
+        guard kind == .controlCenter else {return}
+        fingers = [NSPoint(x:320,y:1118-698*max(0,min(1,progress)))];emit("update")
+    }
     func magnify(_ point:NSPoint?, delta:CGFloat, begin:Bool, end:Bool) {
         if begin {
             guard kind == .none,let point else {return}
@@ -246,11 +257,13 @@ final class Screen: NSView {
     var input: ((Int,Int,Bool)->Void)?
     let gestures = TouchGestures()
     var wheelTimer: Timer?
+    var controlCenterTimer: Timer?
     var tracking: NSTrackingArea?
     var held = false
     var lastPoint = (0,0)
     func cancelTouch() {
         wheelTimer?.invalidate();wheelTimer = nil
+        controlCenterTimer?.invalidate();controlCenterTimer = nil
         gestures.end();gestures.hint(nil,option:false);needsDisplay = true
         if held { held = false; input?(lastPoint.0,lastPoint.1,false) }
     }
@@ -291,6 +304,19 @@ final class Screen: NSView {
         let (x,y) = ScreenGeometry.point(point,in:r)
         lastPoint = (x,y)
         input?(x,y,down)
+    }
+    func openControlCenter() {
+        guard !held,gestures.beginControlCenter() else {return}
+        var tick = 0
+        // Hold the edge for 0.2s, drag for 3s, settle for 1s, then lift.
+        // The slower pacing matches the existing emulated UIKit touch path.
+        let timer = Timer(timeInterval:1.0/30,repeats:true) {[weak self] timer in
+            guard let self,self.gestures.kind == .controlCenter else {timer.invalidate();return}
+            tick += 1
+            if tick >= 6 && tick <= 96 {self.gestures.advanceControlCenter(CGFloat(tick-6)/90)}
+            if tick >= 126 {self.gestures.end();timer.invalidate();self.controlCenterTimer = nil}
+        }
+        controlCenterTimer = timer;RunLoop.main.add(timer,forMode:.common)
     }
     override func mouseDown(with event:NSEvent) {
         window?.makeFirstResponder(self)
@@ -358,7 +384,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "vphone — iOS 7.1.2"; window.minSize = NSSize(width:260,height:440); window.delegate = self
         let root = NSView(); window.contentView = root
         let bar = NSStackView(); bar.orientation = .horizontal; bar.spacing = 16
-        for (icon,title,action) in [("house","Home",#selector(home)),("camera","Screen Capture",#selector(capture))] {
+        for (icon,title,action) in [("house","Home",#selector(home)),("slider.horizontal.3","Control Center",#selector(controlCenter)),("camera","Screen Capture",#selector(capture))] {
             let button = NSButton(image:NSImage(systemSymbolName:icon,accessibilityDescription:title)!,target:self,action:action)
             button.bezelStyle = .texturedRounded; button.toolTip = title; button.setAccessibilityLabel(title); button.isEnabled = false
             buttons.append(button); bar.addArrangedSubview(button)
@@ -383,7 +409,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let path = CommandLine.arguments[1]
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
     }
-    @objc func home() { rfb.home() }
+    @objc func home() { screen.cancelTouch();rfb.home() }
+    @objc func controlCenter() { screen.openControlCenter() }
     @objc func capture() {
         guard let image = screen.image else {return}
         let png = NSBitmapImageRep(cgImage:image).representation(using:.png,properties:[:])

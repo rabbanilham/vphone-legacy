@@ -17,6 +17,8 @@ let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let player = Player()
 player.applicationDidFinishLaunching(Notification(name:NSApplication.didFinishLaunchingNotification))
+assert(player.buttons.count == 3)
+assert(player.buttons[1].toolTip == "Control Center")
 player.status.isHidden = true
 player.window.contentView!.layoutSubtreeIfNeeded()
 var captured: [(Int,Int,Bool)] = []
@@ -106,6 +108,19 @@ g.magnify(nil,delta:0.5,begin:false,end:false)
 assert(frames[1].1 == [NSPoint(x:180,y:400),NSPoint(x:420,y:400)])
 g.magnify(nil,delta:0,begin:false,end:true)
 assert(frames.last!.0 == "end" && g.center == nil)
+// Toolbar Control Center uses one bottom-edge contact and never overlaps input.
+frames.removeAll()
+assert(g.beginControlCenter())
+assert(!g.beginControlCenter())
+assert(frames[0].0 == "begin" && frames[0].1 == [NSPoint(x:320,y:1118)])
+g.advanceControlCenter(0.5)
+assert(frames[1].1 == [NSPoint(x:320,y:769)])
+g.advanceControlCenter(1)
+assert(frames[2].1 == [NSPoint(x:320,y:420)])
+g.end();assert(frames.last!.0 == "end" && g.kind == .none)
+g.advanceControlCenter(0.3);assert(frames.count == 4)
+g.pinch(NSPoint(x:160,y:568),begin:true)
+assert(!g.beginControlCenter());g.end()
 // Each frame contains every contact, with atomic x/y data then slot transition.
 let events = QMPInput.events("begin",[NSPoint(x:160,y:568),NSPoint(x:480,y:568)])
 assert(events.count == 6)
