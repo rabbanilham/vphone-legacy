@@ -9518,6 +9518,17 @@ static void peripheral_write(void *opaque, hwaddr off, uint64_t val, unsigned si
     display_mmio_trace(opaque, "write", off, size, val);
     mmio_trace(p->name, "write", off, size, val);
     peripheral_write_impl(opaque, off, val, size);
+    if (p->base == UINT64_C(0x20a0c0000) && size == 4 &&
+        ((off & 0x3fff) == 0x44 || (off & 0x3fff) == 0x48)) {
+        /* MCA channel +0x44 is a self-clearing reset/flush command register
+         * (bits 0/8 one direction, 1/9 the other) and +0x48 bit 0 a
+         * self-clearing start. AppleAE2MCA sleeps in 10 ms steps until they
+         * read back 0 (0xffffff8000fe6974, ...fe6998, ...fe70b8, ...fe712c);
+         * storing them verbatim wedged mediaserverd on the lock sound and
+         * every later wake. */
+        uint32_t clear = (off & 0x3fff) == 0x44 ? UINT32_MAX : 1;
+        stl_le_p(p->regs + off, ldl_le_p(p->regs + off) & ~clear);
+    }
     if (p->base == UINT64_C(0x201e00000) && off == 0x1000 && (val & 1)) {
         agx_sequencer_run(p);
     }
