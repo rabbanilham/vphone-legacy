@@ -33,11 +33,16 @@ class MouseTouchTests(unittest.TestCase):
 #define INPUT_EVENT_ABS_MAX 32767
 #define INPUT_EVENT_KIND_ABS 0
 #define INPUT_EVENT_KIND_BTN 1
+#define INPUT_EVENT_KIND_MTT 2
 #define INPUT_AXIS_X 0
 #define INPUT_AXIS_Y 1
 #define INPUT_BUTTON_LEFT 0
 #define INPUT_EVENT_MASK_ABS 1
 #define INPUT_EVENT_MASK_BTN 2
+#define INPUT_EVENT_MASK_MTT 4
+enum { INPUT_MULTI_TOUCH_TYPE_BEGIN, INPUT_MULTI_TOUCH_TYPE_UPDATE,
+       INPUT_MULTI_TOUCH_TYPE_END, INPUT_MULTI_TOUCH_TYPE_CANCEL,
+       INPUT_MULTI_TOUCH_TYPE_DATA };
 #define LOG_UNIMP 0
 #define qemu_log_mask(mask, ...) do {} while (0)
 static int64_t now, deadline;
@@ -50,7 +55,7 @@ typedef struct TouchScriptFrame { int64_t ns; int x,y; unsigned state; } TouchSc
         harness += r'''
 typedef struct A7Touch {
     uint8_t sequence, reporting, input_control[4];
-    uint8_t frames[64][56];
+    uint8_t frames[64][TOUCH_FRAME_MAX], frame_len[64];
     unsigned frame_count;
     uint32_t last_timestamp_us;
 } A7Touch;
@@ -59,6 +64,7 @@ typedef void DeviceState;
 typedef struct { int dummy; } SysBusDevice;
 typedef struct A7State {
     MouseTouch mouse_touch;
+    MultiTouch multi_touch;
     void *mouse_touch_timer;
     QemuConsole *con;
     bool touch_force, mouse_touch_enabled;
@@ -72,6 +78,7 @@ typedef struct QemuInputEvent {
     int type;
     struct { int axis, value; } abs;
     struct { int button; bool down; } btn;
+    struct { int type, slot, tracking_id, axis, value; } mtt;
 } QemuInputEvent;
 typedef struct QemuInputHandler {
     const char *name; unsigned mask;
@@ -84,12 +91,13 @@ static void stl_le_p(uint8_t *p, unsigned n) {
 }
 static unsigned lduw_le_p(const uint8_t *p) { return p[0] | p[1]<<8; }
 static void touch_enqueue(A7Touch *t, const uint8_t *f, unsigned len) {
-    assert(t->frame_count<64 && len==56);
+    assert(t->frame_count<64 && (len==56 || len==86));
+    t->frame_len[t->frame_count]=len;
     memcpy(t->frames[t->frame_count++],f,len);
 }
 static A7Touch *touch_device(A7State *s) { return &s->touch; }
 '''
-        harness += extract('static void touch_contact(', 'static A7Touch *touch_device(')
+        harness += extract('static void touch_contacts(', 'static A7Touch *touch_device(')
         harness += extract('static bool touch_reporting_enabled(', 'static void touch_boot_complete(')
         harness += extract('/* Board-owned display device', 'static uint32_t touch_word(')
         harness += r'''
@@ -108,6 +116,27 @@ static void packet(int x, int y, bool down) {
     event(INPUT_EVENT_KIND_ABS,INPUT_AXIS_Y,y);
     mouse_touch_handler.sync(&display);
 }
+static void mtt(int type, int slot, int axis, int value) {
+    QemuInputEvent e={.type=INPUT_EVENT_KIND_MTT};
+    e.mtt.type=type; e.mtt.slot=slot; e.mtt.axis=axis; e.mtt.value=value;
+    mouse_touch_handler.event(&display,s.con,&e);
+}
+static void finger(int slot, int x, int y, int type) {
+    mtt(INPUT_MULTI_TOUCH_TYPE_DATA,slot,INPUT_AXIS_X,x);
+    mtt(INPUT_MULTI_TOUCH_TYPE_DATA,slot,INPUT_AXIS_Y,y);
+    mtt(type,slot,0,0);
+}
+/* Contact i of frame at: path, state, identity, top-left pixel. */
+static void contact(unsigned at, unsigned n, unsigned i, unsigned path,
+                    unsigned state, unsigned x, unsigned y) {
+    uint8_t *f=s.touch.frames[at];
+    const uint8_t *c=f+26+30*i;
+    assert(at<s.touch.frame_count && f[0]==0x74 && f[2]==26);
+    assert(lduw_le_p(f+12)==30*n && f[14]==n && s.touch.frame_len[at]==26+30*n);
+    assert(c[0]==path && c[1]==state && c[2]==2+i && c[3]==1);
+    assert(lduw_le_p(c+4)==x && lduw_le_p(c+6)==1136-y);
+    assert(lduw_le_p(c+18)==(state==7?0:256));
+}
 static void tick(void) {
     assert(deadline>=now); now=deadline; mouse_touch_timer_cb(&s);
 }
@@ -123,7 +152,8 @@ static void reset(void) {
     s.con=&s; s.mouse_touch_enabled=true; s.touch.input_control[0]=4;
 }
 int main(void) {
-    assert(mouse_touch_handler.mask==(INPUT_EVENT_MASK_ABS|INPUT_EVENT_MASK_BTN));
+    assert(mouse_touch_handler.mask==
+           (INPUT_EVENT_MASK_ABS|INPUT_EVENT_MASK_BTN|INPUT_EVENT_MASK_MTT));
     assert(mouse_touch_scale(-5,32767,640)==0);
     assert(mouse_touch_scale(32768,32767,640)==640);
     reset();
@@ -225,6 +255,59 @@ int main(void) {
     /* Motion before the down timer preserves the original start/down point. */
     reset(); packet(0,0,true); packet(32767,32767,true);
     tick(); frame(1,3,0,16); tick(); frame(2,4,640,1136);
+    /* Two MTT fingers (pinch): both in every frame, stable paths. */
+    reset();
+    finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN);
+    finger(1,32767,32767,INPUT_MULTI_TOUCH_TYPE_BEGIN);
+    mouse_touch_handler.sync(&display);
+    contact(0,2,0,1,1,0,16); contact(0,2,1,2,1,640,1136);
+    tick(); contact(1,2,0,1,3,0,16); contact(1,2,1,2,3,640,1136);
+    tick(); contact(2,2,1,2,4,640,1136); /* stationary hold keeps 60 Hz */
+    finger(0,16384,16384,INPUT_MULTI_TOUCH_TYPE_UPDATE);
+    finger(1,16384,16384,INPUT_MULTI_TOUCH_TYPE_UPDATE);
+    mouse_touch_handler.sync(&display);
+    tick(); contact(3,2,0,1,4,320,584); contact(3,2,1,2,4,320,584);
+    /* A click during a live MTT gesture cannot start the mouse finger. */
+    packet(0,0,true); assert(!s.mouse_touch.phase); packet(0,0,false);
+    mtt(INPUT_MULTI_TOUCH_TYPE_END,0,0,0);
+    mtt(INPUT_MULTI_TOUCH_TYPE_END,1,0,0);
+    mouse_touch_handler.sync(&display);
+    for (int i=0; i<18; i++) {
+        tick(); contact(4+i,2,0,1,4,320,584); contact(4+i,2,1,2,4,320,584);
+    }
+    tick(); contact(22,2,1,2,4,320,584);
+    tick(); contact(23,2,0,1,7,320,584); contact(23,2,1,2,7,320,584);
+    assert(!multi_touch_active(&s.multi_touch) && deadline==-1);
+    /* Re-touch while draining (quick flicks): up now, then a fresh start. */
+    reset();
+    finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
+    tick(); tick();
+    finger(0,32767,0,INPUT_MULTI_TOUCH_TYPE_END); mouse_touch_handler.sync(&display);
+    tick(); contact(3,1,0,1,4,640,16); /* settle */
+    finger(0,0,32767,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
+    tick(); contact(4,1,0,1,4,640,16);
+    tick(); contact(5,1,0,1,7,640,16);
+    tick(); contact(6,1,0,1,1,0,1136);
+    tick(); contact(7,1,0,1,3,0,1136);
+    /* A finger leaving a live pinch goes up at once; the other stays. */
+    reset();
+    finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN);
+    finger(1,32767,0,INPUT_MULTI_TOUCH_TYPE_BEGIN);
+    mouse_touch_handler.sync(&display); tick(); tick();
+    mtt(INPUT_MULTI_TOUCH_TYPE_END,1,0,0); mouse_touch_handler.sync(&display);
+    tick(); contact(3,2,1,2,4,640,16);
+    tick(); contact(4,2,1,2,7,640,16); contact(4,2,0,1,4,0,16);
+    tick(); contact(5,1,0,1,4,0,16);
+    /* A live mouse finger blocks MTT; that begin needs a fresh one. */
+    reset(); packet(0,0,true);
+    finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
+    assert(!multi_touch_active(&s.multi_touch) && s.multi_touch.slot[0].blocked);
+    /* Gate closed: no MTT contact either. Slots past the limit ignored. */
+    reset(); s.touch.input_control[0]=0;
+    finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
+    assert(!s.touch.frame_count);
+    reset(); finger(MULTI_TOUCH_SLOTS,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN);
+    mouse_touch_handler.sync(&display); assert(!s.touch.frame_count);
     return 0;
 }
 '''

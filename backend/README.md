@@ -370,9 +370,83 @@ quick clicks, FIFO/gate waits, final release coordinates, ignored buttons/consol
 and script/force/disable policies. The SPI harness also checks controller-stop
 cancellation. These tests do not replace a rebuilt QEMU/Cocoa/iOS run.
 
+### Trackpad gestures (iOS Simulator style)
+
+`backend/patches/0004-cocoa-trackpad-touch-gestures.patch` makes the Cocoa
+window translate host gestures into touchscreen fingers:
+
+| Host input | Guest touch |
+|---|---|
+| Click | Tap (one finger) |
+| Click + drag | Pan / swipe (one finger) |
+| Two-finger trackpad scroll | One finger dragged by the scroll deltas; lifts when the fingers leave the trackpad (iOS supplies its own momentum) |
+| Mouse wheel notch | Short one-finger drag (40 px per notch), lifted after 150 ms without notches |
+| Option + click + drag | Pinch: two fingers mirrored around the screen centre |
+| Option + Shift + click + drag | Two fingers (and the pinch centre) move together |
+| Trackpad pinch | Two fingers around the pointer, spread by the magnification |
+
+While Option is held over the screen, two grey dots show where the pinch
+fingers would land, as in the Simulator. Click and drag keep the absolute
+pointer path described above. Scroll, Option and pinch gestures use QEMU
+multi-touch (MTT) slots 0 and 1, which the board turns into report-0x74 frames
+carrying every live finger: header u16 at 12 = total contact bytes (30·n), byte
+14 = contact count n, path ID = slot + 1 and identity = 2 + slot. MTT fingers follow the
+mouse cadence: start1, down3, move4 every tick even when stationary, up7. When
+the last finger lifts after moving more than 10 px, 18 settle frames are sent first;
+otherwise 3. A finger that leaves a live pinch goes up at once. A re-touch
+while the previous contact drains (rapid flicks) lifts that contact on the next
+tick and then starts a fresh one. A mouse finger and MTT gesture never overlap;
+a blocked begin needs a fresh one. QMP `input-send-event` accepts the same `mtt`
+events (`device: a7-touch-display`), so gestures can also be scripted headlessly.
+
 Run `python3 backend/touch_input_contract_test.py` and its diagnostic `--force`
 variant against the rebuilt QEMU for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
 actual source with host stubs and exercises a complete gesture under ASan/UBSan.
 For a live screen probe, use `backend/display_probe.py --stop-condition duration`
 with `--seconds 90` so it continues through the scheduled gesture; this mode
 still captures the final framebuffer and stops on a kernel panic.
+
+### Optional BCM43342 HSIC Wi-Fi
+
+Build in this checkout with `python3 scripts/qemu/build_backend.py` (requires
+libslirp). `backend/live_run.py --wifi` and `backend/display_probe.py --wifi`
+add `-netdev user,id=wifi0` and `-machine wifi-netdev=wifi0`. Wi-Fi remains
+absent when this option is omitted. Use a visible Cocoa window for iOS runs:
+`live_run.py` always does; use `VPHONE_DISPLAY=cocoa` with `display_probe.py`.
+
+The launcher resolves the Mac's SSID using networksetup, wdutil without sudo,
+and system_profiler, with bounded timeouts. `VPHONE_WIFI_SSID` overrides discovery;
+`vphone-wifi` is the fallback. An explicit `-machine wifi-ssid=NAME` overrides
+the environment. SSIDs contain 1–32 UTF-8 bytes. The single synthetic AP is open,
+channel 6, BSSID `02:43:34:20:00:01`; its name does not imply authentication to
+the physical AP. QEMU uses the Mac's existing routed connection through slirp,
+with DHCP/DNS/NAT supplied by `-netdev user`. No guest network state is seeded.
+
+The device starts as `0a5c:4334`, validates a streamed TRX length/CRC, and
+re-enumerates as `0a5c:bd21` after DL_GO. Runtime CDC ioctls, subscribed scan/join
+notifications and BDC Ethernet are modeled without executing Broadcom firmware.
+WPA, AP mode, P2P, AWDL and firmware execution are outside this model.
+
+Run `python3 backend/wifi_contract_test.py` for bare-metal EHCI descriptor,
+ROM, re-enumeration, CDC, scan, join, slirp ARP and DHCP-offer coverage. This is
+synthetic validation; the native iOS driver/Setup/DHCP acceptance is a separate
+maintainer run. With `-d unimp`, `WIFI RDL`, `WIFI runtime attach`, `WIFI CDC`,
+`WIFI iovar` and `WIFI RX event` messages identify protocol progress. A QEMU
+`filter-dump` object on `wifi0` can capture Ethernet/DHCP without instrumenting
+the guest.
+
+Probe180 follow-up: the configured module asserts sideband DEVICE_READY first,
+then waits for GPIO166 HOST_READY before advertising its initial USB connection.
+Later HOST_READY lows retain the connection (`idle-disconnect=0`); a whole-board
+reset requires a fresh handshake. Standard EP0 requests, lengths, USB address,
+speed, reset and configuration results are now logged under `-d unimp`, alongside
+RDL/CDC messages. The Wi-Fi contract includes nonzero USB addressing, the native
+four-byte configuration header probe, full/short string reads, device/interface/
+endpoint GET_STATUS and SET_CONFIGURATION(1). Native acceptance after this
+lifecycle correction still requires a maintainer boot.
+
+User-hook JSON paths (`cache_path`, `index_path`, `exe_paths`) in display_probe
+resolve relative to this checkout first. If absent here, they fall back to the
+primary worktree (the parent of `git rev-parse --git-common-dir`). Explicit
+absolute paths
+are preserved.

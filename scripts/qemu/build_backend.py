@@ -38,29 +38,35 @@ def main():
     if not (venv / 'bin/meson').exists():
         parser.error('Build tools missing; run with --install-build-deps')
     shutil.copyfile(BACKEND / 's5l8960x.c', source / 'hw/arm/s5l8960x.c')
+    for wifi_source in ('wifi_dongle.c', 'wifi_protocol.h'):
+        shutil.copyfile(BACKEND / wifi_source, source / 'hw/arm' / wifi_source)
     additions = {
         'hw/arm/meson.build': "\narm_common_ss.add(when: 'CONFIG_S5L8960X', if_true: files('s5l8960x.c'))\n",
-        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
+        'hw/arm/Kconfig': '\nconfig S5L8960X\n    bool\n    default y\n    depends on TCG && AARCH64\n    select USB_EHCI_SYSBUS\n    select USB_OHCI_SYSBUS\n',
     }
     for relative, addition in additions.items():
         path = source / relative
         original = subprocess.check_output(['git', '-C', str(source), 'show', f'HEAD:{relative}'])
         path.write_bytes(original + addition.encode())
-    # Upstream fixes kept in the repo: restore each touched file to the
-    # pinned commit, then apply, so rebuilds stay idempotent.
-    for patch in sorted((BACKEND / 'patches').glob('*.patch')):
-        touched = [line[6:].strip() for line in patch.read_text().splitlines()
-                   if line.startswith('+++ b/')]
+    # Upstream fixes kept in the repo: restore every touched file to the
+    # pinned commit first, then apply in order, so rebuilds stay idempotent
+    # and later patches may stack on a file an earlier one changed.
+    patches = sorted((BACKEND / 'patches').glob('*.patch'))
+    touched = sorted({line[6:].strip() for patch in patches
+                      for line in patch.read_text().splitlines()
+                      if line.startswith('+++ b/')})
+    if touched:
         run(['git', '-C', source, 'checkout', '--', *touched])
+    for patch in patches:
         run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
     brew = shutil.which('brew')
     brew_prefix = Path(subprocess.check_output([brew, '--prefix'], text=True).strip()) if brew else None
-    pcs = [brew_prefix / 'opt' / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2')] if brew_prefix else []
+    pcs = [brew_prefix / 'opt' / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2', 'libslirp')] if brew_prefix else []
     env['PKG_CONFIG_PATH'] = os.pathsep.join(str(p) for p in pcs if p.exists()) + os.pathsep + env.get('PKG_CONFIG_PATH', '')
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
-        '--disable-user', '--disable-tools', '--disable-werror', '--disable-slirp',
+        '--disable-user', '--disable-tools', '--disable-werror', '--enable-slirp',
         '--enable-cocoa', '--disable-gtk', '--disable-sdl', '--disable-vnc',
         '--disable-hvf', '--enable-tcg', '--disable-plugins', '--disable-pvg']
     sdk = args.sdk or (BACKEND / 'macos-sdk' if (BACKEND / 'macos-sdk').exists() else None)

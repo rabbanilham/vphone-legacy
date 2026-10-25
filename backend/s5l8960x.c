@@ -39,6 +39,8 @@
 #include <sys/file.h>
 #include <math.h>
 
+#include "wifi_dongle.c"
+
 #define TYPE_A7 MACHINE_TYPE_NAME("s5l8960x")
 OBJECT_DECLARE_SIMPLE_TYPE(A7State, A7)
 #define RAM_BASE UINT64_C(0x800000000)
@@ -245,6 +247,29 @@ typedef struct MouseTouch {
     int64_t due;
 } MouseTouch;
 
+/* One reported finger. Path IDs stay stable for a contact's lifetime. */
+typedef struct TouchContact {
+    int x, y;
+    unsigned state, path;
+} TouchContact;
+#define TOUCH_MAX_CONTACTS 5
+#define TOUCH_FRAME_MAX (26 + 30 * TOUCH_MAX_CONTACTS)
+
+/* QEMU MTT slots (trackpad scroll, pinch) share the MouseTouch cadence:
+ * per-finger start/down, one frame per tick carrying every live finger,
+ * and settle frames once the last finger lifts. */
+#define MULTI_TOUCH_SLOTS 2
+typedef struct MultiTouchSlot {
+    int host_x, host_y, x, y, start_x, start_y;
+    bool host_down, pressed, blocked, restart;
+    unsigned phase; /* as MouseTouch */
+} MultiTouchSlot;
+typedef struct MultiTouch {
+    MultiTouchSlot slot[MULTI_TOUCH_SLOTS];
+    unsigned release_frames;
+    int64_t due;
+} MultiTouch;
+
 static int mouse_touch_scale(int value, int maximum, int pixels)
 {
     value = MAX(0, MIN(value, maximum));
@@ -306,6 +331,101 @@ static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
     return true;
 }
 
+static bool multi_touch_active(const MultiTouch *m)
+{
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        if (m->slot[i].phase) { return true; }
+    }
+    return false;
+}
+
+static bool multi_touch_moved(const MultiTouchSlot *c)
+{
+    int dx = c->x - c->start_x, dy = c->y - c->start_y;
+    return dx > 10 || dx < -10 || dy > 10 || dy < -10;
+}
+
+static void multi_touch_start(MultiTouchSlot *c)
+{
+    c->x = c->start_x = c->host_x;
+    c->y = c->start_y = c->host_y;
+    c->phase = 1;
+    c->pressed = true;
+    c->restart = false;
+}
+
+static void multi_touch_sync(MultiTouch *m, bool allowed, int64_t now)
+{
+    bool was_active = multi_touch_active(m);
+    bool any_pressed = false, moved = false, lifted = false;
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &m->slot[i];
+        if (!c->host_down) {
+            c->blocked = c->restart = false;
+        } else if (!c->phase && !c->blocked) {
+            /* Like MouseTouch, an ignored begin needs a fresh one. */
+            if (allowed) { multi_touch_start(c); } else { c->blocked = true; }
+        } else if (c->phase && !c->pressed) {
+            /* Re-touch while the previous contact drains (quick repeated
+             * flicks): lift it on the next tick, then start afresh. */
+            c->restart = true;
+        }
+        if (c->pressed) {
+            c->x = c->host_x;
+            c->y = c->host_y;
+            if (!c->host_down) {
+                c->pressed = false;
+                lifted = true;
+            }
+        }
+        any_pressed |= c->pressed;
+        moved |= c->phase && multi_touch_moved(c);
+    }
+    if (lifted && !any_pressed) { m->release_frames = moved ? 18 : 3; }
+    if (!was_active && multi_touch_active(m)) { m->due = now; }
+}
+
+static unsigned multi_touch_next(MultiTouch *m, int64_t now, bool ready,
+                                 TouchContact *out)
+{
+    unsigned n = 0;
+    bool any_pressed = false, draining = false;
+    if (!multi_touch_active(m) || now < m->due || !ready) { return 0; }
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        any_pressed |= m->slot[i].pressed;
+    }
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &m->slot[i];
+        if (!c->phase) { continue; }
+        TouchContact *o = &out[n++];
+        o->path = i + 1;
+        o->x = c->x; o->y = c->y;
+        if (c->phase <= 2) {
+            o->state = c->phase == 1 ? 1 : 3;
+            o->x = c->start_x; o->y = c->start_y;
+            c->phase++;
+        } else if (c->phase == 3) {
+            o->state = 4;
+            if (!c->pressed) {
+                /* Only the last lift settles; a finger leaving a live
+                 * pinch, or one being re-touched, goes up at once. */
+                if (!any_pressed && !c->restart && m->release_frames) {
+                    draining = true;
+                } else {
+                    c->phase = 4;
+                }
+            }
+        } else {
+            o->state = 7;
+            c->phase = 0;
+            if (c->restart && c->host_down) { multi_touch_start(c); }
+        }
+    }
+    if (draining) { m->release_frames--; }
+    m->due = now + TOUCH_TICK_NS;
+    return n;
+}
+
 typedef struct A7Bridge {
     hwaddr base;
     uint32_t size;
@@ -352,7 +472,7 @@ typedef struct A7Touch {
     A7State *owner;
     uint8_t reporting, sequence;
     uint8_t input_control[4], face_detection, input_reports;
-    uint8_t frames[64][56], frame_len[64];
+    uint8_t frames[64][TOUCH_FRAME_MAX], frame_len[64];
     unsigned frame_head, frame_count;
     uint32_t last_timestamp_us;
 } A7Touch;
@@ -504,6 +624,10 @@ struct A7State {
     A7Bridge bridges[NUM_BRIDGES];
     MemoryRegion usb_dma_memory, usb_dma_ram;
     AddressSpace usb_dma_as;
+    WifiDongle *wifi;
+    char *wifi_netdev, *wifi_ssid;
+    uint64_t wifi_rom;
+    bool wifi_mac_patched;
     MemoryRegion usb_otg;
     uint32_t usb_regs[0x10000 / 4];
     A7Bridge usb_aux[4];
@@ -524,6 +648,7 @@ struct A7State {
     QEMUTimer *touch_timer;
     QEMUTimer *mouse_touch_timer;
     MouseTouch mouse_touch;
+    MultiTouch multi_touch;
     bool mouse_touch_enabled;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
@@ -1044,6 +1169,14 @@ static void touch_gpio_update(A7State *s)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << 15));
     }
+    if (s->wifi) {
+        config = ldl_le_p(s->gpio_regs + 167 * 4);
+        group = (config >> 16) & 0xff;
+        if (group < 7 && (config & 0xe) == 4) {
+            uint8_t *status = s->gpio_regs + 0x800 + group * 0x40 + (167 / 32) * 4;
+            stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
+        }
+    }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
         for (unsigned w = 0; w < 7; w++) {
@@ -1085,6 +1218,9 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
             uint8_t byte = s->gpio_regs[off + i];
             if (off + i == 15 * 4) {
                 byte = (byte & ~1) | !s->pmu.irq_low;
+            }
+            if (off + i == 167 * 4 && s->wifi) {
+                byte = (byte & ~1) | 1;
             }
             if (off + i == 22 * 4) {
                 byte = (byte & ~1) | !s->touch_irq_low;
@@ -1144,6 +1280,9 @@ static void gpio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             } else {
                 s->gpio_regs[a] = byte;
             }
+        }
+        if (s->wifi && off < 167 * 4 && off + size > 166 * 4) {
+            wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
         }
         touch_gpio_update(s);
         for (unsigned pin = 80; pin <= 83; pin++) {
@@ -1449,35 +1588,48 @@ static void touch_enqueue(A7Touch *t, const uint8_t *frame, unsigned len)
 
 /* MultitouchSupport 187ccdfb0 -> 187ccf8e0: report 74, variable header
  * and contact stride; D3 endian=1 selects LE at 187ccf9a0. Full 30-byte
- * contact avoids the derived-force fallback used for 20-byte records. */
-static void touch_contact(A7Touch *t, unsigned state, int x, int y)
+ * contact avoids the derived-force fallback used for 20-byte records.
+ * Header 187ccf708: u16 at 12 is the TOTAL contact bytes and byte 14 the
+ * count; the unpacker derives stride = total / count and rejects a rest. */
+static void touch_contacts(A7Touch *t, const TouchContact *c, unsigned n)
 {
-    uint8_t f[56] = { 0x74, t->sequence++, 26, 4 };
+    uint8_t f[TOUCH_FRAME_MAX] = { 0x74, t->sequence++, 26, 4 };
     uint32_t ts = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    n = MIN(n, TOUCH_MAX_CONTACTS);
     if (ts <= t->last_timestamp_us) {
         ts = t->last_timestamp_us + 1;
     }
     t->last_timestamp_us = ts;
     stl_le_p(f + 4, ts);
     f[10] = 4; /* contact frame, flags[1:0]=0 -> type 6 */
-    stw_le_p(f + 12, 30);
-    f[14] = 1;
-    /* Binary+2 -> MTContact+18 is identity, not flags. Zero is
-     * unidentified and fails MTParserPath::isFingerContact (HID a134).
-     * Identity2 is a finger (1..5); path ID1 stays stable across frames. */
-    f[26] = 1; f[27] = state; f[28] = 2; f[29] = 1;
-    stw_le_p(f + 30, x);
-    stw_le_p(f + 32, 1136 - y); /* user syntax is top-left pixels */
-    stw_le_p(f + 38, state == 7 ? 0 : 400); /* ellipse radii, 1/100 mm */
-    stw_le_p(f + 40, state == 7 ? 0 : 300);
-    stw_le_p(f + 44, state == 7 ? 0 : 256); /* force */
-    /* Full-stride extensions are density and quality, NOT radii:
-     * 187cd1da0..1dbc/1d78..1d8c scale these by 1/256. */
-    stw_le_p(f + 46, state == 7 ? 0 : 256); /* density */
-    stw_le_p(f + 48, state == 7 ? 0 : 256); /* related density */
-    stw_le_p(f + 50, state == 7 ? 0 : 256); /* quality */
-    stw_le_p(f + 52, state == 7 ? 0 : 256); /* signal */
-    touch_enqueue(t, f, sizeof(f));
+    stw_le_p(f + 12, 30 * n);
+    f[14] = n;
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t *p = f + 26 + 30 * i;
+        bool up = c[i].state == 7;
+        /* Binary+2 -> MTContact+18 is identity, not flags. Zero is
+         * unidentified and fails MTParserPath::isFingerContact (HID a134).
+         * Identity 2.. are fingers (1..5); path IDs stay stable per contact. */
+        p[0] = c[i].path; p[1] = c[i].state; p[2] = 2 + i; p[3] = 1;
+        stw_le_p(p + 4, c[i].x);
+        stw_le_p(p + 6, 1136 - c[i].y); /* user syntax is top-left pixels */
+        stw_le_p(p + 12, up ? 0 : 400); /* ellipse radii, 1/100 mm */
+        stw_le_p(p + 14, up ? 0 : 300);
+        stw_le_p(p + 18, up ? 0 : 256); /* force */
+        /* Full-stride extensions are density and quality, NOT radii:
+         * 187cd1da0..1dbc/1d78..1d8c scale these by 1/256. */
+        stw_le_p(p + 20, up ? 0 : 256); /* density */
+        stw_le_p(p + 22, up ? 0 : 256); /* related density */
+        stw_le_p(p + 24, up ? 0 : 256); /* quality */
+        stw_le_p(p + 26, up ? 0 : 256); /* signal */
+    }
+    touch_enqueue(t, f, 26 + 30 * n);
+}
+
+static void touch_contact(A7Touch *t, unsigned state, int x, int y)
+{
+    TouchContact c = { x, y, state, 1 };
+    touch_contacts(t, &c, 1);
 }
 
 static A7Touch *touch_device(A7State *s)
@@ -1519,6 +1671,12 @@ static void touch_stop_contacts(A7Touch *t)
      * keep last_button so a held mouse cannot silently restart it. */
     t->owner->mouse_touch.phase = 0;
     t->owner->mouse_touch.pressed = false;
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &t->owner->multi_touch.slot[i];
+        c->phase = 0;
+        c->pressed = c->restart = false;
+        c->blocked = c->host_down;
+    }
     timer_del(t->owner->mouse_touch_timer);
     unsigned kept = 0;
     for (unsigned i = 0; i < t->frame_count; i++) {
@@ -1619,11 +1777,21 @@ static void mouse_touch_timer_cb(void *opaque)
 {
     A7State *s = opaque;
     MouseTouch *m = &s->mouse_touch;
+    MultiTouch *mt = &s->multi_touch;
     A7Touch *t = touch_device(s);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     TouchScriptFrame f;
+    TouchContact c[MULTI_TOUCH_SLOTS];
+    unsigned n;
     bool ready = t && (s->touch_force || touch_reporting_enabled(t)) &&
                  t->frame_count < ARRAY_SIZE(t->frames);
+    if ((n = multi_touch_next(mt, now, ready, c))) {
+        touch_contacts(t, c, n);
+        qemu_log_mask(LOG_UNIMP, "A7 MTOUCH n=%u state=%u x=%d y=%d "
+                      "rel=%u queued=%u ns=%" PRId64 "\n",
+                      n, c[0].state, c[0].x, c[0].y, mt->release_frames,
+                      t->frame_count, now);
+    }
     if (mouse_touch_next(m, now, ready, &f)) {
         touch_contact(t, f.state, f.x, f.y);
         qemu_log_mask(LOG_UNIMP, "A7 MOUSE state=%u x=%d y=%d phase=%u rel=%u "
@@ -1631,9 +1799,9 @@ static void mouse_touch_timer_cb(void *opaque)
                       f.state, f.x, f.y, m->phase, m->release_frames,
                       t->frame_count, now);
     }
-    if (m->phase != 0) {
-        timer_mod(s->mouse_touch_timer,
-                  m->due > now ? m->due : now + TOUCH_TICK_NS);
+    if (m->phase != 0 || multi_touch_active(mt)) {
+        int64_t due = m->phase ? m->due : mt->due;
+        timer_mod(s->mouse_touch_timer, due > now ? due : now + TOUCH_TICK_NS);
     } else {
         timer_del(s->mouse_touch_timer);
     }
@@ -1657,6 +1825,22 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
     } else if (evt->type == INPUT_EVENT_KIND_BTN &&
                evt->btn.button == INPUT_BUTTON_LEFT) {
         m->button = evt->btn.down;
+    } else if (evt->type == INPUT_EVENT_KIND_MTT &&
+               evt->mtt.slot >= 0 && evt->mtt.slot < MULTI_TOUCH_SLOTS) {
+        MultiTouchSlot *c = &s->multi_touch.slot[evt->mtt.slot];
+        if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_BEGIN) {
+            c->host_down = true;
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_END ||
+                   evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_CANCEL) {
+            c->host_down = false;
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_DATA &&
+                   evt->mtt.axis == INPUT_AXIS_X) {
+            c->host_x = mouse_touch_scale(evt->mtt.value, INPUT_EVENT_ABS_MAX, 640);
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_DATA &&
+                   evt->mtt.axis == INPUT_AXIS_Y) {
+            int y = mouse_touch_scale(evt->mtt.value, INPUT_EVENT_ABS_MAX, 1136);
+            c->host_y = MIN(1136, y + 16); /* same fingertip shift as above */
+        }
     }
 }
 
@@ -1667,14 +1851,17 @@ static void mouse_touch_input_sync(DeviceState *dev)
     bool allowed = s->mouse_touch_enabled && t &&
                    (s->touch_force || touch_reporting_enabled(t)) &&
                    s->touch_step >= s->touch_script.count;
-    mouse_touch_sync(&s->mouse_touch, allowed,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* Mouse and MTT gestures own the digitizer one at a time. */
+    bool multi = multi_touch_active(&s->multi_touch);
+    mouse_touch_sync(&s->mouse_touch, allowed && !multi, now);
+    multi_touch_sync(&s->multi_touch, allowed && !s->mouse_touch.phase, now);
     mouse_touch_timer_cb(s);
 }
 
 static const QemuInputHandler mouse_touch_handler = {
     .name = "A7 touchscreen mouse",
-    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_MTT,
     .event = mouse_touch_event,
     .sync = mouse_touch_input_sync,
 };
@@ -8123,6 +8310,52 @@ static void apple_c15_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t v
     }
 }
 
+static void a7_wifi_patch_mac(A7State *s)
+{
+    if (!s->wifi) {
+        return;
+    }
+    char name[32];
+    /* devicetree_pa is 0x8018d4000. local-mac-address is at 0x8018d48d8 */
+    address_space_read(&address_space_memory, 0x8018d48d8, MEMTXATTRS_UNSPECIFIED, name, 18);
+    if (!memcmp(name, "local-mac-address\0", 18)) {
+        address_space_write(&address_space_memory, 0x8018d48fc, MEMTXATTRS_UNSPECIFIED,
+                            s->wifi->conf.macaddr.a, 6);
+        fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x8018d48fc\n",
+                s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                      s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                      s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                      s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+        return;
+    }
+    /* Fallback search in devicetree area */
+    for (uint64_t pa = 0x8018d0000; pa < 0x8018e0000 - 48; pa += 4) {
+        address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED, name, 18);
+        if (!memcmp(name, "local-mac-address\0", 18)) {
+            uint32_t len = 0;
+            address_space_read(&address_space_memory, pa + 32, MEMTXATTRS_UNSPECIFIED, &len, 4);
+            if (len == 6) {
+                address_space_write(&address_space_memory, pa + 36, MEMTXATTRS_UNSPECIFIED,
+                                    s->wifi->conf.macaddr.a, 6);
+                fprintf(stderr, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x written at PA 0x%" PRIx64 "\n",
+                        s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                        s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                        s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5],
+                        pa + 36);
+                qemu_log_mask(LOG_UNIMP, "WIFI DeviceTree MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                              s->wifi->conf.macaddr.a[0], s->wifi->conf.macaddr.a[1],
+                              s->wifi->conf.macaddr.a[2], s->wifi->conf.macaddr.a[3],
+                              s->wifi->conf.macaddr.a[4], s->wifi->conf.macaddr.a[5]);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "WIFI DeviceTree: local-mac-address not found in PA 0x8018d0000..0x8018e0000\n");
+}
+
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
@@ -8163,12 +8396,17 @@ static void vblank_timer_cb(void *opaque)
             break;
         }
     }
+    if (s->wifi && !s->wifi_mac_patched) {
+        a7_wifi_patch_mac(s);
+        s->wifi_mac_patched = true;
+    }
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
 }
 
 static void a7_reset(void *opaque)
 {
     A7State *s = opaque;
+    s->wifi_mac_patched = false;
     if (s->iop_cpu) {
         cpu_reset(CPU(s->iop_cpu));
         s->iop_started = false;
@@ -8271,6 +8509,7 @@ static void a7_reset(void *opaque)
     if (s->gpio_regs) {
         memset(s->gpio_regs, 0, GPIO_SIZE);
     }
+    if (s->wifi) wifi_power_reset(s->wifi);
     s->touch_irq_low = false;
     for (int i = 0; i < NUM_BRIDGES; i++) {
         if (s->bridges[i].regs) {
@@ -8295,6 +8534,7 @@ static void a7_reset(void *opaque)
     }
     timer_del(s->mouse_touch_timer);
     memset(&s->mouse_touch, 0, sizeof(s->mouse_touch));
+    memset(&s->multi_touch, 0, sizeof(s->multi_touch));
     touch_script_reset(s);
     s->chestnut_control = 0;
     a7_otg_reset(s);
@@ -8377,10 +8617,23 @@ static const GraphicHwOps display_ops = { .gfx_update = display_update };
 
 /* USB complex DT ranges: arm-io +0xc000000, EHCI +0x200000/+0x400000.
  * Use the EHCI engine, including real reset/run/halt, frame clock, W1C,
- * schedule and IRQ semantics. No USB device is attached by this board.
+ * schedule and IRQ semantics. Optional WLAN attaches to EHCI1 port 1.
  * The root-port counts cover the DT's EHCI0 ports 1/3 and EHCI1 port 1;
  * these are a modeled topology, not recovered capability/OTP dumps.
  */
+static void a7_wifi_init(A7State *s, DeviceState *ehci)
+{
+    if (!s->wifi_netdev) return;
+    USBDevice *dev = USB_DEVICE(qdev_new(TYPE_WIFI_DONGLE));
+    qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
+    if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
+    qdev_prop_set_string(DEVICE(dev), "port", "1");
+    if (s->wifi_rom) qdev_prop_set_bit(DEVICE(dev), "rom", true);
+    usb_realize_and_unref(dev, &SYS_BUS_EHCI(ehci)->ehci.bus, &error_fatal);
+    s->wifi = WIFI_DONGLE(dev);
+    wifi_host_ready(s->wifi, ldl_le_p(s->gpio_regs + 166 * 4) & 1);
+}
+
 static void a7_ehci_class_init(ObjectClass *oc, const void *data)
 {
     SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(oc);
@@ -8409,8 +8662,11 @@ static void a7_usb_init(A7State *s)
      * low alias to system memory would also change CPU and other DMA views.
      * No USB iommu-parent/DART exists in the N53 DT. */
     memory_region_init(&s->usb_dma_memory, OBJECT(s), "a7.usb-dma", UINT64_C(0x100000000));
+    /* Alias the bounded system DRAM aperture, not the entire RAM leaf.
+     * QEMU 11 flattens a full-leaf, zero-offset alias to the RAM region;
+     * that loses the relocation when the leaf lives at RAM_BASE. */
     memory_region_init_alias(&s->usb_dma_ram, OBJECT(s), "a7.usb-dram",
-                             MACHINE(s)->ram, 0, GiB);
+                             get_system_memory(), RAM_BASE, GiB);
     memory_region_add_subregion(&s->usb_dma_memory, 0, &s->usb_dma_ram);
     address_space_init(&s->usb_dma_as, &s->usb_dma_memory, "a7.usb-dma");
     static const char *const types[] = { "a7.ehci0", "a7.ehci1" };
@@ -8419,6 +8675,7 @@ static void a7_usb_init(A7State *s)
         SysBusDevice *bus = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(bus, &error_fatal);
         SYS_BUS_EHCI(dev)->ehci.as = &s->usb_dma_as;
+        if (i == 1) a7_wifi_init(s, dev);
         sysbus_mmio_map(bus, 0, UINT64_C(0x20c200000) + i * 0x200000);
         sysbus_connect_irq(bus, 0, qemu_allocate_irq(a7_usb_irq, s, 163 + i * 2));
     }
@@ -8792,6 +9049,8 @@ static void a7_finalize(Object *o)
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
+    g_free(s->wifi_netdev);
+    g_free(s->wifi_ssid);
     g_free(s->system_image);
     g_free(s->data_image);
     g_free(s->utility_image);
@@ -8802,6 +9061,12 @@ static void a7_instance_init(Object *o)
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;
+    object_property_add(o, "wifi-netdev", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_netdev));
+    object_property_add(o, "wifi-ssid", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_ssid));
+    object_property_add(o, "wifi-rom", "uint64", get_address, set_address, NULL,
+                        (void *)offsetof(A7State, wifi_rom));
     s->boot_el = 1;
     s->framebuffer = RAM_BASE + GiB - 4 * MiB;
     object_property_add(o, "utility-image", "str", get_image, set_image, NULL,
@@ -8847,6 +9112,7 @@ static const TypeInfo a7_touch_display_type = {
 };
 static void a7_register(void)
 {
+    type_register_static(&wifi_type);
     static const unsigned ports[] = { 3, 1 };
     static const TypeInfo ehci_types[] = {
         { .name = "a7.ehci0", .parent = TYPE_SYS_BUS_EHCI,
