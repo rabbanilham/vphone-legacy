@@ -157,7 +157,9 @@ print("PASS: wt/touch scroll, wheel, mirrored pinch, shifted pan, magnify, cance
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-gestures-') as tmp:
             tmp = Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            cache = (ROOT/'build/perf/perf-gpu-present/module-cache').resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['swiftc','-module-cache-path',str(cache),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test')],check=True,timeout=20)
 
     def test_control_center_waits_for_digitizer_and_preserves_active_app(self):
@@ -173,7 +175,9 @@ print("PASS: ready guest keeps app context; gated digitizer gets Home wake and r
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-ready-') as tmp:
             tmp=Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            cache = (ROOT/'build/perf/perf-gpu-present/module-cache').resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['swiftc','-module-cache-path',str(cache),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             server=socket.socket(socket.AF_UNIX);server.bind(str(tmp/'qmp'));server.listen()
             errors=[];downs=[]
             def serve():
@@ -232,7 +236,9 @@ print("PASS: fragmented RFB, incremental rectangles, BGR pixels, PNG, coordinate
         with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-test-') as tmp:
             tmp = Path(tmp)
             (tmp / 'main.swift').write_text(source + harness)
-            subprocess.run(['swiftc', '-module-cache-path', str(ROOT/'build/player/module-cache'), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
+            cache = (ROOT/'build/perf/perf-gpu-present/module-cache').resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['swiftc', '-module-cache-path', str(cache), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
             errors = []
             server = socket.socket(socket.AF_UNIX)
             server.bind(str(tmp/'vnc')); server.listen()
