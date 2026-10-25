@@ -36,6 +36,12 @@ final class PixelBuffer {
         IOSurfaceUnlock(surface, [], nil)
     }
 
+    func copy(into other: PixelBuffer) {
+        other.lock()
+        memcpy(other.baseAddress, baseAddress, bytesPerRow * height)
+        other.unlock()
+    }
+
     func makeImage() -> CGImage? {
         lock()
         defer { unlock() }
@@ -50,6 +56,21 @@ final class PixelBuffer {
     }
 }
 
+// CALayer.contents only recomposites when it is given a different object, so
+// each frame is copied into the next surface of a small ring before present.
+// Re-setting the same IOSurface left updates on screen late (or not at all
+// until something else redrew), and writing the presented surface tore.
+final class SurfaceRing {
+    private let buffers = [PixelBuffer(), PixelBuffer(), PixelBuffer()]
+    private var index = 0
+
+    func next(from source: PixelBuffer) -> IOSurface {
+        index = (index + 1) % buffers.count
+        source.copy(into: buffers[index])
+        return buffers[index].surface
+    }
+}
+
 // RFB 3.8, raw pixels with persistent pixel buffer. All blocking I/O stays on the worker queue.
 final class RFB {
     var fd: Int32 = -1
@@ -60,6 +81,7 @@ final class RFB {
     var failed: ((String) -> Void)?
     var width = 0, height = 0
     let pixelBuffer = PixelBuffer()
+    let ring = SurfaceRing()
     func read(_ count: Int) throws -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: count), offset = 0
         while offset < count {
@@ -196,7 +218,7 @@ final class RFB {
                     }
 
                     if let surfaceHandler = surfaceFrame {
-                        surfaceHandler(pixelBuffer.surface)
+                        surfaceHandler(ring.next(from: pixelBuffer))
                     } else if let frameHandler = frame {
                         if let img = pixelBuffer.makeImage() {
                             frameHandler(img)

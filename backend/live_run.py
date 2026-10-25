@@ -47,7 +47,7 @@ def build_player():
             'CFBundleName': 'vphone', 'CFBundlePackageType': 'APPL',
             'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '14.0',
         }))
-        cache = (ROOT / 'build/perf/perf-gpu-present/module-cache').resolve() if (ROOT / 'build/perf/perf-gpu-present').exists() else (ROOT / 'build/player/module-cache').resolve()
+        cache = (ROOT / 'build/player/module-cache').resolve()
         cache.mkdir(parents=True, exist_ok=True)
         subprocess.run(['swiftc', '-O', '-target', f'{platform.machine()}-apple-macosx14.0',
                         '-module-cache-path', str(cache),
