@@ -453,8 +453,10 @@ final class Screen: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         contentLayer.contentsGravity = .resizeAspect
-        contentLayer.magnificationFilter = .nearest
-        contentLayer.minificationFilter = .linear
+        // Smooth scaling like the old NSImage.draw path; nearest made the
+        // upscaled screen look blocky at non-integer window sizes.
+        contentLayer.magnificationFilter = .linear
+        contentLayer.minificationFilter = .trilinear
         layer?.addSublayer(contentLayer)
         layer?.addSublayer(overlayLayer)
     }
