@@ -95,7 +95,7 @@ typedef struct A7Peripheral {
         harness += r'''
 struct A7State {
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
-    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch;
+    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch; MultiTouch multi_touch;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
     bool touch_force;
@@ -466,8 +466,12 @@ int main(void) {
     /* Reproduce the probe84 stop -> BF metadata/read/modify/write path. */
     state.mouse_touch.phase=3; state.mouse_touch.pressed=true;
     state.mouse_touch.button=state.mouse_touch.last_button=true;
+    state.multi_touch.slot[1].phase=3; state.multi_touch.slot[1].pressed=true;
+    state.multi_touch.slot[1].host_down=true;
     pio(p,stop,16,reply);
     assert(!state.mouse_touch.phase && !state.mouse_touch.pressed);
+    /* MTT fingers are cancelled too and need a fresh begin. */
+    assert(!state.multi_touch.slot[1].phase && state.multi_touch.slot[1].blocked);
     assert(state.mouse_touch.button && state.mouse_touch.last_button);
     stw_le_p(fetch+7,touch_sum(fetch,3));pio(p,fetch,9,reply); /* drain fresh unlock notification */
     assert(!touch_reporting_enabled(&p->spi.touch));

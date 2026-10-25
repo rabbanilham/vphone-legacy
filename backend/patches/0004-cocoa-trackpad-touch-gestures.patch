@@ -1,0 +1,356 @@
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -174,6 +174,22 @@
+     QemuCocoaView
+  ------------------------------------------------------
+ */
++/*
++ * vphone: like the iOS Simulator, trackpad gestures drive touchscreen
++ * fingers through QEMU multi-touch (MTT) slots. A plain click/drag stays
++ * on the absolute pointer path (one finger in the guest).
++ *   two-finger scroll -> one finger dragged by the scroll deltas
++ *   notched wheel     -> short one-finger drag per notch
++ *   Option+drag       -> two fingers mirrored around the pinch centre
++ *   Option+Shift+drag -> both fingers (and the centre) move together
++ *   trackpad pinch    -> two fingers spread by the magnification
++ */
++enum { TOUCH_NONE, TOUCH_SCROLL, TOUCH_WHEEL, TOUCH_PINCH, TOUCH_MAGNIFY };
++#define TOUCH_WHEEL_STEP 40     /* guest pixels per wheel notch */
++#define TOUCH_WHEEL_LIFT 0.15   /* seconds without notches before lift */
++#define TOUCH_MAGNIFY_SPAN 160  /* initial finger distance, guest pixels */
++#define TOUCH_FINGER_SIZE 56    /* overlay dot, guest pixels */
++
+ @interface QemuCocoaView : NSView
+ {
+     QEMUScreen screen;
+@@ -195,6 +211,15 @@
+     int mouseX;
+     int mouseY;
+     bool mouseOn;
++    int touchGesture;
++    int touchFingers;
++    NSPoint touchFinger[2]; /* guest pixels, top-left origin */
++    NSPoint pinchCenter;
++    bool pinchCenterSet;
++    NSPoint magnifyCenter;
++    CGFloat magnifyScale;
++    NSTimer *wheelTimer;
++    CALayer *fingerLayer[2];
+ }
+ - (void) switchSurface:(pixman_image_t *)image;
+ - (void) grabMouse;
+@@ -258,6 +283,22 @@
+                                          kCALayerMinYMargin];
+         [[self layer] addSublayer:cursorLayer];
+ 
++        CGColorRef fill = CGColorCreateGenericGray(0.5, 0.45);
++        CGColorRef edge = CGColorCreateGenericGray(1.0, 0.85);
++        for (int i = 0; i < 2; i++) {
++            fingerLayer[i] = [[CALayer alloc] init];
++            [fingerLayer[i] setBounds:CGRectMake(0, 0, TOUCH_FINGER_SIZE,
++                                                 TOUCH_FINGER_SIZE)];
++            [fingerLayer[i] setCornerRadius:TOUCH_FINGER_SIZE / 2];
++            [fingerLayer[i] setBackgroundColor:fill];
++            [fingerLayer[i] setBorderColor:edge];
++            [fingerLayer[i] setBorderWidth:2];
++            [fingerLayer[i] setHidden:YES];
++            [[self layer] addSublayer:fingerLayer[i]];
++        }
++        CGColorRelease(fill);
++        CGColorRelease(edge);
++
+     }
+     return self;
+ }
+@@ -276,6 +317,9 @@
+ 
+     CGColorSpaceRelease(colorspace);
+     [cursorLayer release];
++    [fingerLayer[0] release];
++    [fingerLayer[1] release];
++    [wheelTimer invalidate];
+     cursor_unref(cursor);
+     [super dealloc];
+ }
+@@ -798,6 +842,7 @@
+ 
+     switch ([event type]) {
+         case NSEventTypeFlagsChanged:
++            [self touchHint:modifiers];
+             switch ([event keyCode]) {
+                 case kVK_Shift:
+                     if (!!(modifiers & NSEventModifierFlagShift)) {
+@@ -918,6 +963,10 @@
+             }
+             return true;
+         case NSEventTypeScrollWheel:
++            if (isAbsoluteEnabled) {
++                [self touchScrollLocked:event];
++                return true;
++            }
+             /*
+              * Send wheel events to the guest regardless of window focus.
+              * This is in-line with standard Mac OS X UI behaviour.
+@@ -949,6 +998,217 @@
+     }
+ }
+ 
++- (NSPoint) touchPointFromWindow:(NSPoint)p
++{
++    CGFloat d = (CGFloat)screen.height / [self frame].size.height;
++    NSPoint t = NSMakePoint(p.x * d, screen.height - p.y * d);
++    t.x = MAX(0, MIN(t.x, screen.width - 1));
++    t.y = MAX(0, MIN(t.y, screen.height - 1));
++    return t;
++}
++
++- (BOOL) touchPointerInView
++{
++    NSPoint p = [[self window] mouseLocationOutsideOfEventStream];
++    return NSPointInRect([self convertPoint:p fromView:nil], [self bounds]);
++}
++
++- (NSPoint) touchPointer
++{
++    return [self touchPointFromWindow:[[self window] mouseLocationOutsideOfEventStream]];
++}
++
++- (NSPoint) touchMirror:(NSPoint)p
++{
++    if (!pinchCenterSet) {
++        pinchCenter = NSMakePoint(screen.width / 2.0, screen.height / 2.0);
++        pinchCenterSet = true;
++    }
++    return NSMakePoint(2 * pinchCenter.x - p.x, 2 * pinchCenter.y - p.y);
++}
++
++- (void) touchShowFingers:(int)count at:(const NSPoint *)points
++{
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    for (int i = 0; i < 2; i++) {
++        if (i < count) {
++            [fingerLayer[i] setPosition:CGPointMake(points[i].x,
++                                                    screen.height - points[i].y)];
++        }
++        [fingerLayer[i] setHidden:i >= count];
++    }
++    [CATransaction commit];
++}
++
++/* Option held over the screen shows where a pinch would land. */
++- (void) touchHint:(NSUInteger)modifiers
++{
++    bool option = isAbsoluteEnabled && (modifiers & NSEventModifierFlagOption);
++    if (touchGesture != TOUCH_NONE) {
++        return;
++    }
++    if (!option) {
++        pinchCenterSet = false; /* next pinch mirrors around the centre */
++        [self touchShowFingers:0 at:NULL];
++        return;
++    }
++    if (![self touchPointerInView]) {
++        [self touchShowFingers:0 at:NULL];
++        return;
++    }
++    NSPoint hint[2];
++    hint[0] = [self touchPointer];
++    hint[1] = [self touchMirror:hint[0]];
++    [self touchShowFingers:2 at:hint];
++}
++
++- (void) touchSendLocked:(InputMultiTouchType)type
++{
++    for (int i = 0; i < touchFingers; i++) {
++        NSPoint p = touchFinger[i];
++        p.x = MAX(0, MIN(p.x, screen.width - 1));
++        p.y = MAX(0, MIN(p.y, screen.height - 1));
++        touchFinger[i] = p;
++        qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_X, p.x, 0, screen.width, i, i);
++        qemu_input_queue_mtt_abs(dcl.con, INPUT_AXIS_Y, p.y, 0, screen.height, i, i);
++        qemu_input_queue_mtt(dcl.con, type, i, i);
++    }
++    qemu_input_event_sync();
++    if (type == INPUT_MULTI_TOUCH_TYPE_END) {
++        touchGesture = TOUCH_NONE;
++        touchFingers = 0;
++        [self touchShowFingers:0 at:NULL];
++        [self touchHint:[NSEvent modifierFlags]];
++    } else if (touchFingers == 2) {
++        [self touchShowFingers:2 at:touchFinger];
++    }
++}
++
++- (void) touchWheelLift:(NSTimer *)timer
++{
++    wheelTimer = nil;
++    with_bql(^{
++        if (touchGesture == TOUCH_WHEEL) {
++            [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_END];
++        }
++    });
++}
++
++- (void) touchScrollLocked:(NSEvent *)event
++{
++    CGFloat d = (CGFloat)screen.height / [self frame].size.height;
++    NSEventPhase phase = [event phase];
++    bool inView = [event window] == [self window] && [self touchPointerInView];
++
++    if (phase == NSEventPhaseNone && [event momentumPhase] != NSEventPhaseNone) {
++        /* iOS decelerates on its own from the release velocity. */
++        return;
++    }
++    if (phase == NSEventPhaseNone) {
++        /* Notched wheel: a short drag per notch, lifted after a pause. */
++        if (touchGesture == TOUCH_NONE && inView) {
++            touchGesture = TOUCH_WHEEL;
++            touchFingers = 1;
++            touchFinger[0] = [self touchPointer];
++            [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_BEGIN];
++        }
++        if (touchGesture != TOUCH_WHEEL) {
++            return;
++        }
++        CGFloat scale = [event hasPreciseScrollingDeltas] ? d : TOUCH_WHEEL_STEP;
++        touchFinger[0].x += [event scrollingDeltaX] * scale;
++        touchFinger[0].y += [event scrollingDeltaY] * scale;
++        [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_UPDATE];
++        [wheelTimer invalidate];
++        wheelTimer = [NSTimer scheduledTimerWithTimeInterval:TOUCH_WHEEL_LIFT
++                                                      target:self
++                                                    selector:@selector(touchWheelLift:)
++                                                    userInfo:nil
++                                                     repeats:NO];
++        return;
++    }
++    if (phase & NSEventPhaseBegan) {
++        if (touchGesture != TOUCH_NONE || !inView) {
++            return;
++        }
++        touchGesture = TOUCH_SCROLL;
++        touchFingers = 1;
++        touchFinger[0] = [self touchPointer];
++        [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_BEGIN];
++    } else if (touchGesture != TOUCH_SCROLL) {
++        return;
++    }
++    if (phase & NSEventPhaseChanged) {
++        /* Deltas already follow the host's scroll direction setting. */
++        touchFinger[0].x += [event scrollingDeltaX] * d;
++        touchFinger[0].y += [event scrollingDeltaY] * d;
++        [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_UPDATE];
++    }
++    if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
++        [self touchSendLocked:INPUT_MULTI_TOUCH_TYPE_END];
++    }
++}
++
++/* Option+click starts a two-finger pinch; returns true when consumed. */
++- (bool) touchPinchEvent:(NSEvent *)event type:(InputMultiTouchType)type
++{
++    NSUInteger modifiers = [event modifierFlags];
++    if (type == INPUT_MULTI_TOUCH_TYPE_BEGIN) {
++        if (!isAbsoluteEnabled || !isMouseGrabbed || touchGesture != TOUCH_NONE ||
++            !(modifiers & NSEventModifierFlagOption)) {
++            return false;
++        }
++    } else if (touchGesture != TOUCH_PINCH) {
++        return false;
++    }
++    NSPoint p = [self touchPointFromWindow:[event locationInWindow]];
++    with_bql(^{
++        if (type == INPUT_MULTI_TOUCH_TYPE_BEGIN) {
++            touchGesture = TOUCH_PINCH;
++            touchFingers = 2;
++        } else if (modifiers & NSEventModifierFlagShift) {
++            pinchCenter.x += p.x - touchFinger[0].x;
++            pinchCenter.y += p.y - touchFinger[0].y;
++        }
++        touchFinger[0] = p;
++        touchFinger[1] = [self touchMirror:p];
++        [self touchSendLocked:type];
++    });
++    return true;
++}
++
++- (void) magnifyWithEvent:(NSEvent *)event
++{
++    NSEventPhase phase = [event phase];
++    if (!isAbsoluteEnabled) {
++        return;
++    }
++    with_bql(^{
++        InputMultiTouchType type = INPUT_MULTI_TOUCH_TYPE_UPDATE;
++        if (phase & NSEventPhaseBegan) {
++            if (touchGesture != TOUCH_NONE || ![self touchPointerInView]) {
++                return;
++            }
++            touchGesture = TOUCH_MAGNIFY;
++            touchFingers = 2;
++            magnifyCenter = [self touchPointer];
++            magnifyScale = 1;
++            type = INPUT_MULTI_TOUCH_TYPE_BEGIN;
++        } else if (touchGesture != TOUCH_MAGNIFY) {
++            return;
++        }
++        magnifyScale = MAX(0.1, magnifyScale + [event magnification]);
++        CGFloat r = MIN(TOUCH_MAGNIFY_SPAN / 2.0 * magnifyScale, screen.height);
++        touchFinger[0] = NSMakePoint(magnifyCenter.x - r, magnifyCenter.y);
++        touchFinger[1] = NSMakePoint(magnifyCenter.x + r, magnifyCenter.y);
++        if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
++            type = INPUT_MULTI_TOUCH_TYPE_END;
++        }
++        [self touchSendLocked:type];
++    });
++}
++
+ - (void) handleMouseEvent:(NSEvent *)event button:(InputButton)button down:(bool)down
+ {
+     if (!isMouseGrabbed) {
+@@ -987,6 +1247,7 @@
+ 
+ - (void) mouseExited:(NSEvent *)event
+ {
++    [self touchHint:0];
+     if (isAbsoluteEnabled && isMouseGrabbed) {
+         [self ungrabMouse];
+     }
+@@ -1001,11 +1262,15 @@
+ 
+ - (void) mouseMoved:(NSEvent *)event
+ {
++    [self touchHint:[event modifierFlags]];
+     [self handleMouseEvent:event];
+ }
+ 
+ - (void) mouseDown:(NSEvent *)event
+ {
++    if ([self touchPinchEvent:event type:INPUT_MULTI_TOUCH_TYPE_BEGIN]) {
++        return;
++    }
+     [self handleMouseEvent:event button:INPUT_BUTTON_LEFT down:true];
+ }
+ 
+@@ -1021,6 +1286,9 @@
+ 
+ - (void) mouseDragged:(NSEvent *)event
+ {
++    if ([self touchPinchEvent:event type:INPUT_MULTI_TOUCH_TYPE_UPDATE]) {
++        return;
++    }
+     [self handleMouseEvent:event];
+ }
+ 
+@@ -1036,6 +1304,9 @@
+ 
+ - (void) mouseUp:(NSEvent *)event
+ {
++    if ([self touchPinchEvent:event type:INPUT_MULTI_TOUCH_TYPE_END]) {
++        return;
++    }
+     if (!isMouseGrabbed) {
+         [self grabMouse];
+     }

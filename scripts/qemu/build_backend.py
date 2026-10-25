@@ -46,12 +46,16 @@ def main():
         path = source / relative
         original = subprocess.check_output(['git', '-C', str(source), 'show', f'HEAD:{relative}'])
         path.write_bytes(original + addition.encode())
-    # Upstream fixes kept in the repo: restore each touched file to the
-    # pinned commit, then apply, so rebuilds stay idempotent.
-    for patch in sorted((BACKEND / 'patches').glob('*.patch')):
-        touched = [line[6:].strip() for line in patch.read_text().splitlines()
-                   if line.startswith('+++ b/')]
+    # Upstream fixes kept in the repo: restore every touched file to the
+    # pinned commit first, then apply in order, so rebuilds stay idempotent
+    # and later patches may stack on a file an earlier one changed.
+    patches = sorted((BACKEND / 'patches').glob('*.patch'))
+    touched = sorted({line[6:].strip() for patch in patches
+                      for line in patch.read_text().splitlines()
+                      if line.startswith('+++ b/')})
+    if touched:
         run(['git', '-C', source, 'checkout', '--', *touched])
+    for patch in patches:
         run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
