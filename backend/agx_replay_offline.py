@@ -183,17 +183,17 @@ def fragment_words(f, ppp):
             continue
         base = PDS_HEAP | word
         try:
-            data = [f.u32(base + 4 * i) for i in range(8)]
+            data = [f.u32(base + 4 * i) for i in range(16)]
         except (KeyError, ValueError):
             continue
-        for k in range(0, 8, 2):
+        for k in range(0, 16, 2):
             ptr = data[k] | (data[k + 1] << 32)
             if not 0x1000 <= ptr < (1 << 40):
-                break  # contiguous pointer list; the rest may be the next draw's
+                continue
             try:
-                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
+                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(128)]))
             except (KeyError, ValueError):
-                break  # unmapped or invalid pointer terminates the contiguous list
+                continue
     return found
 
 
@@ -481,7 +481,9 @@ def extract_blur_params(f, vs_data, ppp, prog):
     weights = [t[1] for t in taps]
     direction = def_dir
     n_taps = len(taps)
-    max_taps = 4 if prog == BLUR_4TAP else (7 if prog == BLUR_7TAP else 6)
+    max_taps = 4 if prog == BLUR_4TAP else (7 if prog == BLUR_7TAP else 7)
+    found_offsets = False
+    found_weights = False
 
     # 1. Inspect vertex uniforms (vs_data + 48)
     if vs_data:
@@ -512,31 +514,68 @@ def extract_blur_params(f, vs_data, ppp, prog):
                     if len(read_offs) >= 3:
                         offsets = read_offs
                         n_taps = len(read_offs)
+                        found_offsets = True
         except Exception:
             pass
 
-    # 2. Inspect fragment uniforms for weights
+    # 2. Inspect fragment uniforms for weights and offsets
     if ppp:
         try:
             words = fragment_words(f, ppp)
             for _, ws in words:
                 fl = [struct.unpack('<f', struct.pack('<I', w))[0] for w in ws]
-                for i in range(len(fl)):
-                    if i + n_taps <= len(fl):
-                        sub = fl[i:i + n_taps]
-                        if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
-                            weights = list(sub)
+                # Look for weights
+                if not found_weights:
+                    for n in (7, 4):
+                        for i in range(len(fl) - n + 1):
+                            sub = fl[i:i + n]
+                            if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                                weights = list(sub)
+                                n_taps = n
+                                found_weights = True
+                                break
+                        if found_weights:
                             break
-                if len(weights) == n_taps and weights != [t[1] for t in taps]:
+
+                # Search for offsets in fragment uniforms if not found in vertex uniforms
+                if not found_offsets:
+                    for n in (n_taps, 7, 4):
+                        for offset_sub in (0, 1):
+                            for start_idx in range(len(fl) - n * 4 + 1):
+                                xs = [fl[start_idx + k * 4 + offset_sub] for k in range(n)]
+                                ys = [fl[start_idx + k * 4 + offset_sub + 1] for k in range(n)]
+                                if all(0.05 < xs[k] < 50.0 for k in range(n)) and all(abs(ys[k]) < 0.001 for k in range(n)):
+                                    if all(xs[k] < xs[k + 1] for k in range(n - 1)):
+                                        direction = 'horizontal'
+                                        offsets = xs
+                                        n_taps = n
+                                        found_offsets = True
+                                        break
+                                if all(0.05 < ys[k] < 50.0 for k in range(n)) and all(abs(xs[k]) < 0.001 for k in range(n)):
+                                    if all(ys[k] < ys[k + 1] for k in range(n - 1)):
+                                        direction = 'vertical'
+                                        offsets = ys
+                                        n_taps = n
+                                        found_offsets = True
+                                        break
+                            if found_offsets:
+                                break
+                        if found_offsets:
+                            break
+
+                if found_weights and found_offsets:
                     break
         except Exception:
             pass
+
+    extracted = (found_weights and found_offsets) or (prog in (BLUR_4TAP, BLUR_7TAP))
 
     return {
         'direction': direction,
         'offsets': offsets,
         'weights': weights,
         'n_taps': n_taps,
+        'extracted': extracted,
     }
 
 
@@ -688,18 +727,19 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             pass
 
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
+    if stride == 16 and prog == SPANS:
+        return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
+    if stride == 36 and prog == PILL_BORDER:
+        return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
+    if stride == 12 and is_blur_prog:
+        params = extract_blur_params(f, vs_data, ppp, prog)
+        if params.get('extracted'):
+            d_name = params['direction']
+            n = params['n_taps']
+            return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
+        return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
+
     if not tex and stride not in (20, 28):
-        if stride == 16 and prog == SPANS:
-            return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
-        if stride == 36 and prog == PILL_BORDER:
-            return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
-        if stride == 12 and is_blur_prog:
-            if prog in (BLUR_4TAP, BLUR_7TAP):
-                params = extract_blur_params(f, vs_data, ppp, prog)
-                d_name = params['direction']
-                n = params['n_taps']
-                return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
-            return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
         if stride == 24 and prog == 0:
             return 'skipped: stride 24 untextured with program 0x0', {'stride': stride, 'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
@@ -803,8 +843,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
 
     if is_blur:
-        if prog in (BLUR_4TAP, BLUR_7TAP):
-            params = extract_blur_params(f, vs_data, ppp, prog)
+        params = extract_blur_params(f, vs_data, ppp, prog)
+        if params.get('extracted'):
             d_name = params['direction']
             n = params['n_taps']
             return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap)', {
@@ -1328,7 +1368,17 @@ def main():
                             g = max(0, min(255, int(round(gout * 255.0))))
                             b = max(0, min(255, int(round(bout * 255.0))))
                             a = 255
-                        if tint != 0xffffffff:
+                        if prog == ROUNDED_CAPS and (tex.get('addr') == 0x10524000 or (tex.get('w') == 114 and tex.get('h') == 87)):
+                            cov = (r * a) // 255
+                            ta = tint >> 24
+                            tr = (tint >> 16) & 0xff
+                            tg = (tint >> 8) & 0xff
+                            tb = tint & 0xff
+                            a = (ta * cov) // 255
+                            r = (tr * a) // 255
+                            g = (tg * a) // 255
+                            b = (tb * a) // 255
+                        elif tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4

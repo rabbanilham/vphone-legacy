@@ -5995,7 +5995,7 @@ static unsigned agx_audit_clock(A7State *s, uint64_t cat, AGXSurface *sf)
     return bright;
 }
 
-static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
+static bool agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                                     const uint32_t *ppp, unsigned ppp_count,
                                     uint64_t prog,
                                     float *offsets, float *weights, unsigned *n_taps,
@@ -6029,6 +6029,9 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
     *n_taps = def_taps;
     *is_vertical = def_vert;
 
+    bool found_offsets = false;
+    bool found_weights = false;
+
     if (vs_data) {
         uint32_t vs_hdr[16];
         if (agx_ctx_read(s, cat, vs_data, vs_hdr, sizeof(vs_hdr))) {
@@ -6044,7 +6047,8 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                         *is_vertical = true;
                     }
                     unsigned read_taps = 0;
-                    for (unsigned i = 0; i < max_taps; i++) {
+                    unsigned limit_taps = (max_taps > 0) ? max_taps : 7;
+                    for (unsigned i = 0; i < limit_taps; i++) {
                         float off = *is_vertical ? *(float *)&u_words[16 + 4 * i + 1]
                                                  : *(float *)&u_words[16 + 4 * i];
                         if (off > 0.05f && off < 50.0f) {
@@ -6056,6 +6060,7 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
                     }
                     if (read_taps >= 3) {
                         *n_taps = read_taps;
+                        found_offsets = true;
                     }
                 }
             }
@@ -6065,31 +6070,76 @@ static void agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
     if (ppp && ppp_count) {
         for (unsigned i = 0; i < ppp_count; i++) {
             if ((ppp[i] & 0xc0000000) != 0x80000000) continue;
-            uint32_t data[8];
+            uint32_t data[16];
             if (!agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], data, sizeof(data))) continue;
-            for (unsigned k = 0; k < 8; k += 2) {
+            for (unsigned k = 0; k < 16; k += 2) {
                 uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
-                if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) break;
-                uint32_t f_words[16];
-                if (!agx_ctx_read(s, cat, ptr, f_words, sizeof(f_words))) break;
-                for (unsigned s_idx = 0; s_idx + *n_taps <= 16; s_idx++) {
-                    float sum = 0.0f;
-                    bool ok = true;
-                    for (unsigned t = 0; t < *n_taps; t++) {
-                        float w = *(float *)&f_words[s_idx + t];
-                        if (w < 0.0005f || w > 0.6f) { ok = false; break; }
-                        sum += w;
-                    }
-                    if (ok && fabsf(sum - 0.5f) < 0.01f) {
-                        for (unsigned t = 0; t < *n_taps; t++) {
-                            weights[t] = *(float *)&f_words[s_idx + t];
+                if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) continue;
+                uint32_t f_words[128];
+                if (!agx_ctx_read(s, cat, ptr, f_words, sizeof(f_words))) continue;
+
+                /* Search for weights */
+                if (!found_weights) {
+                    for (unsigned n = 7; n >= 4; n = (n == 7 ? 4 : 0)) {
+                        for (unsigned s_idx = 0; s_idx + n <= 128; s_idx++) {
+                            float sum = 0.0f;
+                            bool ok = true;
+                            for (unsigned t = 0; t < n; t++) {
+                                float w = *(float *)&f_words[s_idx + t];
+                                if (w < 0.0005f || w > 0.6f) { ok = false; break; }
+                                sum += w;
+                            }
+                            if (ok && fabsf(sum - 0.5f) < 0.01f) {
+                                *n_taps = n;
+                                for (unsigned t = 0; t < n; t++) {
+                                    weights[t] = *(float *)&f_words[s_idx + t];
+                                }
+                                found_weights = true;
+                                break;
+                            }
                         }
-                        return;
+                        if (found_weights) break;
                     }
                 }
+
+                /* Search for offsets if not found in vertex uniforms */
+                if (!found_offsets) {
+                    for (unsigned sub = 0; sub <= 1; sub++) {
+                        for (unsigned s_idx = 0; s_idx + (*n_taps) * 4 + sub + 1 <= 128; s_idx++) {
+                            bool is_h = true, is_v = true;
+                            float read_offs[8];
+                            for (unsigned t = 0; t < *n_taps; t++) {
+                                float ox = *(float *)&f_words[s_idx + t * 4 + sub];
+                                float oy = *(float *)&f_words[s_idx + t * 4 + sub + 1];
+                                if (!(ox > 0.05f && ox < 50.0f && fabsf(oy) < 0.001f)) is_h = false;
+                                if (!(oy > 0.05f && oy < 50.0f && fabsf(ox) < 0.001f)) is_v = false;
+                                if (is_h) read_offs[t] = ox;
+                                else if (is_v) read_offs[t] = oy;
+                                else break;
+                            }
+                            if (is_h) {
+                                for (unsigned t = 0; t < *n_taps; t++) offsets[t] = read_offs[t];
+                                *is_vertical = false;
+                                found_offsets = true;
+                                break;
+                            } else if (is_v) {
+                                for (unsigned t = 0; t < *n_taps; t++) offsets[t] = read_offs[t];
+                                *is_vertical = true;
+                                found_offsets = true;
+                                break;
+                            }
+                        }
+                        if (found_offsets) break;
+                    }
+                }
+
+                if (found_weights && found_offsets) break;
             }
+            if (found_weights && found_offsets) break;
         }
     }
+
+    return (found_weights && found_offsets) || (prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP);
 }
 
 static bool agx_extract_color_matrix(A7State *s, uint64_t cat,
@@ -6976,9 +7026,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 float blur_offs[8], blur_ws[8];
                                 unsigned blur_taps = 0;
                                 bool blur_vert = false;
-                                agx_extract_blur_params(s, cat, vs_data, retained_ppp, 32, prog,
-                                                        blur_offs, blur_ws, &blur_taps, &blur_vert);
-                                if (prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP) {
+                                bool blur_found = agx_extract_blur_params(s, cat, vs_data, retained_ppp, 32, prog,
+                                                                          blur_offs, blur_ws, &blur_taps, &blur_vert);
+                                if (blur_found || prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP) {
                                     agx_blur_1d(raw_tex, tmp_tex, bw, bh,
                                                 blur_offs, blur_ws, blur_taps, blur_vert);
                                 } else {
@@ -7138,7 +7188,18 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
                         uint32_t dst = row[x - x0], out = 0;
-                        if (tint != 0xffffffff) {
+                        if (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87))) {
+                            uint32_t cov = (((src >> 16) & 0xff) * (src >> 24)) / 255;
+                            uint32_t ta = (tint >> 24) & 0xff;
+                            uint32_t tr = (tint >> 16) & 0xff;
+                            uint32_t tg = (tint >> 8) & 0xff;
+                            uint32_t tb = tint & 0xff;
+                            uint32_t a = (ta * cov) / 255;
+                            uint32_t r = (tr * a) / 255;
+                            uint32_t g = (tg * a) / 255;
+                            uint32_t b = (tb * a) / 255;
+                            src = (a << 24) | (r << 16) | (g << 8) | b;
+                        } else if (tint != 0xffffffff) {
                             uint32_t m = 0;
                             for (unsigned c = 0; c < 32; c += 8) {
                                 m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
