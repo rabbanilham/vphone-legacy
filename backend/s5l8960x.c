@@ -5865,6 +5865,30 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
     return tex->addr + (uint64_t)y * tex->stride + x * 4;
 }
 
+static __thread uint32_t agx_morton_x_lut[4096];
+static __thread uint32_t agx_morton_cached_w = 0, agx_morton_cached_h = 0;
+
+static void agx_update_morton_lut(uint32_t w, uint32_t h)
+{
+    if (agx_morton_cached_w == w && agx_morton_cached_h == h) {
+        return;
+    }
+    for (uint32_t x = 0; x < w && x < 4096; x++) {
+        uint32_t offset = 0;
+        unsigned bit = 0;
+        for (unsigned mask = 1; mask < w || mask < h; mask <<= 1) {
+            if (mask < h) { bit++; }
+            if (mask < w) {
+                if (x & mask) { offset |= 1u << bit; }
+                bit++;
+            }
+        }
+        agx_morton_x_lut[x] = offset;
+    }
+    agx_morton_cached_w = w;
+    agx_morton_cached_h = h;
+}
+
 /* A Morton row is scattered within 4 KiB tiles. Cache one tile while
  * gathering it, instead of walking the GPU tables for every pixel. */
 static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
@@ -5872,6 +5896,31 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
 {
     if (!tex->twiddled) {
         return agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), out, tex->w * 4);
+    }
+    if (tex->w <= 4096) {
+        agx_update_morton_lut(tex->w, tex->h);
+        uint64_t y_offset = 0;
+        unsigned bit = 0;
+        for (unsigned mask = 1; mask < tex->w || mask < tex->h; mask <<= 1) {
+            if (mask < tex->h) {
+                if (y & mask) { y_offset |= (uint64_t)1 << bit; }
+                bit++;
+            }
+            if (mask < tex->w) { bit++; }
+        }
+        uint8_t page[4096];
+        uint64_t cached = UINT64_MAX;
+        uint64_t base_addr = tex->addr;
+        for (unsigned x = 0; x < tex->w; x++) {
+            uint64_t gva = base_addr + ((y_offset | (uint64_t)agx_morton_x_lut[x]) << 2);
+            uint64_t base = gva & ~UINT64_C(0xfff);
+            if (base != cached) {
+                if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+                cached = base;
+            }
+            out[x] = ldl_le_p(page + (gva & 0xfff));
+        }
+        return true;
     }
     uint8_t page[4096];
     uint64_t cached = UINT64_MAX;
@@ -5907,14 +5956,24 @@ static uint32_t agx_blend_vibrancy(uint32_t dst, uint32_t src)
 }
 
 /* Premultiplied BGRA src-over, alpha included (offscreen layers keep it). */
-static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
+static inline __attribute__((always_inline)) uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 {
-    uint32_t a = src >> 24, out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
-        out |= MIN(v, 255u) << c;
+    uint32_t a = src >> 24;
+    if (a == 255) {
+        return src;
     }
-    return out;
+    if (src == 0) {
+        return dst;
+    }
+    uint32_t inv_a = 255 - a;
+    uint32_t b = (src & 0xff) + ((dst & 0xff) * inv_a) / 255;
+    uint32_t g = ((src >> 8) & 0xff) + (((dst >> 8) & 0xff) * inv_a) / 255;
+    uint32_t r = ((src >> 16) & 0xff) + (((dst >> 16) & 0xff) * inv_a) / 255;
+    uint32_t oa = a + ((dst >> 24) * inv_a) / 255;
+    return (MIN(b, 255u)) |
+           (MIN(g, 255u) << 8) |
+           (MIN(r, 255u) << 16) |
+           (MIN(oa, 255u) << 24);
 }
 
 /* CA fragment shaders recognised by an FNV-1a hash of the first 64 bytes of
@@ -5934,12 +5993,11 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 /* Additive blend (CoreAnimation plusL / plusLighter): clamp(S + D, 0, 255). */
 static inline uint32_t agx_blend_plus_lighter(uint32_t dst, uint32_t src)
 {
-    uint32_t out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff);
-        out |= MIN(v, 255u) << c;
-    }
-    return out;
+    uint32_t b = (src & 0xff) + (dst & 0xff);
+    uint32_t g = ((src >> 8) & 0xff) + ((dst >> 8) & 0xff);
+    uint32_t r = ((src >> 16) & 0xff) + ((dst >> 16) & 0xff);
+    uint32_t a = (src >> 24) + (dst >> 24);
+    return MIN(b, 255u) | (MIN(g, 255u) << 8) | (MIN(r, 255u) << 16) | (MIN(a, 255u) << 24);
 }
 
 __attribute__((unused))
@@ -6016,23 +6074,51 @@ static const struct {
 
 static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
                                                 uint32_t c01, uint32_t c11,
+                                                float fx, float fy);
+
+static inline __attribute__((always_inline)) uint32_t agx_bilinear_interpolate_wy(uint32_t c00, uint32_t c10,
+                                                                                    uint32_t c01, uint32_t c11,
+                                                                                    float fx, int wy)
+{
+    if (c00 == c10 && c00 == c01 && c00 == c11) {
+        return c00;
+    }
+    int wx = (int)(fx * 256.0f + 0.5f);
+    if ((wx | wy) == 0) {
+        return c00;
+    }
+    if (wy == 0 || (c00 == c01 && c10 == c11)) {
+        if (wx == 0) {
+            return c00;
+        }
+        int w0 = 256 - wx, w1 = wx;
+        uint32_t b = ((c00 & 0xff) * w0 + (c10 & 0xff) * w1 + 128) >> 8;
+        uint32_t g = (((c00 >> 8) & 0xff) * w0 + ((c10 >> 8) & 0xff) * w1 + 128) >> 8;
+        uint32_t r = (((c00 >> 16) & 0xff) * w0 + ((c10 >> 16) & 0xff) * w1 + 128) >> 8;
+        uint32_t a = ((c00 >> 24) * w0 + (c10 >> 24) * w1 + 128) >> 8;
+        return b | (g << 8) | (r << 16) | (a << 24);
+    }
+    int w00 = (256 - wx) * (256 - wy);
+    int w10 = wx * (256 - wy);
+    int w01 = (256 - wx) * wy;
+    int w11 = wx * wy;
+
+    uint32_t b = ((c00 & 0xff) * w00 + (c10 & 0xff) * w10 +
+                  (c01 & 0xff) * w01 + (c11 & 0xff) * w11 + 32768) >> 16;
+    uint32_t g = (((c00 >> 8) & 0xff) * w00 + ((c10 >> 8) & 0xff) * w10 +
+                  ((c01 >> 8) & 0xff) * w01 + ((c11 >> 8) & 0xff) * w11 + 32768) >> 16;
+    uint32_t r = (((c00 >> 16) & 0xff) * w00 + ((c10 >> 16) & 0xff) * w10 +
+                  ((c01 >> 16) & 0xff) * w01 + ((c11 >> 16) & 0xff) * w11 + 32768) >> 16;
+    uint32_t a = ((c00 >> 24) * w00 + (c10 >> 24) * w10 +
+                  (c01 >> 24) * w01 + (c11 >> 24) * w11 + 32768) >> 16;
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
+static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
+                                                uint32_t c01, uint32_t c11,
                                                 float fx, float fy)
 {
-    int wx = (int)(fx * 256.0f + 0.5f);
-    int wy = (int)(fy * 256.0f + 0.5f);
-    uint32_t out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        int b00 = (c00 >> c) & 0xff;
-        int b10 = (c10 >> c) & 0xff;
-        int b01 = (c01 >> c) & 0xff;
-        int b11 = (c11 >> c) & 0xff;
-        int top = b00 * (256 - wx) + b10 * wx;
-        int bot = b01 * (256 - wx) + b11 * wx;
-        int val = (top * (256 - wy) + bot * wy + 32768) >> 16;
-        int iv = val < 0 ? 0 : (val > 255 ? 255 : val);
-        out |= (uint32_t)iv << c;
-    }
-    return out;
+    return agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, (int)(fy * 256.0f + 0.5f));
 }
 
 static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h, float u, float v)
@@ -6060,39 +6146,113 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
+static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+{
+    int w = (int)(frac * 256.0f + 0.5f);
+    if (w == 0 || c0 == c1) {
+        return c0;
+    }
+    int w0 = 256 - w, w1 = w;
+    uint32_t b = ((c0 & 0xff) * w0 + (c1 & 0xff) * w1 + 128) >> 8;
+    uint32_t g = (((c0 >> 8) & 0xff) * w0 + ((c1 >> 8) & 0xff) * w1 + 128) >> 8;
+    uint32_t r = (((c0 >> 16) & 0xff) * w0 + ((c1 >> 16) & 0xff) * w1 + 128) >> 8;
+    uint32_t a = ((c0 >> 24) * w0 + (c1 >> 24) * w1 + 128) >> 8;
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
 {
     if (!n_taps || !w || !h) return;
-    for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = 0; x < w; x++) {
-            float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (is_vertical) {
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t y0_pos[8], y1_pos[8], y0_neg[8], y1_neg[8];
+            float fy_pos[8], fy_neg[8];
             for (unsigned t = 0; t < n_taps; t++) {
                 float off = offsets[t];
-                float weight = weights[t];
-                uint32_t s_pos, s_neg;
-                if (is_vertical) {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
-                } else {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
-                }
-                for (unsigned c = 0; c < 4; c++) {
-                    float cp = (float)((s_pos >> (c * 8)) & 0xff);
-                    float cn = (float)((s_neg >> (c * 8)) & 0xff);
-                    acc[c] += (cp + cn) * weight;
-                }
+                float fv_p = (float)y + off;
+                if (fv_p < 0.0f) fv_p = 0.0f;
+                if (fv_p > (float)(h - 1)) fv_p = (float)(h - 1);
+                y0_pos[t] = (uint32_t)fv_p;
+                y1_pos[t] = y0_pos[t] + 1 < h ? y0_pos[t] + 1 : y0_pos[t];
+                fy_pos[t] = fv_p - (float)y0_pos[t];
+
+                float fv_n = (float)y - off;
+                if (fv_n < 0.0f) fv_n = 0.0f;
+                if (fv_n > (float)(h - 1)) fv_n = (float)(h - 1);
+                y0_neg[t] = (uint32_t)fv_n;
+                y1_neg[t] = y0_neg[t] + 1 < h ? y0_neg[t] + 1 : y0_neg[t];
+                fy_neg[t] = fv_n - (float)y0_neg[t];
             }
-            uint32_t out = 0;
-            for (unsigned c = 0; c < 4; c++) {
-                int iv = (int)lroundf(acc[c]);
-                if (iv < 0) iv = 0;
-                if (iv > 255) iv = 255;
-                out |= (uint32_t)iv << (c * 8);
+            uint32_t *row_out = buf_tmp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (unsigned t = 0; t < n_taps; t++) {
+                    float weight = weights[t];
+                    uint32_t c00_p = buf_in[(size_t)y0_pos[t] * w + x];
+                    uint32_t c01_p = buf_in[(size_t)y1_pos[t] * w + x];
+                    uint32_t s_pos = agx_sample_1d(c00_p, c01_p, fy_pos[t]);
+
+                    uint32_t c00_n = buf_in[(size_t)y0_neg[t] * w + x];
+                    uint32_t c01_n = buf_in[(size_t)y1_neg[t] * w + x];
+                    uint32_t s_neg = agx_sample_1d(c00_n, c01_n, fy_neg[t]);
+
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                }
+                int iv0 = (int)lroundf(acc[0]);
+                int iv1 = (int)lroundf(acc[1]);
+                int iv2 = (int)lroundf(acc[2]);
+                int iv3 = (int)lroundf(acc[3]);
+                row_out[x] = (uint32_t)(iv0 < 0 ? 0 : (iv0 > 255 ? 255 : iv0)) |
+                             ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
+                             ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
+                             ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
             }
-            buf_tmp[y * w + x] = out;
+        }
+    } else {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t *row_in = buf_in + (size_t)y * w;
+            uint32_t *row_out = buf_tmp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (unsigned t = 0; t < n_taps; t++) {
+                    float off = offsets[t];
+                    float weight = weights[t];
+
+                    float fu_p = (float)x + off;
+                    if (fu_p < 0.0f) fu_p = 0.0f;
+                    if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
+                    uint32_t x0_p = (uint32_t)fu_p;
+                    uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
+                    float fx_p = fu_p - (float)x0_p;
+                    uint32_t s_pos = agx_sample_1d(row_in[x0_p], row_in[x1_p], fx_p);
+
+                    float fu_n = (float)x - off;
+                    if (fu_n < 0.0f) fu_n = 0.0f;
+                    if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
+                    uint32_t x0_n = (uint32_t)fu_n;
+                    uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
+                    float fx_n = fu_n - (float)x0_n;
+                    uint32_t s_neg = agx_sample_1d(row_in[x0_n], row_in[x1_n], fx_n);
+
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                }
+                int iv0 = (int)lroundf(acc[0]);
+                int iv1 = (int)lroundf(acc[1]);
+                int iv2 = (int)lroundf(acc[2]);
+                int iv3 = (int)lroundf(acc[3]);
+                row_out[x] = (uint32_t)(iv0 < 0 ? 0 : (iv0 > 255 ? 255 : iv0)) |
+                             ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
+                             ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
+                             ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+            }
         }
     }
     for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -6560,6 +6720,29 @@ static bool agx_extract_color_matrix(A7State *s, uint64_t cat,
     return false;
 }
 
+static __thread uint32_t *agx_scratch1 = NULL;
+static __thread size_t agx_scratch1_cap = 0;
+static __thread uint32_t *agx_scratch2 = NULL;
+static __thread size_t agx_scratch2_cap = 0;
+
+static uint32_t *agx_get_scratch1(size_t count)
+{
+    if (count > agx_scratch1_cap) {
+        agx_scratch1 = g_realloc(agx_scratch1, count * sizeof(uint32_t));
+        agx_scratch1_cap = count;
+    }
+    return agx_scratch1;
+}
+
+static uint32_t *agx_get_scratch2(size_t count)
+{
+    if (count > agx_scratch2_cap) {
+        agx_scratch2 = g_realloc(agx_scratch2, count * sizeof(uint32_t));
+        agx_scratch2_cap = count;
+    }
+    return agx_scratch2;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear, uint32_t pitch, uint64_t scissor_base)
@@ -6732,8 +6915,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             uint32_t *blurred_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
-                uint32_t *raw_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
-                uint32_t *tmp_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
+                size_t num_pix = (size_t)tex.w * tex.h;
+                uint32_t *raw_tex = agx_get_scratch1(num_pix);
+                uint32_t *tmp_tex = agx_get_scratch2(num_pix);
                 if (raw_tex && tmp_tex) {
                     bool read_ok = true;
                     for (uint32_t ty = 0; ty < tex.h; ty++) {
@@ -6751,11 +6935,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         agx_blur_1d(raw_tex, tmp_tex, tex.w, tex.h,
                                     blur_offs, blur_ws, blur_taps, blur_vert);
                         blurred_tex = raw_tex;
-                        raw_tex = NULL;
                     }
                 }
-                g_free(raw_tex);
-                g_free(tmp_tex);
             }
             unsigned step = (count == 4) ? 4 : 6;
             bool any_drawn = false;
@@ -6938,6 +7119,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         float cy = (float)y + 0.5f;
                         float fy = (cy - qminy) / qh;
                         int first_in = -1, last_in = -1;
+                        float cov_buf[640];
                         for (int x = x0; x < x1; x++) {
                             float cx = (float)x + 0.5f;
                             float fx = (cx - qminx) / qw;
@@ -6954,8 +7136,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
                             float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
                             if (outer_cov > 0.0f && inner_cov > 0.0f) {
+                                outer_cov = (outer_cov > 1.0f ? 1.0f : outer_cov);
+                                inner_cov = (inner_cov > 1.0f ? 1.0f : inner_cov);
+                                cov_buf[x - x0] = outer_cov * inner_cov;
                                 if (first_in < 0) first_in = x;
                                 last_in = x;
+                            } else {
+                                cov_buf[x - x0] = 0.0f;
                             }
                         }
                         if (first_in < 0) {
@@ -6967,23 +7154,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             continue;
                         }
                         for (int x = first_in; x <= last_in; x++) {
-                            float cx = (float)x + 0.5f;
-                            float fx = (cx - qminx) / qw;
-                            float u1 = (1.0f - fx) * (1.0f - fy) * u1_tl + fx * (1.0f - fy) * u1_tr +
-                                       (1.0f - fx) * fy * u1_bl + fx * fy * u1_br;
-                            float v1 = (1.0f - fx) * (1.0f - fy) * v1_tl + fx * (1.0f - fy) * v1_tr +
-                                       (1.0f - fx) * fy * v1_bl + fx * fy * v1_br;
-                            float u2 = (1.0f - fx) * (1.0f - fy) * u2_tl + fx * (1.0f - fy) * u2_tr +
-                                       (1.0f - fx) * fy * u2_bl + fx * fy * u2_br;
-                            float v2 = (1.0f - fx) * (1.0f - fy) * v2_tl + fx * (1.0f - fy) * v2_tr +
-                                       (1.0f - fx) * fy * v2_bl + fx * fy * v2_br;
-                            float r1 = sqrtf(u1 * u1 + v1 * v1);
-                            float r2 = sqrtf(u2 * u2 + v2 * v2);
-                            float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
-                            float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
-                            outer_cov = (outer_cov < 0.0f) ? 0.0f : (outer_cov > 1.0f ? 1.0f : outer_cov);
-                            inner_cov = (inner_cov < 0.0f) ? 0.0f : (inner_cov > 1.0f ? 1.0f : inner_cov);
-                            float cov = outer_cov * inner_cov;
+                            float cov = cov_buf[x - x0];
                             if (cov > 0.0f) {
                                 uint32_t a = (uint32_t)lroundf((float)base_a * cov);
                                 uint32_t b = (uint32_t)lroundf((float)base_b * cov);
@@ -7143,6 +7314,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 float cy = (float)y + 0.5f;
                                 float py = cy - lp0[1];
                                 int first_in = -1, last_in = -1;
+                                float cov_buf[640];
                                 for (int x = x0; x < x1; x++) {
                                     float cx = (float)x + 0.5f;
                                     float px = cx - lp0[0];
@@ -7151,14 +7323,20 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                     float min_end = (t < (L - t)) ? t : (L - t);
                                     float cov_par = min_end + 0.5f;
                                     if (cov_par <= 0.0f) {
+                                        cov_buf[x - x0] = 0.0f;
                                         continue;
                                     }
                                     float cross = dx * py - dy * px;
                                     float dist_perp = fabsf(cross) * inv_L;
                                     float cov_perp = half_w + 0.5f - dist_perp;
                                     if (cov_perp > 0.0f) {
+                                        cov_par = (cov_par > 1.0f) ? 1.0f : cov_par;
+                                        cov_perp = (cov_perp > 1.0f) ? 1.0f : cov_perp;
+                                        cov_buf[x - x0] = cov_perp * cov_par;
                                         if (first_in < 0) first_in = x;
                                         last_in = x;
+                                    } else {
+                                        cov_buf[x - x0] = 0.0f;
                                     }
                                 }
                                 if (first_in < 0) {
@@ -7174,18 +7352,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 uint32_t g = (colour >> 8) & 0xff;
                                 uint32_t b = colour & 0xff;
                                 for (int x = first_in; x <= last_in; x++) {
-                                    float cx = (float)x + 0.5f;
-                                    float px = cx - lp0[0];
-                                    float dot = px * dx + py * dy;
-                                    float t = dot * inv_L;
-                                    float min_end = (t < (L - t)) ? t : (L - t);
-                                    float cov_par = min_end + 0.5f;
-                                    cov_par = (cov_par < 0.0f) ? 0.0f : ((cov_par > 1.0f) ? 1.0f : cov_par);
-                                    float cross = dx * py - dy * px;
-                                    float dist_perp = fabsf(cross) * inv_L;
-                                    float cov_perp = half_w + 0.5f - dist_perp;
-                                    cov_perp = (cov_perp < 0.0f) ? 0.0f : ((cov_perp > 1.0f) ? 1.0f : cov_perp);
-                                    float cov = cov_perp * cov_par;
+                                    float cov = cov_buf[x - x0];
                                     if (cov > 0.0f) {
                                         uint32_t ca = (uint32_t)lroundf((float)a * cov);
                                         uint32_t cr = (uint32_t)lroundf((float)r * cov);
@@ -7256,8 +7423,23 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         if (agx_ctx_read(s, cat, buf + (uint64_t)t * stride + 16, &tri_colour, 4)) {
                             tri_colour = (tri_colour & 0xff00ff00u) | ((tri_colour >> 16) & 0xff) | ((tri_colour & 0xff) << 16);
                         }
+                        uint32_t a = tri_colour >> 24;
+                        uint32_t r = (tri_colour >> 16) & 0xff;
+                        uint32_t g = (tri_colour >> 8) & 0xff;
+                        uint32_t b = tri_colour & 0xff;
+                        uint32_t src_table[17];
+                        src_table[0] = 0;
+                        for (unsigned c = 1; c <= 16; c++) {
+                            float cov = (float)c * 0.0625f;
+                            uint32_t ca = (uint32_t)lroundf((float)a * cov);
+                            uint32_t cr = (uint32_t)lroundf((float)r * cov);
+                            uint32_t cg = (uint32_t)lroundf((float)g * cov);
+                            uint32_t cb = (uint32_t)lroundf((float)b * cov);
+                            src_table[c] = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                        }
                         for (int y = y0; y < y1; y++) {
                             int first_in = -1, last_in = -1;
+                            uint8_t cnt_buf[640];
                             for (int x = x0; x < x1; x++) {
                                 unsigned cnt = 0;
                                 for (unsigned si = 0; si < 4; si++) {
@@ -7274,6 +7456,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                         }
                                     }
                                 }
+                                cnt_buf[x - x0] = (uint8_t)cnt;
                                 if (cnt > 0) {
                                     if (first_in < 0) first_in = x;
                                     last_in = x;
@@ -7287,33 +7470,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
                                 continue;
                             }
-                            uint32_t a = tri_colour >> 24;
-                            uint32_t r = (tri_colour >> 16) & 0xff;
-                            uint32_t g = (tri_colour >> 8) & 0xff;
-                            uint32_t b = tri_colour & 0xff;
                             for (int x = first_in; x <= last_in; x++) {
-                                unsigned cnt = 0;
-                                for (unsigned si = 0; si < 4; si++) {
-                                    float sx = (float)x + (float)(2 * si + 1) * 0.125f;
-                                    for (unsigned sj = 0; sj < 4; sj++) {
-                                        float sy = (float)y + (float)(2 * sj + 1) * 0.125f;
-                                        float e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0]);
-                                        float e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0]);
-                                        float e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0]);
-                                        bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
-                                                                   : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
-                                        if (inside) {
-                                            cnt++;
-                                        }
-                                    }
-                                }
+                                unsigned cnt = cnt_buf[x - x0];
                                 if (cnt > 0) {
-                                    float cov = (float)cnt * 0.0625f;
-                                    uint32_t ca = (uint32_t)lroundf((float)a * cov);
-                                    uint32_t cr = (uint32_t)lroundf((float)r * cov);
-                                    uint32_t cg = (uint32_t)lroundf((float)g * cov);
-                                    uint32_t cb = (uint32_t)lroundf((float)b * cov);
-                                    uint32_t src = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                                    uint32_t src = src_table[cnt];
                                     row[x - first_in] = (prog == AGX_USC_COPY) ? src
                                                                                 : agx_blend_over(row[x - first_in], src);
                                 }
@@ -7498,10 +7658,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     if ((uint64_t)tex.w * tex.h > 4096 * 4096) {
                         continue;
                     }
-                    quad_tex = g_malloc((size_t)tex.w * tex.h * 4);
+                    quad_tex = agx_get_scratch1((size_t)tex.w * tex.h);
                     for (unsigned ty = 0; ty < tex.h; ty++) {
                         if (!agx_texture_row(s, cat, &tex, ty, quad_tex + (size_t)ty * tex.w)) {
-                            g_free(quad_tex);
                             quad_tex = NULL;
                             break;
                         }
@@ -7511,6 +7670,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     sample_tex = quad_tex;
                 }
+                uint32_t tint_a = tint >> 24;
+                uint32_t tint_r = (tint >> 16) & 0xff;
+                uint32_t tint_g = (tint >> 8) & 0xff;
+                uint32_t tint_b = tint & 0xff;
+                bool rounded_caps = (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87)));
+                bool simple_blend = !dest_in && !vibrancy && (prog != AGX_USC_PLUS_L) && (prog != AGX_USC_PLUS_L2);
+
                 int cached_y0 = -1, cached_y1 = -1, cached_mask_y = -1;
                 bool mask_row_ok = false;
 
@@ -7527,6 +7693,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     uint32_t ty0 = 0, ty1 = 0;
                     float fy = 0.0f;
+                    int wy = 0;
                     if (!sample_tex) {
                         if (is_scaled || tex.linear_filter) {
                             float v_sample = fv * sv - 0.5f;
@@ -7535,6 +7702,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             ty0 = (uint32_t)v_sample;
                             ty1 = ty0 + 1 < tex.h ? ty0 + 1 : ty0;
                             fy = v_sample - (float)ty0;
+                            wy = (int)(fy * 256.0f + 0.5f);
 
                             if ((int)ty0 != cached_y0) {
                                 if (!agx_texture_row(s, cat, &tex, ty0, texrow)) {
@@ -7583,9 +7751,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             float fx = u_sample - (float)tx0;
                             uint32_t c00 = texrow[tx0];
                             uint32_t c10 = texrow[tx1];
-                            uint32_t c01 = (ty1 == ty0) ? texrow[tx0] : texrow1[tx0];
-                            uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
-                            src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
+                            uint32_t c01 = (ty1 == ty0) ? c00 : texrow1[tx0];
+                            uint32_t c11 = (ty1 == ty0) ? c10 : texrow1[tx1];
+                            src = agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, wy);
                         } else {
                             src = texrow[tx];
                         }
@@ -7609,31 +7777,36 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             b = MAX(0, MIN(255, b));
                             src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
-                        uint32_t dst = row[x - x0], out = 0;
-                        if (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87))) {
+                        uint32_t dst = row[x - x0];
+                        if (rounded_caps) {
                             uint32_t cov = (((src >> 16) & 0xff) * (src >> 24)) / 255;
-                            uint32_t ta = (tint >> 24) & 0xff;
-                            uint32_t tr = (tint >> 16) & 0xff;
-                            uint32_t tg = (tint >> 8) & 0xff;
-                            uint32_t tb = tint & 0xff;
-                            uint32_t a = (ta * cov) / 255;
-                            uint32_t r = (tr * a) / 255;
-                            uint32_t g = (tg * a) / 255;
-                            uint32_t b = (tb * a) / 255;
+                            uint32_t a = (tint_a * cov) / 255;
+                            uint32_t r = (tint_r * a) / 255;
+                            uint32_t g = (tint_g * a) / 255;
+                            uint32_t b = (tint_b * a) / 255;
                             src = (a << 24) | (r << 16) | (g << 8) | b;
                         } else if (tint != 0xffffffff) {
-                            uint32_t m = 0;
-                            for (unsigned c = 0; c < 32; c += 8) {
-                                m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
-                            }
-                            src = m;
+                            uint32_t b = ((src & 0xff) * tint_b) / 255;
+                            uint32_t g = (((src >> 8) & 0xff) * tint_g) / 255;
+                            uint32_t r = (((src >> 16) & 0xff) * tint_r) / 255;
+                            uint32_t a = ((src >> 24) * tint_a) / 255;
+                            src = b | (g << 8) | (r << 16) | (a << 24);
                         }
                         if (dest_in) {
                             uint32_t a = src >> 24;
-                            for (unsigned c = 0; c < 32; c += 8) {
-                                out |= (((dst >> c) & 0xff) * a / 255) << c;
+                            if (a == 255) {
+                                row[x - x0] = dst;
+                            } else if (a == 0) {
+                                row[x - x0] = 0;
+                            } else {
+                                uint32_t b = ((dst & 0xff) * a) / 255;
+                                uint32_t g = (((dst >> 8) & 0xff) * a) / 255;
+                                uint32_t r = (((dst >> 16) & 0xff) * a) / 255;
+                                uint32_t oa = ((dst >> 24) * a) / 255;
+                                row[x - x0] = b | (g << 8) | (r << 16) | (oa << 24);
                             }
-                            row[x - x0] = out;
+                        } else if (simple_blend) {
+                            row[x - x0] = agx_blend_over(dst, src);
                         } else if (vibrancy) {
                             if (stride == 36 && has_mask_tex && mask_row_ok) {
                                 uint32_t m_alpha = (maskrow[tx] >> 24) & 0xff;
@@ -7662,9 +7835,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                 }
-                g_free(quad_tex);
             }
-            g_free(blurred_tex);
             if (any_drawn) {
                 draws++;
             }
