@@ -31,6 +31,9 @@ class MouseTouchTests(unittest.TestCase):
 #define TOUCH_TICK_NS INT64_C(16666667)
 #define QEMU_CLOCK_VIRTUAL 0
 #define INPUT_EVENT_ABS_MAX 32767
+#define INPUT_EVENT_KIND_KEY 3
+#define INPUT_EVENT_MASK_KEY 8
+#define Q_KEY_CODE_HOME 1
 #define INPUT_EVENT_KIND_ABS 0
 #define INPUT_EVENT_KIND_BTN 1
 #define INPUT_EVENT_KIND_MTT 2
@@ -63,6 +66,8 @@ typedef void QemuConsole;
 typedef void DeviceState;
 typedef struct { int dummy; } SysBusDevice;
 typedef struct A7State {
+    bool home_pressed;
+    void *home_timer;
     MouseTouch mouse_touch;
     MultiTouch multi_touch;
     void *mouse_touch_timer;
@@ -76,6 +81,7 @@ typedef struct A7State {
     static T *C(void *p) { return p; }
 typedef struct QemuInputEvent {
     int type;
+    struct { int key; bool down; } key;
     struct { int axis, value; } abs;
     struct { int button; bool down; } btn;
     struct { int type, slot, tracking_id, axis, value; } mtt;
@@ -97,6 +103,7 @@ static void touch_enqueue(A7Touch *t, const uint8_t *f, unsigned len) {
 }
 static A7Touch *touch_device(A7State *s) { return &s->touch; }
 '''
+        harness += 'static int qemu_input_linux_to_qcode(int key) { return key; }\nstatic void home_level(A7State *s, bool pressed) {s->home_pressed=pressed;}\n'
         harness += extract('static void touch_contacts(', 'static A7Touch *touch_device(')
         harness += extract('static bool touch_reporting_enabled(', 'static void touch_boot_complete(')
         harness += extract('/* Board-owned display device', 'static uint32_t touch_word(')
@@ -153,7 +160,7 @@ static void reset(void) {
 }
 int main(void) {
     assert(mouse_touch_handler.mask==
-           (INPUT_EVENT_MASK_ABS|INPUT_EVENT_MASK_BTN|INPUT_EVENT_MASK_MTT));
+           (INPUT_EVENT_MASK_KEY|INPUT_EVENT_MASK_ABS|INPUT_EVENT_MASK_BTN|INPUT_EVENT_MASK_MTT));
     assert(mouse_touch_scale(-5,32767,640)==0);
     assert(mouse_touch_scale(32768,32767,640)==640);
     reset();

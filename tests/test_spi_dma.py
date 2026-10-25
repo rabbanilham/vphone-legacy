@@ -98,7 +98,7 @@ static void wifi_host_ready(void *wifi, bool ready) { assert(wifi); wifi_ready=r
 struct A7State {
     void *wifi;
     uint32_t device_irq[8]; SioMailbox sio; A7Peripheral peripherals[2];
-    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch; MultiTouch multi_touch;
+    A7D2045 pmu; uint8_t *gpio_regs; bool touch_irq_low, home_pressed; QEMUTimer *touch_timer, *mouse_touch_timer; MouseTouch mouse_touch; MultiTouch multi_touch;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
     bool touch_force;
@@ -174,6 +174,7 @@ int main(void) {
     A7Peripheral *p=&state.peripherals[0]; p->owner=&state;
     p->base=UINT64_C(0x20a084000); p->regs=regs;
     static uint8_t gpio[GPIO_SIZE]; state.gpio_regs=gpio;
+    home_release(&state); assert(!state.home_pressed);
     p->spi.touch.owner=&state;
     uint8_t probe[16]={0x1a,0xa1}, reply[128];
     for (unsigned i=2;i<16;i+=2) { probe[i]=0x18;probe[i+1]=0xe1; }
