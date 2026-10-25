@@ -57,6 +57,12 @@ def main():
     storage = plan_path.parent.parent / 'storage-before'
     if not storage.exists():
         storage = ROOT / 'build/ios712-validated'
+    binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
+    required = [storage / 'utility.raw', Path(plan['image']), binary]
+    required += [Path(image['path']) for image in plan.get('auxiliary_images', [])]
+    for path in required:
+        if not path.is_file():
+            p.error(f'Missing input: {path}. See docs/firmware.md for the required profile artifacts and backend build.')
     work = Path(tempfile.mkdtemp(prefix='vphone-live-', dir='/tmp'))
     images = work / 'images'
     images.mkdir()
@@ -68,7 +74,6 @@ def main():
                f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},"
                f"system-image={images}/system.raw,data-image={images}/data.raw,"
                f"utility-image={images}/utility.raw,system-writable=1")
-    binary = args.qemu_binary.resolve() if args.qemu_binary else ROOT / 'backend/bin/qemu-system-aarch64'
     cmd = [str(binary), '-machine', machine,
            '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'multi'), '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
            '-kernel', plan['image'], '-display', 'cocoa',

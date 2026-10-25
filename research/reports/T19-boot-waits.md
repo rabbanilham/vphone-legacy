@@ -1,6 +1,6 @@
 # T19: absent modem and Oscar boot waits
 
-2026-10-22, `wt/baseband`, `/Users/bagas/Downloads/vphone-wt-baseband`.
+2026-10-22, `wt/baseband`, `${WORKTREES_ROOT}/vphone-wt-baseband`.
 
 ## Result and scope
 
@@ -86,7 +86,7 @@ New synthetic contract tests use the real `build_image` path, check both seriali
 Rebuilding the backend alone does **not** apply this fix: the DT is embedded in generated RAM. Keep the old plan and disks for A/B, generate a new plan with this worktree's loader. From this worktree (no commands below change guest disks):
 
 ```sh
-LEGACY=/Users/bagas/Downloads/vphone-legacy
+LEGACY=${REPO_ROOT}
 python3 scripts/qemu/boot_image.py \
   --kernel "$LEGACY/build/ios712-validated/kernel.macho" \
   --devicetree "$LEGACY/build/ios712-validated/DeviceTree.raw" \
@@ -101,7 +101,7 @@ Use the original SMP plan's exact `boot_args` instead if different. Keep NVRAM/A
 Build the backend by your normal procedure, then use the **same built binary** for both runs. `display_probe.py` expects it in this worktree's `backend/bin/qemu-system-aarch64`. This worktree must also resolve its usual `build/ios712-validated` storage inputs (`utility.raw` in particular). Explicitly select identical diagnostic system and data sources; the probe clones disks into each output directory before running.
 
 ```sh
-LEGACY=/Users/bagas/Downloads/vphone-legacy
+LEGACY=${REPO_ROOT}
 VPHONE_TCG_THREAD=multi VPHONE_DISPLAY=cocoa \
 python3 backend/display_probe.py \
   --output /tmp/t19-after --seconds 120 --stop-condition duration \

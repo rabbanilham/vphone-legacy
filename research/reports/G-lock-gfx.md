@@ -1,7 +1,7 @@
 # G-lock-gfx: full lock screen and live Home (final report)
 
 Workers: Codex (initial WIP, commit `a77b241`), Antigravity / `agy` (Task G2 completion).
-Branch `wt/lock-gfx` (worktree `/Users/bagas/Downloads/vphone-wt-lock-gfx`).
+Branch `wt/lock-gfx` (worktree `${WORKTREES_ROOT}/vphone-wt-lock-gfx`).
 See full Task G2 report in `research/reports/G2-lock-gfx.md`.
 
 ## Status per goal

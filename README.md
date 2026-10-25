@@ -1,82 +1,74 @@
 # vphone-legacy
 
-Pengembangan emulator **iPhone6,2 / n53ap / iOS 7.1.2 / 11D257** pada Mac Apple Silicon. Firmware asli sudah diekstrak dan divalidasi, secure monitor asli menjalankan XNU, dan debugger membuktikan callback mount HFS System kembali sukses. **iOS belum mencapai launchd/SpringBoard dan belum usable.**
+Inspired by [vphone-cli](https://github.com/Lakr233/vphone-cli)
 
-Manager hanya menampilkan status dan log sebenarnya. SpringBoard/aplikasi tiruan, respons terminal buatan, shim pencetak log, dan timer sukses telah dikeluarkan dari jalur produksi. Jendela QEMU menampilkan framebuffer guest. iOS 8–9 belum didukung.
+An experimental iPhone 5s emulator for **iPhone6,2 / n53ap / iOS 7.1.2 (11D257)** on Apple Silicon Macs. It combines a pinned QEMU backend, firmware preparation tools, and a software model of selected A7 peripherals and AGX rendering commands.
 
-| Gerbang | Status |
+**Research software:** recorded local runs reach the original lock screen, Home, and Settings with guest touch input. A fresh IPSW preparation does **not** yet reproduce that configuration: the latest UI profile depends on additional local boot/keybag artifacts. See [current status](docs/status.md) and [firmware preparation](docs/firmware.md) before attempting a boot.
+
+| Home | Settings |
 | --- | --- |
-| BuildManifest, dekripsi kernel/DeviceTree/RootFS, checksum, sektor HFSX | Lulus untuk IPSW lokal target |
-| Monitor EL3, XNU, MMU, timer dan thread kernel | Teramati lewat debugger/trace |
-| Firmware ANS asli | Diekstrak dan handoff RAM disiapkan; eksekusi diagnostik berhenti pada MMIO koprosesor yang belum tersedia |
-| Serial XNU asli | Output guest teramati; boot userspace belum terbukti |
-| Storage dan callback mount HFS System | Teramati lewat model ASP dan debugger; root directory/volume Data masih belum terbukti |
-| Process1 dan launchd | Belum lulus |
-| Compositor, SpringBoard, touch/Home, keyboard iOS | Belum lulus |
-| Tiga cold boot, persistensi Notes, sesi 15 menit | Belum dapat diuji |
+| ![Original iOS Home after clock rendering fixes](research/evidence/public-readme-20261024/home.png) | ![Original iOS Settings after UISwitch and navigation-bar fixes](research/evidence/public-readme-20261024/settings.png) |
 
-Lihat [handover](ANTIGRAVITY_HANDOVER.md), [bukti mount dan wait bootstrap](research/bootstrap-launchd-20261013.md), [audit storage](research/continuation-20261013-storage.md), [catatan bring-up](research/bringup.md), dan [kontrak backend](backend/README.md).
+*Latest available normal-speed live captures from `merge-u2-live` (2026-10-24), after the clock, blur, and UISwitch fixes. [Capture provenance](research/evidence/public-readme-20261024/README.md). These are recorded research-profile results, not screenshots produced by the quick start below.*
 
-## Build
+## Quick start: setup and tests
 
-Python, Xcode/Command Line Tools, GLib, Pixman, OpenSSL, dan `qemu-img` dibutuhkan. Dependency Python berada di `.venv`; dependency build QEMU berada di `backend/.venv`.
+Requires macOS on Apple Silicon, Xcode Command Line Tools, Homebrew, Python 3.11+ (3.13 preferred), and a C compiler. No firmware is needed for the default tests. Intel Macs and other operating systems are not validated.
 
 ```sh
+git clone https://github.com/rabbanilham/vphone-legacy.git
+cd vphone-legacy
+brew install python@3.13 keystone glib pixman openssl@3 qemu
 make setup
+make test
+./vphone-legacy --help
+```
+
+The Homebrew QEMU package supplies `qemu-img` for disk conversion. Guest execution uses the separately built, pinned project backend:
+
+```sh
 .venv/bin/python scripts/qemu/build_backend.py --fetch --install-build-deps
-make test
-```
-
-QEMU dipin ke v11.1.2, commit `4fc49f46dc95d4a27de2509e7fceb2931e91faeb`. Builder menghasilkan `backend/bin/qemu-system-aarch64`; launcher memverifikasi binary, sumber mesin, dan commit pin. `qemu-img` global hanya dipakai untuk konversi image. `make backend` memakai checkout/dependency yang sudah tersedia.
-
-Builder menerima `--sdk /path/to/MacOSX.sdk` bila linker tidak cocok dengan SDK default. Pada host ini build berhasil dengan SDK macOS 15.5 dalam Xcode 2.app; lihat backend README.
-
-## Firmware dan VM
-
-IPSW lokal wajib diberikan. Pipeline memilih identitas erase tepat dari BuildManifest, menyimpan komponen asli, dan gagal bila identitas, dekripsi, struktur atau checksum salah. Patch kernel berbasis tebakan string ditolak.
-
-```sh
-# Default: ~/.vphone-legacy/VMs. Opsional penyimpanan workspace:
-export VPHONE_LEGACY_VMS_DIR="$PWD/build"
-./vphone-legacy vm create ios712 --ios 7.1.2 \
-  --ipsw ./iPhone6,2_7.1.2_11D257_Restore.ipsw
-./vphone-legacy vm doctor ios712
-./vphone-legacy vm launch ios712 --headless --probe-seconds 0.05
-./vphone-legacy vm status ios712
-```
-
-Bundle tervalidasi yang tersedia pada workspace ini bernama `ios712-validated`. `vm doctor` memeriksa artefak/backend; exit code nol dari doctor atau probe bukan sertifikasi boot iOS. Bundle lama ditolak dan tidak ditimpa; pilih nama baru untuk membangun ulang.
-
-Loader memuat Mach-O/BSS kernel dan monitor asli yang mengikuti stream complzss. CPU mulai di entry monitor EL3; monitor menyerahkan eksekusi kepada XNU. Ini tidak mengeksekusi iBoot. Partisi SEP 6 MiB dan monitor 2 MiB mengikuti kontrak iBoot yang diperiksa; kernel memakai physical base `0x800800000`, virtual base `0xffffff8000200000`. PRAM/STRAM dan region ANS mengikuti kontrak firmware; framebuffer diagnostik dialokasikan terpisah. Clock/fuse dan NVRAM awal memakai profil emulator yang dicatat. CPU tetap prototipe Cortex-A57 dengan sebagian register Apple, bukan Cyclone lengkap. Mesin memakai TCG, satu CPU aplikasi dan RAM fisik 1 GiB pada `0x800000000`.
-
-ANS ARM32 asli diekstrak dari iBoot dan dimuat ke region 8 MiB setelah fixup yang diaudit. Eksekusi ANS tersedia sebagai probe riset opt-in dengan CPU Cortex-A7 sementara. Storage produksi memakai model software ASP terpisah; eksekusi diagnostik koprosesor belum melewati seluruh MMIO yang dibutuhkan. Lihat [kontrak ANS](research/native-ans-firmware.md).
-
-RootFS UDIF sudah dikonversi menjadi sektor disk dan partisi HFSX asli. Model ASP eksperimental memakai path image eksplisit dan memeriksa error I/O/DMA. `system.raw` tetap utuh; `system-runtime.raw` adalah salinan persisten untuk journal/tulisan guest, dan `data.raw` tetap persisten. Namespace utility logis disimpan dalam `utility.raw` dengan header, region dan provenance tervalidasi; ini bukan metadata NAND fisik asli. Tulisan journal System dan NVRAM guest benar-benar bertahan pada file backing. Callback mount HFS kembali dengan kode nol di guest, tetapi root directory, pemetaan Data ke `/private/var`, seed data dan first boot belum terbukti. Setiap sesi menyimpan salinan ketiga disk sebelum boot beserta checksum.
-
-## Display dan lifecycle
-
-```sh
-./vphone-legacy vm launch ios712-validated       # QEMU Cocoa
-./vphone-legacy vm launch ios712-validated --paused
-./vphone-legacy vm stop ios712-validated --force
-./vphone-legacy gui
-```
-
-Scanout RAM guest memakai 640×1136 BGRX32, stride 2560. Smoke test membuktikan pixel yang ditulis guest muncul dalam capture QMP. Ini belum membuktikan AppleH6PDisplayPipe/AGX atau SpringBoard. Touch, Home/Power dan keyboard belum tersedia.
-
-Launcher memiliki satu proses QEMU dan satu koneksi QMP; stop diarahkan ke launcher pemilik. QMP terpisah dari serial. Exit code/crash diteruskan dan proses direap. Shutdown guest/flush filesystem belum tersedia; stop normal ditolak dan `--force` mencatat shutdown tidak bersih. `make clean` mempertahankan bundle/data VM.
-
-`vm_manifest.json` menyimpan identitas/checksum; `runtime.json` terpisah dengan tahap process/kernel/userspace/display/agent. Kata Darwin atau SpringBoard dalam log tidak menjadi bukti boot. Probe menyimpan command, image boot turunan, hash sumber/binary, register awal/akhir, serial, trace MMIO/exception, status QMP, framebuffer dan status akhir dalam `logs/SESSION/`. Panic XNU membuat launcher keluar gagal meskipun QEMU ditutup dengan exit code nol.
-
-## Verifikasi
-
-```sh
-make test
 .venv/bin/python backend/smoke_test.py
-VPHONE_TEST_BUNDLE="$PWD/build/ios712-validated" \
-  .venv/bin/python -m unittest discover -s tests -p test_backend_lifecycle.py -v
 ```
 
-Smoke test menggunakan fixture program kecil untuk UART/framebuffer. Lifecycle test memakai QEMU sebenarnya untuk kepemilikan tunggal, penolakan launch ganda dan force stop. QMP memerlukan izin local Unix socket. Dekripsi firmware asli bersifat opt-in; lihat `tests/test_firmware_gate.py`.
+See [installation](docs/setup.md) for prerequisites, SDK selection, and overrides. Building QEMU requires network access, substantial disk space, and time. No firmware, prepared VM, or emulator binary is included.
 
-Kriteria selesai tetap: tiga cold boot mencapai SpringBoard asli, Settings/Calculator/Notes berfungsi melalui input guest, data bertahan setelah shutdown, layar membeku ketika CPU dihentikan, dan sesi 15 menit tanpa crash/restart. Semua kriteria ini masih terbuka.
+## Using your own firmware
+
+```sh
+./vphone-legacy vm create ios712 --ios 7.1.2 --ipsw /path/to/iPhone6,2_7.1.2_11D257_Restore.ipsw
+./vphone-legacy vm doctor ios712
+./vphone-legacy vm launch ios712 --headless --probe-seconds 5
+```
+
+This prepares and probes the **baseline bring-up bundle**, not the UI profile pictured above. A successful `doctor` checks artifacts, not a completed iOS boot. Read [firmware and launch](docs/firmware.md) for the distinction and current blockers.
+
+## Roadmap: performance and emulator quality
+
+The next milestone is a reproducible, responsive iOS 7.1.2 session with reliable input and persistent data. The work below is planned, not a list of supported features. Prioritize correctness and measurements before changing timing or adding more firmware targets.
+
+1. **Make the UI profile reproducible.** Complete the local IPSW → diagnostic disks → keybag/SMP boot plan → UI profile pipeline, with explicit inputs and validation. Investigate the baseline FIPS POST failure rather than treating QEMU exit code zero as success. Acceptance: a clean checkout can prepare the documented configuration without depending on another developer's artifact store.
+2. **Establish repeatable performance baselines.** Measure cold boot to lock screen, swipe to settled Home, Settings launch, input latency, frame-time percentiles, host CPU use and peak memory. Record source/backend/input hashes, host configuration, guest time and wall time separately. Use lightweight captures for timing; full AGX dumps can stall the guest. Compare repeated runs of the same workload before and after each optimization.
+3. **Remove measured execution and rendering bottlenecks.** Profile TCG execution, guest waits, device polling, renderer queue/BQL contention, texture access and framebuffer copies. Optimize the dominant costs while preserving interrupt delivery, draw ordering and existing device contracts. Trace the delayed unlock-to-Home commit and restore visible intermediate animation frames. Keep normal timing (`k=1`): the evaluated time-dilation settings did not complete unlock and are not a performance fix.
+4. **Improve rendering fidelity.** Fix jagged clock hands and the remaining UISwitch shadow edge, verify the slider glint live, and expand coverage of unsupported AGX programs, blending and texture sampling. Use the chained offline corpus for focused regressions, then compare live captures across transitions; an offline replay alone does not establish correct guest rendering.
+5. **Strengthen input, lifecycle and persistence.** Test repeated taps, swipes, sleep/wake and unlock across cold boots. Add graceful guest shutdown and verify storage flush behavior before claiming clean persistence. Acceptance: Settings, Calculator and Notes work through guest input, Notes data survives a clean restart, three cold boots complete, and a 15-minute session has no panic or unintended restart.
+6. **Expand device compatibility incrementally.** Validate Wi-Fi/networking and remaining peripheral contracts using real guest behavior and failure cases. Keep experimental paths separate until accepted; a Home screenshot or a successful synthetic contract is not proof of complete device support. Broader iOS/device support follows a stable, reproducible n53ap baseline.
+
+Each change should include relevant [tests](docs/testing.md), before/after evidence and an update to [known limitations](docs/status.md). Performance gains must retain the same guest workload and visible output; skipped rendering or altered guest time must not be counted as speed improvements.
+
+## Documentation
+
+- [Setup and backend build](docs/setup.md)
+- [Firmware, VM lifecycle, and research profile](docs/firmware.md)
+- [Status and known limitations](docs/status.md)
+- [Architecture](docs/architecture.md) and [backend contracts](backend/README.md)
+- [Testing](docs/testing.md) and [troubleshooting](docs/troubleshooting.md)
+- [Contributing](CONTRIBUTING.md)
+- [Research archive](research/README.md)
+- [Third-party notices and license status](THIRD_PARTY_NOTICES.md)
+- [Publication audit](docs/publication-audit.md)
+
+## License status
+
+The QEMU machine overlay declares **GPL-2.0-or-later**. A repository-wide license has not yet been established for the remaining code. See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution and the unresolved licensing work before redistribution. Apple firmware and artwork are not project code.

@@ -1,6 +1,6 @@
 # T-live-swipe — Mouse swipe and short swipe unlock in Cocoa window
 
-Worktree `/Users/bagas/Downloads/vphone-wt-live-swipe`, branch `wt/live-swipe`.
+Worktree `${WORKTREES_ROOT}/vphone-wt-live-swipe`, branch `wt/live-swipe`.
 
 ## Summary & Goals
 

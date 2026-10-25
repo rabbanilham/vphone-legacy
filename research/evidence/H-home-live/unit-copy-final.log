@@ -1,7 +1,7 @@
-............................................................s...s.........../Users/bagas/Downloads/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=5>
+............................................................s...s...........${WORKTREES_ROOT}/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=5>
   run_service_fixture()
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/Users/bagas/Downloads/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=3>
+${WORKTREES_ROOT}/vphone-wt-home-live/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=3>
   run_service_fixture()
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ..........................................................s.............................................................Host load 7.00 exceeds 6; waiting 10 seconds.

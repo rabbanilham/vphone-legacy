@@ -15,7 +15,7 @@ Read `CLAUDE_HANDOVER.md` sections 14–17, the existing jump-cache patch, the A
 Inputs:
 
 - Crash: `scratchpad/probe108-crashlogs/SpringBoard_2106-02-06-222631_iPhone.ips`, SHA256 `9732cf834254ad6b2b2f8c18ec0c903e3a2420b91fb03df678cd72e0bd359c7c`.
-- Cache: `/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64`, SHA256 `d3d6e3be15108b04c33e36f62afb9230400c348cc63a11b2fdc91c82b2961427`, with adjacent `cache-index.json`.
+- Cache: `${REPO_ROOT}/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64`, SHA256 `d3d6e3be15108b04c33e36f62afb9230400c348cc63a11b2fdc91c82b2961427`, with adjacent `cache-index.json`.
 - Executable: `/tmp/t4-touch-evidence/SpringBoard`, SHA256 `7ac0648541d8b4efef35bff46de2c5b2e0aa45e48fdd1f902e580eac5ca22620`.
 
 `LatestCrash.ips` and `LatestCrash-SpringBoard.ips` repeat the same incident identifier and registers. The supplied directory has one independent crash, not three. `probe108-breakpoints.json` has 16 events and attributes SpringBoard work to PIDs 38 and 102, confirming a respawn. It contains no worker block/continuation heap dump. No additional `.ips` was found beneath Retired.
@@ -32,7 +32,7 @@ Cross-check: MobileKeyBag `0x190138000 - 0x187c4c000` and IOKit `0x18aa80000 - 0
 
 SpringBoard has a separate slide: runtime base `0x1000f4000` minus preferred base `0x100000000` = `0xf4000`. Subtract it before using `fileoff = preferred VA - 0x100000000`.
 
-Disassembly used Capstone from `/Users/bagas/Downloads/vphone-legacy/.venv/bin/python`. Public names below were checked against Mach-O symbol tables; SpringBoard method names were recovered with `otool -ov`. Names for redacted dispatch internals are inferred from instruction behavior and compared with Apple's era-adjacent [libdispatch-339.92.1 queue.c](https://github.com/apple-oss-distributions/libdispatch/blob/libdispatch-339.92.1/src/queue.c) and [queue_internal.h](https://github.com/apple-oss-distributions/libdispatch/blob/libdispatch-339.92.1/src/queue_internal.h); those sources are corroboration, not proof of the exact iOS build.
+Disassembly used Capstone from `${REPO_ROOT}/.venv/bin/python`. Public names below were checked against Mach-O symbol tables; SpringBoard method names were recovered with `otool -ov`. Names for redacted dispatch internals are inferred from instruction behavior and compared with Apple's era-adjacent [libdispatch-339.92.1 queue.c](https://github.com/apple-oss-distributions/libdispatch/blob/libdispatch-339.92.1/src/queue.c) and [queue_internal.h](https://github.com/apple-oss-distributions/libdispatch/blob/libdispatch-339.92.1/src/queue_internal.h); those sources are corroboration, not proof of the exact iOS build.
 
 ## Fault and provenance established by the instructions
 
@@ -159,9 +159,9 @@ From this worktree, with the usual backend/build assets available:
 python3 backend/display_probe.py \
   --output /tmp/t13-sb-release \
   --seconds 90 --stop-condition duration \
-  --plan /Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/boot_plan.json \
-  --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/diagnostic/system-diagnostic-sep.raw \
-  --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/diagnostic/data-diagnostic-systembag.raw \
+  --plan ${REPO_ROOT}/build/ios712-validated/boot/boot_plan.json \
+  --diagnostic-system ${REPO_ROOT}/build/diagnostic/system-diagnostic-sep.raw \
+  --diagnostic-data ${REPO_ROOT}/build/diagnostic/data-diagnostic-systembag.raw \
   --breakpoint userclient_start=0xffffff8000c5cf18 \
   --max-hits userclient_start=0 \
   --user-hooks backend/sb_restart_hooks.json \
@@ -179,7 +179,7 @@ Use at least 8 clean, independent 180-second probes, and the deterministic confi
 ```sh
 python3 backend/crash_batch.py --out-root /tmp/t13-sb-fixed --runs 8 \
   --process SpringBoard --max-parallel 2 \
-  --common '--seconds 180 --stop-condition duration --plan /Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/boot_plan.json --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/diagnostic/system-diagnostic-sep.raw --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/diagnostic/data-diagnostic-systembag.raw --breakpoint userclient_start=0xffffff8000c5cf18 --max-hits userclient_start=0'
+  --common '--seconds 180 --stop-condition duration --plan ${REPO_ROOT}/build/ios712-validated/boot/boot_plan.json --diagnostic-system ${REPO_ROOT}/build/diagnostic/system-diagnostic-sep.raw --diagnostic-data ${REPO_ROOT}/build/diagnostic/data-diagnostic-systembag.raw --breakpoint userclient_start=0xffffff8000c5cf18 --max-hits userclient_start=0'
 ```
 
 For every run require probe exit 0, SpringBoard observed, exactly one SpringBoard PID, no backboardd respawn/panic, and confirmation that this PID is still alive at the final endpoint (late task/thread snapshot or process listing). The batch's PID history is a respawn detector, not a liveness check: a lone early PID that dies without a later observed hook is insufficient. Read crash reports from each surviving run image if a PID changes. `parallel_probe.py` cleans copied images, so use `display_probe.py` directly when retaining disks/crashlogs is necessary.

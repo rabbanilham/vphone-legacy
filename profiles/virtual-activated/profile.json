@@ -1,0 +1,86 @@
+{
+  "profile": "virtual-activated",
+  "virtual_activation_only": true,
+  "runtime_verified": false,
+  "inputs": {
+    "${REPO_ROOT}/build/diagnostic/system-diagnostic-sep.raw": "8918b9b0c4fcbfee47f52b26f9a0de2103b8a1b6e6feefb662ec8687241bdae1",
+    "${REPO_ROOT}/build/diagnostic/data-diagnostic-systembag.raw": "bbd1bdb8232e537efc6ce14ee8e1876e78eb0686528bbc24f87a46ce5d5e63a2"
+  },
+  "probe_sha256": "52c9fd501ea2683a5a0e28554ab774a13dc82dd744c78b6005636edfe196311d",
+  "boot": {
+    "source_plan": "${REPO_ROOT}/backend/evidence/keybag-contract-20261015/boot-plan-smp-nooscar/boot_plan.json",
+    "source_plan_sha256": "43d7eb200f93c4c2763266206321b651b4fdcfa839874ea8f023693d5d3e3739",
+    "source_image_sha256": "b07cfd12e9ddefad0e5ba31daac5abe3ac4b6a5fdfc2b4fa6115881ba4ea89e1",
+    "image_sha256": "98d34e7517e4ba89dee3125af2c921fe59281b9ebd9335517888f5aee5837add",
+    "boot_args": "-v serial=3 debug=0x14e cpus=2 csi_disable_watchdog=1 amfi_allow_any_signature=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1",
+    "chosen_debug_enabled": true,
+    "kernel_instruction_patches": []
+  },
+  "lockdownd": {
+    "profile": "virtual-activated",
+    "classification": "virtual activation for testing; not Apple activation",
+    "build": "11D257",
+    "device": "iPhone6,2/n53ap",
+    "original_sha256": "d1421e2fc37a76732717e23da1c276c80b51d0e2da1599765b0afbbe585d426e",
+    "patched_sha256": "8919b2e827cc000ae58f3ae8243318b2e466e01c3d7491560263f0853cd6defc",
+    "patches": [
+      {
+        "file_offset": 77404,
+        "unslid_va": "0x100012e5c",
+        "before": "c0070034",
+        "after": "1f2003d5",
+        "reason": "Select the existing native activation short-circuit"
+      }
+    ],
+    "code_signature": "Original signature retained but invalidated by patch; loading must be verified",
+    "runtime_verified": true
+  },
+  "job_cache": {
+    "offset": 625068,
+    "size": 161292,
+    "before_sha256": "2ea3fdde29a7a15c61a9066b8aae127940361cb9967e644d665f5fa7889de9c6",
+    "after_sha256": "56e4a56b8caf215caefad535e576b3725d84ef93bc30157748a8899cdc1b6d37"
+  },
+  "guest_ownership": [
+    {
+      "catalog_id": 70312,
+      "name": "vphone-activation-probe",
+      "file_offset": 81945780,
+      "before_uid_gid": [
+        501,
+        20
+      ],
+      "after_uid_gid": [
+        0,
+        0
+      ]
+    },
+    {
+      "catalog_id": 70313,
+      "name": "org.vphone.virtual-activation-probe.plist",
+      "file_offset": 90744772,
+      "before_uid_gid": [
+        501,
+        20
+      ],
+      "after_uid_gid": [
+        0,
+        0
+      ]
+    }
+  ],
+  "outputs": {
+    "build/virtual-activated-profile-v5/system.raw": "112576a782b78066c3f0451115c6233a5f194e56bbb22dc02658f464f52557bf",
+    "build/virtual-activated-profile-v5/data.raw": "4a46a7d4374888712476a69d1a7f4b4243abd8367a7d9478702200f431f3d97f"
+  },
+  "activation_verified": true,
+  "home_screen_verified": false,
+  "acceptance_status": "activation verified across service restarts and three cold boots; live Home rendering unresolved",
+  "validation_runs": [
+    "${REPO_ROOT}/backend/evidence/virtual-activated-20261023/cold-boot1",
+    "${REPO_ROOT}/backend/evidence/virtual-activated-20261023/cold-boot2",
+    "${REPO_ROOT}/backend/evidence/virtual-activated-20261023/cold-boot3"
+  ],
+  "validation_qemu_sha256": "3a2bf2d243d56eaf1c2754eec8e672aaf40ca1a0051c17b4104f8a0dbafbe8b8",
+  "baseline_images_unchanged": true
+}

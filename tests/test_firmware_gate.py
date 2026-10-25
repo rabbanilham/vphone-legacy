@@ -191,7 +191,7 @@ class FirmwareGateTests(unittest.TestCase):
     def test_real_kernel_and_devicetree(self):
         from patchers.patch_devicetree import decode_devicetree
         from macho import inspect_macho
-        ipsw = PROJECT / "iPhone6,2_7.1.2_11D257_Restore.ipsw"
+        ipsw = Path(os.environ.get("VPHONE_TEST_IPSW", str(PROJECT / "iPhone6,2_7.1.2_11D257_Restore.ipsw"))).expanduser()
         metadata = resolve_firmware("7.1.2", str(ipsw))
         with zipfile.ZipFile(ipsw) as archive:
             import hashlib

@@ -1,6 +1,6 @@
 {
-  "cache_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
-  "index_path": "/Users/bagas/Downloads/vphone-legacy/backend/evidence/ca-surface-20261014-214745/cache-index.json",
+  "cache_path": "backend/evidence/ca-surface-20261014-214745/dyld_shared_cache_arm64",
+  "index_path": "backend/evidence/ca-surface-20261014-214745/cache-index.json",
   "symbols": {
     "sb_compiler_ctor_ready": "0x1851bf1ac",
     "sb_compiler_release_reply": "0x1851bf240",

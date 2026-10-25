@@ -1,7 +1,8 @@
-typer
-capstone
-keystone-engine
-pyimg4
-pycryptodome
-requests
-tqdm
+# Direct dependencies validated with Python 3.13 on macOS.
+typer==0.27.3
+capstone==5.0.9
+keystone-engine==0.9.2
+pyimg4==0.8.8
+pycryptodome==4.1.0
+requests==2.34.2
+tqdm==4.70.1

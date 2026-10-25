@@ -57,7 +57,9 @@ def main():
         run(['git', '-C', source, 'apply', patch])
     env = os.environ.copy()
     env['PATH'] = str(venv / 'bin') + os.pathsep + env.get('PATH', '')
-    pcs = [Path('/opt/homebrew/opt') / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2', 'libslirp')]
+    brew = shutil.which('brew')
+    brew_prefix = Path(subprocess.check_output([brew, '--prefix'], text=True).strip()) if brew else None
+    pcs = [brew_prefix / 'opt' / lib / 'lib/pkgconfig' for lib in ('glib', 'pixman', 'pcre2', 'libslirp')] if brew_prefix else []
     env['PKG_CONFIG_PATH'] = os.pathsep.join(str(p) for p in pcs if p.exists()) + os.pathsep + env.get('PKG_CONFIG_PATH', '')
     configure = [source / 'configure', '--target-list=aarch64-softmmu', '--disable-docs',
         '--disable-user', '--disable-tools', '--disable-werror', '--enable-slirp',

@@ -7,6 +7,7 @@
 """
 from collections import Counter
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -16,9 +17,7 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'backend/s5l8960x.c'
 ROOT = Path(__file__).resolve().parents[1]
-DUMPS_DIR = Path('/Users/bagas/Downloads/vphone-legacy/backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps')
-if not DUMPS_DIR.exists():
-    DUMPS_DIR = ROOT / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'
+DUMPS_DIR = Path(os.environ.get('VPHONE_AGX_DUMPS', str(ROOT / 'backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'))).expanduser()
 
 REPLAY_SPEC = importlib.util.spec_from_file_location(
     'agx_replay_offline', ROOT / 'backend/agx_replay_offline.py')
@@ -102,7 +101,7 @@ class AGXDrawCoverageTests(unittest.TestCase):
         res, _ = aro.classify_draw(mf, 0x500, ppp, (4 << 29, 6), viewport, 640, 1136, 640, 1136)
         self.assertEqual(res, 'skipped: unknown VDM block')
 
-        # 5. Non-axis-aligned / rotated geometry
+        # 5. Non-axis-aligned / rotated geometry (untextured solid triangles)
         rot_verts = b''
         for x, y in [(0.0, 0.0), (100.0, 50.0), (50.0, 100.0), (50.0, 100.0), (100.0, 50.0), (150.0, 150.0)]:
             rot_verts += struct.pack('<2f8x4s', x, y, b'\xff\xff\xff\xff')
@@ -112,7 +111,16 @@ class AGXDrawCoverageTests(unittest.TestCase):
         for i, b in enumerate(vs_data_rot_bytes):
             mf.data[0x800 + i] = b
         res, _ = aro.classify_draw(mf, 0x800, ppp, draw_cmd, viewport, 640, 1136, 640, 1136)
-        self.assertEqual(res, 'skipped: non-axis-aligned or rotated geometry')
+        self.assertEqual(res, 'replayed exactly: solid triangles (stride=20)')
+
+        # 6. Non-axis-aligned / rotated textured geometry
+        orig_texture = aro.texture
+        try:
+            aro.texture = lambda f, p: {'w': 64, 'h': 64, 'addr': 0x5000, 'strip': False, 'stride': 256}
+            res, _ = aro.classify_draw(mf, 0x800, ppp, draw_cmd, viewport, 640, 1136, 640, 1136)
+            self.assertEqual(res, 'skipped: non-axis-aligned or rotated geometry')
+        finally:
+            aro.texture = orig_texture
 
     def test_audit_all_150_frames_zero_skips(self):
         """Audit all 150 frame dumps in probe-164-gfxdump: exactly 533 draws, 0 skipped."""

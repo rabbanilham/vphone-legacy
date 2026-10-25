@@ -1,6 +1,6 @@
 # T16: A7 application-processor SMP
 
-Worktree: `/Users/bagas/Downloads/vphone-wt-smp`, branch `wt/smp`.
+Worktree: `${WORKTREES_ROOT}/vphone-wt-smp`, branch `wt/smp`.
 Research inputs were read only. QEMU was neither built nor run by this agent.
 
 ## Implemented
@@ -43,7 +43,7 @@ Research inputs were read only. QEMU was neither built nor run by this agent.
 ## VERIFIED: static kernel / monitor evidence
 
 Kernel input:
-`/Users/bagas/Downloads/vphone-legacy/build/ios712-validated/boot/KernelMemory.bin`.
+`${REPO_ROOT}/build/ios712-validated/boot/KernelMemory.bin`.
 Kernel disassembly used the supplied relation
 `offset = VA - 0xffffff8000a00000 + 0x1000000`, with Capstone from the legacy
 venv. Monitor VA 0x4100000000 corresponds to file offset 0x600000.

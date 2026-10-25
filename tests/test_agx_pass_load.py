@@ -15,18 +15,17 @@ Verifies:
   in agx_replay_frame, agx_trace_rt, and AGXRenderJob.
 """
 
+import os
 from pathlib import Path
 import struct
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / 'backend'
-CANDIDATE_DUMPS = [
-    BACKEND / 'evidence/keybag-contract-20261015/probe-164-gfxdump/dumps',
-    Path('/Users/bagas/Downloads/vphone-legacy/backend/evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'),
-]
-DUMPS_DIR = next((p for p in CANDIDATE_DUMPS if p.is_dir()), None)
+DUMPS_PATH = Path(os.environ.get('VPHONE_AGX_DUMPS', str(BACKEND / 'evidence/keybag-contract-20261015/probe-164-gfxdump/dumps'))).expanduser()
+DUMPS_DIR = DUMPS_PATH if DUMPS_PATH.is_dir() else None
 S5L8960X_C = BACKEND / 's5l8960x.c'
+needs_dumps = unittest.skipIf(DUMPS_DIR is None, 'probe-164 frame dumps not present')
 
 import sys
 sys.path.insert(0, str(BACKEND))
@@ -35,6 +34,7 @@ from agx_replay_offline import is_clear_pass
 
 
 class AGXPassLoadTests(unittest.TestCase):
+    @needs_dumps
     def test_display_passes_are_load_passes(self):
         """Display passes (640x1136) must load existing framebuffer (+0x23c == 1)."""
         display_frames = [1, 2, 10, 50, 72, 100, 113]
@@ -53,6 +53,7 @@ class AGXPassLoadTests(unittest.TestCase):
             self.assertEqual(w23c & 1, 1, f"Frame {frame_num} display pass must have load flag set (+0x23c == 1)")
             self.assertFalse(is_clear_pass(f.type1_command), f"Frame {frame_num} must NOT be a clear pass")
 
+    @needs_dumps
     def test_offscreen_passes_are_clear_passes(self):
         """Offscreen backdrops (608x64, 448x64) must clear canvas (+0x23c == 0)."""
         offscreen_frames = [64, 65, 71, 114, 120, 141, 150]
@@ -83,6 +84,7 @@ class AGXPassLoadTests(unittest.TestCase):
         struct.pack_into('<I', cmd, 0x23c, 1)
         self.assertFalse(is_clear_pass(cmd))
 
+    @needs_dumps
     def test_background_pds_structure_difference(self):
         """Verify background PDS data: display has tile-load sampler/USC; offscreen has zeros."""
         disp_frame = Frame(DUMPS_DIR / 'frame-1.bin')
