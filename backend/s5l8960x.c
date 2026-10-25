@@ -705,6 +705,29 @@ struct A7State {
      * A drain before then must continue from here, not re-read the guest's
      * stale index, or it would replay and stamp the same commands twice. */
     struct { uint64_t control; uint32_t index; bool valid; } agx_host_read[16];
+    /* AGX submission/latency perf stats (VPHONE_PERF_STATS=1) */
+    bool agx_perf_enabled;
+    QEMUTimer *agx_perf_timer;
+    int64_t agx_doorbell_time_us;
+    bool agx_doorbell_in_flight;
+    uint64_t agx_perf_total_doorbells;
+    uint64_t agx_perf_total_passes;
+    uint64_t agx_perf_total_jobs;
+    uint64_t agx_perf_total_repolls_1ms;
+    uint64_t agx_perf_win_doorbells;
+    uint64_t agx_perf_win_passes;
+    uint64_t agx_perf_win_jobs;
+    uint64_t agx_perf_win_repolls_1ms;
+    uint64_t agx_perf_win_capture_ta_us;
+    uint64_t agx_perf_win_queue_wait_us_sum;
+    uint64_t agx_perf_win_queue_wait_count;
+    uint64_t agx_perf_win_render_us_sum;
+    uint64_t agx_perf_win_render_count;
+    uint64_t agx_perf_win_bh_delay_us_sum;
+    uint64_t agx_perf_win_bh_delay_count;
+    uint64_t agx_perf_win_lat_us_sum;
+    uint32_t agx_perf_win_lat_count;
+    int64_t agx_perf_win_lat_samples[16384];
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -5440,6 +5463,13 @@ typedef struct AGXRenderJob {
     unsigned commands;
     unsigned stamps;
 
+    /* Perf stats */
+    int64_t doorbell_time_us;
+    int64_t enqueue_time_us;
+    int64_t render_start_us;
+    int64_t render_end_us;
+    int64_t done_enqueue_us;
+
     struct AGXRenderJob *next;
 } AGXRenderJob;
 
@@ -7549,9 +7579,93 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 /* AGX_REPLAY_CORE_END */
 
 /* Publish one finished job (main loop, BQL held). */
+static int agx_cmp_int64(const void *a, const void *b)
+{
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static void agx_perf_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    double avg_lat = 0, p50_lat = 0, max_lat = 0;
+    if (s->agx_perf_win_lat_count > 0) {
+        qsort(s->agx_perf_win_lat_samples, s->agx_perf_win_lat_count, sizeof(int64_t), agx_cmp_int64);
+        avg_lat = (double)s->agx_perf_win_lat_us_sum / s->agx_perf_win_lat_count;
+        p50_lat = (double)s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count / 2];
+        max_lat = (double)s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count - 1];
+    }
+
+    double avg_q_wait = s->agx_perf_win_queue_wait_count ?
+        (double)s->agx_perf_win_queue_wait_us_sum / s->agx_perf_win_queue_wait_count : 0.0;
+    double avg_render_ms = s->agx_perf_win_render_count ?
+        (double)s->agx_perf_win_render_us_sum / (s->agx_perf_win_render_count * 1000.0) : 0.0;
+    double avg_bh_delay = s->agx_perf_win_bh_delay_count ?
+        (double)s->agx_perf_win_bh_delay_us_sum / s->agx_perf_win_bh_delay_count : 0.0;
+    double capture_ta_ms = (double)s->agx_perf_win_capture_ta_us / 1000.0;
+
+    fprintf(stderr,
+            "[agx-perf 5s] doorbells=%lu passes=%lu jobs=%lu latency_us(avg/p50/max)=%.1f/%.1f/%.1f "
+            "queue_wait_us=%.1f render_ms=%.2f bh_delay_us=%.1f capture_ta_ms=%.2f repolls_1ms=%lu\n",
+            (unsigned long)s->agx_perf_win_doorbells,
+            (unsigned long)s->agx_perf_win_passes,
+            (unsigned long)s->agx_perf_win_jobs,
+            avg_lat, p50_lat, max_lat,
+            avg_q_wait, avg_render_ms, avg_bh_delay, capture_ta_ms,
+            (unsigned long)s->agx_perf_win_repolls_1ms);
+
+    s->agx_perf_win_doorbells = 0;
+    s->agx_perf_win_passes = 0;
+    s->agx_perf_win_jobs = 0;
+    s->agx_perf_win_repolls_1ms = 0;
+    s->agx_perf_win_capture_ta_us = 0;
+    s->agx_perf_win_queue_wait_us_sum = 0;
+    s->agx_perf_win_queue_wait_count = 0;
+    s->agx_perf_win_render_us_sum = 0;
+    s->agx_perf_win_render_count = 0;
+    s->agx_perf_win_bh_delay_us_sum = 0;
+    s->agx_perf_win_bh_delay_count = 0;
+    s->agx_perf_win_lat_us_sum = 0;
+    s->agx_perf_win_lat_count = 0;
+
+    timer_mod(s->agx_perf_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
+}
+
 static void agx_replay_complete_job(AGXRenderJob *job)
 {
     A7State *s = job->s;
+
+    if (s->agx_perf_enabled) {
+        int64_t now = g_get_monotonic_time();
+        s->agx_perf_total_jobs++;
+        s->agx_perf_win_jobs++;
+        if (job->target != 0) {
+            s->agx_perf_total_passes++;
+            s->agx_perf_win_passes++;
+            if (job->render_end_us > job->render_start_us) {
+                s->agx_perf_win_render_us_sum += (job->render_end_us - job->render_start_us);
+                s->agx_perf_win_render_count++;
+            }
+        }
+        if (job->render_start_us > job->enqueue_time_us) {
+            s->agx_perf_win_queue_wait_us_sum += (job->render_start_us - job->enqueue_time_us);
+            s->agx_perf_win_queue_wait_count++;
+        }
+        if (job->done_enqueue_us > 0) {
+            s->agx_perf_win_bh_delay_us_sum += (now - job->done_enqueue_us);
+            s->agx_perf_win_bh_delay_count++;
+        }
+        if (job->post_completion && job->doorbell_time_us > 0) {
+            int64_t lat = now - job->doorbell_time_us;
+            if (lat >= 0) {
+                s->agx_perf_win_lat_us_sum += lat;
+                if (s->agx_perf_win_lat_count < ARRAY_SIZE(s->agx_perf_win_lat_samples)) {
+                    s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count++] = lat;
+                }
+            }
+        }
+    }
 
     /* Thread-safety: agx_replay_done_bh runs this on the main loop context with
      * the BQL held. Stamp writes, queue control updates, and firmware completion
@@ -7635,6 +7749,10 @@ static void *agx_render_thread_fn(void *opaque)
 
         qemu_mutex_unlock(&s->agx_render_mutex);
 
+        if (s->agx_perf_enabled) {
+            job->render_start_us = g_get_monotonic_time();
+        }
+
         /* Thread-safety: rasterise off the BQL under RCU read lock.
          * Guest RAM access (address_space_read/write on address_space_memory)
          * is permitted without the BQL under RCU. No shared emulator machine
@@ -7646,6 +7764,11 @@ static void *agx_render_thread_fn(void *opaque)
                              job->width, job->height, job->is_clear, job->pitch, job->scissor_base);
             agx_read_snapshot = NULL;
             rcu_read_unlock();
+        }
+
+        if (s->agx_perf_enabled) {
+            job->render_end_us = g_get_monotonic_time();
+            job->done_enqueue_us = job->render_end_us;
         }
 
         /* Stamps and the kick completion are published in order by
@@ -7680,8 +7803,10 @@ static void agx_enqueue_render_jobs(A7State *s, AGXRenderJob *head, AGXRenderJob
     if (!head || !tail) {
         return;
     }
+    int64_t enq_time = s->agx_perf_enabled ? g_get_monotonic_time() : 0;
     for (AGXRenderJob *j = head; j; j = j->next) {
         s->agx_inflight_jobs++;
+        j->enqueue_time_us = enq_time;
     }
 
     agx_render_ensure_thread(s);
@@ -8094,6 +8219,12 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
             uint32_t value;
             if (!agx_gpu_access(s, agx_meta_gva(command[1]), &value, 4, false) ||
                 (int32_t)(value - command[2]) < 0) {
+#ifdef QEMU_OSDEP_H
+                if (s->agx_perf_enabled) {
+                    s->agx_perf_total_repolls_1ms++;
+                    s->agx_perf_win_repolls_1ms++;
+                }
+#endif
                 timer_mod(s->agx_kick_timer,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
                 break;
@@ -8178,7 +8309,15 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                     agx_snapshot_unref(s->agx_ta_snapshot[context][slot]);
                     uint64_t cat = context < ARRAY_SIZE(s->agx_ctx_cat) - 3 && s->agx_ctx_cat[context + 3] ?
                                    s->agx_ctx_cat[context + 3] : s->agx_cat_base;
+#ifdef QEMU_OSDEP_H
+                    int64_t t_cap = s->agx_perf_enabled ? g_get_monotonic_time() : 0;
+#endif
                     s->agx_ta_snapshot[context][slot] = agx_capture_ta(s, cat, ta);
+#ifdef QEMU_OSDEP_H
+                    if (s->agx_perf_enabled) {
+                        s->agx_perf_win_capture_ta_us += (g_get_monotonic_time() - t_cap);
+                    }
+#endif
                     s->agx_last_ta_valid[context] = true;
                     s->agx_last_ta_queue[context] = block;
                 }
@@ -8303,6 +8442,9 @@ static void agx_drain_context_ring(A7State *s)
 static void agx_kick_cb(void *opaque)
 {
     A7State *s = opaque;
+    int64_t db_time = s->agx_doorbell_time_us ? s->agx_doorbell_time_us :
+                      (s->agx_perf_enabled ? g_get_monotonic_time() : 0);
+    s->agx_doorbell_in_flight = false;
     uint32_t rings = s->agx_pending_doorbells;
     s->agx_pending_doorbells = 0;
     agx_drain_context_ring(s);
@@ -8342,6 +8484,11 @@ static void agx_kick_cb(void *opaque)
     for (unsigned q = 0; q < s->agx_queue_count; q++) {
         commands += agx_drain_queue(s, s->agx_queues[q], &stamps, &local_head, &local_tail);
     }
+    for (AGXRenderJob *j = local_head; j; j = j->next) {
+        if (!j->doorbell_time_us) {
+            j->doorbell_time_us = db_time;
+        }
+    }
     if (local_tail) {
         local_tail->post_completion = true;
         local_tail->commands = commands;
@@ -8354,10 +8501,21 @@ static void agx_kick_cb(void *opaque)
             comp_job->post_completion = true;
             comp_job->commands = commands;
             comp_job->stamps = stamps;
+            comp_job->doorbell_time_us = db_time;
             agx_enqueue_render_jobs(s, comp_job, comp_job);
         } else {
             qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n", commands, stamps);
             agx_post_fw_message(s, 1); /* type 1: work completed */
+            if (s->agx_perf_enabled && db_time > 0) {
+                int64_t now = g_get_monotonic_time();
+                int64_t lat = now - db_time;
+                if (lat >= 0) {
+                    s->agx_perf_win_lat_us_sum += lat;
+                    if (s->agx_perf_win_lat_count < ARRAY_SIZE(s->agx_perf_win_lat_samples)) {
+                        s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count++] = lat;
+                    }
+                }
+            }
         }
     }
 }
@@ -8368,6 +8526,14 @@ static void agx_doorbell(A7State *s, uint64_t value)
         return;
     }
     s->agx_pending_doorbells |= 1U << (value & 3);
+    if (s->agx_perf_enabled) {
+        s->agx_perf_total_doorbells++;
+        s->agx_perf_win_doorbells++;
+        if (!s->agx_doorbell_in_flight) {
+            s->agx_doorbell_time_us = g_get_monotonic_time();
+            s->agx_doorbell_in_flight = true;
+        }
+    }
     timer_mod(s->agx_kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
 }
 
@@ -9176,6 +9342,12 @@ static void a7_init(MachineState *ms)
     s->agx_render_thread_exit = false;
     s->agx_inflight_jobs = 0;
     agx_render_ensure_thread(s);
+    const char *perf_stats_env = getenv("VPHONE_PERF_STATS");
+    s->agx_perf_enabled = perf_stats_env && strcmp(perf_stats_env, "0") != 0;
+    if (s->agx_perf_enabled) {
+        s->agx_perf_timer = timer_new_ms(QEMU_CLOCK_REALTIME, agx_perf_timer_cb, s);
+        timer_mod(s->agx_perf_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
+    }
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);
@@ -9228,6 +9400,11 @@ static void a7_finalize(Object *o)
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
+    if (s->agx_perf_timer) {
+        timer_del(s->agx_perf_timer);
+        timer_free(s->agx_perf_timer);
+        s->agx_perf_timer = NULL;
+    }
     g_free(s->wifi_netdev);
     g_free(s->wifi_ssid);
     g_free(s->system_image);
