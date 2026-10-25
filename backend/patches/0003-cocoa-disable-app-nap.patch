@@ -1,0 +1,22 @@
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 3751be3..48db40b 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1214,6 +1214,17 @@ - (void)applicationDidFinishLaunching: (NSNotification *) note
+ {
+     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
+     allow_events = true;
++    /*
++     * Guest time follows the host clock, so App Nap and timer coalescing
++     * of a background or display-off QEMU slow the guest relative to its
++     * own deadlines (vphone: lock-screen idle fires before scripted touch,
++     * touch frames are never fetched). Keep the emulator at full speed;
++     * idle system sleep stays allowed. The activity lasts for the process.
++     */
++    [[[NSProcessInfo processInfo]
++        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
++                                 NSActivityLatencyCritical
++                          reason:@"Emulated machine runs in real time"] retain];
+ }
+ 
+ - (void)applicationWillTerminate:(NSNotification *)aNotification

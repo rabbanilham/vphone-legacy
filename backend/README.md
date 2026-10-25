@@ -370,6 +370,35 @@ quick clicks, FIFO/gate waits, final release coordinates, ignored buttons/consol
 and script/force/disable policies. The SPI harness also checks controller-stop
 cancellation. These tests do not replace a rebuilt QEMU/Cocoa/iOS run.
 
+### Trackpad gestures (iOS Simulator style)
+
+`backend/patches/0004-cocoa-trackpad-touch-gestures.patch` makes the Cocoa
+window translate host gestures into touchscreen fingers:
+
+| Host input | Guest touch |
+|---|---|
+| Click | Tap (one finger) |
+| Click + drag | Pan / swipe (one finger) |
+| Two-finger trackpad scroll | One finger dragged by the scroll deltas; lifts when the fingers leave the trackpad (iOS supplies its own momentum) |
+| Mouse wheel notch | Short one-finger drag (40 px per notch), lifted after 150 ms without notches |
+| Option + click + drag | Pinch: two fingers mirrored around the screen centre |
+| Option + Shift + click + drag | Two fingers (and the pinch centre) move together |
+| Trackpad pinch | Two fingers around the pointer, spread by the magnification |
+
+While Option is held over the screen, two grey dots show where the pinch
+fingers would land, as in the Simulator. Click and drag keep the absolute
+pointer path described above. Scroll, Option and pinch gestures use QEMU
+multi-touch (MTT) slots 0 and 1, which the board turns into report-0x74 frames
+carrying every live finger: header u16 at 12 = total contact bytes (30·n), byte
+14 = contact count n, path ID = slot + 1 and identity = 2 + slot. MTT fingers follow the
+mouse cadence: start1, down3, move4 every tick even when stationary, up7. When
+the last finger lifts after moving more than 10 px, 18 settle frames are sent first;
+otherwise 3. A finger that leaves a live pinch goes up at once. A re-touch
+while the previous contact drains (rapid flicks) lifts that contact on the next
+tick and then starts a fresh one. A mouse finger and MTT gesture never overlap;
+a blocked begin needs a fresh one. QMP `input-send-event` accepts the same `mtt`
+events (`device: a7-touch-display`), so gestures can also be scripted headlessly.
+
 Run `python3 backend/touch_input_contract_test.py` and its diagnostic `--force`
 variant against the rebuilt QEMU for a diskless AArch64 GPIO/AIC/SPI test. `tests/test_spi_dma.py` compiles the
 actual source with host stubs and exercises a complete gesture under ASan/UBSan.

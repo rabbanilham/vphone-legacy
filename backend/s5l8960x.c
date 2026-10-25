@@ -245,6 +245,29 @@ typedef struct MouseTouch {
     int64_t due;
 } MouseTouch;
 
+/* One reported finger. Path IDs stay stable for a contact's lifetime. */
+typedef struct TouchContact {
+    int x, y;
+    unsigned state, path;
+} TouchContact;
+#define TOUCH_MAX_CONTACTS 5
+#define TOUCH_FRAME_MAX (26 + 30 * TOUCH_MAX_CONTACTS)
+
+/* QEMU MTT slots (trackpad scroll, pinch) share the MouseTouch cadence:
+ * per-finger start/down, one frame per tick carrying every live finger,
+ * and settle frames once the last finger lifts. */
+#define MULTI_TOUCH_SLOTS 2
+typedef struct MultiTouchSlot {
+    int host_x, host_y, x, y, start_x, start_y;
+    bool host_down, pressed, blocked, restart;
+    unsigned phase; /* as MouseTouch */
+} MultiTouchSlot;
+typedef struct MultiTouch {
+    MultiTouchSlot slot[MULTI_TOUCH_SLOTS];
+    unsigned release_frames;
+    int64_t due;
+} MultiTouch;
+
 static int mouse_touch_scale(int value, int maximum, int pixels)
 {
     value = MAX(0, MIN(value, maximum));
@@ -306,6 +329,101 @@ static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
     return true;
 }
 
+static bool multi_touch_active(const MultiTouch *m)
+{
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        if (m->slot[i].phase) { return true; }
+    }
+    return false;
+}
+
+static bool multi_touch_moved(const MultiTouchSlot *c)
+{
+    int dx = c->x - c->start_x, dy = c->y - c->start_y;
+    return dx > 10 || dx < -10 || dy > 10 || dy < -10;
+}
+
+static void multi_touch_start(MultiTouchSlot *c)
+{
+    c->x = c->start_x = c->host_x;
+    c->y = c->start_y = c->host_y;
+    c->phase = 1;
+    c->pressed = true;
+    c->restart = false;
+}
+
+static void multi_touch_sync(MultiTouch *m, bool allowed, int64_t now)
+{
+    bool was_active = multi_touch_active(m);
+    bool any_pressed = false, moved = false, lifted = false;
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &m->slot[i];
+        if (!c->host_down) {
+            c->blocked = c->restart = false;
+        } else if (!c->phase && !c->blocked) {
+            /* Like MouseTouch, an ignored begin needs a fresh one. */
+            if (allowed) { multi_touch_start(c); } else { c->blocked = true; }
+        } else if (c->phase && !c->pressed) {
+            /* Re-touch while the previous contact drains (quick repeated
+             * flicks): lift it on the next tick, then start afresh. */
+            c->restart = true;
+        }
+        if (c->pressed) {
+            c->x = c->host_x;
+            c->y = c->host_y;
+            if (!c->host_down) {
+                c->pressed = false;
+                lifted = true;
+            }
+        }
+        any_pressed |= c->pressed;
+        moved |= c->phase && multi_touch_moved(c);
+    }
+    if (lifted && !any_pressed) { m->release_frames = moved ? 18 : 3; }
+    if (!was_active && multi_touch_active(m)) { m->due = now; }
+}
+
+static unsigned multi_touch_next(MultiTouch *m, int64_t now, bool ready,
+                                 TouchContact *out)
+{
+    unsigned n = 0;
+    bool any_pressed = false, draining = false;
+    if (!multi_touch_active(m) || now < m->due || !ready) { return 0; }
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        any_pressed |= m->slot[i].pressed;
+    }
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &m->slot[i];
+        if (!c->phase) { continue; }
+        TouchContact *o = &out[n++];
+        o->path = i + 1;
+        o->x = c->x; o->y = c->y;
+        if (c->phase <= 2) {
+            o->state = c->phase == 1 ? 1 : 3;
+            o->x = c->start_x; o->y = c->start_y;
+            c->phase++;
+        } else if (c->phase == 3) {
+            o->state = 4;
+            if (!c->pressed) {
+                /* Only the last lift settles; a finger leaving a live
+                 * pinch, or one being re-touched, goes up at once. */
+                if (!any_pressed && !c->restart && m->release_frames) {
+                    draining = true;
+                } else {
+                    c->phase = 4;
+                }
+            }
+        } else {
+            o->state = 7;
+            c->phase = 0;
+            if (c->restart && c->host_down) { multi_touch_start(c); }
+        }
+    }
+    if (draining) { m->release_frames--; }
+    m->due = now + TOUCH_TICK_NS;
+    return n;
+}
+
 typedef struct A7Bridge {
     hwaddr base;
     uint32_t size;
@@ -352,7 +470,7 @@ typedef struct A7Touch {
     A7State *owner;
     uint8_t reporting, sequence;
     uint8_t input_control[4], face_detection, input_reports;
-    uint8_t frames[64][56], frame_len[64];
+    uint8_t frames[64][TOUCH_FRAME_MAX], frame_len[64];
     unsigned frame_head, frame_count;
     uint32_t last_timestamp_us;
 } A7Touch;
@@ -524,6 +642,7 @@ struct A7State {
     QEMUTimer *touch_timer;
     QEMUTimer *mouse_touch_timer;
     MouseTouch mouse_touch;
+    MultiTouch multi_touch;
     bool mouse_touch_enabled;
     TouchScript touch_script;
     int64_t touch_epoch_ns;
@@ -1449,35 +1568,48 @@ static void touch_enqueue(A7Touch *t, const uint8_t *frame, unsigned len)
 
 /* MultitouchSupport 187ccdfb0 -> 187ccf8e0: report 74, variable header
  * and contact stride; D3 endian=1 selects LE at 187ccf9a0. Full 30-byte
- * contact avoids the derived-force fallback used for 20-byte records. */
-static void touch_contact(A7Touch *t, unsigned state, int x, int y)
+ * contact avoids the derived-force fallback used for 20-byte records.
+ * Header 187ccf708: u16 at 12 is the TOTAL contact bytes and byte 14 the
+ * count; the unpacker derives stride = total / count and rejects a rest. */
+static void touch_contacts(A7Touch *t, const TouchContact *c, unsigned n)
 {
-    uint8_t f[56] = { 0x74, t->sequence++, 26, 4 };
+    uint8_t f[TOUCH_FRAME_MAX] = { 0x74, t->sequence++, 26, 4 };
     uint32_t ts = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    n = MIN(n, TOUCH_MAX_CONTACTS);
     if (ts <= t->last_timestamp_us) {
         ts = t->last_timestamp_us + 1;
     }
     t->last_timestamp_us = ts;
     stl_le_p(f + 4, ts);
     f[10] = 4; /* contact frame, flags[1:0]=0 -> type 6 */
-    stw_le_p(f + 12, 30);
-    f[14] = 1;
-    /* Binary+2 -> MTContact+18 is identity, not flags. Zero is
-     * unidentified and fails MTParserPath::isFingerContact (HID a134).
-     * Identity2 is a finger (1..5); path ID1 stays stable across frames. */
-    f[26] = 1; f[27] = state; f[28] = 2; f[29] = 1;
-    stw_le_p(f + 30, x);
-    stw_le_p(f + 32, 1136 - y); /* user syntax is top-left pixels */
-    stw_le_p(f + 38, state == 7 ? 0 : 400); /* ellipse radii, 1/100 mm */
-    stw_le_p(f + 40, state == 7 ? 0 : 300);
-    stw_le_p(f + 44, state == 7 ? 0 : 256); /* force */
-    /* Full-stride extensions are density and quality, NOT radii:
-     * 187cd1da0..1dbc/1d78..1d8c scale these by 1/256. */
-    stw_le_p(f + 46, state == 7 ? 0 : 256); /* density */
-    stw_le_p(f + 48, state == 7 ? 0 : 256); /* related density */
-    stw_le_p(f + 50, state == 7 ? 0 : 256); /* quality */
-    stw_le_p(f + 52, state == 7 ? 0 : 256); /* signal */
-    touch_enqueue(t, f, sizeof(f));
+    stw_le_p(f + 12, 30 * n);
+    f[14] = n;
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t *p = f + 26 + 30 * i;
+        bool up = c[i].state == 7;
+        /* Binary+2 -> MTContact+18 is identity, not flags. Zero is
+         * unidentified and fails MTParserPath::isFingerContact (HID a134).
+         * Identity 2.. are fingers (1..5); path IDs stay stable per contact. */
+        p[0] = c[i].path; p[1] = c[i].state; p[2] = 2 + i; p[3] = 1;
+        stw_le_p(p + 4, c[i].x);
+        stw_le_p(p + 6, 1136 - c[i].y); /* user syntax is top-left pixels */
+        stw_le_p(p + 12, up ? 0 : 400); /* ellipse radii, 1/100 mm */
+        stw_le_p(p + 14, up ? 0 : 300);
+        stw_le_p(p + 18, up ? 0 : 256); /* force */
+        /* Full-stride extensions are density and quality, NOT radii:
+         * 187cd1da0..1dbc/1d78..1d8c scale these by 1/256. */
+        stw_le_p(p + 20, up ? 0 : 256); /* density */
+        stw_le_p(p + 22, up ? 0 : 256); /* related density */
+        stw_le_p(p + 24, up ? 0 : 256); /* quality */
+        stw_le_p(p + 26, up ? 0 : 256); /* signal */
+    }
+    touch_enqueue(t, f, 26 + 30 * n);
+}
+
+static void touch_contact(A7Touch *t, unsigned state, int x, int y)
+{
+    TouchContact c = { x, y, state, 1 };
+    touch_contacts(t, &c, 1);
 }
 
 static A7Touch *touch_device(A7State *s)
@@ -1519,6 +1651,12 @@ static void touch_stop_contacts(A7Touch *t)
      * keep last_button so a held mouse cannot silently restart it. */
     t->owner->mouse_touch.phase = 0;
     t->owner->mouse_touch.pressed = false;
+    for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
+        MultiTouchSlot *c = &t->owner->multi_touch.slot[i];
+        c->phase = 0;
+        c->pressed = c->restart = false;
+        c->blocked = c->host_down;
+    }
     timer_del(t->owner->mouse_touch_timer);
     unsigned kept = 0;
     for (unsigned i = 0; i < t->frame_count; i++) {
@@ -1619,11 +1757,21 @@ static void mouse_touch_timer_cb(void *opaque)
 {
     A7State *s = opaque;
     MouseTouch *m = &s->mouse_touch;
+    MultiTouch *mt = &s->multi_touch;
     A7Touch *t = touch_device(s);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     TouchScriptFrame f;
+    TouchContact c[MULTI_TOUCH_SLOTS];
+    unsigned n;
     bool ready = t && (s->touch_force || touch_reporting_enabled(t)) &&
                  t->frame_count < ARRAY_SIZE(t->frames);
+    if ((n = multi_touch_next(mt, now, ready, c))) {
+        touch_contacts(t, c, n);
+        qemu_log_mask(LOG_UNIMP, "A7 MTOUCH n=%u state=%u x=%d y=%d "
+                      "rel=%u queued=%u ns=%" PRId64 "\n",
+                      n, c[0].state, c[0].x, c[0].y, mt->release_frames,
+                      t->frame_count, now);
+    }
     if (mouse_touch_next(m, now, ready, &f)) {
         touch_contact(t, f.state, f.x, f.y);
         qemu_log_mask(LOG_UNIMP, "A7 MOUSE state=%u x=%d y=%d phase=%u rel=%u "
@@ -1631,9 +1779,9 @@ static void mouse_touch_timer_cb(void *opaque)
                       f.state, f.x, f.y, m->phase, m->release_frames,
                       t->frame_count, now);
     }
-    if (m->phase != 0) {
-        timer_mod(s->mouse_touch_timer,
-                  m->due > now ? m->due : now + TOUCH_TICK_NS);
+    if (m->phase != 0 || multi_touch_active(mt)) {
+        int64_t due = m->phase ? m->due : mt->due;
+        timer_mod(s->mouse_touch_timer, due > now ? due : now + TOUCH_TICK_NS);
     } else {
         timer_del(s->mouse_touch_timer);
     }
@@ -1657,6 +1805,22 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
     } else if (evt->type == INPUT_EVENT_KIND_BTN &&
                evt->btn.button == INPUT_BUTTON_LEFT) {
         m->button = evt->btn.down;
+    } else if (evt->type == INPUT_EVENT_KIND_MTT &&
+               evt->mtt.slot >= 0 && evt->mtt.slot < MULTI_TOUCH_SLOTS) {
+        MultiTouchSlot *c = &s->multi_touch.slot[evt->mtt.slot];
+        if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_BEGIN) {
+            c->host_down = true;
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_END ||
+                   evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_CANCEL) {
+            c->host_down = false;
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_DATA &&
+                   evt->mtt.axis == INPUT_AXIS_X) {
+            c->host_x = mouse_touch_scale(evt->mtt.value, INPUT_EVENT_ABS_MAX, 640);
+        } else if (evt->mtt.type == INPUT_MULTI_TOUCH_TYPE_DATA &&
+                   evt->mtt.axis == INPUT_AXIS_Y) {
+            int y = mouse_touch_scale(evt->mtt.value, INPUT_EVENT_ABS_MAX, 1136);
+            c->host_y = MIN(1136, y + 16); /* same fingertip shift as above */
+        }
     }
 }
 
@@ -1667,14 +1831,17 @@ static void mouse_touch_input_sync(DeviceState *dev)
     bool allowed = s->mouse_touch_enabled && t &&
                    (s->touch_force || touch_reporting_enabled(t)) &&
                    s->touch_step >= s->touch_script.count;
-    mouse_touch_sync(&s->mouse_touch, allowed,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* Mouse and MTT gestures own the digitizer one at a time. */
+    bool multi = multi_touch_active(&s->multi_touch);
+    mouse_touch_sync(&s->mouse_touch, allowed && !multi, now);
+    multi_touch_sync(&s->multi_touch, allowed && !s->mouse_touch.phase, now);
     mouse_touch_timer_cb(s);
 }
 
 static const QemuInputHandler mouse_touch_handler = {
     .name = "A7 touchscreen mouse",
-    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_MTT,
     .event = mouse_touch_event,
     .sync = mouse_touch_input_sync,
 };
@@ -8295,6 +8462,7 @@ static void a7_reset(void *opaque)
     }
     timer_del(s->mouse_touch_timer);
     memset(&s->mouse_touch, 0, sizeof(s->mouse_touch));
+    memset(&s->multi_touch, 0, sizeof(s->multi_touch));
     touch_script_reset(s);
     s->chestnut_control = 0;
     a7_otg_reset(s);
