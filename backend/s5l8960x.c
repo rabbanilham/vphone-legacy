@@ -5564,6 +5564,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 
 #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
 #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
+#define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
 
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
  * pointers to blocks holding sampler state, texture state words (TSW) and
@@ -5637,7 +5638,8 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 /* A stand-alone TSW is only 16 bytes. Constants following
                  * it can belong to the next draw; their luma weights must
                  * not turn an opaque wallpaper/icon draw into vibrancy. */
-                return !memcmp(blocks[b], luma, sizeof(luma)) ?
+                return (!memcmp(blocks[b], luma, sizeof(luma)) ||
+                        prog == AGX_USC_STRIDE36_DUAL_TEX) ?
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
@@ -5651,6 +5653,31 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
         }
     }
     return AGX_TEX_NONE;
+}
+
+static bool agx_replay_decode_mask_tsw(A7State *s, uint64_t cat, const uint32_t *ppp,
+                                      unsigned n, AGXTexture *mask_tex)
+{
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t data[8];
+        if ((ppp[i] & 0xc0000000) != 0x80000000 ||
+            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[i], data, sizeof(data))) {
+            continue;
+        }
+        for (unsigned k = 0; k < 8; k += 2) {
+            uint64_t ptr = data[k] | ((uint64_t)data[k + 1] << 32);
+            if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40)) {
+                break;
+            }
+            uint32_t block[12];
+            if (agx_ctx_read(s, cat, ptr, block, sizeof(block))) {
+                if (agx_replay_decode_tsw(s, cat, block + 4, mask_tex)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
@@ -6325,7 +6352,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
      * ensuring safe re-entrancy between the dedicated off-BQL render thread
      * and the inline BQL fallback. Guest memory is accessed via
      * address_space_read/write on address_space_memory under RCU read lock. */
-    static __thread uint32_t row[640 * 4], texrow[0x4000], texrow1[0x4000];
+    static __thread uint32_t row[640 * 4], texrow[0x4000], texrow1[0x4000], maskrow[0x4000];
     uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
     uint32_t ppp[64], retained_ppp[32] = {0};
     unsigned ppp_count = 0, draws = 0;
@@ -6467,6 +6494,14 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             float col_mat[9], col_bias[3];
             if (is_color_matrix) {
                 agx_extract_color_matrix(s, cat, ppp, ppp_count, col_mat, col_bias);
+            }
+            AGXTexture mask_tex = { 0 };
+            bool has_mask_tex = false;
+            if (stride == 36 && prog == AGX_USC_STRIDE36_DUAL_TEX) {
+                has_mask_tex = agx_replay_decode_mask_tsw(s, cat, retained_ppp, 32, &mask_tex);
+                if (!has_mask_tex && ppp_count > 0) {
+                    has_mask_tex = agx_replay_decode_mask_tsw(s, cat, ppp, ppp_count, &mask_tex);
+                }
             }
             uint32_t *blurred_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
@@ -7101,11 +7136,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 uint32_t colour = 0xff000000;
                 if (stride == 20 || (stride == 28 && !textured)) {
                     agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &colour, 4);
-                } else if (stride == 24 || stride == 28 || clip_space) {
-                    /* stride 36 (two UV sets, grabber/camera mask + backdrop) is not decoded */
-                    unsigned uv = clip_space ? 8 : (stride == 28 ? 20 : 16);
+                } else if (stride == 24 || stride == 28 || stride == 36 || clip_space) {
+                    /* stride 36 (two UV sets, grabber/camera mask + backdrop) */
+                    unsigned uv = clip_space ? 8 : (stride >= 28 ? 20 : 16);
                     u0 = v0 = 1e9; u1 = v1 = -1e9;
-                    if (stride == 28) {
+                    if (stride == 28 || stride == 36) {
                         agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &tint, 4);
                     }
                     for (unsigned i = q_start; i < q_start + step; i++) {
@@ -7212,6 +7247,21 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     float step_y = hypotf(uv_map[1] * su, uv_map[4] * sv);
                     is_scaled = fabsf(step_x - 1.0f) > 0.1f || fabsf(step_y - 1.0f) > 0.1f;
                 }
+                if (stride == 36 && prog == AGX_USC_STRIDE36_DUAL_TEX) {
+                    bool complete = true;
+                    for (int y = y0; y < y1; y++) {
+                        float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :
+                                            agx_quad_coordinate(y, miny, maxy, v0, v1);
+                        uint32_t ty = MIN(tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                        if (!agx_texture_row(s, cat, &tex, ty, texrow)) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if (!complete) {
+                        continue;
+                    }
+                }
                 /* A cross-axis V coordinate needs multiple source rows per
                  * output row: snapshot this bounded texture for the quad (the
                  * axis-aligned path keeps its two-row cache; blur already
@@ -7234,12 +7284,20 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     sample_tex = quad_tex;
                 }
-                int cached_y0 = -1, cached_y1 = -1;
+                int cached_y0 = -1, cached_y1 = -1, cached_mask_y = -1;
+                bool mask_row_ok = false;
 
                 for (int y = y0; y < y1; y++) {
                     /* Clip coverage, not the interpolation domain. */
                     float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :
                                         agx_quad_coordinate(y, miny, maxy, v0, v1);
+                    if (has_mask_tex && mask_tex.addr) {
+                        uint32_t mask_ty = MIN(mask_tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                        if ((int)mask_ty != cached_mask_y) {
+                            mask_row_ok = agx_texture_row(s, cat, &mask_tex, mask_ty, maskrow);
+                            cached_mask_y = (int)mask_ty;
+                        }
+                    }
                     uint32_t ty0 = 0, ty1 = 0;
                     float fy = 0.0f;
                     if (!sample_tex) {
@@ -7279,14 +7337,15 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                             agx_quad_coordinate(x, minx, maxx, u0, u1);
                         float sample_v = affine ? fv + uv_map[3] * (x + 0.5f) : fv;
                         uint32_t src;
+                        uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
                         if (sample_tex) {
                             if (is_blur || is_scaled || tex.linear_filter) {
                                 src = agx_sample_bilinear(sample_tex, tex.w, tex.h,
                                                           fu * su, sample_v * sv);
                             } else {
-                                unsigned tx = MIN(tex.w - 1, (unsigned)MAX(0.0f, fu * su));
-                                unsigned ty = MIN(tex.h - 1, (unsigned)MAX(0.0f, sample_v * sv));
-                                src = sample_tex[(size_t)ty * tex.w + tx];
+                                unsigned stx = MIN(tex.w - 1, (unsigned)MAX(0.0f, fu * su));
+                                unsigned sty = MIN(tex.h - 1, (unsigned)MAX(0.0f, sample_v * sv));
+                                src = sample_tex[(size_t)sty * tex.w + stx];
                             }
                         } else if (is_scaled || tex.linear_filter) {
                             float u_sample = fu * su - 0.5f;
@@ -7301,7 +7360,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
                             src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
                         } else {
-                            uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
                             src = texrow[tx];
                         }
                         if (clip_space) {
@@ -7339,7 +7397,25 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                             row[x - x0] = out;
                         } else if (vibrancy) {
-                            row[x - x0] = agx_blend_vibrancy(dst, src);
+                            if (stride == 36 && has_mask_tex && mask_row_ok) {
+                                uint32_t m_alpha = (maskrow[tx] >> 24) & 0xff;
+                                if (m_alpha == 0) {
+                                    row[x - x0] = dst;
+                                } else {
+                                    uint32_t vib = agx_blend_vibrancy(dst, src);
+                                    if (m_alpha == 255) {
+                                        row[x - x0] = vib;
+                                    } else {
+                                        uint32_t inv = 255 - m_alpha;
+                                        uint32_t b = (((vib & 0xff) * m_alpha + (dst & 0xff) * inv) / 255);
+                                        uint32_t g = ((((vib >> 8) & 0xff) * m_alpha + ((dst >> 8) & 0xff) * inv) / 255);
+                                        uint32_t r = ((((vib >> 16) & 0xff) * m_alpha + ((dst >> 16) & 0xff) * inv) / 255);
+                                        row[x - x0] = 0xff000000u | (r << 16) | (g << 8) | b;
+                                    }
+                                }
+                            } else {
+                                row[x - x0] = agx_blend_vibrancy(dst, src);
+                            }
                         } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2) {
                             row[x - x0] = agx_blend_plus_lighter(dst, src);
                         } else {
