@@ -6434,6 +6434,28 @@ static float agx_quad_coordinate(float pixel, float low, float high,
 
 /* Preserve the association between vertex positions and texture coordinates.
  * CA also submits quads with U along screen Y (and even constant V). */
+/* Vertex position. Strides of 20 and up carry a vec4 (x, y, z, w). CA leaves
+ * w at 1 for flat layers, but 3D layer transforms (the unlock icon fly-in
+ * zooms icons in perspective) are pre-multiplied, so x and y must be divided
+ * by w; ignoring it drew the icons at normal size, bunched together. */
+static bool agx_vertex_xy(A7State *s, uint64_t cat, uint64_t gva, unsigned stride, float xy[2])
+{
+    float p[4];
+    if (stride < 20) {
+        return agx_ctx_read(s, cat, gva, xy, 8);
+    }
+    if (!agx_ctx_read(s, cat, gva, p, 16)) {
+        return false;
+    }
+    xy[0] = p[0];
+    xy[1] = p[1];
+    if (isfinite(p[3]) && p[3] > 1e-6f && fabsf(p[3] - 1.0f) > 1e-6f) {
+        xy[0] /= p[3];
+        xy[1] /= p[3];
+    }
+    return true;
+}
+
 static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float out[6])
 {
     float dx1 = xy[1][0] - xy[0][0], dy1 = xy[1][1] - xy[0][1];
@@ -7049,7 +7071,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         uint64_t v_gva = buf + (uint64_t)(q_start + i) * stride;
                         float xy[2];
                         float uvs[4];
-                        if (!agx_ctx_read(s, cat, v_gva, xy, 8) ||
+                        if (!agx_vertex_xy(s, cat, v_gva, stride, xy) ||
                             !agx_ctx_read(s, cat, v_gva + 20, uvs, 16)) {
                             read_ok = false;
                             break;
@@ -7197,7 +7219,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 unsigned v_count = MIN(count, 64u);
                 for (unsigned i = 0; i < v_count; i++) {
                     float xy[2];
-                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                    if (!agx_vertex_xy(s, cat, buf + (uint64_t)i * stride, stride, xy)) {
                         v_count = i;
                         break;
                     }
@@ -7513,7 +7535,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
                 for (unsigned i = q_start; i < q_start + step; i++) {
                     float xy[2];
-                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                    if (!agx_vertex_xy(s, cat, buf + (uint64_t)i * stride, stride, xy)) {
                         break;
                     }
                     if (clip_space) {

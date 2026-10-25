@@ -5,8 +5,8 @@ Walks the VDM stream from the TA command, decodes each draw's vertices
 PDS data -> TSW), then rasterises axis-aligned quads with src-over blending.
 """
 from pathlib import Path
-import struct
 import math
+import struct
 import sys
 import zlib
 
@@ -168,6 +168,12 @@ def vertices(f, vs_data, count):
     for i in range(count):
         v = f.read(buf + i * stride, stride)
         x, y = struct.unpack_from('<2f', v, 0)
+        if stride >= 20:
+            # vec4 position: 3D layer transforms (unlock icon fly-in) leave
+            # w != 1, so divide like the C replay's agx_vertex_xy.
+            w = struct.unpack_from('<f', v, 12)[0]
+            if math.isfinite(w) and w > 1e-6 and abs(w - 1) > 1e-6:
+                x, y = x / w, y / w
         out.append((x, y, v[8:] if stride == 16 else v[16:]))
     return stride, out
 
