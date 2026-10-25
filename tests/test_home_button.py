@@ -20,12 +20,14 @@ class HomeButtonTests(unittest.TestCase):
 #include <string.h>
 #include <assert.h>
 typedef struct A7State {
- uint8_t gpio_regs[0x100000]; bool touch_irq_low, home_pressed;
+ uint8_t gpio_regs[0x100000]; bool touch_irq_low, home_pressed, hold_pressed;
  struct { bool irq_low; } pmu; void *wifi; uint32_t device_irq[32];
 } A7State;
 static uint32_t ldl_le_p(const void *p) { uint32_t v; memcpy(&v,p,4); return v; }
 static void stl_le_p(void *p,uint32_t v) { memcpy(p,&v,4); }
 static void aic_update(A7State *s) { (void)s; }
+#define LOG_UNIMP 0
+#define qemu_log_mask(mask, ...) ((void)(mask))
 '''
         harness = '''
 int main(void) {
@@ -43,6 +45,13 @@ int main(void) {
    assert(!!(ldl_le_p(status)&4)==(type==6));
    stl_le_p(status,0); home_release(&s); assert(!s.home_pressed);
    assert(!!(ldl_le_p(status)&4)==(type==8 || type==0xc || type==4));
+   /* Hold (sleep/wake) is the same active-low contract on GPIO3. */
+   memset(&s,0,sizeof(s));
+   stl_le_p(s.gpio_regs+12,(group<<16)|type);
+   button_level(&s,3,&s.hold_pressed,true); assert(s.hold_pressed);
+   assert(!!(ldl_le_p(status)&8)==press);
+   stl_le_p(status,0); hold_release(&s); assert(!s.hold_pressed);
+   assert(!!(ldl_le_p(status)&8)==(type==8 || type==0xc || type==4));
   }
  }
  memset(&s,0,sizeof(s)); stl_le_p(s.gpio_regs+8,0xff000c);
@@ -52,7 +61,7 @@ int main(void) {
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
-            tmp=Path(tmp); (tmp/'home.c').write_text(prelude+'\n'.join(function(n) for n in ['touch_gpio_update','home_level','home_release'])+harness)
+            tmp=Path(tmp); (tmp/'home.c').write_text(prelude+'\n'.join(function(n) for n in ['touch_gpio_update','button_level','home_level','home_release','hold_release'])+harness)
             subprocess.run(['cc','-Wall','-Werror',str(tmp/'home.c'),'-o',str(tmp/'home')],check=True)
             subprocess.run([str(tmp/'home')],check=True)
 

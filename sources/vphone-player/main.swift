@@ -276,6 +276,31 @@ final class QMPInput {
         guard try line()["QMP"] != nil else {throw NSError(domain:"QMP greeting tidak valid",code:1)}
         try execute("qmp_capabilities"); connected = true
     }
+    func reset() {
+        if io.fd >= 0 {close(io.fd);io.fd = -1}
+        connected = false
+    }
+    // Sleep/wake button: a click locks an awake device or wakes a sleeping one.
+    func pressPower(_ completion: @escaping (String?)->Void) {
+        queue.async {
+            do {
+                if !self.connected {try self.connect()}
+                for down in [true,false] {
+                    try self.execute("input-send-event",["device":"a7-touch-display","events":[["type":"key","data":["down":down,"key":["type":"qcode","data":"power"]]]]])
+                }
+                completion(nil)
+            } catch {self.reset();completion(error.localizedDescription)}
+        }
+    }
+    // nil when the backend cannot say (older build or QMP down).
+    func displayOn(_ completion: @escaping (Bool?)->Void) {
+        queue.async {
+            do {
+                if !self.connected {try self.connect()}
+                completion(try self.execute("qom-get",["path":"/machine","property":"display-on"]) as? Bool)
+            } catch {self.reset();completion(nil)}
+        }
+    }
     func prepareControlCenter(_ completion: @escaping (String?)->Void) {
         queue.async {
             do {
@@ -411,6 +436,30 @@ enum ScreenGeometry {
     }
 }
 
+// Shown over the screen while the guest has its display off (sleep/locked).
+final class SleepOverlay: NSView {
+    var onWake: (() -> Void)?
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString:"Perangkat terkunci")
+    private let hint = NSTextField(labelWithString:"Klik untuk membangunkan")
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        icon.image = NSImage(systemSymbolName:"lock.fill",accessibilityDescription:"Terkunci")
+        icon.symbolConfiguration = .init(pointSize:34,weight:.regular)
+        icon.contentTintColor = NSColor(white:0.75,alpha:1)
+        label.font = .systemFont(ofSize:15,weight:.semibold);label.textColor = NSColor(white:0.85,alpha:1)
+        hint.font = .systemFont(ofSize:12);hint.textColor = NSColor(white:0.55,alpha:1)
+        let stack = NSStackView(views:[icon,label,hint]);stack.orientation = .vertical;stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false;addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo:centerXAnchor),stack.centerYAnchor.constraint(equalTo:centerYAnchor)])
+        setAccessibilityLabel("Perangkat terkunci. Klik untuk membangunkan.")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+    override func mouseDown(with event: NSEvent) { onWake?() }
+}
+
 final class Screen: NSView {
     private var cachedImage: CGImage?
     var pixelBuffer: PixelBuffer?
@@ -431,6 +480,8 @@ final class Screen: NSView {
     }
     let contentLayer = CALayer()
     let overlayLayer = CALayer()
+    let sleepOverlay = SleepOverlay()
+    private(set) var sleeping = false
     var input: ((Int,Int,Bool)->Void)?
     let gestures = TouchGestures()
     var wheelTimer: Timer?
@@ -459,6 +510,19 @@ final class Screen: NSView {
         contentLayer.minificationFilter = .trilinear
         layer?.addSublayer(contentLayer)
         layer?.addSublayer(overlayLayer)
+        sleepOverlay.isHidden = true
+        addSubview(sleepOverlay)
+    }
+    // Display off: hide the last rendered frame and block input until woken.
+    func setSleeping(_ value: Bool) {
+        guard value != sleeping else {return}
+        sleeping = value
+        if value {cancelTouch()}
+        CATransaction.begin();CATransaction.setDisableActions(true)
+        contentLayer.isHidden = value
+        CATransaction.commit()
+        sleepOverlay.isHidden = !value
+        trace?("display \(value ? "off (sleep)" : "on")")
     }
     override func layout() {
         super.layout()
@@ -467,6 +531,7 @@ final class Screen: NSView {
         contentLayer.frame = displayRect
         overlayLayer.frame = bounds
         CATransaction.commit()
+        sleepOverlay.frame = displayRect
         updateOverlay()
     }
     func present(surface: IOSurface) {
@@ -605,6 +670,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var inputLog: FileHandle?
     var window: NSWindow!
     var buttons: [NSButton] = []
+    var displayTimer: Timer?
+    var displayQuery = false
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
@@ -618,7 +685,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "vphone — iOS 7.1.2"; window.minSize = NSSize(width:260,height:440); window.delegate = self
         let root = NSView(); window.contentView = root
         let bar = NSStackView(); bar.orientation = .horizontal; bar.spacing = 16
-        for (icon,title,action) in [("house","Home",#selector(home)),("slider.horizontal.3","Control Center",#selector(controlCenter)),("camera","Screen Capture",#selector(capture))] {
+        for (icon,title,action) in [("house","Home",#selector(home)),("slider.horizontal.3","Control Center",#selector(controlCenter)),("camera","Screen Capture",#selector(capture)),("lock","Lock",#selector(lock))] {
             let button = NSButton(image:NSImage(systemSymbolName:icon,accessibilityDescription:title)!,target:self,action:action)
             button.bezelStyle = .texturedRounded; button.toolTip = title; button.setAccessibilityLabel(title); button.isEnabled = false
             buttons.append(button); bar.addArrangedSubview(button)
@@ -654,6 +721,10 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
+        screen.sleepOverlay.onWake = {[weak self] in self?.home()}
+        // Poll the guest's display power so a sleeping device shows as locked
+        // instead of a frozen frame that ignores touches.
+        displayTimer = Timer.scheduledTimer(withTimeInterval:0.5,repeats:true) {[weak self] _ in self?.pollDisplay()}
         let path = CommandLine.arguments[1]
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
     }
@@ -672,6 +743,22 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
     @objc func home() { screen.cancelTouch();rfb.home() }
+    @objc func lock() {
+        screen.cancelTouch()
+        touchInput?.pressPower {[weak self] error in
+            guard let error else {return}
+            DispatchQueue.main.async {self?.handleGestureFailure(error)}
+        }
+    }
+    func pollDisplay() {
+        guard !displayQuery, let touchInput else {return}
+        displayQuery = true
+        touchInput.displayOn {[weak self] on in DispatchQueue.main.async {
+            guard let self else {return}
+            self.displayQuery = false
+            if let on {self.screen.setSleeping(!on)}
+        }}
+    }
     @objc func controlCenter() {
         guard !controlCenterPending,!screen.held,screen.gestures.kind == .none,let touchInput else {return}
         controlCenterPending = true;buttons[1].isEnabled = false

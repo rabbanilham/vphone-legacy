@@ -653,6 +653,10 @@ struct A7State {
     bool touch_irq_low;
     bool home_pressed;
     QEMUTimer *home_timer;
+    bool hold_pressed;          /* sleep/wake ("hold") button, GPIO3 */
+    bool backlight_off;         /* LM3534 disabled: the guest display sleeps */
+    int64_t hold_down_ns;
+    QEMUTimer *hold_timer;
     QEMUTimer *touch_timer;
     QEMUTimer *mouse_touch_timer;
     MouseTouch mouse_touch;
@@ -1211,13 +1215,16 @@ static void touch_gpio_update(A7State *s)
             stl_le_p(status, ldl_le_p(status) | (1u << (167 % 32)));
         }
     }
-    config = ldl_le_p(s->gpio_regs + 2 * 4);
-    group = (config >> 16) & 0xff;
-    type = config & 0xe;
-    if (group < 7 && ((type == 6 && s->home_pressed) ||
-                      (type == 4 && !s->home_pressed))) {
-        uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
-        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+    /* Level-triggered push buttons: Home (GPIO2) and hold (GPIO3). */
+    for (unsigned pin = 2; pin <= 3; pin++) {
+        bool pressed = pin == 2 ? s->home_pressed : s->hold_pressed;
+        config = ldl_le_p(s->gpio_regs + pin * 4);
+        group = (config >> 16) & 0xff;
+        type = config & 0xe;
+        if (group < 7 && ((type == 6 && pressed) || (type == 4 && !pressed))) {
+            uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
+            stl_le_p(status, ldl_le_p(status) | (1u << pin));
+        }
     }
     for (unsigned g = 0; g < 7; g++) {
         uint32_t pending = 0;
@@ -1245,24 +1252,53 @@ static void touch_gpio_level(A7State *s, bool low)
     touch_gpio_update(s);
 }
 
-/* Home is active-low GPIO2. Respect the guest's edge/level selection. */
-static void home_level(A7State *s, bool pressed)
+/* Push buttons are active-low: Home on GPIO2, hold (sleep/wake) on GPIO3.
+ * Respect the guest's edge/level selection. */
+static void button_level(A7State *s, unsigned pin, bool *state, bool pressed)
 {
-    uint32_t config = ldl_le_p(s->gpio_regs + 2 * 4);
+    uint32_t config = ldl_le_p(s->gpio_regs + pin * 4);
     unsigned group = (config >> 16) & 0xff, type = config & 0xe;
-    bool edge = s->home_pressed != pressed &&
+    bool edge = *state != pressed &&
         (type == 0xc || (type == 0xa && pressed) || (type == 8 && !pressed));
     if (group < 7 && edge) {
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
-        stl_le_p(status, ldl_le_p(status) | (1u << 2));
+        stl_le_p(status, ldl_le_p(status) | (1u << pin));
     }
-    s->home_pressed = pressed;
+    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d ns=%" PRId64 "\n",
+                  pin, pressed, config, edge, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    *state = pressed;
     touch_gpio_update(s);
+}
+
+static void home_level(A7State *s, bool pressed)
+{
+    button_level(s, 2, &s->home_pressed, pressed);
 }
 
 static void home_release(void *opaque)
 {
     home_level(opaque, false);
+}
+
+static void hold_release(void *opaque)
+{
+    A7State *s = opaque;
+    button_level(s, 3, &s->hold_pressed, false);
+}
+
+/* Sleep/wake key from the host. A click is a 100 ms press (lock or wake);
+ * holding the key holds the button (slide to power off), with a 10 s guard
+ * against a lost key-up. */
+static void hold_key(A7State *s, bool down)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (down && !s->hold_pressed) {
+        button_level(s, 3, &s->hold_pressed, true);
+        s->hold_down_ns = now;
+        timer_mod(s->hold_timer, now + NANOSECONDS_PER_SECOND * 10);
+    } else if (!down && s->hold_pressed) {
+        timer_mod(s->hold_timer, MAX(now, s->hold_down_ns + 100000000));
+    }
 }
 
 static bool touch_irq_latched(A7State *s)
@@ -1317,7 +1353,8 @@ static uint64_t gpio_read(void *opaque, hwaddr off, unsigned size)
                     uint32_t config = ldl_le_p(s->gpio_regs + off + i);
                     bool driven = !(config & 0x200) && (config & 0xe) == 2;
                     bool sample = !driven || (config & 1);
-                    byte = (byte & ~1) | (pin == 2 ? !s->home_pressed : sample);
+                    byte = (byte & ~1) | (pin == 2 ? !s->home_pressed :
+                                          pin == 3 ? !s->hold_pressed : sample);
                 }
             }
             val |= (uint64_t)byte << (i * 8);
@@ -1883,6 +1920,8 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
                 timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);
             }
             /* Release is timer-owned: a stalled host must not create a long press. */
+        } else if (qemu_input_linux_to_qcode(evt->key.key) == Q_KEY_CODE_POWER) {
+            hold_key(s, evt->key.down);
         }
     } else if (evt->type == INPUT_EVENT_KIND_ABS) {
         if (evt->abs.axis == INPUT_AXIS_X) {
@@ -2368,6 +2407,10 @@ static void d2045_store(A7State *s, uint16_t reg, uint8_t value)
         d->rtc_base = (seconds & ~(0xffu << shift)) | (uint32_t)value << shift;
         d->rtc_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     }
+    if ((reg >= 0x70 && reg < 0x7c) || (reg >= 0x180 && reg < 0x190)) {
+        qemu_log_mask(LOG_UNIMP, "PMU write reg=0x%x val=0x%02x ns=%" PRId64 "\n",
+                      reg, value, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     if (reg >= 0x50 && reg < 0x5c) {
         d->regs[reg] &= ~value; /* defensive W1C; normal driver uses read-clear */
     } else {
@@ -2569,6 +2612,13 @@ static void board_i2c_command(A7Peripheral *p, uint32_t value)
             unsigned reg = d->pointer++;
             if (!tristar) {
                 d->regs[reg & 3] = value;
+                qemu_log_mask(LOG_UNIMP, "LM3534 reg 0x%x = 0x%02x\n", reg, value & 0xff);
+                /* Control register bit 0 enables the backlight. iOS clears it
+                 * (after the DWI fade) when the display sleeps and sets it on
+                 * wake; the player shows a locked screen meanwhile. */
+                if ((reg & 3) == 0) {
+                    p->owner->backlight_off = !(value & 1);
+                }
             } else if (reg < 0xc || reg == 0xe) {
                 d->regs[reg] = value;
             }
@@ -2624,6 +2674,10 @@ static void d2045_command(A7Peripheral *p, uint32_t value)
                 byte = fraction >> ((reg - 0x5c6) * 8);
             }
             p->pmu_rx[i] = byte;
+            if ((reg >= 0x180 && reg < 0x190) || (reg >= 0x50 && reg < 0x5c && byte)) {
+                qemu_log_mask(LOG_UNIMP, "PMU read reg=0x%x val=0x%02x ns=%" PRId64 "\n",
+                              reg, byte, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            }
             if (reg >= 0x50 && reg < 0x5c) {
                 d->regs[reg] = 0; /* native handler has no explicit acknowledge */
             }
@@ -4508,6 +4562,8 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
              * AppleS5L8940DWI::_waitTransaction (10ea5a4) polls for. Nothing
              * is attached to the wire, so the transfer completes at once. */
             val &= ~UINT64_C(1);
+            qemu_log_mask(LOG_UNIMP, "DWI go off=0x%" HWADDR_PRIx " word=0x%08x\n",
+                          off, ldl_le_p(p->regs + off + 4));
         }
         if (p->base == UINT64_C(0x208040000) && !p->owner->iop_diagnostic && p->owner->sys_fd >= 0) {
             A7State *s = p->owner;
@@ -5579,7 +5635,11 @@ typedef struct AGXRenderJob {
  * into the offline host harness (backend/agx_replay_host.c), which defines
  * AGX_REPLAY_SKIP to count the draws that replay leaves out. */
 #ifndef AGX_REPLAY_SKIP
-#define AGX_REPLAY_SKIP(reason) do { } while (0)
+#define AGX_REPLAY_SKIP(reason) do { \
+    if (getenv("VPHONE_AGX_REPLAY_AUDIT")) { \
+        qemu_log_mask(LOG_GUEST_ERROR, "AGX replay skip: %s\n", reason); \
+    } \
+} while (0)
 #endif
 
 #define AGX_PDS_HEAP UINT64_C(0x600000000)
@@ -5664,12 +5724,18 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
 
 /* GPU-rendered surface layout. Display surfaces are linear 2560-byte rows in
  * physical memory, mapped as 16-row strips (40 KiB) at 64 KiB-aligned GVAs,
- * which leaves an unmapped hole at base + 0xa000. Other render targets
- * (offscreen layers) are mapped densely with a 16-pixel aligned pitch. */
+ * which leaves an unmapped hole at base + 0xa000. Other targets use the
+ * PBE layout: an explicit linear pitch or Y-first Morton order (layout 1).
+ * The helper below initializes the display/linear fallback; replay supplies
+ * the PBE-derived layout and pass dimensions for target-row access. */
 typedef struct AGXSurface {
     uint64_t base;
     uint32_t pitch;
     bool strip;
+    bool twiddled;
+    uint32_t w, h;
+    uint32_t *pixels;            /* NC target staging; NULL for established paths */
+    uint8_t *loaded, *dirty;
 } AGXSurface;
 
 static void agx_surface_layout(A7State *s, uint64_t cat, uint64_t base, uint32_t w,
@@ -5677,6 +5743,11 @@ static void agx_surface_layout(A7State *s, uint64_t cat, uint64_t base, uint32_t
 {
     hwaddr pa;
     out->base = base;
+    out->twiddled = false;
+    out->w = w;
+    out->h = 0;
+    out->pixels = NULL;
+    out->loaded = out->dirty = NULL;
     /* Only full-width, 64 KiB-aligned display surfaces use 16-row strips.
      * For small/offset glyph allocations these probes inspect unrelated
      * neighbours, whose holes must not select a 2560-byte display pitch. */
@@ -5698,11 +5769,15 @@ typedef struct AGXTexture {
     uint64_t addr;
     uint32_t w, h, stride;
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
-    bool twiddled;              /* uploaded 2D texture, Y-first Morton order */
+    bool twiddled;              /* layout-1 texture/target, Y-first Morton order */
     bool linear_filter;         /* sampler word 1 bits [5:4] or [7:6] == 1 */
+    bool nc_sparse;             /* proved sparse NC allocation, not general layout 1 */
     bool clamp_to_edge;         /* sampler word 1 bits [11:9] or [14:12] == 2 */
     uint32_t sampler_words[4];
 } AGXTexture;
+
+static bool agx_nc_sparse_layout(A7State *s, uint64_t cat, uint64_t base,
+                                  uint32_t w, uint32_t h);
 
 enum { AGX_TEX_NONE, AGX_TEX_FOUND, AGX_TEX_VIBRANCY };
 
@@ -5726,7 +5801,9 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     AGXSurface sf;
     agx_surface_layout(s, cat, tex->addr, tex->w, &sf);
     tex->strip = sf.strip;
-    tex->twiddled = !sf.strip && (tsw[0] & 0x8007) == 0x8001;
+    tex->nc_sparse = !sf.strip && (tsw[0] & 0x8007) == 1 &&
+                     agx_nc_sparse_layout(s, cat, tex->addr, tex->w, tex->h);
+    tex->twiddled = !sf.strip && ((tsw[0] & 0x8007) == 0x8001 || tex->nc_sparse);
     if (sf.strip) {
         tex->stride = sf.pitch;
     } else if ((tsw[0] & 7) == 1) {
@@ -5794,6 +5871,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                 continue;
             }
             if (agx_replay_decode_tsw(s, cat, blocks[b] + k, tex)) {
+
                 const uint32_t *sw = NULL;
                 if (k >= 4) {
                     sw = blocks[b] + k - 4;
@@ -5823,6 +5901,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
             }
         }
         if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
+
             const uint32_t *sw = blocks[b] + 4;
             memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
             tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
@@ -5851,6 +5930,7 @@ static bool agx_replay_decode_mask_tsw(A7State *s, uint64_t cat, const uint32_t 
             uint32_t block[12];
             if (agx_ctx_read(s, cat, ptr, block, sizeof(block))) {
                 if (agx_replay_decode_tsw(s, cat, block + 4, mask_tex)) {
+
                     return true;
                 }
             }
@@ -5948,6 +6028,185 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
     return true;
 }
 
+/* NC allocates these scratch extents sparsely. Require BOTH absent linear
+ * row pages and a completely mapped 32x32 Morton-tile footprint. Dense
+ * glyph caches and every other extent retain the established addressing. */
+static __thread struct {
+    uint64_t cat, base;
+    uint32_t w, h;
+    bool sparse;
+} agx_nc_layout_cache[8];
+static __thread unsigned agx_nc_layout_count;
+static __thread bool agx_nc_layout_active;
+
+static bool agx_nc_sparse_layout(A7State *s, uint64_t cat, uint64_t base,
+                                  uint32_t w, uint32_t h)
+{
+    if ((base & 4095) || !((w == 128 && h == 96) ||
+        (w == 640 && (h == 224 || h == 288 || h == 320)))) { return false; }
+    if (agx_nc_layout_active) {
+        for (unsigned i = 0; i < agx_nc_layout_count; i++) {
+            if (agx_nc_layout_cache[i].cat == cat && agx_nc_layout_cache[i].base == base &&
+                agx_nc_layout_cache[i].w == w && agx_nc_layout_cache[i].h == h) {
+                return agx_nc_layout_cache[i].sparse;
+            }
+        }
+    }
+    hwaddr pa;
+    bool missing_linear = false, complete_morton = true;
+    uint32_t pitch = ((w + 15) & ~15u) * 4;
+    for (unsigned y = 0; y < h; y++) {
+        if (!agx_gpu_translate_ctx(s, cat, base + (uint64_t)y * pitch, &pa)) {
+            missing_linear = true;
+            break;
+        }
+    }
+    if (missing_linear) {
+        AGXTexture tex = {.addr = base, .w = w, .h = h, .twiddled = true};
+        for (unsigned y = 0; y < h && complete_morton; y += 32) {
+            for (unsigned x = 0; x < w; x += 32) {
+                if (!agx_gpu_translate_ctx(s, cat, agx_texel_gva(&tex, x, y), &pa)) {
+                    complete_morton = false;
+                    break;
+                }
+            }
+        }
+    }
+    bool sparse = missing_linear && complete_morton;
+    if (agx_nc_layout_active && agx_nc_layout_count < ARRAY_SIZE(agx_nc_layout_cache)) {
+        unsigned i = agx_nc_layout_count++;
+        agx_nc_layout_cache[i].cat = cat; agx_nc_layout_cache[i].base = base;
+        agx_nc_layout_cache[i].w = w; agx_nc_layout_cache[i].h = h;
+        agx_nc_layout_cache[i].sparse = sparse;
+    }
+    return sparse;
+}
+
+
+/* Layout 1 is Morton ordered for GPU render targets too. Bit 15 is not
+ * the layout selector: render-target descriptors omit it. A row read/write
+ * must gather/scatter pixels rather than walking through unmapped padding. */
+static bool agx_nc_transfer_region(A7State *s, uint64_t cat, uint64_t base,
+                                    uint32_t w, uint32_t h, uint32_t *pixels, bool write,
+                                    unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+    AGXTexture tex = {.addr = base, .w = w, .h = h, .twiddled = true};
+    uint32_t page[1024];
+    static __thread uint16_t tile_offsets[1024];
+    static __thread bool ready;
+    if (!ready) {
+        for (unsigned y = 0; y < 32; y++) {
+            for (unsigned x = 0; x < 32; x++) {
+                unsigned off = 0;
+                for (unsigned b = 0; b < 5; b++) {
+                    off |= ((y >> b) & 1) << (b * 2);
+                    off |= ((x >> b) & 1) << (b * 2 + 1);
+                }
+                tile_offsets[y * 32 + x] = off;
+            }
+        }
+        ready = true;
+    }
+    for (unsigned ty = y0 & ~31u; ty < y1; ty += 32) {
+        for (unsigned tx = x0 & ~31u; tx < x1; tx += 32) {
+            uint64_t gva = agx_texel_gva(&tex, tx, ty);
+            if (!write && !agx_ctx_read(s, cat, gva, page, sizeof(page))) { return false; }
+            for (unsigned y = 0; y < 32; y++) {
+                for (unsigned x = 0; x < 32; x++) {
+                    unsigned off = tile_offsets[y * 32 + x];
+                    uint32_t *pixel = pixels + (size_t)(ty + y) * w + tx + x;
+                    if (write) { page[off] = *pixel; }
+                    else { *pixel = page[off]; }
+                }
+            }
+            if (write && !agx_ctx_write(s, cat, gva, page, sizeof(page))) { return false; }
+        }
+    }
+    return true;
+}
+
+static bool agx_nc_transfer(A7State *s, uint64_t cat, uint64_t base,
+                             uint32_t w, uint32_t h, uint32_t *pixels, bool write)
+{
+    return agx_nc_transfer_region(s, cat, base, w, h, pixels, write, 0, 0, w, h);
+}
+
+/* Load each touched destination tile once and commit only dirty tiles. */
+static bool agx_nc_target_span(A7State *s, uint64_t cat, const AGXSurface *sf,
+                                unsigned x, unsigned y, uint32_t *pixels,
+                                unsigned count, bool write)
+{
+    unsigned columns = sf->w / 32;
+    for (unsigned tx = x & ~31u; tx < x + count; tx += 32) {
+        unsigned index = (y / 32) * columns + tx / 32;
+        if (!sf->loaded[index]) {
+            unsigned ty = y & ~31u;
+            if (!agx_nc_transfer_region(s, cat, sf->base, sf->w, sf->h, sf->pixels,
+                                        false, tx, ty, tx + 32, ty + 32)) { return false; }
+            sf->loaded[index] = 1;
+        }
+        if (write) { sf->dirty[index] = 1; }
+    }
+    uint32_t *row = sf->pixels + (size_t)y * sf->w + x;
+    if (write) { memcpy(row, pixels, count * 4); }
+    else { memcpy(pixels, row, count * 4); }
+    return true;
+}
+
+static bool agx_target_row(A7State *s, uint64_t cat, const AGXSurface *sf,
+                            unsigned x, unsigned y, uint32_t *pixels,
+                            unsigned count, bool write)
+{
+    if (sf->pixels) { return agx_nc_target_span(s, cat, sf, x, y, pixels, count, write); }
+    if (!sf->twiddled) {
+        uint64_t gva = agx_surface_gva(sf, x, y);
+        return write ? agx_ctx_write(s, cat, gva, pixels, count * 4)
+                     : agx_ctx_read(s, cat, gva, pixels, count * 4);
+    }
+    AGXTexture tex = { .addr = sf->base, .w = sf->w, .h = sf->h,
+                       .twiddled = true };
+    /* A row touches each tile once. Preserve the other rows in its pages. */
+    agx_update_morton_lut(sf->w, sf->h);
+    uint64_t y_offset = agx_texel_gva(&tex, 0, y) - sf->base;
+    uint8_t page[4096];
+    uint64_t cached = UINT64_MAX;
+    bool ok = true;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t gva = sf->base + (y_offset | ((uint64_t)agx_morton_x_lut[x + i] << 2));
+        uint64_t base = gva & ~UINT64_C(0xfff);
+        if (base != cached) {
+            if (write && cached != UINT64_MAX) {
+                ok &= agx_ctx_write(s, cat, cached, page, sizeof(page));
+            }
+            if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+            cached = base;
+        }
+        if (write) { memcpy(page + (gva & 0xfff), pixels + i, 4); }
+        else { memcpy(pixels + i, page + (gva & 0xfff), 4); }
+    }
+    if (write && cached != UINT64_MAX) {
+        ok &= agx_ctx_write(s, cat, cached, page, sizeof(page));
+    }
+    return ok;
+}
+
+static inline __attribute__((always_inline)) bool agx_target_read(A7State *s, uint64_t cat, const AGXSurface *sf,
+                             unsigned x, unsigned y, uint32_t *pixels, unsigned count)
+{
+    if (sf->pixels) { return agx_nc_target_span(s, cat, sf, x, y, pixels, count, false); }
+    if (!sf->twiddled) { return agx_ctx_read(s, cat, agx_surface_gva(sf, x, y), pixels, count * 4); }
+    return agx_target_row(s, cat, sf, x, y, pixels, count, false);
+}
+
+static inline __attribute__((always_inline)) bool agx_target_write(A7State *s, uint64_t cat, const AGXSurface *sf,
+                              unsigned x, unsigned y, uint32_t *pixels, unsigned count)
+{
+    if (sf->pixels) { return agx_nc_target_span(s, cat, sf, x, y, pixels, count, true); }
+    if (!sf->twiddled) { return agx_ctx_write(s, cat, agx_surface_gva(sf, x, y), pixels, count * 4); }
+    return agx_target_row(s, cat, sf, x, y, pixels, count, true);
+}
+
+
 /* darkenSourceOver / lightenSourceOver: scale the (premultiplied) source by
  * Y^4 of the destination luminance (dark shadows) or (1-Y)^4 (light halos),
  * then src-over. Light sources are recognised by their colour. */
@@ -6028,8 +6287,10 @@ static uint32_t agx_blend_plus_darker(uint32_t dst, uint32_t src)
  * Recovered from CA::OGL::BlurState::narrow_blur / narrowBlurParameters in QuartzCore. */
 #define AGX_USC_BLUR_4TAP UINT64_C(0x0cda5e479d40815f)
 #define AGX_USC_BLUR_7TAP UINT64_C(0xf82f9a96aff1e034)
+#define AGX_USC_DOWNSAMPLE_8 UINT64_C(0x00e3b3d44520e23f)
 
-/* 41-byte USC machine code preamble common to all CoreAnimation separable Gaussian blur shaders. */
+/* Historical blur signature: also the uniform-colour export shader used
+ * by stride-12 region clears. Only the 4/7-pair hashes identify convolution. */
 static const uint8_t agx_blur_preamble[41] = {
     0x2a, 0x0a, 0x94, 0x99, 0x99, 0xaf, 0x1b, 0x80,
     0x00, 0x33, 0x00, 0x00, 0x80, 0x40, 0x80, 0x01,
@@ -6159,6 +6420,22 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
+static uint32_t agx_sample_downsample(const uint32_t *buf, uint32_t w, uint32_t h,
+                                        float u, float v, const float offsets[4][2])
+{
+    unsigned acc[4] = {0};
+    for (unsigned i = 0; i < 4; i++) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            uint32_t sample = agx_sample_bilinear(buf, w, h,
+                u + sign * offsets[i][0] * w, v + sign * offsets[i][1] * h);
+            for (unsigned c = 0; c < 4; c++) { acc[c] += (sample >> (c * 8)) & 255; }
+        }
+    }
+    uint32_t src = 0;
+    for (unsigned c = 0; c < 4; c++) { src |= ((acc[c] + 4) / 8) << (c * 8); }
+    return src;
+}
+
 static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
 {
     int w = (int)(frac * 256.0f + 0.5f);
@@ -6284,12 +6561,35 @@ static void agx_blur_texture(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, ui
     agx_blur_1d(buf_in, buf_tmp, w, h, offs, ws, 6, true);
 }
 
+
+
 struct A7State;
 static uint64_t agx_replay_program_ext(struct A7State *s, uint64_t cat, const uint32_t *ppp, unsigned n, bool *is_blur);
 
 static uint64_t agx_replay_program(A7State *s, uint64_t cat, const uint32_t *ppp, unsigned n)
 {
     return agx_replay_program_ext((struct A7State *)s, cat, ppp, n, NULL);
+}
+
+
+/* A tap-radius halo makes every interior value identical to prefiltering
+ * the full source. Only unused allocation padding is excluded from the work. */
+static void agx_nc_blur_roi(uint32_t *pixels, uint32_t w, uint32_t h,
+                            unsigned x0, unsigned y0, unsigned x1, unsigned y1,
+                            const float *offsets, const float *weights,
+                            unsigned taps, bool vertical)
+{
+    unsigned rw = x1 - x0, rh = y1 - y0;
+    uint32_t *crop = g_new(uint32_t, (size_t)rw * rh);
+    uint32_t *tmp = g_new(uint32_t, (size_t)rw * rh);
+    for (unsigned y = 0; y < rh; y++) {
+        memcpy(crop + (size_t)y * rw, pixels + (size_t)(y0 + y) * w + x0, rw * 4);
+    }
+    agx_blur_1d(crop, tmp, rw, rh, offsets, weights, taps, vertical);
+    for (unsigned y = 0; y < rh; y++) {
+        memcpy(pixels + (size_t)(y0 + y) * w + x0, crop + (size_t)y * rw, rw * 4);
+    }
+    g_free(crop); g_free(tmp);
 }
 
 /* PPP packet bit-to-slot mapping (32 state words total).
@@ -6434,6 +6734,28 @@ static float agx_quad_coordinate(float pixel, float low, float high,
 
 /* Preserve the association between vertex positions and texture coordinates.
  * CA also submits quads with U along screen Y (and even constant V). */
+/* Vertex position. Strides of 20 and up carry a vec4 (x, y, z, w). CA leaves
+ * w at 1 for flat layers, but 3D layer transforms (the unlock icon fly-in
+ * zooms icons in perspective) are pre-multiplied, so x and y must be divided
+ * by w; ignoring it drew the icons at normal size, bunched together. */
+static bool agx_vertex_xy(A7State *s, uint64_t cat, uint64_t gva, unsigned stride, float xy[2])
+{
+    float p[4];
+    if (stride < 20) {
+        return agx_ctx_read(s, cat, gva, xy, 8);
+    }
+    if (!agx_ctx_read(s, cat, gva, p, 16)) {
+        return false;
+    }
+    xy[0] = p[0];
+    xy[1] = p[1];
+    if (isfinite(p[3]) && p[3] > 1e-6f && fabsf(p[3] - 1.0f) > 1e-6f) {
+        xy[0] /= p[3];
+        xy[1] /= p[3];
+    }
+    return true;
+}
+
 static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float out[6])
 {
     float dx1 = xy[1][0] - xy[0][0], dy1 = xy[1][1] - xy[0][1];
@@ -6453,6 +6775,81 @@ static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float ou
     }
     return true;
 }
+
+/* The short USC preamble used by stride-12 draws exports an uploaded
+ * uniform colour. PDS 0x90000004 describes four shared words (the next word carries flags);
+ * constants in following allocations are NOT blur parameters for this draw. */
+/* QuartzCore's eight-sample reduction uses +/- offset[0,3,5,6],
+ * each with weight 1/8. The PDS uploads two vec4-aligned uniform chunks
+ * starting at array entries 0 and 3 (descriptor pointer slots 2 and 3). */
+static bool agx_extract_downsample(A7State *s, uint64_t cat,
+                                    const uint32_t ppp[32], float offsets[4][2])
+{
+    uint32_t data[8];
+    float first[12], rest[16];
+    if (!agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[12], data, sizeof(data))) { return false; }
+    uint64_t p0 = data[4] | ((uint64_t)data[5] << 32);
+    uint64_t p3 = data[6] | ((uint64_t)data[7] << 32);
+    if (p0 < 0x1000 || p0 >= (UINT64_C(1) << 40) ||
+        p3 < 0x1000 || p3 >= (UINT64_C(1) << 40) ||
+        !agx_ctx_read(s, cat, p0, first, sizeof(first)) ||
+        !agx_ctx_read(s, cat, p3, rest, sizeof(rest))) { return false; }
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned index = i == 0 ? 0 : i == 1 ? 0 : i == 2 ? 8 : 12;
+        for (unsigned c = 0; c < 2; c++) {
+            float v = i == 0 ? first[c] : rest[index + c];
+            if (!isfinite(v) || fabsf(v) > 1) { return false; }
+            offsets[i][c] = v;
+        }
+    }
+    return true;
+}
+
+/* The normalized-copy VS uploads texmat0 after its matrix/padding. Some
+ * subsequent PDS packets reuse that upload. Repeated U can exceed 1 while
+ * V remains normalized, so max(U,V) cannot determine the coordinate units. */
+static bool agx_nc_copy_texmat(A7State *s, uint64_t cat, uint64_t vs_data,
+                                uint32_t *last_code, bool *last_normalized,
+                                bool *have_last)
+{
+    uint32_t data[16];
+    float uniforms[28];
+    if (!agx_ctx_read(s, cat, vs_data, data, sizeof(data))) { return false; }
+    uint64_t ptr = data[12] | ((uint64_t)data[13] << 32);
+    if (ptr >= 0x1000 && ptr < (UINT64_C(1) << 40) &&
+        agx_ctx_read(s, cat, ptr, uniforms, sizeof(uniforms))) {
+        *last_code = data[10];
+        *have_last = true;
+        *last_normalized = uniforms[24] == 1 && uniforms[25] == 1 &&
+                           uniforms[26] == 0 && uniforms[27] == 0;
+    }
+    return *have_last && *last_code == data[10] && *last_normalized;
+}
+
+static bool agx_extract_region_clear(A7State *s, uint64_t cat,
+                                      const uint32_t ppp[32], uint32_t *colour)
+{
+    uint32_t data[4];
+    float rgba[4];
+    uint64_t base = AGX_PDS_HEAP | ppp[12];
+    if (!agx_ctx_read(s, cat, base, data, sizeof(data)) ||
+        data[2] != 0x90000004 || (data[3] & 0x0fffffff) != 0) { return false; }
+    uint64_t ptr = data[0] | ((uint64_t)data[1] << 32);
+    if (ptr < 0x1000 || ptr >= (UINT64_C(1) << 40) ||
+        !agx_ctx_read(s, cat, ptr, rgba, sizeof(rgba))) { return false; }
+    uint32_t channels[4];
+    for (unsigned i = 0; i < 4; i++) {
+        if (!isfinite(rgba[i]) || rgba[i] < 0 || rgba[i] > 1) { return false; }
+        channels[i] = lroundf(rgba[i] * 255.0f);
+    }
+    *colour = channels[2] | (channels[1] << 8) | (channels[0] << 16) | (channels[3] << 24);
+    return true;
+}
+
+static bool agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
+                                    const uint32_t *ppp, unsigned ppp_count,
+                                    uint64_t prog, float *offsets, float *weights,
+                                    unsigned *n_taps, bool *is_vertical);
 
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
@@ -6517,14 +6914,46 @@ static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t
                         }
                     }
                 }
+                /* Vertex uniform blocks include offsets and texmat after
+                 * the matrix; retaining just its 64 bytes was insufficient. */
+                uint64_t uniforms = data[12] | ((uint64_t)data[13] << 32);
+                uint8_t uniform_bytes[192];
+                if (uniforms >= 0x1000 && uniforms < (UINT64_C(1) << 40)) {
+                    agx_ctx_read(s, cat, uniforms, uniform_bytes, sizeof(uniform_bytes));
+                }
                 AGXTexture tex;
-                uint64_t prog = agx_replay_program(s, cat, retained_ppp, 32);
+                bool blur = false;
+                uint64_t prog = agx_replay_program_ext(s, cat, retained_ppp, 32, &blur);
                 if (!prog && n > 0) {
-                    prog = agx_replay_program(s, cat, ppp, n);
+                    prog = agx_replay_program_ext(s, cat, ppp, n, &blur);
                 }
                 int found = agx_replay_texture(s, cat, retained_ppp, 32, prog, &tex);
                 if (found == AGX_TEX_NONE && n > 0) {
                     found = agx_replay_texture(s, cat, ppp, n, prog, &tex);
+                }
+                uint32_t colour;
+                bool clear = data[0] == 12 && blur &&
+                             agx_extract_region_clear(s, cat, retained_ppp, &colour);
+                if (blur && !clear) {
+                    float offsets[8], weights[8];
+                    unsigned taps;
+                    bool vertical;
+                    agx_extract_blur_params(s, cat, vs_data, retained_ppp, 32,
+                                            prog, offsets, weights, &taps, &vertical);
+                }
+                /* Snapshot fragment metadata/parameters, not render-target
+                 * texels: those are produced by queued 3D passes after TA.
+                 * Uploaded texels and GPU input lifetime need live validation. */
+                for (unsigned i = 0; i < 32; i++) {
+                    if ((retained_ppp[i] & 0xc0000000) != 0x80000000) { continue; }
+                    uint32_t desc[16], block[128];
+                    if (!agx_ctx_read(s, cat, AGX_PDS_HEAP | retained_ppp[i], desc, sizeof(desc))) { continue; }
+                    for (unsigned k = 0; k < 16; k += 2) {
+                        uint64_t ptr = desc[k] | ((uint64_t)desc[k + 1] << 32);
+                        if (ptr >= 0x1000 && ptr < (UINT64_C(1) << 40)) {
+                            agx_ctx_read(s, cat, ptr, block, sizeof(block));
+                        }
+                    }
                 }
             }
             pc += 12;
@@ -6551,6 +6980,42 @@ static unsigned agx_audit_clock(A7State *s, uint64_t cat, AGXSurface *sf)
     }
     agx_read_snapshot = saved;
     return bright;
+}
+
+static bool agx_extract_nc_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
+                                       const uint32_t *ppp, unsigned ppp_count,
+                                       uint64_t prog, float *offsets, float *weights,
+                                       unsigned *n_taps, bool *is_vertical)
+{
+    if ((prog == AGX_USC_BLUR_4TAP || prog == AGX_USC_BLUR_7TAP) && ppp_count == 32) {
+        unsigned n = prog == AGX_USC_BLUR_4TAP ? 4 : 7;
+        uint64_t uptr, wptr;
+        uint32_t desc[6];
+        float uniforms[48];
+        if (!agx_ctx_read(s, cat, vs_data + 48, &uptr, sizeof(uptr)) ||
+            uptr < 0x1000 || uptr >= (UINT64_C(1) << 40) ||
+            !agx_ctx_read(s, cat, uptr, uniforms, sizeof(uniforms)) ||
+            !agx_ctx_read(s, cat, AGX_PDS_HEAP | ppp[12], desc, sizeof(desc))) { return false; }
+        wptr = desc[4] | ((uint64_t)desc[5] << 32);
+        if (wptr < 0x1000 || wptr >= (UINT64_C(1) << 40) ||
+            !agx_ctx_read(s, cat, wptr, weights, n * sizeof(float))) { return false; }
+        bool horizontal = fabsf(uniforms[17]) < 0.001f && uniforms[16] > 0.05f;
+        bool vertical = fabsf(uniforms[16]) < 0.001f && uniforms[17] > 0.05f;
+        float sum = 0, previous = 0;
+        if (!horizontal && !vertical) { return false; }
+        for (unsigned i = 0; i < n; i++) {
+            float off = uniforms[16 + 4 * i + vertical];
+            if (!isfinite(off) || off <= previous || off >= 50 ||
+                !isfinite(weights[i]) || weights[i] < 0 || weights[i] > 0.6f) { return false; }
+            offsets[i] = previous = off;
+            sum += weights[i];
+        }
+        if (fabsf(sum - 0.5f) >= 0.01f) { return false; }
+        *n_taps = n;
+        *is_vertical = vertical;
+        return true;
+    }
+    return false;
 }
 
 static bool agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
@@ -6779,6 +7244,18 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     AGXSurface sf;
     agx_surface_layout(s, cat, target, width, &sf);
     if (!sf.strip && pitch >= width * 4) { sf.pitch = pitch; }
+    agx_nc_layout_count = 0;
+    agx_nc_layout_active = true;
+    sf.twiddled = !sf.strip && agx_nc_sparse_layout(s, cat, target, width, height);
+    sf.w = width;
+    sf.h = height;
+    if (sf.twiddled) {
+        sf.pixels = g_new0(uint32_t, (size_t)width * height);
+        unsigned tiles = (width / 32) * (height / 32);
+        sf.loaded = g_malloc0(tiles * 2);
+        sf.dirty = sf.loaded + tiles;
+        if (is_clear) { memset(sf.loaded, 1, tiles * 2); }
+    }
 #ifdef QEMU_OSDEP_H
     agx_tlb_reset();
     for (uint32_t y = 0; y < height; y++) {
@@ -6790,14 +7267,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
         }
     }
 #endif
-    bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") && target >= UINT64_C(0x400000000);
-    unsigned before_clock = audit ? agx_audit_clock(s, cat, &sf) : 0;
+    bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") != NULL;
+    bool audit_clock = audit && target >= UINT64_C(0x400000000);
+    unsigned before_clock = audit_clock ? agx_audit_clock(s, cat, &sf) : 0;
 
     if (is_clear) {
         uint32_t zero_row[ARRAY_SIZE(row)];
         memset(zero_row, 0, sizeof(zero_row));
-        for (uint32_t y = 0; y < height; y++) {
-            agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, y), zero_row, width * 4);
+        if (!sf.pixels) {
+            for (uint32_t y = 0; y < height; y++) {
+                agx_target_write(s, cat, &sf, 0, y, zero_row, width);
+            }
         }
     }
 
@@ -6805,6 +7285,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
     float last_m4[4];
     bool has_last_m4 = false;
+    uint32_t last_copy_vs = 0;
+    bool last_copy_normalized = false, have_copy_texmat = false;
+    uint64_t decoded_nc_addr = 0;
+    uint32_t decoded_nc_w = 0, decoded_nc_h = 0;
+    uint32_t *decoded_nc_pixels = NULL;
     bool scenable = false;
     uint16_t scindex = 0;
     bool has_rc = false;
@@ -6914,11 +7399,22 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             if (is_span) {
                 count = MIN(w[1], 1024u);
             }
+            bool nc_context = sf.twiddled || (found != AGX_TEX_NONE && tex.nc_sparse);
+            uint32_t clear_colour = 0;
+            bool nc_normalized = nc_context && stride == 24 &&
+                prog == UINT64_C(0x8eb52cf6fe248b1d) &&
+                agx_nc_copy_texmat(s, cat, vs_data, &last_copy_vs,
+                                    &last_copy_normalized, &have_copy_texmat);
+            bool region_clear = nc_context && stride == 12 && is_blur_prog &&
+                                agx_extract_region_clear(s, cat, retained_ppp, &clear_colour);
             bool textured = found != AGX_TEX_NONE && (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
             bool vibrancy = found == AGX_TEX_VIBRANCY;
             bool dest_in = textured && prog == AGX_USC_DEST_IN;
             bool is_blur = textured && is_blur_prog;
             bool is_color_matrix = textured && prog == AGX_USC_COLOR_MATRIX;
+            if (!(textured && !is_blur && tex.nc_sparse && tex.addr != target)) {
+                decoded_nc_addr = 0;
+            }
             float col_mat[9], col_bias[3];
             if (is_color_matrix) {
                 agx_extract_color_matrix(s, cat, ppp, ppp_count, col_mat, col_bias);
@@ -6931,29 +7427,100 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     has_mask_tex = agx_replay_decode_mask_tsw(s, cat, ppp, ppp_count, &mask_tex);
                 }
             }
-            uint32_t *blurred_tex = NULL;
+            bool downsample = nc_context && textured && prog == AGX_USC_DOWNSAMPLE_8;
+            float reduction_offsets[4][2];
+            if (downsample && !agx_extract_downsample(s, cat, retained_ppp, reduction_offsets)) {
+                AGX_REPLAY_SKIP("downsample uniforms unavailable or invalid");
+                continue;
+            }
+            /* Eight identical zero-offset samples equal the ordinary bilinear
+             * path; do not read the whole full-resolution framebuffer for it. */
+            if (downsample) {
+                bool nonzero = false;
+                for (unsigned i = 0; i < 4; i++) {
+                    nonzero |= reduction_offsets[i][0] != 0 || reduction_offsets[i][1] != 0;
+                }
+                downsample = nonzero;
+            }
+            bool nc_blur = is_blur && nc_context;
+            float nc_offsets[8], nc_weights[8];
+            unsigned nc_taps = 0;
+            bool nc_vertical = false;
+            if (nc_blur &&
+                !agx_extract_nc_blur_params(s, cat, vs_data, retained_ppp, 32, prog,
+                                            nc_offsets, nc_weights, &nc_taps, &nc_vertical)) {
+                AGX_REPLAY_SKIP("NC blur uniforms unavailable or invalid");
+                continue;
+            }
+            int nc_bx0 = 0, nc_by0 = 0;
+            int nc_bx1 = found != AGX_TEX_NONE ? tex.w : 0;
+            int nc_by1 = found != AGX_TEX_NONE ? tex.h : 0;
+            if (nc_blur) {
+            float lo_u = 1e9f, lo_v = 1e9f, hi_u = -1e9f, hi_v = -1e9f;
+            for (unsigned i = 0; i < count; i++) {
+                float uv[2];
+                unsigned off = stride >= 28 ? 20 : 16;
+                if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride + off, uv, sizeof(uv))) { continue; }
+                lo_u = MIN(lo_u, uv[0]); hi_u = MAX(hi_u, uv[0]);
+                lo_v = MIN(lo_v, uv[1]); hi_v = MAX(hi_v, uv[1]);
+            }
+            float su = MAX(hi_u, hi_v) <= 1.0001f ? tex.w : 1;
+            float sv = MAX(hi_u, hi_v) <= 1.0001f ? tex.h : 1;
+            int pad = (int)ceilf(nc_offsets[nc_taps - 1]) + 2;
+            nc_bx0 = MAX(0, MIN((int)tex.w - 1, (int)floorf(lo_u * su) - pad));
+            nc_by0 = MAX(0, MIN((int)tex.h - 1, (int)floorf(lo_v * sv) - pad));
+            nc_bx1 = MIN((int)tex.w, MAX(nc_bx0 + 1, (int)ceilf(hi_u * su) + pad));
+            nc_by1 = MIN((int)tex.h, MAX(nc_by0 + 1, (int)ceilf(hi_v * sv) + pad));
+            }
+            uint32_t *prepared_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
                 size_t num_pix = (size_t)tex.w * tex.h;
                 uint32_t *raw_tex = agx_get_scratch1(num_pix);
                 uint32_t *tmp_tex = agx_get_scratch2(num_pix);
                 if (raw_tex && tmp_tex) {
                     bool read_ok = true;
-                    for (uint32_t ty = 0; ty < tex.h; ty++) {
-                        if (!agx_texture_row(s, cat, &tex, ty, raw_tex + (size_t)ty * tex.w)) {
-                            read_ok = false;
-                            break;
+                    if (tex.nc_sparse) {
+                        read_ok = agx_nc_transfer_region(s, cat, tex.addr, tex.w, tex.h, raw_tex, false,
+                                                         nc_bx0, nc_by0, nc_bx1, nc_by1);
+                    } else {
+                        for (uint32_t ty = nc_blur ? nc_by0 : 0; ty < (nc_blur ? nc_by1 : tex.h); ty++) {
+                            if (!agx_texture_row(s, cat, &tex, ty, raw_tex + (size_t)ty * tex.w)) {
+                                read_ok = false;
+                                break;
+                            }
                         }
                     }
                     if (read_ok) {
-                        float blur_offs[8], blur_ws[8];
-                        unsigned blur_taps = 0;
-                        bool blur_vert = false;
-                        agx_extract_blur_params(s, cat, vs_data, ppp, ppp_count, prog,
-                                                blur_offs, blur_ws, &blur_taps, &blur_vert);
-                        agx_blur_1d(raw_tex, tmp_tex, tex.w, tex.h,
-                                    blur_offs, blur_ws, blur_taps, blur_vert);
-                        blurred_tex = raw_tex;
+                        if (nc_blur) {
+                            agx_nc_blur_roi(raw_tex, tex.w, tex.h, nc_bx0, nc_by0, nc_bx1, nc_by1,
+                                            nc_offsets, nc_weights, nc_taps, nc_vertical);
+                        } else {
+                            float blur_offs[8], blur_ws[8];
+                            unsigned blur_taps = 0;
+                            bool blur_vert = false;
+                            agx_extract_blur_params(s, cat, vs_data, ppp, ppp_count, prog,
+                                                    blur_offs, blur_ws, &blur_taps, &blur_vert);
+                            agx_blur_1d(raw_tex, tmp_tex, tex.w, tex.h,
+                                        blur_offs, blur_ws, blur_taps, blur_vert);
+                        }
+                        prepared_tex = raw_tex;
                     }
+                }
+            }
+            /* Decode an NC Morton source once per draw. Row-by-row gathers
+             * would fetch the same 4KiB tile again for each of its 32 rows. */
+            if (textured && !is_blur && tex.nc_sparse) {
+                if (decoded_nc_addr == tex.addr && decoded_nc_w == tex.w && decoded_nc_h == tex.h) {
+                    prepared_tex = decoded_nc_pixels;
+                } else {
+                    uint32_t *raw_tex = agx_get_scratch1((size_t)tex.w * tex.h);
+                    if (!agx_nc_transfer(s, cat, tex.addr, tex.w, tex.h, raw_tex, false)) {
+                        AGX_REPLAY_SKIP("NC source tiles unavailable");
+                        continue;
+                    }
+                    prepared_tex = decoded_nc_pixels = raw_tex;
+                    decoded_nc_addr = tex.addr != target ? tex.addr : 0;
+                    decoded_nc_w = tex.w; decoded_nc_h = tex.h;
                 }
             }
             unsigned step = (count == 4) ? 4 : 6;
@@ -7023,7 +7590,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     if (ix0 >= ix1) {
                         continue;
                     }
-                    if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, ix0, iy), row, (ix1 - ix0) * 4)) {
+                    if (!agx_target_read(s, cat, &sf, ix0, iy, row, ix1 - ix0)) {
                         continue;
                     }
                     uint32_t a = alpha;
@@ -7031,7 +7598,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     for (int x = ix0; x < ix1; x++) {
                         row[x - ix0] = agx_blend_over(row[x - ix0], span_c);
                     }
-                    agx_ctx_write(s, cat, agx_surface_gva(&sf, ix0, iy), row, (ix1 - ix0) * 4);
+                    agx_target_write(s, cat, &sf, ix0, iy, row, ix1 - ix0);
                     any_drawn = true;
                 }
                 if (any_drawn) {
@@ -7049,7 +7616,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         uint64_t v_gva = buf + (uint64_t)(q_start + i) * stride;
                         float xy[2];
                         float uvs[4];
-                        if (!agx_ctx_read(s, cat, v_gva, xy, 8) ||
+                        if (!agx_vertex_xy(s, cat, v_gva, stride, xy) ||
                             !agx_ctx_read(s, cat, v_gva + 20, uvs, 16)) {
                             read_ok = false;
                             break;
@@ -7168,7 +7735,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                         any_drawn = true;
                         int span_w = last_in - first_in + 1;
-                        if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                        if (!agx_target_read(s, cat, &sf, first_in, y, row, span_w)) {
                             continue;
                         }
                         for (int x = first_in; x <= last_in; x++) {
@@ -7182,7 +7749,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 row[x - first_in] = agx_blend_over(row[x - first_in], src);
                             }
                         }
-                        agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                        agx_target_write(s, cat, &sf, first_in, y, row, span_w);
                     }
                 }
                 if (any_drawn) {
@@ -7197,7 +7764,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 unsigned v_count = MIN(count, 64u);
                 for (unsigned i = 0; i < v_count; i++) {
                     float xy[2];
-                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                    if (!agx_vertex_xy(s, cat, buf + (uint64_t)i * stride, stride, xy)) {
                         v_count = i;
                         break;
                     }
@@ -7362,7 +7929,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 }
                                 any_drawn = true;
                                 int span_w = last_in - first_in + 1;
-                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                                if (!agx_target_read(s, cat, &sf, first_in, y, row, span_w)) {
                                     continue;
                                 }
                                 uint32_t a = colour >> 24;
@@ -7381,7 +7948,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                                                                     : agx_blend_over(row[x - first_in], src);
                                     }
                                 }
-                                agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                                agx_target_write(s, cat, &sf, first_in, y, row, span_w);
                             }
                         }
                     }
@@ -7405,14 +7972,14 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         }
                         any_drawn = true;
                         for (int y = y0; y < y1; y++) {
-                            if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4)) {
+                            if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) {
                                 continue;
                             }
                             for (int x = x0; x < x1; x++) {
                                 row[x - x0] = (prog == AGX_USC_COPY) ? colour
                                                                      : agx_blend_over(row[x - x0], colour);
                             }
-                            agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
+                            agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
                         }
                     }
                 } else {
@@ -7485,7 +8052,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                             any_drawn = true;
                             int span_w = last_in - first_in + 1;
-                            if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
+                            if (!agx_target_read(s, cat, &sf, first_in, y, row, span_w)) {
                                 continue;
                             }
                             for (int x = first_in; x <= last_in; x++) {
@@ -7496,7 +8063,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                                                                 : agx_blend_over(row[x - first_in], src);
                                 }
                             }
-                            agx_ctx_write(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4);
+                            agx_target_write(s, cat, &sf, first_in, y, row, span_w);
                         }
                     }
                 }
@@ -7513,7 +8080,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
                 for (unsigned i = q_start; i < q_start + step; i++) {
                     float xy[2];
-                    if (!agx_ctx_read(s, cat, buf + (uint64_t)i * stride, xy, 8)) {
+                    if (!agx_vertex_xy(s, cat, buf + (uint64_t)i * stride, stride, xy)) {
                         break;
                     }
                     if (clip_space) {
@@ -7573,12 +8140,19 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
                 any_drawn = true;
-                if (audit && y0 < 304 && y1 > 96) {
+                if (audit) {
                     qemu_log_mask(LOG_UNIMP, "AGX AUDIT draw target 0x%llx stride %u prog 0x%llx rect %d,%d-%d,%d texture 0x%llx tint 0x%x uv %g,%g-%g,%g\n",
                                   (unsigned long long)target, stride, (unsigned long long)prog, x0,y0,x1,y1,
                                   (unsigned long long)(textured ? tex.addr : 0), tint, u0,v0,u1,v1);
                 }
 
+                if (region_clear) {
+                    for (int x = 0; x < x1 - x0; x++) { row[x] = clear_colour; }
+                    for (int y = y0; y < y1; y++) {
+                        agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
+                    }
+                    continue;
+                }
                 if (stride == 12 && is_blur_prog && !textured) {
                     /* Untextured Gaussian blur backdrop pass on canvas */
                     int pad = 16;
@@ -7593,8 +8167,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         if (raw_tex && tmp_tex) {
                             bool read_ok = true;
                             for (uint32_t y = 0; y < bh; y++) {
-                                if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, bx0, by0 + y),
-                                                  raw_tex + (size_t)y * bw, bw * 4)) {
+                                if (!agx_target_read(s, cat, &sf, bx0, by0 + y, raw_tex + (size_t)y * bw, bw)) {
                                     read_ok = false;
                                     break;
                                 }
@@ -7613,8 +8186,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 }
                                 for (int y = y0; y < y1; y++) {
                                     size_t src_off = (size_t)(y - by0) * bw + (size_t)(x0 - bx0);
-                                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y),
-                                                  raw_tex + src_off, (x1 - x0) * 4);
+                                    agx_target_write(s, cat, &sf, x0, y, raw_tex + src_off, x1 - x0);
                                 }
                             }
                         }
@@ -7626,8 +8198,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 
                 if (!textured) {
                     for (int y = y0; y < y1; y++) {
-                        if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
-                                          (x1 - x0) * 4)) {
+                        if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) {
                             continue;
                         }
                         for (int x = x0; x < x1; x++) {
@@ -7635,14 +8206,14 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                          prog == AGX_USC_SOLID_PLUS_L ? agx_blend_plus_lighter(row[x - x0], colour) :
                                          agx_blend_over(row[x - x0], colour);
                         }
-                        agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
+                        agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
                     }
                     continue;
                 }
 
                 /* Texel-unit coordinates (rectangle textures) exceed 1. */
-                float su = MAX(u1, v1) <= 1.0001f ? tex.w : 1;
-                float sv = MAX(u1, v1) <= 1.0001f ? tex.h : 1;
+                float su = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.w : 1;
+                float sv = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.h : 1;
                 float sub_w = (u1 - u0) * su;
                 float sub_h = (v1 - v0) * sv;
                 bool is_scaled = (fabsf((maxx - minx) - sub_w) > 0.1f ||
@@ -7671,8 +8242,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                  * output row: snapshot this bounded texture for the quad (the
                  * axis-aligned path keeps its two-row cache; blur already
                  * owns a snapshot). */
-                uint32_t *sample_tex = blurred_tex, *quad_tex = NULL;
-                if (affine && fabsf(uv_map[3]) > 1e-8f && !sample_tex) {
+                uint32_t *sample_tex = prepared_tex, *quad_tex = NULL;
+                if ((downsample || (affine && fabsf(uv_map[3]) > 1e-8f)) && !sample_tex) {
                     if ((uint64_t)tex.w * tex.h > 4096 * 4096) {
                         continue;
                     }
@@ -7741,8 +8312,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                         }
                     }
-                    if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, x0, y), row,
-                                      (x1 - x0) * 4)) {
+                    if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) {
                         continue;
                     }
                     for (int x = x0; x < x1; x++) {
@@ -7751,7 +8321,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         float sample_v = affine ? fv + uv_map[3] * (x + 0.5f) : fv;
                         uint32_t src;
                         uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
-                        if (sample_tex) {
+                        if (downsample && sample_tex) {
+                            src = agx_sample_downsample(sample_tex, tex.w, tex.h,
+                                                        fu * su, sample_v * sv, reduction_offsets);
+                        } else if (sample_tex) {
                             if (is_blur || is_scaled || tex.linear_filter) {
                                 src = agx_sample_bilinear(sample_tex, tex.w, tex.h,
                                                           fu * su, sample_v * sv);
@@ -7851,7 +8424,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             row[x - x0] = agx_blend_over(dst, src);
                         }
                     }
-                    agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
+                    agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
                 }
             }
             if (any_drawn) {
@@ -7863,7 +8436,21 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             break;
         }
     }
-    if (audit) {
+    if (sf.pixels) {
+        unsigned columns = width / 32;
+        for (unsigned y = 0; y < height; y += 32) {
+            for (unsigned x = 0; x < width; x += 32) {
+                if (sf.dirty[(y / 32) * columns + x / 32]) {
+                    agx_nc_transfer_region(s, cat, target, width, height, sf.pixels,
+                                            true, x, y, x + 32, y + 32);
+                }
+            }
+        }
+        g_free(sf.loaded);
+        g_free(sf.pixels);
+        sf.pixels = NULL;
+    }
+    if (audit_clock) {
         unsigned after_clock = agx_audit_clock(s, cat, &sf);
         if (before_clock != after_clock || draws > 1) {
             qemu_log_mask(LOG_UNIMP, "AGX AUDIT result target 0x%llx draws %u clock %u -> %u clear %u strip %u pitch %u\n",
@@ -7872,6 +8459,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     }
     qemu_log_mask(LOG_UNIMP, "AGX replay target 0x%llx draws %u\n",
                   (unsigned long long)target, draws);
+    agx_nc_layout_active = false;
 }
 /* AGX_REPLAY_CORE_END */
 
@@ -8900,12 +9488,25 @@ static void agx_sequencer_run(A7Peripheral *p)
             timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
         }
     }
+    /* The program has run: the run bits self-clear. The idle check at
+     * 0xffffff80011874f8 waits for sgx1+0x1000 & 0xf == 0, which the sleep
+     * path's power-down program never reached. */
+    stl_le_p(p->regs + 0x1000, ldl_le_p(p->regs + 0x1000) & ~UINT32_C(0xf));
 }
 
 static uint64_t peripheral_read(void *opaque, hwaddr off, unsigned size)
 {
     A7Peripheral *p = opaque;
     uint64_t val = peripheral_read_impl(opaque, off, size);
+    if (p->base == UINT64_C(0x201e00000) && off == 0 && size == 4 &&
+        p->owner->agx_inflight_jobs == 0) {
+        /* sgx1+0 bit 29 is the GPU's idle status. AGXMetaFirmware's idle
+         * check (0xffffff80011874d4) needs bits 29 and 30 both set before it
+         * lets the display sleep; the driver only ever writes bit 30, so
+         * without this the sleep path polled forever and later Home and
+         * hold presses were never handled. */
+        val |= UINT32_C(0x20000000);
+    }
     display_mmio_trace(opaque, "read", off, size, val);
     mmio_trace(p->name, "read", off, size, val);
     return val;
@@ -8917,6 +9518,17 @@ static void peripheral_write(void *opaque, hwaddr off, uint64_t val, unsigned si
     display_mmio_trace(opaque, "write", off, size, val);
     mmio_trace(p->name, "write", off, size, val);
     peripheral_write_impl(opaque, off, val, size);
+    if (p->base == UINT64_C(0x20a0c0000) && size == 4 &&
+        ((off & 0x3fff) == 0x44 || (off & 0x3fff) == 0x48)) {
+        /* MCA channel +0x44 is a self-clearing reset/flush command register
+         * (bits 0/8 one direction, 1/9 the other) and +0x48 bit 0 a
+         * self-clearing start. AppleAE2MCA sleeps in 10 ms steps until they
+         * read back 0 (0xffffff8000fe6974, ...fe6998, ...fe70b8, ...fe712c);
+         * storing them verbatim wedged mediaserverd on the lock sound and
+         * every later wake. */
+        uint32_t clear = (off & 0x3fff) == 0x44 ? UINT32_MAX : 1;
+        stl_le_p(p->regs + off, ldl_le_p(p->regs + off) & ~clear);
+    }
     if (p->base == UINT64_C(0x201e00000) && off == 0x1000 && (val & 1)) {
         agx_sequencer_run(p);
     }
@@ -9216,6 +9828,9 @@ static void a7_reset(void *opaque)
     memset(&s->multi_touch, 0, sizeof(s->multi_touch));
     timer_del(s->home_timer);
     s->home_pressed = false;
+    timer_del(s->hold_timer);
+    s->hold_pressed = false;
+    s->backlight_off = false;
     touch_script_reset(s);
     s->chestnut_control = 0;
     a7_otg_reset(s);
@@ -9714,6 +10329,7 @@ static void a7_init(MachineState *ms)
     s->pmu.adc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, d2045_adc_done, s);
     s->touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
     s->home_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, home_release, s);
+    s->hold_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, hold_release, s);
     s->mouse_touch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mouse_touch_timer_cb, s);
     const char *mouse_touch = getenv("VPHONE_MOUSE_TOUCH");
     s->mouse_touch_enabled = !mouse_touch || strcmp(mouse_touch, "0");
@@ -9819,10 +10435,16 @@ static bool a7_touch_reporting(Object *o, Error **errp)
     return t && (s->touch_force || touch_reporting_enabled(t));
 }
 
+static bool a7_display_on(Object *o, Error **errp)
+{
+    return !A7(o)->backlight_off;
+}
+
 static void a7_instance_init(Object *o)
 {
     A7State *s = A7(o);
     object_property_add_bool(o, "touch-reporting-enabled", a7_touch_reporting, NULL);
+    object_property_add_bool(o, "display-on", a7_display_on, NULL);
     s->sys_fd = -1;
     s->data_fd = -1;
     s->utility_fd = -1;

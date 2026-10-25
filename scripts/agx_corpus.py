@@ -91,6 +91,24 @@ SCENES = {
         'display_only': False,
         'seconds': 160,
     },
+    # Notification Center pulled over Home: the wide backdrop blur chain
+    # (downsample, blur, saturation matrix, composite), offscreen passes too.
+    'notification-center': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=108;down 320,2;move 320,700 dur=0.6 steps=36;up',
+        'at': [109, 111, 113],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 116,
+    },
+    # A real unlock on the current build: few passes per window, so the dump
+    # overhead does not stall the unlock the way unlock-flyin did.
+    'unlock-real': {
+        'touch': UNLOCK,
+        'at': [96.5, 97.5, 98.5, 99.5, 100.5],
+        'per_at': 4,
+        'display_only': False,
+        'seconds': 106,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],

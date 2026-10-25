@@ -5,8 +5,8 @@ Walks the VDM stream from the TA command, decodes each draw's vertices
 PDS data -> TSW), then rasterises axis-aligned quads with src-over blending.
 """
 from pathlib import Path
-import struct
 import math
+import struct
 import sys
 import zlib
 
@@ -168,6 +168,12 @@ def vertices(f, vs_data, count):
     for i in range(count):
         v = f.read(buf + i * stride, stride)
         x, y = struct.unpack_from('<2f', v, 0)
+        if stride >= 20:
+            # vec4 position: 3D layer transforms (unlock icon fly-in) leave
+            # w != 1, so divide like the C replay's agx_vertex_xy.
+            w = struct.unpack_from('<f', v, 12)[0]
+            if math.isfinite(w) and w > 1e-6 and abs(w - 1) > 1e-6:
+                x, y = x / w, y / w
         out.append((x, y, v[8:] if stride == 16 else v[16:]))
     return stride, out
 
@@ -204,6 +210,28 @@ def is_strip_surface(f, base, width):
             (base + 0xa000) // 4096 * 4096 not in f.pages)
 
 
+def nc_sparse_layout(f, base, w, h):
+    """Recognize only the proved NC scratch extents with sparse page maps."""
+    if base & 4095 or (w, h) not in ((128, 96), (640, 224), (640, 288), (640, 320)):
+        return False
+    pitch = ((w + 15) & ~15) * 4
+    if all(((base + y * pitch) & ~4095) in f.pages for y in range(h)):
+        return False
+    for y in range(0, h, 32):
+        for x in range(0, w, 32):
+            offset = bit = 0
+            mask = 1
+            while mask < w or mask < h:
+                if mask < h:
+                    offset |= bool(y & mask) << bit; bit += 1
+                if mask < w:
+                    offset |= bool(x & mask) << bit; bit += 1
+                mask <<= 1
+            if ((base + offset * 4) & ~4095) not in f.pages:
+                return False
+    return True
+
+
 def decode_tsw(f, tsw):
     if tsw[0] >> 28 != 6:
         return None
@@ -213,8 +241,8 @@ def decode_tsw(f, tsw):
     addr = ((q >> 16) & 0x3ffffffff) << 2
     if not addr or (addr & ~0xfff) not in f.pages:
         return None
-    # GPU-rendered surfaces (layout 1): display-style 16-row strips when the
-    # mapping has a hole at +0xa000, otherwise dense 16-pixel aligned rows.
+    # Display mappings use 16-row strips. Other layout-1 surfaces use
+    # Y-first Morton order, including GPU-produced render targets.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
     strip = is_strip_surface(f, addr, w)
     if strip:
@@ -224,7 +252,10 @@ def decode_tsw(f, tsw):
     else:
         pitch = ((tsw[2] & 0xffff) + 1) * 4
         stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, twiddled=not strip and (tsw[0] & 0x8007) == 0x8001, tsw=tsw)
+    nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
+    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride,
+                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or nc_sparse),
+                nc_sparse=nc_sparse, tsw=tsw)
 
 
 def decode_sampler(words):
@@ -353,6 +384,64 @@ def extract_color_matrix(f, ppp):
     }
 
 
+def extract_downsample(f, ppp):
+    """Four symmetric pairs at offset[0,3,5,6], in normalized units."""
+    if len(ppp) != 32:
+        state = [0] * 32
+        update_ppp_state(state, ppp)
+        ppp = state
+    try:
+        base = PDS_HEAP | ppp[12]
+        first = struct.unpack('<12f', f.read(f.u64(base + 16), 48))
+        rest = struct.unpack('<16f', f.read(f.u64(base + 24), 64))
+        offsets = [first[:2], rest[:2], rest[8:10], rest[12:14]]
+        if all(math.isfinite(x) and abs(x) <= 1 for pair in offsets for x in pair):
+            return offsets
+    except (KeyError, ValueError):
+        pass
+    return None
+
+
+def sample_downsample(buf, w, h, u, v, offsets):
+    samples = [sample_bilinear(buf, w, h, u + sign * dx * w, v + sign * dy * h)
+               for dx, dy in offsets for sign in (-1, 1)]
+    return tuple((sum(p[c] for p in samples) + 4) // 8 for c in range(4))
+
+
+def nc_copy_texmat(f, vs_data, state):
+    """Recover/inherit texmat0 for NC's normalized copy vertex program."""
+    try:
+        data = struct.unpack('<16I', f.read(vs_data, 64))
+        ptr = data[12] | data[13] << 32
+        if 0x1000 <= ptr < 1 << 40:
+            uniforms = struct.unpack('<28f', f.read(ptr, 112))
+            state['code'] = data[10]
+            state['normalized'] = uniforms[24:28] == (1.0, 1.0, 0.0, 0.0)
+        return state.get('code') == data[10] and state.get('normalized', False)
+    except (KeyError, ValueError):
+        return False
+
+
+def extract_region_clear(f, ppp):
+    """Four uploaded RGBA constants; do not scan the next draw's allocation."""
+    if len(ppp) != 32:
+        state = [0] * 32
+        update_ppp_state(state, ppp)
+        ppp = state
+    try:
+        data = struct.unpack('<4I', f.read(PDS_HEAP | ppp[12], 16))
+        if data[2] != 0x90000004 or data[3] & 0x0fffffff:
+            return None
+        ptr = data[0] | data[1] << 32
+        rgba = struct.unpack('<4f', f.read(ptr, 16))
+        if not all(math.isfinite(v) and 0 <= v <= 1 for v in rgba):
+            return None
+        r, g, b, a = (int(v * 255 + 0.5) for v in rgba)
+        return b | g << 8 | r << 16 | a << 24
+    except (KeyError, ValueError):
+        return None
+
+
 def is_clear_pass(type1_command):
     """Determine if a pass background is a clear (True) or load (False).
 
@@ -382,6 +471,7 @@ BLUR_PROGRAMS = {
 
 BLUR_4TAP = 0x0cda5e479d40815f
 BLUR_7TAP = 0xf82f9a96aff1e034
+DOWNSAMPLE_8 = 0x00e3b3d44520e23f
 
 BLUR_PROGRAMS_12 = {
     0x13a51b8bc1b85b4c,
@@ -467,6 +557,32 @@ BLUR_TAPS = [
     (8.3332, 0.0126),
     (10.2979, 0.0027),
 ]
+
+
+def extract_nc_blur_params(f, vs_data, ppp, prog):
+    """Extract tap offsets, weights, direction and tap count for a blur draw."""
+    if prog in (BLUR_4TAP, BLUR_7TAP):
+        n = 4 if prog == BLUR_4TAP else 7
+        state = ppp
+        if len(state) != 32:
+            state = [0] * 32
+            update_ppp_state(state, ppp)
+        try:
+            uniforms = struct.unpack('<48f', f.read(f.u64(vs_data + 48), 192))
+            weights = struct.unpack('<' + 'f' * n, f.read(f.u64((PDS_HEAP | state[12]) + 16), n * 4))
+            horizontal = abs(uniforms[17]) < 0.001 and uniforms[16] > 0.05
+            vertical = abs(uniforms[16]) < 0.001 and uniforms[17] > 0.05
+            offsets = [uniforms[16 + 4 * i + int(vertical)] for i in range(n)]
+            if ((horizontal or vertical) and all(math.isfinite(x) and 0.05 < x < 50 for x in offsets)
+                    and all(a < b for a, b in zip(offsets, offsets[1:]))
+                    and all(math.isfinite(x) and 0 <= x <= 0.6 for x in weights)
+                    and abs(sum(weights) - 0.5) < 0.01):
+                return dict(direction='vertical' if vertical else 'horizontal', offsets=offsets,
+                            weights=list(weights), n_taps=n, extracted=True)
+        except (KeyError, ValueError):
+            pass
+        return dict(direction='horizontal', offsets=[], weights=[], n_taps=0, extracted=False)
+    return dict(direction="horizontal", offsets=[], weights=[], n_taps=0, extracted=False)
 
 
 def extract_blur_params(f, vs_data, ppp, prog):
@@ -703,7 +819,7 @@ def quad_affine(xy, uv):
     return tuple(out) if all(math.isfinite(v) for v in out) else None
 
 
-def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None):
+def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None, copy_texmat_state=None):
     """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
     count = draw[1]
     w0 = draw[0]
@@ -730,13 +846,20 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         except TypeError:
             pass
 
+    nc_context = nc_sparse_layout(f, f.header['pbe_target'], target_w, target_h) if hasattr(f, 'header') else False
+    nc_context = nc_context or bool(tex and tex.get('nc_sparse'))
+    nc_normalized = (nc_context and stride == 24 and prog == 0x8eb52cf6fe248b1d and
+                     nc_copy_texmat(f, vs_data, copy_texmat_state if copy_texmat_state is not None else {}))
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
     if stride == 16 and prog == SPANS:
         return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
     if stride == 36 and prog == PILL_BORDER:
         return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
     if stride == 12 and is_blur_prog:
-        params = extract_blur_params(f, vs_data, ppp, prog)
+        colour = extract_region_clear(f, retained_ppp or ppp) if nc_context else None
+        if colour is not None:
+            return 'replayed exactly: region clear (uniform RGBA)', {'colour': hex(colour), 'prog': hex(prog)}
+        params = extract_blur_params(f, vs_data, retained_ppp or ppp, prog)
         if params.get('extracted'):
             d_name = params['direction']
             n = params['n_taps']
@@ -824,6 +947,12 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         # Untextured glyphs (clock digits): RGBA colour at +16, like stride 20.
         return 'replayed exactly: solid quad (stride=28)', {'count': count}
 
+    if nc_context and prog == DOWNSAMPLE_8:
+        offsets = extract_downsample(f, retained_ppp or ppp)
+        if offsets is None:
+            return 'skipped: downsample uniforms unavailable or invalid', {'prog': hex(prog)}
+        zero = all(x == 0 for pair in offsets for x in pair)
+        return 'replayed exactly: 8-sample downsample' + (' (zero captured offsets)' if zero else ''), {'offsets': offsets}
     is_blur = is_blur_program(f, ppp, prog)
     is_dest_in = prog == DEST_IN
     is_vibrancy = tex.get('vibrancy', False)
@@ -832,7 +961,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
     uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
     u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
     v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
-    su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+    su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
     xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
     ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
     x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
@@ -847,7 +976,10 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
 
     if is_blur:
-        params = extract_blur_params(f, vs_data, ppp, prog)
+        params = (extract_nc_blur_params(f, vs_data, retained_ppp or ppp, prog) if nc_context
+                  else extract_blur_params(f, vs_data, ppp, prog))
+        if nc_context and prog in (BLUR_4TAP, BLUR_7TAP) and not params['extracted']:
+            return 'skipped: blur uniforms unavailable or invalid', {'prog': hex(prog)}
         if params.get('extracted'):
             d_name = params['direction']
             n = params['n_taps']
@@ -883,12 +1015,29 @@ def audit_frame(f):
     outcomes = []
     did = 0
     retained_ppp = [0] * 32
+    copy_texmat_state = {}
     for vs_data, ppp, draw, viewport in walk(f):
         update_ppp_state(retained_ppp, ppp)
-        res, details = classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=retained_ppp)
+        res, details = classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=retained_ppp, copy_texmat_state=copy_texmat_state)
         outcomes.append((did, res, details))
         did += 1
     return outcomes
+
+
+def render_target_texture(f, width, height):
+    """Decode PBE layout, changing only the proved sparse NC targets."""
+    target = f.header['pbe_target']
+    try:
+        eot = PDS_HEAP | struct.unpack_from('<I', f.type1_command, 0x1bc)[0]
+        pbe = f.u32(eot + 8)
+        tex = decode_tsw(f, [f.u32(pbe + 8 + 4 * i) for i in range(4)])
+        if tex and tex['addr'] == target:
+            return tex
+    except (KeyError, ValueError):
+        pass
+    strip = is_strip_surface(f, target, width)
+    return dict(addr=target, w=width, h=height, strip=strip, twiddled=not strip and nc_sparse_layout(f, target, width, height),
+                stride=2560 if strip else ((width + 15) & ~15) * 4)
 
 
 def render_target_pitch(f, width):
@@ -935,22 +1084,17 @@ def main():
     fb = bytearray(target_w * target_h * 4)
     target = f.header.get('pbe_target')
     if not is_clear_pass(f.type1_command) and target and target in f.pages:
-        strip = is_strip_surface(f, target, target_w)
-        stride = 2560 if strip else render_target_pitch(f, target_w)
+        rt = render_target_texture(f, target_w, target_h)
         for y in range(target_h):
             for x in range(target_w):
-                gva = (target + (y >> 4) * 0x10000 + (y & 15) * stride + x * 4 if strip
-                       else target + y * stride + x * 4)
-                try:
-                    b, g, r, a = f.read(gva, 4)
-                    off = (y * target_w + x) * 4
-                    fb[off:off + 4] = bytes((r, g, b, a))
-                except KeyError:
-                    pass
+                b, g, r, a = texel(f, rt, x, y)
+                off = (y * target_w + x) * 4
+                fb[off:off + 4] = bytes((r, g, b, a))
     scissor_base = struct.unpack_from('<I', f.type1_command, 0x50)[0]
     clip_state = {'scenable': False, 'scindex': 0, 'has_rc': False, 'rc_box': None}
     last_m = None
     retained_ppp = [0] * 32
+    copy_texmat_state = {}
     for vs_data, ppp, draw, viewport in walk(f):
         clip_state = decode_ppp_clipping(ppp, clip_state)
         update_ppp_state(retained_ppp, ppp)
@@ -1024,9 +1168,20 @@ def main():
             else:
                 continue
         is_blur = is_blur_program(f, ppp, prog) or is_blur_program(f, retained_ppp, prog)
+        nc_context = nc_sparse_layout(f, target, target_w, target_h) or bool(tex and tex.get('nc_sparse'))
+        nc_normalized = (nc_context and stride == 24 and prog == 0x8eb52cf6fe248b1d and
+                         nc_copy_texmat(f, vs_data, copy_texmat_state))
+        region_clear = extract_region_clear(f, retained_ppp) if nc_context and stride == 12 and is_blur else None
         blurred_tex = None
-        if tex and is_blur and tex['w'] > 0 and tex['h'] > 0:
-            params = extract_blur_params(f, vs_data, ppp, prog)
+        downsample_offsets = extract_downsample(f, retained_ppp) if nc_context and prog == DOWNSAMPLE_8 else None
+        downsample_tex = None
+        if downsample_offsets is not None and any(x != 0 for pair in downsample_offsets for x in pair) and tex:
+            downsample_tex = [texel(f, tex, x, y) for y in range(tex['h']) for x in range(tex['w'])]
+        if tex and is_blur and region_clear is None and stride >= 24 and tex['w'] > 0 and tex['h'] > 0:
+            params = (extract_nc_blur_params(f, vs_data, retained_ppp, prog) if nc_context
+                      else extract_blur_params(f, vs_data, ppp, prog))
+            if nc_context and prog in (BLUR_4TAP, BLUR_7TAP) and not params['extracted']:
+                continue
             raw_pixels = []
             for ty in range(tex['h']):
                 for tx in range(tex['w']):
@@ -1291,7 +1446,7 @@ def main():
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
                 v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
-                su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+                su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
                 tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
@@ -1355,7 +1510,9 @@ def main():
                                 row0, row1 = get_tex_row(ty0), get_tex_row(ty1)
                             else:
                                 row0 = get_tex_row(max(0, min(tex['h'] - 1, int(sample_v))))
-                        if blurred_tex:
+                        if downsample_tex is not None:
+                            b, g, r, a = sample_downsample(downsample_tex, tex['w'], tex['h'], fu, sample_v, downsample_offsets)
+                        elif blurred_tex:
                             b, g, r, a = sample_bilinear(blurred_tex, tex['w'], tex['h'], fu, sample_v)
                         elif is_scaled:
                             u_sample = max(0.0, min(float(tex['w'] - 1), fu - 0.5))
@@ -1427,8 +1584,14 @@ def main():
                         else:
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c] * (255 - a) // 255)
+            elif region_clear is not None:
+                rgba = bytes((region_clear >> 16 & 255, region_clear >> 8 & 255,
+                              region_clear & 255, region_clear >> 24))
+                for y in range(y0, y1):
+                    start = (y * target_w + x0) * 4
+                    fb[start:start + (x1 - x0) * 4] = rgba * (x1 - x0)
             elif stride == 12 and (is_blur or is_blur_program(f, ppp, prog)):
-                params = extract_blur_params(f, vs_data, ppp, prog)
+                params = extract_blur_params(f, vs_data, retained_ppp or ppp, prog)
                 pad = 16
                 bx0 = max(0, x0 - pad)
                 by0 = max(0, y0 - pad)

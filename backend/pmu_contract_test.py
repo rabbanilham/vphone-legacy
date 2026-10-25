@@ -102,7 +102,7 @@ static void stl_le_p(void *p, uint32_t v) {
 '''
     types = r'''
 typedef struct { void *wifi; A7D2045 pmu; uint8_t gpio_regs[0x1000];
- uint32_t device_irq[32]; uint8_t chestnut_control; } A7State;
+ uint32_t device_irq[32]; uint8_t chestnut_control; bool backlight_off; } A7State;
 typedef struct { A7State *owner; hwaddr base; uint8_t regs[0x1000];
  bool i2c_active, i2c_read; uint8_t i2c_address;
  uint8_t chestnut_pointer, i2c_rx_byte;
@@ -115,7 +115,7 @@ static void aic_update(A7State *s) { (void)s; }
     gpio = source[source.index('static void touch_gpio_update('):
                   source.index('static void touch_gpio_level(')]
     types = types.replace('uint8_t chestnut_control;',
-                          'uint8_t chestnut_control; bool touch_irq_low, home_pressed;')
+                          'uint8_t chestnut_control; bool touch_irq_low, home_pressed, hold_pressed;')
     main = r'''
 static void send(A7Peripheral *p, uint32_t v) { i2c_write(p, 0, v); }
 static void prefix(A7Peripheral *p, unsigned reg) {
