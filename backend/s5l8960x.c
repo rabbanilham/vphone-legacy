@@ -697,6 +697,9 @@ struct A7State {
      * the completion event before an earlier stamp (probe-167 GPU hang). */
     struct AGXRenderJob *agx_done_head, *agx_done_tail;
     QEMUBH *agx_done_bh;
+    QEMUBH *agx_kick_bh;
+    bool agx_stamp_wait;
+    bool agx_async_enabled;
     bool agx_render_thread_running;
     bool agx_render_thread_exit;
     unsigned agx_inflight_jobs;
@@ -4890,6 +4893,32 @@ static bool agx_gpu_translate_ctx(A7State *s, uint64_t cat_base,
     if (!cat_base) {
         return false;
     }
+#ifdef QEMU_OSDEP_H
+    if (cat_base >= RAM_BASE && cat_base < RAM_BASE + GiB) {
+        uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
+        uint64_t pce_addr = cat_base + ((gva >> 30) & 0x3ff) * 4;
+        if (pce_addr + 4 <= RAM_BASE + GiB) {
+            uint32_t pce = ldl_le_p(ram + pce_addr - RAM_BASE);
+            if (pce & 1) {
+                uint64_t pde_addr = ((uint64_t)(pce >> 4) << 12) + ((gva >> 21) & 0x1ff) * 8;
+                if (pde_addr >= RAM_BASE && pde_addr + 8 <= RAM_BASE + GiB) {
+                    uint64_t pde = ldq_le_p(ram + pde_addr - RAM_BASE);
+                    if (pde & 1) {
+                        uint64_t pte_addr = (pde & UINT64_C(0xfffffff000)) + ((gva >> 12) & 0x1ff) * 8;
+                        if (pte_addr >= RAM_BASE && pte_addr + 8 <= RAM_BASE + GiB) {
+                            uint64_t pte = ldq_le_p(ram + pte_addr - RAM_BASE);
+                            if (pte & 1) {
+                                *pa = (pte & UINT64_C(0xfffffff000)) | (gva & 0xfff);
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
     uint32_t pce = address_space_ldl_le(&address_space_memory,
                                         cat_base + ((gva >> 30) & 0x3ff) * 4,
                                         MEMTXATTRS_UNSPECIFIED, &r);
@@ -5165,6 +5194,54 @@ static unsigned agx_vdm_draw_count(A7State *s, uint64_t cat, const uint8_t *ta)
     return draws;
 }
 
+#ifdef QEMU_OSDEP_H
+typedef struct AGXTLBEntry {
+    uint64_t gva_page;     /* (gva & ~0xfffULL) */
+    uint64_t cat_base;     /* page table root */
+    hwaddr pa_page;        /* physical address base */
+    uint8_t *host_ptr;     /* host RAM pointer */
+    uint32_t gen;          /* generation counter */
+} AGXTLBEntry;
+
+#define AGX_TLB_SIZE 1024
+#define AGX_TLB_MASK (AGX_TLB_SIZE - 1)
+
+static __thread AGXTLBEntry agx_tlb[AGX_TLB_SIZE];
+static __thread uint32_t agx_tlb_gen;
+
+static inline void agx_tlb_reset(void)
+{
+    agx_tlb_gen++;
+    if (agx_tlb_gen == 0) {
+        memset(agx_tlb, 0, sizeof(agx_tlb));
+        agx_tlb_gen = 1;
+    }
+}
+
+static inline AGXTLBEntry *agx_tlb_lookup(A7State *s, uint64_t cat, uint64_t gva_page)
+{
+    unsigned idx = (gva_page >> 12) & AGX_TLB_MASK;
+    AGXTLBEntry *e = &agx_tlb[idx];
+    if (e->gen == agx_tlb_gen && e->cat_base == cat && e->gva_page == gva_page) {
+        return e;
+    }
+    hwaddr pa;
+    if (gva_page >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva_page, &pa)) {
+        return NULL;
+    }
+    if (pa < RAM_BASE || pa >= RAM_BASE + GiB) {
+        return NULL;
+    }
+    uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
+    e->gva_page = gva_page;
+    e->cat_base = cat;
+    e->pa_page = pa;
+    e->host_ptr = ram + (pa - RAM_BASE);
+    e->gen = agx_tlb_gen;
+    return e;
+}
+#endif
+
 /* Row-wise counterpart of agx_ctx_read: one page walk and one memory-API
  * write per page instead of a walk plus a store per pixel, which made the
  * replay hold the BQL for most of each frame (probe-162 host profile). */
@@ -5173,13 +5250,25 @@ static bool agx_ctx_write(A7State *s, uint64_t cat, uint64_t gva, const void *bu
     const uint8_t *in = buf;
     bool ok = true;
     while (n) {
-        hwaddr pa;
         size_t chunk = MIN(n, 0x1000 - (gva & 0xfff));
-        /* Like the old per-pixel stores, skip only the unmapped pages. */
-        if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
-            address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
-                                in, chunk) != MEMTX_OK) {
-            ok = false;
+#ifdef QEMU_OSDEP_H
+        uint64_t base = gva & ~UINT64_C(0xfff);
+        AGXTLBEntry *tlb = agx_tlb_lookup(s, cat, base);
+        if (tlb) {
+            memcpy(tlb->host_ptr + (gva & 0xfff), in, chunk);
+            memory_region_set_dirty(MACHINE(s)->ram,
+                                    (tlb->pa_page - RAM_BASE) + (gva & 0xfff),
+                                    chunk);
+        } else
+#endif
+        {
+            hwaddr pa;
+            /* Like the old per-pixel stores, skip only the unmapped pages. */
+            if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+                address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                    in, chunk) != MEMTX_OK) {
+                ok = false;
+            }
         }
         in += chunk;
         gva += chunk;
@@ -5540,10 +5629,18 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
         }
         if (cached) {
             memcpy(out, cached + (gva & 0xfff), chunk);
-        } else if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
-            address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
-                               out, chunk) != MEMTX_OK) {
-            return false;
+        } else {
+#ifdef QEMU_OSDEP_H
+            AGXTLBEntry *tlb = agx_tlb_lookup(s, cat, base);
+            if (tlb) {
+                memcpy(out, tlb->host_ptr + (gva & 0xfff), chunk);
+            } else
+#endif
+            if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+                address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                   out, chunk) != MEMTX_OK) {
+                return false;
+            }
         }
         out += chunk;
         gva += chunk;
@@ -6481,6 +6578,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     AGXSurface sf;
     agx_surface_layout(s, cat, target, width, &sf);
     if (!sf.strip && pitch >= width * 4) { sf.pitch = pitch; }
+#ifdef QEMU_OSDEP_H
+    agx_tlb_reset();
+    for (uint32_t y = 0; y < height; y++) {
+        uint64_t row_start = agx_surface_gva(&sf, 0, y);
+        uint64_t row_end = row_start + width * 4 - 1;
+        agx_tlb_lookup(s, cat, row_start & ~0xfffULL);
+        if ((row_start & ~0xfffULL) != (row_end & ~0xfffULL)) {
+            agx_tlb_lookup(s, cat, row_end & ~0xfffULL);
+        }
+    }
+#endif
     bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") && target >= UINT64_C(0x400000000);
     unsigned before_clock = audit ? agx_audit_clock(s, cat, &sf) : 0;
 
@@ -7703,9 +7811,12 @@ static void agx_replay_complete_job(AGXRenderJob *job)
     g_free(job);
 }
 
+static void agx_kick_cb(void *opaque);
+
 static void agx_replay_done_bh(void *opaque)
 {
     A7State *s = opaque;
+    bool stamp_updated = false;
     for (;;) {
         qemu_mutex_lock(&s->agx_render_mutex);
         AGXRenderJob *job = s->agx_done_head;
@@ -7717,10 +7828,17 @@ static void agx_replay_done_bh(void *opaque)
         }
         qemu_mutex_unlock(&s->agx_render_mutex);
         if (!job) {
-            return;
+            break;
+        }
+        if (job->has_stamp) {
+            stamp_updated = true;
         }
         job->next = NULL;
         agx_replay_complete_job(job);
+    }
+    if (stamp_updated || s->agx_stamp_wait) {
+        s->agx_stamp_wait = false;
+        agx_kick_cb(s);
     }
 }
 
@@ -7807,6 +7925,31 @@ static void agx_enqueue_render_jobs(A7State *s, AGXRenderJob *head, AGXRenderJob
     for (AGXRenderJob *j = head; j; j = j->next) {
         s->agx_inflight_jobs++;
         j->enqueue_time_us = enq_time;
+    }
+
+    if (s->agx_async_enabled && s->agx_inflight_jobs <= 3) {
+        for (AGXRenderJob *j = head; j; j = j->next) {
+            if (j->has_stamp) {
+                agx_gpu_access(s, j->stamp_gva, &j->stamp_value, 4, true);
+                j->has_stamp = false;
+            }
+            if (j->has_queue_ctrl) {
+                smp_wmb();
+                agx_gpu_access(s, j->queue_ctrl_gva, &j->queue_read_index, 4, true);
+                for (unsigned i = 0; i < ARRAY_SIZE(s->agx_host_read); i++) {
+                    if (s->agx_host_read[i].valid &&
+                        s->agx_host_read[i].control == j->queue_ctrl_gva &&
+                        s->agx_host_read[i].index == j->queue_read_index) {
+                        s->agx_host_read[i].valid = false;
+                    }
+                }
+                j->has_queue_ctrl = false;
+            }
+            if (j->post_completion) {
+                agx_post_fw_message(s, 1);
+                j->post_completion = false;
+            }
+        }
     }
 
     agx_render_ensure_thread(s);
@@ -8224,9 +8367,10 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                     s->agx_perf_total_repolls_1ms++;
                     s->agx_perf_win_repolls_1ms++;
                 }
+                s->agx_stamp_wait = true;
 #endif
                 timer_mod(s->agx_kick_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000);
                 break;
             }
         }
@@ -8534,7 +8678,7 @@ static void agx_doorbell(A7State *s, uint64_t value)
             s->agx_doorbell_in_flight = true;
         }
     }
-    timer_mod(s->agx_kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
+    qemu_bh_schedule(s->agx_kick_bh);
 }
 
 static void agx_sequencer_run(A7Peripheral *p)
@@ -9336,6 +9480,7 @@ static void a7_init(MachineState *ms)
     qemu_mutex_init(&s->agx_render_mutex);
     qemu_cond_init(&s->agx_render_cond);
     s->agx_done_bh = qemu_bh_new(agx_replay_done_bh, s);
+    s->agx_kick_bh = qemu_bh_new(agx_kick_cb, s);
     s->agx_job_head = NULL;
     s->agx_job_tail = NULL;
     s->agx_render_thread_running = false;
@@ -9348,6 +9493,8 @@ static void a7_init(MachineState *ms)
         s->agx_perf_timer = timer_new_ms(QEMU_CLOCK_REALTIME, agx_perf_timer_cb, s);
         timer_mod(s->agx_perf_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
     }
+    const char *async_env = getenv("VPHONE_AGX_ASYNC");
+    s->agx_async_enabled = async_env && strcmp(async_env, "0") != 0;
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);
@@ -9404,6 +9551,10 @@ static void a7_finalize(Object *o)
         timer_del(s->agx_perf_timer);
         timer_free(s->agx_perf_timer);
         s->agx_perf_timer = NULL;
+    }
+    if (s->agx_kick_bh) {
+        qemu_bh_delete(s->agx_kick_bh);
+        s->agx_kick_bh = NULL;
     }
     g_free(s->wifi_netdev);
     g_free(s->wifi_ssid);
