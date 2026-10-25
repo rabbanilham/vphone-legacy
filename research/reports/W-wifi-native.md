@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-This report covers the native acceptance validation and model corrections for the BCM43342 FullMAC USB Wi-Fi emulation on the HSIC/EHCI1 port in worktree `/Users/bagas/Downloads/vphone-wt-wifi` (`wt/wifi` branch), booting an iPhone 5s (`s5l8960x`) on iOS 7.1.2 (`11D257`) with the `build/virtual-activated-profile-v5` profile.
+This report covers the native acceptance validation and model corrections for the BCM43342 FullMAC USB Wi-Fi emulation on the HSIC/EHCI1 port on the `wt/wifi` branch, booting an iPhone 5s (`s5l8960x`) on iOS 7.1.2 (`11D257`) with the `build/virtual-activated-profile-v5` profile.
 
 ### Results Matrix (updated 2026-10-24, wt/wifi `53c4f9f`)
 
@@ -164,9 +164,9 @@ During `AppleBCMWLANCore::start()`, the driver invokes `AppleBCMWLANProvisioning
 #      "preferences/SystemConfiguration/com.apple.wifi.plist" = {AllowEnable: 1, "List of known networks":
 #      [{SSID_STR: vphone-wifi, SSID: <data>, AP_MODE: 2, HIDDEN_NETWORK: false}]}
 VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi backend/.venv/bin/python backend/display_probe.py \
-  --plan /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5-wlanlog/boot/boot_plan.json \
-  --diagnostic-system /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5/system.raw \
-  --diagnostic-data /Users/bagas/Downloads/vphone-legacy/build/virtual-activated-profile-v5-wlanlog/data-wifiknown.raw \
+  --plan build/virtual-activated-profile-v5-wlanlog/boot/boot_plan.json \
+  --diagnostic-system build/virtual-activated-profile-v5/system.raw \
+  --diagnostic-data build/virtual-activated-profile-v5-wlanlog/data-wifiknown.raw \
   --output research/acceptance-wifi-native-N --stop-condition duration --seconds 160 --wifi \
   --qemu-arg=-object --qemu-arg=filter-dump,id=f0,netdev=wifi0,file=$PWD/research/acceptance-wifi-native-N/wifi.pcap
 # wifid log: mount <output>/images/data.raw read-only, copy logs/CrashReporter/WiFi/*, then delete <output>/images.
