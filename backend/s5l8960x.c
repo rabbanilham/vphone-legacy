@@ -1264,8 +1264,12 @@ static void button_level(A7State *s, unsigned pin, bool *state, bool pressed)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << pin));
     }
-    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d\n",
-                  pin, pressed, config, edge);
+    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d "
+                  "aic_masked=%d gpio_pending=0x%08x ns=%" PRId64 "\n",
+                  pin, pressed, config, edge,
+                  group < 7 ? !!(s->mask[(108 + group) / 32] & (1u << ((108 + group) % 32))) : -1,
+                  group < 7 ? ldl_le_p(s->gpio_regs + 0x800 + group * 0x40) : 0,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     *state = pressed;
     touch_gpio_update(s);
 }
@@ -2407,6 +2411,10 @@ static void d2045_store(A7State *s, uint16_t reg, uint8_t value)
         d->rtc_base = (seconds & ~(0xffu << shift)) | (uint32_t)value << shift;
         d->rtc_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     }
+    if ((reg >= 0x70 && reg < 0x7c) || (reg >= 0x180 && reg < 0x190)) {
+        qemu_log_mask(LOG_UNIMP, "PMU write reg=0x%x val=0x%02x ns=%" PRId64 "\n",
+                      reg, value, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     if (reg >= 0x50 && reg < 0x5c) {
         d->regs[reg] &= ~value; /* defensive W1C; normal driver uses read-clear */
     } else {
@@ -2670,6 +2678,10 @@ static void d2045_command(A7Peripheral *p, uint32_t value)
                 byte = fraction >> ((reg - 0x5c6) * 8);
             }
             p->pmu_rx[i] = byte;
+            if ((reg >= 0x180 && reg < 0x190) || (reg >= 0x50 && reg < 0x5c && byte)) {
+                qemu_log_mask(LOG_UNIMP, "PMU read reg=0x%x val=0x%02x ns=%" PRId64 "\n",
+                              reg, byte, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            }
             if (reg >= 0x50 && reg < 0x5c) {
                 d->regs[reg] = 0; /* native handler has no explicit acknowledge */
             }
@@ -8970,12 +8982,25 @@ static void agx_sequencer_run(A7Peripheral *p)
             timer_mod(s->agx_meta_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
         }
     }
+    /* The program has run: the run bits self-clear. The idle check at
+     * 0xffffff80011874f8 waits for sgx1+0x1000 & 0xf == 0, which the sleep
+     * path's power-down program never reached. */
+    stl_le_p(p->regs + 0x1000, ldl_le_p(p->regs + 0x1000) & ~UINT32_C(0xf));
 }
 
 static uint64_t peripheral_read(void *opaque, hwaddr off, unsigned size)
 {
     A7Peripheral *p = opaque;
     uint64_t val = peripheral_read_impl(opaque, off, size);
+    if (p->base == UINT64_C(0x201e00000) && off == 0 && size == 4 &&
+        p->owner->agx_inflight_jobs == 0) {
+        /* sgx1+0 bit 29 is the GPU's idle status. AGXMetaFirmware's idle
+         * check (0xffffff80011874d4) needs bits 29 and 30 both set before it
+         * lets the display sleep; the driver only ever writes bit 30, so
+         * without this the sleep path polled forever and later Home and
+         * hold presses were never handled. */
+        val |= UINT32_C(0x20000000);
+    }
     display_mmio_trace(opaque, "read", off, size, val);
     mmio_trace(p->name, "read", off, size, val);
     return val;
