@@ -6453,6 +6453,11 @@ static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float ou
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
     AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
+#ifdef QEMU_OSDEP_H
+    /* The translation cache is per thread; the main loop must not reuse
+     * entries across passes after the guest remaps GPU pages. */
+    agx_tlb_reset();
+#endif
     snapshot->refs = 1;
     snapshot->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     agx_read_snapshot = snapshot;
@@ -8152,6 +8157,9 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     uint8_t raw[0x280];
     hwaddr pa = 0, last_pa = 0;
     bool mapped, last_mapped, contiguous;
+#ifdef QEMU_OSDEP_H
+    agx_tlb_reset();
+#endif
     uint64_t first = UINT64_MAX, actual = 0;
     const char *fill = getenv("VPHONE_AGX_RT_FILL");
 
