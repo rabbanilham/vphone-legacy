@@ -4719,7 +4719,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 return;
             }
             if (off == 0x1050) {
-                fprintf(stderr, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
+                qemu_log_mask(LOG_UNIMP, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
                         val, p->owner->disp_pending_token);
                 *(uint32_t *)(p->regs + 0x1044) = 0;
                 p->owner->disp_swap_pending = true;
@@ -8555,7 +8555,7 @@ static void vblank_timer_cb(void *opaque)
                  * synthesize it as a successful swap completion. */
                 *status |= (1U << 8);
                 *(uint32_t *)(p->regs + 0x1048) = s->disp_token;
-                fprintf(stderr, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
+                qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;

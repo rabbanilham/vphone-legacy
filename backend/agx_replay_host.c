@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef uint64_t hwaddr;
 typedef int MemTxResult;
@@ -180,7 +181,11 @@ static int replay_one(const char *dump, const char *rgba_path, GHashTable *carri
         pitch = rt.stride;
     }
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     agx_replay_frame(&state, cat, ta, target, width, height, is_clear, pitch, scissor_base);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double replay_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
     /* Read the target back the way the replay addressed it. */
     uint32_t w = MIN(width, 640u * 4), h = MIN(height, 4096u);
@@ -228,11 +233,11 @@ static int replay_one(const char *dump, const char *rgba_path, GHashTable *carri
     printf("{\"width\": %u, \"height\": %u, \"target\": \"0x%llx\", \"clear\": %s, "
            "\"strip\": %s, \"pitch\": %u, \"draws\": %u, \"skips\": %s, "
            "\"guest_errors\": %u, \"missing_rows\": %u, \"capped\": %s, \"ta_valid\": %s, "
-           "\"carried_pages\": %u}\n",
+           "\"carried_pages\": %u, \"replay_ms\": %.3f}\n",
            w, h, (unsigned long long)target, is_clear ? "true" : "false",
            sf.strip ? "true" : "false", sf.pitch, host_draws, skips->str,
            host_guest_errors, missing_rows, (flags & 2) ? "true" : "false",
-           (flags & 1) ? "true" : "false", carried_in);
+           (flags & 1) ? "true" : "false", carried_in, replay_ms);
     fflush(stdout);
     g_string_free(skips, true);
     g_hash_table_destroy(host_pages);

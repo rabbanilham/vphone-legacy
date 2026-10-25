@@ -199,13 +199,17 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
                 machine += f",system-image={system},data-image={data},system-writable=1"
                 if "utility" in storage_paths:
                     machine += ",utility-image=" + storage_paths["utility"].replace(",", ",,")
-            accelerator = "tcg,thread=single" if plan["cpu_count"] == 2 else "tcg"
+            # MTTCG by default, as live_run.py and merge-live.sh boot to Home.
+            accelerator = "tcg,thread=" + os.environ.get("VPHONE_TCG_THREAD", "multi")
+            # -d int logs every exception and timer FIQ (~100 MB per boot) and
+            # unimp logs every modeled MMIO access; both slow the guest a lot.
+            trace_mask = os.environ.get("VPHONE_QEMU_DEBUG", "guest_errors")
             command = [backend["binary"], "-machine", machine, "-accel", accelerator,
                        "-smp", str(plan["cpu_count"]), "-m", "1024M",
                        "-kernel", plan["image"], "-display", "none" if headless else "cocoa",
                        "-qmp", f"unix:{qmp_path},server=on,wait=off", "-monitor", "none",
                        "-chardev", f"stdio,id=console,signal=off,logfile={logs / 'serial.log'}",
-                       "-serial", "chardev:console", "-d", "guest_errors,unimp,int", "-D", str(logs / "qemu-trace.log")]
+                       "-serial", "chardev:console", "-d", trace_mask, "-D", str(logs / "qemu-trace.log")]
             for image in plan["auxiliary_images"]:
                 command += ["-device", f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
             if probe_seconds is not None or paused:
@@ -230,7 +234,7 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
             qmp = None
             reason = None
             launch_failed = False
-            verbose_trace = True
+            verbose_trace = "int" in trace_mask.split(",")
             panic_monitor = PanicMonitor()
             try:
                 process = subprocess.Popen(command, start_new_session=True)
@@ -276,7 +280,8 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
                     if verbose_trace and trace.exists() and trace.stat().st_size > 16 * 1024 * 1024:
                         # Normal timer FIQs and demand-page faults also produce
                         # int traces. A byte limit is not evidence of failure.
-                        qmp.execute("human-monitor-command", {"command-line": "log guest_errors,unimp"})
+                        qmp.execute("human-monitor-command", {"command-line": "log " + ",".join(
+                            m for m in trace_mask.split(",") if m != "int")})
                         verbose_trace = False
                         status["diagnostics"] = dict(interrupt_trace_limited=True, trace=str(trace),
                                                      reason="16MiB interrupt trace budget reached; device-error tracing continues")
