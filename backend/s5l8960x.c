@@ -1264,12 +1264,8 @@ static void button_level(A7State *s, unsigned pin, bool *state, bool pressed)
         uint8_t *status = s->gpio_regs + 0x800 + group * 0x40;
         stl_le_p(status, ldl_le_p(status) | (1u << pin));
     }
-    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d "
-                  "aic_masked=%d gpio_pending=0x%08x ns=%" PRId64 "\n",
-                  pin, pressed, config, edge,
-                  group < 7 ? !!(s->mask[(108 + group) / 32] & (1u << ((108 + group) % 32))) : -1,
-                  group < 7 ? ldl_le_p(s->gpio_regs + 0x800 + group * 0x40) : 0,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    qemu_log_mask(LOG_UNIMP, "A7 BUTTON pin=%u pressed=%d config=0x%08x edge=%d ns=%" PRId64 "\n",
+                  pin, pressed, config, edge, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     *state = pressed;
     touch_gpio_update(s);
 }
