@@ -93,7 +93,7 @@ class TestAGXUntexturedStrides(unittest.TestCase):
         self.assertGreater(len(outcomes), 0)
         did, res, details = outcomes[0]
         self.assertEqual(did, 0)
-        self.assertEqual(res, 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)')
+        self.assertEqual(res, 'replayed exactly: 1D Gaussian blur (horizontal, 7-tap, canvas backdrop)')
         self.assertEqual(details.get('prog'), '0x23e324c0933a2344')
 
     def test_corpus_frame_stride_24_prog_0_audit(self):
