@@ -5264,10 +5264,14 @@ static bool agx_ctx_write(A7State *s, uint64_t cat, uint64_t gva, const void *bu
         uint64_t base = gva & ~UINT64_C(0xfff);
         AGXTLBEntry *tlb = agx_tlb_lookup(s, cat, base);
         if (tlb) {
-            memcpy(tlb->host_ptr + (gva & 0xfff), in, chunk);
-            memory_region_set_dirty(MACHINE(s)->ram,
-                                    (tlb->pa_page - RAM_BASE) + (gva & 0xfff),
-                                    chunk);
+            /* Reuse the cached translation but keep address_space_write: a
+             * raw memcpy plus memory_region_set_dirty marks code pages dirty
+             * without invalidating their TBs, so recycled pages ran stale
+             * translated code (Settings launched seconds late). */
+            if (address_space_write(&address_space_memory, tlb->pa_page + (gva & 0xfff),
+                                    MEMTXATTRS_UNSPECIFIED, in, chunk) != MEMTX_OK) {
+                ok = false;
+            }
         } else
 #endif
         {
