@@ -1,13 +1,65 @@
 import AppKit
 import Darwin
+import IOSurface
+import QuartzCore
 
-// RFB 3.8, raw pixels only. All blocking I/O stays on the worker queue.
+// Persistent pixel buffer backed by IOSurface for zero-copy GPU presentation.
+final class PixelBuffer {
+    let width = 640
+    let height = 1136
+    let bytesPerRow: Int
+    let surface: IOSurface
+    let baseAddress: UnsafeMutableRawPointer
+
+    init() {
+        self.bytesPerRow = width * 4
+        let props: [CFString: Any] = [
+            kIOSurfaceWidth: width,
+            kIOSurfaceHeight: height,
+            kIOSurfaceBytesPerElement: 4,
+            kIOSurfaceBytesPerRow: width * 4,
+            kIOSurfaceAllocSize: width * height * 4,
+            kIOSurfacePixelFormat: 0x42475241 // 'BGRA'
+        ]
+        self.surface = IOSurfaceCreate(props as CFDictionary)!
+        IOSurfaceLock(surface, [], nil)
+        self.baseAddress = IOSurfaceGetBaseAddress(surface)
+        memset(baseAddress, 0, width * height * 4)
+        IOSurfaceUnlock(surface, [], nil)
+    }
+
+    func lock() {
+        IOSurfaceLock(surface, [], nil)
+    }
+
+    func unlock() {
+        IOSurfaceUnlock(surface, [], nil)
+    }
+
+    func makeImage() -> CGImage? {
+        lock()
+        defer { unlock() }
+        let ctx = CGContext(data: baseAddress,
+                            width: width,
+                            height: height,
+                            bitsPerComponent: 8,
+                            bytesPerRow: bytesPerRow,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        return ctx?.makeImage()
+    }
+}
+
+// RFB 3.8, raw pixels with persistent pixel buffer. All blocking I/O stays on the worker queue.
 final class RFB {
     var fd: Int32 = -1
     let writes = NSLock()
     var frame: ((CGImage) -> Void)?
+    var surfaceFrame: ((IOSurface) -> Void)?
+    var trace: ((String) -> Void)?
     var failed: ((String) -> Void)?
     var width = 0, height = 0
+    let pixelBuffer = PixelBuffer()
     func read(_ count: Int) throws -> [UInt8] {
         var bytes = [UInt8](repeating: 0, count: count), offset = 0
         while offset < count {
@@ -17,6 +69,15 @@ final class RFB {
             offset += n
         }
         return bytes
+    }
+    func read(into ptr: UnsafeMutableRawPointer, count: Int) throws {
+        var offset = 0
+        while offset < count {
+            let n = Darwin.recv(fd, ptr.advanced(by: offset), count - offset, 0)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw NSError(domain: "Koneksi layar terputus", code: 1) }
+            offset += n
+        }
     }
     func send(_ bytes: [UInt8]) throws {
         writes.lock(); defer { writes.unlock() }
@@ -72,7 +133,12 @@ final class RFB {
             // 32-bit little endian BGRX, 24-bit true color.
             try send([0,0,0,0,32,24,0,1,0,255,0,255,0,255,16,8,0,0,0,0])
             try send([2,0,0,1,0,0,0,0]); try request(false)
-            var pixels = [UInt8](repeating:0,count:width*height*4)
+            let statsEnabled = ProcessInfo.processInfo.environment["VPHONE_PLAYER_STATS"] != nil
+            var statsLastTime = Date().timeIntervalSince1970
+            var statsFrames = 0
+            var statsRects = 0
+            var statsBytes = 0
+            var totalFrames = 0
             while true {
                 let type = try read(1)[0]
                 if type == 2 { continue }
@@ -83,16 +149,60 @@ final class RFB {
                 }
                 guard type == 0 else { throw NSError(domain:"Pesan RFB tidak didukung",code:Int(type)) }
                 let h = try read(3); let count = Int(h[1])*256+Int(h[2])
-                for _ in 0..<count {
-                    let rect = try read(12)
-                    let x = Int(rect[0])*256+Int(rect[1]), y = Int(rect[2])*256+Int(rect[3])
-                    let w = Int(rect[4])*256+Int(rect[5]), hh = Int(rect[6])*256+Int(rect[7])
-                    guard rect[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else { throw NSError(domain:"Rectangle RFB tidak valid",code:1) }
-                    let data = try read(w*hh*4)
-                    for row in 0..<hh { pixels.replaceSubrange(((y+row)*width+x)*4..<((y+row)*width+x+w)*4,with:data[row*w*4..<(row+1)*w*4]) }
+                if count > 0 {
+                    pixelBuffer.lock()
+                    var frameBytes = 0
+                    for _ in 0..<count {
+                        let rect = try read(12)
+                        let x = Int(rect[0])*256+Int(rect[1]), y = Int(rect[2])*256+Int(rect[3])
+                        let w = Int(rect[4])*256+Int(rect[5]), hh = Int(rect[6])*256+Int(rect[7])
+                        guard rect[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else {
+                            pixelBuffer.unlock()
+                            throw NSError(domain:"Rectangle RFB tidak valid",code:1)
+                        }
+                        frameBytes += w*hh*4
+                        if w == width && x == 0 {
+                            try read(into: pixelBuffer.baseAddress.advanced(by: y * pixelBuffer.bytesPerRow),
+                                     count: width * hh * 4)
+                        } else {
+                            for row in 0..<hh {
+                                let dst = pixelBuffer.baseAddress.advanced(by: (y + row) * pixelBuffer.bytesPerRow + x * 4)
+                                try read(into: dst, count: w * 4)
+                            }
+                        }
+                    }
+                    pixelBuffer.unlock()
+
+                    totalFrames += 1
+                    if statsEnabled {
+                        statsFrames += 1
+                        statsRects += count
+                        statsBytes += frameBytes
+                        let now = Date().timeIntervalSince1970
+                        if now - statsLastTime >= 1.0 {
+                            let dt = now - statsLastTime
+                            let fps = Double(statsFrames) / dt
+                            let rps = Double(statsRects) / dt
+                            let kbps = Double(statsBytes) / dt / 1024.0
+                            let msg = String(format: "[player-stats] FPS: %.1f, rects/s: %.1f, kB/s: %.1f (total frames: %d)",
+                                             fps, rps, kbps, totalFrames)
+                            fputs("\(msg)\n", stderr)
+                            trace?(msg)
+                            statsFrames = 0
+                            statsRects = 0
+                            statsBytes = 0
+                            statsLastTime = now
+                        }
+                    }
+
+                    if let surfaceHandler = surfaceFrame {
+                        surfaceHandler(pixelBuffer.surface)
+                    } else if let frameHandler = frame {
+                        if let img = pixelBuffer.makeImage() {
+                            frameHandler(img)
+                        }
+                    }
                 }
-                let provider = CGDataProvider(data: Data(pixels) as CFData)!
-                if let image = CGImage(width:width,height:height,bitsPerComponent:8,bitsPerPixel:32,bytesPerRow:width*4,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.noneSkipFirst.rawValue).union(.byteOrder32Little),provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent) { frame?(image) }
                 try request(true)
             }
         } catch { failed?(error.localizedDescription) }
@@ -280,7 +390,25 @@ enum ScreenGeometry {
 }
 
 final class Screen: NSView {
-    var image: CGImage? { didSet { needsDisplay = true } }
+    private var cachedImage: CGImage?
+    var pixelBuffer: PixelBuffer?
+    var image: CGImage? {
+        get {
+            if let pixelBuffer { return pixelBuffer.makeImage() }
+            return cachedImage
+        }
+        set {
+            cachedImage = newValue
+            if let newValue {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                contentLayer.contents = newValue
+                CATransaction.commit()
+            }
+        }
+    }
+    let contentLayer = CALayer()
+    let overlayLayer = CALayer()
     var input: ((Int,Int,Bool)->Void)?
     let gestures = TouchGestures()
     var wheelTimer: Timer?
@@ -290,11 +418,63 @@ final class Screen: NSView {
     var held = false
     var lastPoint = (0,0)
     var trace: ((String)->Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupLayers()
+    }
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupLayers()
+    }
+    private func setupLayers() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        contentLayer.contentsGravity = .resizeAspect
+        contentLayer.magnificationFilter = .nearest
+        contentLayer.minificationFilter = .linear
+        layer?.addSublayer(contentLayer)
+        layer?.addSublayer(overlayLayer)
+    }
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.frame = displayRect
+        overlayLayer.frame = bounds
+        CATransaction.commit()
+        updateOverlay()
+    }
+    func present(surface: IOSurface) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.contents = surface
+        CATransaction.commit()
+    }
+    func updateOverlay() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        overlayLayer.frame = bounds
+        overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        let r = displayRect, diameter = 56 * r.width / 640
+        for p in gestures.overlay {
+            let dot = CALayer()
+            dot.frame = CGRect(x: r.minX + p.x * r.width / 640 - diameter / 2,
+                               y: r.minY + p.y * r.height / 1136 - diameter / 2,
+                               width: diameter, height: diameter)
+            dot.cornerRadius = diameter / 2
+            dot.backgroundColor = NSColor.gray.withAlphaComponent(0.45).cgColor
+            dot.borderColor = NSColor.white.withAlphaComponent(0.85).cgColor
+            dot.borderWidth = 1
+            overlayLayer.addSublayer(dot)
+        }
+        CATransaction.commit()
+    }
     func cancelTouch() {
         touchEpoch += 1
         wheelTimer?.invalidate();wheelTimer = nil
         controlCenterTimer?.invalidate();controlCenterTimer = nil
-        gestures.end();gestures.hint(nil,option:false);needsDisplay = true
+        gestures.end();gestures.hint(nil,option:false);updateOverlay()
         if held { held = false; input?(lastPoint.0,lastPoint.1,false) }
     }
     var displayRect: NSRect {
@@ -312,14 +492,7 @@ final class Screen: NSView {
     // start the guest contact, otherwise the entire first drag is discarded.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill(); bounds.fill()
-        if let image { NSImage(cgImage:image,size:NSSize(width:640,height:1136)).draw(in:displayRect,from:.zero,operation:.copy,fraction:1,respectFlipped:true,hints:nil) }
-        let r = displayRect, diameter = 56*r.width/640
-        for p in gestures.overlay {
-            let dot = NSRect(x:r.minX+p.x*r.width/640-diameter/2,y:r.minY+p.y*r.height/1136-diameter/2,width:diameter,height:diameter)
-            NSColor.gray.withAlphaComponent(0.45).setFill();NSBezierPath(ovalIn:dot).fill()
-            NSColor.white.withAlphaComponent(0.85).setStroke();let path = NSBezierPath(ovalIn:dot);path.lineWidth = 1;path.stroke()
-        }
+        // Presentation is handled by GPU CALayer.
     }
     func guestPoint(_ event:NSEvent)->NSPoint? {
         let p = convert(event.locationInWindow,from:nil), r = displayRect
@@ -356,27 +529,27 @@ final class Screen: NSView {
         // or a pending toolbar swipe must never swallow subsequent clicks.
         if gestures.kind != .none {cancelTouch()}
         if event.modifierFlags.contains(.option),let point = guestPoint(event) {
-            gestures.pinch(point,begin:true);needsDisplay = true
+            gestures.pinch(point,begin:true);updateOverlay()
         } else {pointer(event,true)}
     }
     override func mouseDragged(with event:NSEvent) {
         if gestures.kind == .pinch {
             let p = convert(event.locationInWindow,from:nil),r = displayRect
             let point = gestures.clamp(NSPoint(x:(p.x-r.minX)/r.width*640,y:(p.y-r.minY)/r.height*1136))
-            gestures.pinch(point,begin:false,pan:event.modifierFlags.contains(.shift));needsDisplay = true
+            gestures.pinch(point,begin:false,pan:event.modifierFlags.contains(.shift));updateOverlay()
         } else if held {pointer(event,true)}
     }
     override func mouseUp(with event:NSEvent) {
-        if gestures.kind == .pinch {gestures.end();gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));needsDisplay = true}
+        if gestures.kind == .pinch {gestures.end();gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));updateOverlay()}
         else if held {pointer(event,false)}
     }
     override func flagsChanged(with event:NSEvent) {
         let p = window.map {convert($0.mouseLocationOutsideOfEventStream,from:nil)}
         let point = p.flatMap {displayRect.contains($0) ? NSPoint(x:($0.x-displayRect.minX)/displayRect.width*640,y:($0.y-displayRect.minY)/displayRect.height*1136):nil}
-        gestures.hint(point,option:event.modifierFlags.contains(.option));needsDisplay = true
+        gestures.hint(point,option:event.modifierFlags.contains(.option));updateOverlay()
     }
-    override func mouseMoved(with event:NSEvent) {gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));needsDisplay = true}
-    override func mouseExited(with event:NSEvent) {gestures.hint(nil,option:false);needsDisplay = true}
+    override func mouseMoved(with event:NSEvent) {gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));updateOverlay()}
+    override func mouseExited(with event:NSEvent) {gestures.hint(nil,option:false);updateOverlay()}
     override func scrollWheel(with event:NSEvent) {
         guard !held,event.momentumPhase.isEmpty else {return}
         let wheel = event.phase.isEmpty
@@ -387,14 +560,14 @@ final class Screen: NSView {
             end:event.phase.contains(.ended) || event.phase.contains(.cancelled),wheel:wheel)
         if wheel,gestures.kind == .wheel {
             wheelTimer?.invalidate()
-            wheelTimer = Timer.scheduledTimer(withTimeInterval:0.15,repeats:false) {[weak self] _ in self?.gestures.end();self?.needsDisplay = true}
+            wheelTimer = Timer.scheduledTimer(withTimeInterval:0.15,repeats:false) {[weak self] _ in self?.gestures.end();self?.updateOverlay()}
         }
-        needsDisplay = true
+        updateOverlay()
     }
     override func magnify(with event:NSEvent) {
         guard !held else {return}
         gestures.magnify(guestPoint(event),delta:event.magnification,begin:event.phase.contains(.began),end:event.phase.contains(.ended) || event.phase.contains(.cancelled))
-        needsDisplay = true
+        updateOverlay()
     }
 }
 
@@ -437,6 +610,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ = FileManager.default.createFile(atPath:logURL.path,contents:nil)
         inputLog = try? FileHandle(forWritingTo:logURL)
         screen.trace = {[weak self] text in self?.logInput(text)}
+        rfb.trace = {[weak self] text in self?.logInput(text)}
         logInput("player started; VNC pointer and QMP gesture input configured")
         let qmp = QMPInput(CommandLine.arguments[2]);touchInput = qmp
         screen.gestures.send = {[weak self,weak qmp] type,points in
@@ -444,8 +618,16 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             qmp?.touch(type,points)
         }
         qmp.failed = {[weak self] message in DispatchQueue.main.async {self?.handleGestureFailure(message)}}
+        screen.pixelBuffer = rfb.pixelBuffer
         screen.input = { [weak self] x,y,down in self?.rfb.pointer(x,y,down) }
-        rfb.frame = { [weak self] image in DispatchQueue.main.async { guard let self else {return}; self.screen.image = image; if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}; self.buttons.enumerated().forEach {i,button in button.isEnabled = !self.inputFailed && !(i == 1 && self.controlCenterPending)} } }
+        rfb.surfaceFrame = { [weak self] surface in
+            DispatchQueue.main.async {
+                guard let self else {return}
+                self.screen.present(surface: surface)
+                if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}
+                self.buttons.enumerated().forEach {i,button in button.isEnabled = !self.inputFailed && !(i == 1 && self.controlCenterPending)}
+            }
+        }
         rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
         let path = CommandLine.arguments[1]
