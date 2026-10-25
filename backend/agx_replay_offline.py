@@ -183,17 +183,17 @@ def fragment_words(f, ppp):
             continue
         base = PDS_HEAP | word
         try:
-            data = [f.u32(base + 4 * i) for i in range(8)]
+            data = [f.u32(base + 4 * i) for i in range(16)]
         except (KeyError, ValueError):
             continue
-        for k in range(0, 8, 2):
+        for k in range(0, 16, 2):
             ptr = data[k] | (data[k + 1] << 32)
             if not 0x1000 <= ptr < (1 << 40):
-                break  # contiguous pointer list; the rest may be the next draw's
+                continue
             try:
-                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(12)]))
+                found.append((ptr, [f.u32(ptr + 4 * i) for i in range(128)]))
             except (KeyError, ValueError):
-                break  # unmapped or invalid pointer terminates the contiguous list
+                continue
     return found
 
 
@@ -272,7 +272,9 @@ def texture(f, ppp, prog=None):
                 tex = decode_tsw(f, ws[k:k + 4])
                 if tex:
                     # Trailing constants may be the next draw's allocation.
-                    tex['vibrancy'] = tuple(ws[:3]) == LUMA
+                    tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog == STRIDE36_DUAL_TEX
+                    if prog == STRIDE36_DUAL_TEX and len(ws) >= 8:
+                        tex['mask_tex'] = decode_tsw(f, ws[4:8])
                     sampler = None
                     if k >= 4:
                         sampler = decode_sampler(ws[k - 4:k])
@@ -309,6 +311,8 @@ SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
 PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
+STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
+
 
 
 def extract_color_matrix(f, ppp):
@@ -481,7 +485,9 @@ def extract_blur_params(f, vs_data, ppp, prog):
     weights = [t[1] for t in taps]
     direction = def_dir
     n_taps = len(taps)
-    max_taps = 4 if prog == BLUR_4TAP else (7 if prog == BLUR_7TAP else 6)
+    max_taps = 4 if prog == BLUR_4TAP else (7 if prog == BLUR_7TAP else 7)
+    found_offsets = False
+    found_weights = False
 
     # 1. Inspect vertex uniforms (vs_data + 48)
     if vs_data:
@@ -512,31 +518,68 @@ def extract_blur_params(f, vs_data, ppp, prog):
                     if len(read_offs) >= 3:
                         offsets = read_offs
                         n_taps = len(read_offs)
+                        found_offsets = True
         except Exception:
             pass
 
-    # 2. Inspect fragment uniforms for weights
+    # 2. Inspect fragment uniforms for weights and offsets
     if ppp:
         try:
             words = fragment_words(f, ppp)
             for _, ws in words:
                 fl = [struct.unpack('<f', struct.pack('<I', w))[0] for w in ws]
-                for i in range(len(fl)):
-                    if i + n_taps <= len(fl):
-                        sub = fl[i:i + n_taps]
-                        if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
-                            weights = list(sub)
+                # Look for weights
+                if not found_weights:
+                    for n in (7, 4):
+                        for i in range(len(fl) - n + 1):
+                            sub = fl[i:i + n]
+                            if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                                weights = list(sub)
+                                n_taps = n
+                                found_weights = True
+                                break
+                        if found_weights:
                             break
-                if len(weights) == n_taps and weights != [t[1] for t in taps]:
+
+                # Search for offsets in fragment uniforms if not found in vertex uniforms
+                if not found_offsets:
+                    for n in (n_taps, 7, 4):
+                        for offset_sub in (0, 1):
+                            for start_idx in range(len(fl) - n * 4 + 1):
+                                xs = [fl[start_idx + k * 4 + offset_sub] for k in range(n)]
+                                ys = [fl[start_idx + k * 4 + offset_sub + 1] for k in range(n)]
+                                if all(0.05 < xs[k] < 50.0 for k in range(n)) and all(abs(ys[k]) < 0.001 for k in range(n)):
+                                    if all(xs[k] < xs[k + 1] for k in range(n - 1)):
+                                        direction = 'horizontal'
+                                        offsets = xs
+                                        n_taps = n
+                                        found_offsets = True
+                                        break
+                                if all(0.05 < ys[k] < 50.0 for k in range(n)) and all(abs(xs[k]) < 0.001 for k in range(n)):
+                                    if all(ys[k] < ys[k + 1] for k in range(n - 1)):
+                                        direction = 'vertical'
+                                        offsets = ys
+                                        n_taps = n
+                                        found_offsets = True
+                                        break
+                            if found_offsets:
+                                break
+                        if found_offsets:
+                            break
+
+                if found_weights and found_offsets:
                     break
         except Exception:
             pass
+
+    extracted = (found_weights and found_offsets) or (prog in (BLUR_4TAP, BLUR_7TAP))
 
     return {
         'direction': direction,
         'offsets': offsets,
         'weights': weights,
         'n_taps': n_taps,
+        'extracted': extracted,
     }
 
 
@@ -688,18 +731,19 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             pass
 
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
+    if stride == 16 and prog == SPANS:
+        return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
+    if stride == 36 and prog == PILL_BORDER:
+        return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
+    if stride == 12 and is_blur_prog:
+        params = extract_blur_params(f, vs_data, ppp, prog)
+        if params.get('extracted'):
+            d_name = params['direction']
+            n = params['n_taps']
+            return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
+        return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
+
     if not tex and stride not in (20, 28):
-        if stride == 16 and prog == SPANS:
-            return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
-        if stride == 36 and prog == PILL_BORDER:
-            return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
-        if stride == 12 and is_blur_prog:
-            if prog in (BLUR_4TAP, BLUR_7TAP):
-                params = extract_blur_params(f, vs_data, ppp, prog)
-                d_name = params['direction']
-                n = params['n_taps']
-                return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap, canvas backdrop)', {'prog': hex(prog)}
-            return 'approximated: Gaussian blur (separable 6-tap, canvas backdrop)', {'prog': hex(prog)}
         if stride == 24 and prog == 0:
             return 'skipped: stride 24 untextured with program 0x0', {'stride': stride, 'prog': hex(prog)}
         return 'skipped: untextured with stride not in (20, 28)', {'stride': stride, 'prog': hex(prog)}
@@ -764,7 +808,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
         if not tex:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
-        uv_off = 4 if stride == 28 else 0
+        uv_off = 4 if stride in (28, 36) else 0
         uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
         xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
         ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
@@ -803,8 +847,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
 
     if is_blur:
-        if prog in (BLUR_4TAP, BLUR_7TAP):
-            params = extract_blur_params(f, vs_data, ppp, prog)
+        params = extract_blur_params(f, vs_data, ppp, prog)
+        if params.get('extracted'):
             d_name = params['direction']
             n = params['n_taps']
             return f'replayed exactly: 1D Gaussian blur ({d_name}, {n}-tap)', {
@@ -818,6 +862,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
+        if stride == 36 and prog == STRIDE36_DUAL_TEX:
+            return 'replayed exactly: dual-texture vibrancy (stride=36)', {'prog': hex(prog)}
         return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
     elif prog == COLOR_MATRIX:
         return 'replayed exactly: color matrix (saturation & tint)', {'prog': hex(prog)}
@@ -1240,7 +1286,7 @@ def main():
             if tex and (stride >= 24 or (stride == 16 and prog == WALLPAPER) or prog == ROUNDED_CAPS):
                 # stride 24: float u,v (normalised) at +16; stride 28/36: BGRA tint at +16,
                 # then u,v in texels at +20.
-                uv_off = 4 if stride == 28 else 0
+                uv_off = 4 if stride in (28, 36) else 0
                 uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in q_vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER)
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
@@ -1248,7 +1294,7 @@ def main():
                 su, sv = (1, 1) if max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
-                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride == 28 else 0xffffffff
+                tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su
@@ -1260,6 +1306,22 @@ def main():
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
                 if tex.get('sampler') and tex['sampler']['linear_filter']:
                     is_scaled = True
+                if stride == 36 and prog == STRIDE36_DUAL_TEX:
+                    complete = True
+                    for y in range(y0, y1):
+                        fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
+                              quad_coordinate(y, min(ys), max(ys), v0, v1)) * sv
+                        ty = max(0, min(tex['h'] - 1, int(fv)))
+                        try:
+                            gva = tex['addr'] + ty * tex['stride']
+                            if (gva & ~0xfff) not in f.pages:
+                                complete = False
+                                break
+                        except Exception:
+                            complete = False
+                            break
+                    if not complete:
+                        continue
                 tex_cached_rows = {}
                 def get_tex_row(ry):
                     if ry not in tex_cached_rows:
@@ -1328,7 +1390,17 @@ def main():
                             g = max(0, min(255, int(round(gout * 255.0))))
                             b = max(0, min(255, int(round(bout * 255.0))))
                             a = 255
-                        if tint != 0xffffffff:
+                        if prog == ROUNDED_CAPS and (tex.get('addr') == 0x10524000 or (tex.get('w') == 114 and tex.get('h') == 87)):
+                            cov = (r * a) // 255
+                            ta = tint >> 24
+                            tr = (tint >> 16) & 0xff
+                            tg = (tint >> 8) & 0xff
+                            tb = tint & 0xff
+                            a = (ta * cov) // 255
+                            r = (tr * a) // 255
+                            g = (tg * a) // 255
+                            b = (tb * a) // 255
+                        elif tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4
@@ -1336,7 +1408,19 @@ def main():
                             fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                             continue
                         if tex.get('vibrancy'):
-                            fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
+                            if stride == 36 and prog == STRIDE36_DUAL_TEX and tex.get('mask_tex'):
+                                mask_tex = tex['mask_tex']
+                                m_b, m_g, m_r, m_a = texel(f, mask_tex, tx, ty)
+                                if m_a == 0:
+                                    continue
+                                vib = blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a))
+                                if m_a == 255:
+                                    fb[d:d + 4] = bytes(vib)
+                                else:
+                                    inv = 255 - m_a
+                                    fb[d:d + 4] = bytes(((vib[i] * m_a + fb[d + i] * inv) // 255) for i in range(4))
+                            else:
+                                fb[d:d + 4] = bytes(blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a)))
                         elif prog in (PLUS_L, PLUS_L2):
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = min(255, src + fb[d + c])
