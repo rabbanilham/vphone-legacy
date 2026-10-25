@@ -1,0 +1,22 @@
+diff --git a/ui/vnc.c b/ui/vnc.c
+index 656768f..00f20d1 100644
+--- a/ui/vnc.c
++++ b/ui/vnc.c
+@@ -58,8 +58,15 @@
+ #include "io/dns-resolver.h"
+ #include "monitor/monitor.h"
+ 
+-#define VNC_REFRESH_INTERVAL_BASE GUI_REFRESH_INTERVAL_DEFAULT
+-#define VNC_REFRESH_INTERVAL_INC  50
++/*
++ * vphone: poll at 8 ms with no idle back-off. Upstream starts at 30 ms and
++ * backs off by 50 ms per idle tick up to 3 s; input that arrives over QMP
++ * (gestures) never resets that, so the first frame after a touch could wait
++ * seconds. The machine's display_update skips unchanged rows, so an idle
++ * tick costs one framebuffer compare.
++ */
++#define VNC_REFRESH_INTERVAL_BASE 8
++#define VNC_REFRESH_INTERVAL_INC  0
+ #define VNC_REFRESH_INTERVAL_MAX  GUI_REFRESH_INTERVAL_IDLE
+ static const struct timeval VNC_REFRESH_STATS = { 0, 500000 };
+ static const struct timeval VNC_REFRESH_LOSSY = { 2, 0 };

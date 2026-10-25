@@ -637,6 +637,12 @@ struct A7State {
     uint64_t boot_entry, boot_args, framebuffer, boot_el, iop_diagnostic, system_writable, display_trace;
     uint64_t disp_mmu_table;          /* DPU0MMUPGADDR0 << 4, 0 = linear scanout */
     uint32_t disp_stride, disp_offset;
+    uint64_t disp_cached_mmu_table;
+    uint32_t disp_cached_offset;
+    uint64_t disp_cached_pa_base;
+    uint32_t disp_page_ram_offset[2048];
+    bool disp_mapping_valid;
+    bool disp_mapping_contiguous;
     bool iop_started, secondary_started;
     unsigned iop_unknown_count;
     uint64_t apple_c15[2][8][16][8]; /* Storage only: hardware effects are NOT emulated. */
@@ -697,6 +703,9 @@ struct A7State {
      * the completion event before an earlier stamp (probe-167 GPU hang). */
     struct AGXRenderJob *agx_done_head, *agx_done_tail;
     QEMUBH *agx_done_bh;
+    QEMUBH *agx_kick_bh;
+    bool agx_stamp_wait;
+    bool agx_async_enabled;
     bool agx_render_thread_running;
     bool agx_render_thread_exit;
     unsigned agx_inflight_jobs;
@@ -705,6 +714,29 @@ struct A7State {
      * A drain before then must continue from here, not re-read the guest's
      * stale index, or it would replay and stamp the same commands twice. */
     struct { uint64_t control; uint32_t index; bool valid; } agx_host_read[16];
+    /* AGX submission/latency perf stats (VPHONE_PERF_STATS=1) */
+    bool agx_perf_enabled;
+    QEMUTimer *agx_perf_timer;
+    int64_t agx_doorbell_time_us;
+    bool agx_doorbell_in_flight;
+    uint64_t agx_perf_total_doorbells;
+    uint64_t agx_perf_total_passes;
+    uint64_t agx_perf_total_jobs;
+    uint64_t agx_perf_total_repolls_1ms;
+    uint64_t agx_perf_win_doorbells;
+    uint64_t agx_perf_win_passes;
+    uint64_t agx_perf_win_jobs;
+    uint64_t agx_perf_win_repolls_1ms;
+    uint64_t agx_perf_win_capture_ta_us;
+    uint64_t agx_perf_win_queue_wait_us_sum;
+    uint64_t agx_perf_win_queue_wait_count;
+    uint64_t agx_perf_win_render_us_sum;
+    uint64_t agx_perf_win_render_count;
+    uint64_t agx_perf_win_bh_delay_us_sum;
+    uint64_t agx_perf_win_bh_delay_count;
+    uint64_t agx_perf_win_lat_us_sum;
+    uint32_t agx_perf_win_lat_count;
+    int64_t agx_perf_win_lat_samples[16384];
     uint32_t disp_token;
     uint32_t disp_pending_token;
     uint32_t disp_fifo[512], disp_fifo_count, disp_fifo_expected, disp_fifo_token;
@@ -4719,10 +4751,11 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 return;
             }
             if (off == 0x1050) {
-                fprintf(stderr, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
+                qemu_log_mask(LOG_UNIMP, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
                         val, p->owner->disp_pending_token);
                 *(uint32_t *)(p->regs + 0x1044) = 0;
                 p->owner->disp_swap_pending = true;
+                p->owner->disp_mapping_valid = false;
                 if (p->owner->disp_pending_token != 0) {
                     p->owner->disp_token = p->owner->disp_pending_token;
                 } else {
@@ -4733,6 +4766,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
             if (off == 0x4044) {
                 fprintf(stderr, "[DISP0] layer0 base off=0x4044 val=0x%" PRIx64 "\n", val);
                 *(uint32_t *)(p->regs + off) = (uint32_t)val;
+                p->owner->disp_mapping_valid = false;
                 if (val != 0) {
                     p->owner->framebuffer = RAM_BASE | (uint32_t)val;
                 }
@@ -4750,6 +4784,7 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 s->disp_mmu_table = (uint64_t)(uint32_t)val << 4;
                 s->disp_stride = *(uint32_t *)(p->regs + 0x4040);
                 s->disp_offset = *(uint32_t *)(p->regs + 0x4044);
+                s->disp_mapping_valid = false;
                 if (val != 0) {
                     MemTxResult r;
                     uint32_t page0 = address_space_ldl_le(&address_space_memory, s->disp_mmu_table,
@@ -4867,6 +4902,32 @@ static bool agx_gpu_translate_ctx(A7State *s, uint64_t cat_base,
     if (!cat_base) {
         return false;
     }
+#ifdef QEMU_OSDEP_H
+    if (cat_base >= RAM_BASE && cat_base < RAM_BASE + GiB) {
+        uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
+        uint64_t pce_addr = cat_base + ((gva >> 30) & 0x3ff) * 4;
+        if (pce_addr + 4 <= RAM_BASE + GiB) {
+            uint32_t pce = ldl_le_p(ram + pce_addr - RAM_BASE);
+            if (pce & 1) {
+                uint64_t pde_addr = ((uint64_t)(pce >> 4) << 12) + ((gva >> 21) & 0x1ff) * 8;
+                if (pde_addr >= RAM_BASE && pde_addr + 8 <= RAM_BASE + GiB) {
+                    uint64_t pde = ldq_le_p(ram + pde_addr - RAM_BASE);
+                    if (pde & 1) {
+                        uint64_t pte_addr = (pde & UINT64_C(0xfffffff000)) + ((gva >> 12) & 0x1ff) * 8;
+                        if (pte_addr >= RAM_BASE && pte_addr + 8 <= RAM_BASE + GiB) {
+                            uint64_t pte = ldq_le_p(ram + pte_addr - RAM_BASE);
+                            if (pte & 1) {
+                                *pa = (pte & UINT64_C(0xfffffff000)) | (gva & 0xfff);
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
     uint32_t pce = address_space_ldl_le(&address_space_memory,
                                         cat_base + ((gva >> 30) & 0x3ff) * 4,
                                         MEMTXATTRS_UNSPECIFIED, &r);
@@ -5142,6 +5203,54 @@ static unsigned agx_vdm_draw_count(A7State *s, uint64_t cat, const uint8_t *ta)
     return draws;
 }
 
+#ifdef QEMU_OSDEP_H
+typedef struct AGXTLBEntry {
+    uint64_t gva_page;     /* (gva & ~0xfffULL) */
+    uint64_t cat_base;     /* page table root */
+    hwaddr pa_page;        /* physical address base */
+    uint8_t *host_ptr;     /* host RAM pointer */
+    uint32_t gen;          /* generation counter */
+} AGXTLBEntry;
+
+#define AGX_TLB_SIZE 1024
+#define AGX_TLB_MASK (AGX_TLB_SIZE - 1)
+
+static __thread AGXTLBEntry agx_tlb[AGX_TLB_SIZE];
+static __thread uint32_t agx_tlb_gen;
+
+static inline void agx_tlb_reset(void)
+{
+    agx_tlb_gen++;
+    if (agx_tlb_gen == 0) {
+        memset(agx_tlb, 0, sizeof(agx_tlb));
+        agx_tlb_gen = 1;
+    }
+}
+
+static inline AGXTLBEntry *agx_tlb_lookup(A7State *s, uint64_t cat, uint64_t gva_page)
+{
+    unsigned idx = (gva_page >> 12) & AGX_TLB_MASK;
+    AGXTLBEntry *e = &agx_tlb[idx];
+    if (e->gen == agx_tlb_gen && e->cat_base == cat && e->gva_page == gva_page) {
+        return e;
+    }
+    hwaddr pa;
+    if (gva_page >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva_page, &pa)) {
+        return NULL;
+    }
+    if (pa < RAM_BASE || pa >= RAM_BASE + GiB) {
+        return NULL;
+    }
+    uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
+    e->gva_page = gva_page;
+    e->cat_base = cat;
+    e->pa_page = pa;
+    e->host_ptr = ram + (pa - RAM_BASE);
+    e->gen = agx_tlb_gen;
+    return e;
+}
+#endif
+
 /* Row-wise counterpart of agx_ctx_read: one page walk and one memory-API
  * write per page instead of a walk plus a store per pixel, which made the
  * replay hold the BQL for most of each frame (probe-162 host profile). */
@@ -5150,13 +5259,29 @@ static bool agx_ctx_write(A7State *s, uint64_t cat, uint64_t gva, const void *bu
     const uint8_t *in = buf;
     bool ok = true;
     while (n) {
-        hwaddr pa;
         size_t chunk = MIN(n, 0x1000 - (gva & 0xfff));
-        /* Like the old per-pixel stores, skip only the unmapped pages. */
-        if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
-            address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
-                                in, chunk) != MEMTX_OK) {
-            ok = false;
+#ifdef QEMU_OSDEP_H
+        uint64_t base = gva & ~UINT64_C(0xfff);
+        AGXTLBEntry *tlb = agx_tlb_lookup(s, cat, base);
+        if (tlb) {
+            /* Reuse the cached translation but keep address_space_write: a
+             * raw memcpy plus memory_region_set_dirty marks code pages dirty
+             * without invalidating their TBs, so recycled pages ran stale
+             * translated code (Settings launched seconds late). */
+            if (address_space_write(&address_space_memory, tlb->pa_page + (gva & 0xfff),
+                                    MEMTXATTRS_UNSPECIFIED, in, chunk) != MEMTX_OK) {
+                ok = false;
+            }
+        } else
+#endif
+        {
+            hwaddr pa;
+            /* Like the old per-pixel stores, skip only the unmapped pages. */
+            if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+                address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                    in, chunk) != MEMTX_OK) {
+                ok = false;
+            }
         }
         in += chunk;
         gva += chunk;
@@ -5440,6 +5565,13 @@ typedef struct AGXRenderJob {
     unsigned commands;
     unsigned stamps;
 
+    /* Perf stats */
+    int64_t doorbell_time_us;
+    int64_t enqueue_time_us;
+    int64_t render_start_us;
+    int64_t render_end_us;
+    int64_t done_enqueue_us;
+
     struct AGXRenderJob *next;
 } AGXRenderJob;
 
@@ -5510,10 +5642,18 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
         }
         if (cached) {
             memcpy(out, cached + (gva & 0xfff), chunk);
-        } else if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
-            address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
-                               out, chunk) != MEMTX_OK) {
-            return false;
+        } else {
+#ifdef QEMU_OSDEP_H
+            AGXTLBEntry *tlb = agx_tlb_lookup(s, cat, base);
+            if (tlb) {
+                memcpy(out, tlb->host_ptr + (gva & 0xfff), chunk);
+            } else
+#endif
+            if (gva >= (UINT64_C(1) << 40) || !agx_gpu_translate_ctx(s, cat, gva, &pa) ||
+                address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                                   out, chunk) != MEMTX_OK) {
+                return false;
+            }
         }
         out += chunk;
         gva += chunk;
@@ -5738,6 +5878,30 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
     return tex->addr + (uint64_t)y * tex->stride + x * 4;
 }
 
+static __thread uint32_t agx_morton_x_lut[4096];
+static __thread uint32_t agx_morton_cached_w = 0, agx_morton_cached_h = 0;
+
+static void agx_update_morton_lut(uint32_t w, uint32_t h)
+{
+    if (agx_morton_cached_w == w && agx_morton_cached_h == h) {
+        return;
+    }
+    for (uint32_t x = 0; x < w && x < 4096; x++) {
+        uint32_t offset = 0;
+        unsigned bit = 0;
+        for (unsigned mask = 1; mask < w || mask < h; mask <<= 1) {
+            if (mask < h) { bit++; }
+            if (mask < w) {
+                if (x & mask) { offset |= 1u << bit; }
+                bit++;
+            }
+        }
+        agx_morton_x_lut[x] = offset;
+    }
+    agx_morton_cached_w = w;
+    agx_morton_cached_h = h;
+}
+
 /* A Morton row is scattered within 4 KiB tiles. Cache one tile while
  * gathering it, instead of walking the GPU tables for every pixel. */
 static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
@@ -5745,6 +5909,31 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
 {
     if (!tex->twiddled) {
         return agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), out, tex->w * 4);
+    }
+    if (tex->w <= 4096) {
+        agx_update_morton_lut(tex->w, tex->h);
+        uint64_t y_offset = 0;
+        unsigned bit = 0;
+        for (unsigned mask = 1; mask < tex->w || mask < tex->h; mask <<= 1) {
+            if (mask < tex->h) {
+                if (y & mask) { y_offset |= (uint64_t)1 << bit; }
+                bit++;
+            }
+            if (mask < tex->w) { bit++; }
+        }
+        uint8_t page[4096];
+        uint64_t cached = UINT64_MAX;
+        uint64_t base_addr = tex->addr;
+        for (unsigned x = 0; x < tex->w; x++) {
+            uint64_t gva = base_addr + ((y_offset | (uint64_t)agx_morton_x_lut[x]) << 2);
+            uint64_t base = gva & ~UINT64_C(0xfff);
+            if (base != cached) {
+                if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+                cached = base;
+            }
+            out[x] = ldl_le_p(page + (gva & 0xfff));
+        }
+        return true;
     }
     uint8_t page[4096];
     uint64_t cached = UINT64_MAX;
@@ -5780,14 +5969,24 @@ static uint32_t agx_blend_vibrancy(uint32_t dst, uint32_t src)
 }
 
 /* Premultiplied BGRA src-over, alpha included (offscreen layers keep it). */
-static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
+static inline __attribute__((always_inline)) uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 {
-    uint32_t a = src >> 24, out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff) * (255 - a) / 255;
-        out |= MIN(v, 255u) << c;
+    uint32_t a = src >> 24;
+    if (a == 255) {
+        return src;
     }
-    return out;
+    if (src == 0) {
+        return dst;
+    }
+    uint32_t inv_a = 255 - a;
+    uint32_t b = (src & 0xff) + ((dst & 0xff) * inv_a) / 255;
+    uint32_t g = ((src >> 8) & 0xff) + (((dst >> 8) & 0xff) * inv_a) / 255;
+    uint32_t r = ((src >> 16) & 0xff) + (((dst >> 16) & 0xff) * inv_a) / 255;
+    uint32_t oa = a + ((dst >> 24) * inv_a) / 255;
+    return (MIN(b, 255u)) |
+           (MIN(g, 255u) << 8) |
+           (MIN(r, 255u) << 16) |
+           (MIN(oa, 255u) << 24);
 }
 
 /* CA fragment shaders recognised by an FNV-1a hash of the first 64 bytes of
@@ -5807,12 +6006,11 @@ static uint32_t agx_blend_over(uint32_t dst, uint32_t src)
 /* Additive blend (CoreAnimation plusL / plusLighter): clamp(S + D, 0, 255). */
 static inline uint32_t agx_blend_plus_lighter(uint32_t dst, uint32_t src)
 {
-    uint32_t out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        uint32_t v = ((src >> c) & 0xff) + ((dst >> c) & 0xff);
-        out |= MIN(v, 255u) << c;
-    }
-    return out;
+    uint32_t b = (src & 0xff) + (dst & 0xff);
+    uint32_t g = ((src >> 8) & 0xff) + ((dst >> 8) & 0xff);
+    uint32_t r = ((src >> 16) & 0xff) + ((dst >> 16) & 0xff);
+    uint32_t a = (src >> 24) + (dst >> 24);
+    return MIN(b, 255u) | (MIN(g, 255u) << 8) | (MIN(r, 255u) << 16) | (MIN(a, 255u) << 24);
 }
 
 __attribute__((unused))
@@ -5889,23 +6087,51 @@ static const struct {
 
 static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
                                                 uint32_t c01, uint32_t c11,
+                                                float fx, float fy);
+
+static inline __attribute__((always_inline)) uint32_t agx_bilinear_interpolate_wy(uint32_t c00, uint32_t c10,
+                                                                                    uint32_t c01, uint32_t c11,
+                                                                                    float fx, int wy)
+{
+    if (c00 == c10 && c00 == c01 && c00 == c11) {
+        return c00;
+    }
+    int wx = (int)(fx * 256.0f + 0.5f);
+    if ((wx | wy) == 0) {
+        return c00;
+    }
+    if (wy == 0 || (c00 == c01 && c10 == c11)) {
+        if (wx == 0) {
+            return c00;
+        }
+        int w0 = 256 - wx, w1 = wx;
+        uint32_t b = ((c00 & 0xff) * w0 + (c10 & 0xff) * w1 + 128) >> 8;
+        uint32_t g = (((c00 >> 8) & 0xff) * w0 + ((c10 >> 8) & 0xff) * w1 + 128) >> 8;
+        uint32_t r = (((c00 >> 16) & 0xff) * w0 + ((c10 >> 16) & 0xff) * w1 + 128) >> 8;
+        uint32_t a = ((c00 >> 24) * w0 + (c10 >> 24) * w1 + 128) >> 8;
+        return b | (g << 8) | (r << 16) | (a << 24);
+    }
+    int w00 = (256 - wx) * (256 - wy);
+    int w10 = wx * (256 - wy);
+    int w01 = (256 - wx) * wy;
+    int w11 = wx * wy;
+
+    uint32_t b = ((c00 & 0xff) * w00 + (c10 & 0xff) * w10 +
+                  (c01 & 0xff) * w01 + (c11 & 0xff) * w11 + 32768) >> 16;
+    uint32_t g = (((c00 >> 8) & 0xff) * w00 + ((c10 >> 8) & 0xff) * w10 +
+                  ((c01 >> 8) & 0xff) * w01 + ((c11 >> 8) & 0xff) * w11 + 32768) >> 16;
+    uint32_t r = (((c00 >> 16) & 0xff) * w00 + ((c10 >> 16) & 0xff) * w10 +
+                  ((c01 >> 16) & 0xff) * w01 + ((c11 >> 16) & 0xff) * w11 + 32768) >> 16;
+    uint32_t a = ((c00 >> 24) * w00 + (c10 >> 24) * w10 +
+                  (c01 >> 24) * w01 + (c11 >> 24) * w11 + 32768) >> 16;
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
+static inline uint32_t agx_bilinear_interpolate(uint32_t c00, uint32_t c10,
+                                                uint32_t c01, uint32_t c11,
                                                 float fx, float fy)
 {
-    int wx = (int)(fx * 256.0f + 0.5f);
-    int wy = (int)(fy * 256.0f + 0.5f);
-    uint32_t out = 0;
-    for (unsigned c = 0; c < 32; c += 8) {
-        int b00 = (c00 >> c) & 0xff;
-        int b10 = (c10 >> c) & 0xff;
-        int b01 = (c01 >> c) & 0xff;
-        int b11 = (c11 >> c) & 0xff;
-        int top = b00 * (256 - wx) + b10 * wx;
-        int bot = b01 * (256 - wx) + b11 * wx;
-        int val = (top * (256 - wy) + bot * wy + 32768) >> 16;
-        int iv = val < 0 ? 0 : (val > 255 ? 255 : val);
-        out |= (uint32_t)iv << c;
-    }
-    return out;
+    return agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, (int)(fy * 256.0f + 0.5f));
 }
 
 static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h, float u, float v)
@@ -5933,39 +6159,113 @@ static uint32_t agx_sample_bilinear(const uint32_t *buf, uint32_t w, uint32_t h,
     return agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
 }
 
+static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+{
+    int w = (int)(frac * 256.0f + 0.5f);
+    if (w == 0 || c0 == c1) {
+        return c0;
+    }
+    int w0 = 256 - w, w1 = w;
+    uint32_t b = ((c0 & 0xff) * w0 + (c1 & 0xff) * w1 + 128) >> 8;
+    uint32_t g = (((c0 >> 8) & 0xff) * w0 + ((c1 >> 8) & 0xff) * w1 + 128) >> 8;
+    uint32_t r = (((c0 >> 16) & 0xff) * w0 + ((c1 >> 16) & 0xff) * w1 + 128) >> 8;
+    uint32_t a = ((c0 >> 24) * w0 + (c1 >> 24) * w1 + 128) >> 8;
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
 {
     if (!n_taps || !w || !h) return;
-    for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = 0; x < w; x++) {
-            float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (is_vertical) {
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t y0_pos[8], y1_pos[8], y0_neg[8], y1_neg[8];
+            float fy_pos[8], fy_neg[8];
             for (unsigned t = 0; t < n_taps; t++) {
                 float off = offsets[t];
-                float weight = weights[t];
-                uint32_t s_pos, s_neg;
-                if (is_vertical) {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f + off);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f, (float)y + 0.5f - off);
-                } else {
-                    s_pos = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f + off, (float)y + 0.5f);
-                    s_neg = agx_sample_bilinear(buf_in, w, h, (float)x + 0.5f - off, (float)y + 0.5f);
-                }
-                for (unsigned c = 0; c < 4; c++) {
-                    float cp = (float)((s_pos >> (c * 8)) & 0xff);
-                    float cn = (float)((s_neg >> (c * 8)) & 0xff);
-                    acc[c] += (cp + cn) * weight;
-                }
+                float fv_p = (float)y + off;
+                if (fv_p < 0.0f) fv_p = 0.0f;
+                if (fv_p > (float)(h - 1)) fv_p = (float)(h - 1);
+                y0_pos[t] = (uint32_t)fv_p;
+                y1_pos[t] = y0_pos[t] + 1 < h ? y0_pos[t] + 1 : y0_pos[t];
+                fy_pos[t] = fv_p - (float)y0_pos[t];
+
+                float fv_n = (float)y - off;
+                if (fv_n < 0.0f) fv_n = 0.0f;
+                if (fv_n > (float)(h - 1)) fv_n = (float)(h - 1);
+                y0_neg[t] = (uint32_t)fv_n;
+                y1_neg[t] = y0_neg[t] + 1 < h ? y0_neg[t] + 1 : y0_neg[t];
+                fy_neg[t] = fv_n - (float)y0_neg[t];
             }
-            uint32_t out = 0;
-            for (unsigned c = 0; c < 4; c++) {
-                int iv = (int)lroundf(acc[c]);
-                if (iv < 0) iv = 0;
-                if (iv > 255) iv = 255;
-                out |= (uint32_t)iv << (c * 8);
+            uint32_t *row_out = buf_tmp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (unsigned t = 0; t < n_taps; t++) {
+                    float weight = weights[t];
+                    uint32_t c00_p = buf_in[(size_t)y0_pos[t] * w + x];
+                    uint32_t c01_p = buf_in[(size_t)y1_pos[t] * w + x];
+                    uint32_t s_pos = agx_sample_1d(c00_p, c01_p, fy_pos[t]);
+
+                    uint32_t c00_n = buf_in[(size_t)y0_neg[t] * w + x];
+                    uint32_t c01_n = buf_in[(size_t)y1_neg[t] * w + x];
+                    uint32_t s_neg = agx_sample_1d(c00_n, c01_n, fy_neg[t]);
+
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                }
+                int iv0 = (int)lroundf(acc[0]);
+                int iv1 = (int)lroundf(acc[1]);
+                int iv2 = (int)lroundf(acc[2]);
+                int iv3 = (int)lroundf(acc[3]);
+                row_out[x] = (uint32_t)(iv0 < 0 ? 0 : (iv0 > 255 ? 255 : iv0)) |
+                             ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
+                             ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
+                             ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
             }
-            buf_tmp[y * w + x] = out;
+        }
+    } else {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t *row_in = buf_in + (size_t)y * w;
+            uint32_t *row_out = buf_tmp + (size_t)y * w;
+            for (uint32_t x = 0; x < w; x++) {
+                float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (unsigned t = 0; t < n_taps; t++) {
+                    float off = offsets[t];
+                    float weight = weights[t];
+
+                    float fu_p = (float)x + off;
+                    if (fu_p < 0.0f) fu_p = 0.0f;
+                    if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
+                    uint32_t x0_p = (uint32_t)fu_p;
+                    uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
+                    float fx_p = fu_p - (float)x0_p;
+                    uint32_t s_pos = agx_sample_1d(row_in[x0_p], row_in[x1_p], fx_p);
+
+                    float fu_n = (float)x - off;
+                    if (fu_n < 0.0f) fu_n = 0.0f;
+                    if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
+                    uint32_t x0_n = (uint32_t)fu_n;
+                    uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
+                    float fx_n = fu_n - (float)x0_n;
+                    uint32_t s_neg = agx_sample_1d(row_in[x0_n], row_in[x1_n], fx_n);
+
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                }
+                int iv0 = (int)lroundf(acc[0]);
+                int iv1 = (int)lroundf(acc[1]);
+                int iv2 = (int)lroundf(acc[2]);
+                int iv3 = (int)lroundf(acc[3]);
+                row_out[x] = (uint32_t)(iv0 < 0 ? 0 : (iv0 > 255 ? 255 : iv0)) |
+                             ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
+                             ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
+                             ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+            }
         }
     }
     for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -6157,6 +6457,11 @@ static bool agx_quad_affine(const float xy[3][2], const float uv[3][2], float ou
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
     AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
+#ifdef QEMU_OSDEP_H
+    /* The translation cache is per thread; the main loop must not reuse
+     * entries across passes after the guest remaps GPU pages. */
+    agx_tlb_reset();
+#endif
     snapshot->refs = 1;
     snapshot->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     agx_read_snapshot = snapshot;
@@ -6433,6 +6738,29 @@ static bool agx_extract_color_matrix(A7State *s, uint64_t cat,
     return false;
 }
 
+static __thread uint32_t *agx_scratch1 = NULL;
+static __thread size_t agx_scratch1_cap = 0;
+static __thread uint32_t *agx_scratch2 = NULL;
+static __thread size_t agx_scratch2_cap = 0;
+
+static uint32_t *agx_get_scratch1(size_t count)
+{
+    if (count > agx_scratch1_cap) {
+        agx_scratch1 = g_realloc(agx_scratch1, count * sizeof(uint32_t));
+        agx_scratch1_cap = count;
+    }
+    return agx_scratch1;
+}
+
+static uint32_t *agx_get_scratch2(size_t count)
+{
+    if (count > agx_scratch2_cap) {
+        agx_scratch2 = g_realloc(agx_scratch2, count * sizeof(uint32_t));
+        agx_scratch2_cap = count;
+    }
+    return agx_scratch2;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear, uint32_t pitch, uint64_t scissor_base)
@@ -6451,6 +6779,17 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     AGXSurface sf;
     agx_surface_layout(s, cat, target, width, &sf);
     if (!sf.strip && pitch >= width * 4) { sf.pitch = pitch; }
+#ifdef QEMU_OSDEP_H
+    agx_tlb_reset();
+    for (uint32_t y = 0; y < height; y++) {
+        uint64_t row_start = agx_surface_gva(&sf, 0, y);
+        uint64_t row_end = row_start + width * 4 - 1;
+        agx_tlb_lookup(s, cat, row_start & ~0xfffULL);
+        if ((row_start & ~0xfffULL) != (row_end & ~0xfffULL)) {
+            agx_tlb_lookup(s, cat, row_end & ~0xfffULL);
+        }
+    }
+#endif
     bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") && target >= UINT64_C(0x400000000);
     unsigned before_clock = audit ? agx_audit_clock(s, cat, &sf) : 0;
 
@@ -6594,8 +6933,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             uint32_t *blurred_tex = NULL;
             if (is_blur && tex.w > 0 && tex.h > 0 && tex.w <= 2048 && tex.h <= 2048) {
-                uint32_t *raw_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
-                uint32_t *tmp_tex = g_malloc((size_t)tex.w * tex.h * sizeof(uint32_t));
+                size_t num_pix = (size_t)tex.w * tex.h;
+                uint32_t *raw_tex = agx_get_scratch1(num_pix);
+                uint32_t *tmp_tex = agx_get_scratch2(num_pix);
                 if (raw_tex && tmp_tex) {
                     bool read_ok = true;
                     for (uint32_t ty = 0; ty < tex.h; ty++) {
@@ -6613,11 +6953,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         agx_blur_1d(raw_tex, tmp_tex, tex.w, tex.h,
                                     blur_offs, blur_ws, blur_taps, blur_vert);
                         blurred_tex = raw_tex;
-                        raw_tex = NULL;
                     }
                 }
-                g_free(raw_tex);
-                g_free(tmp_tex);
             }
             unsigned step = (count == 4) ? 4 : 6;
             bool any_drawn = false;
@@ -6800,6 +7137,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         float cy = (float)y + 0.5f;
                         float fy = (cy - qminy) / qh;
                         int first_in = -1, last_in = -1;
+                        float cov_buf[640];
                         for (int x = x0; x < x1; x++) {
                             float cx = (float)x + 0.5f;
                             float fx = (cx - qminx) / qw;
@@ -6816,8 +7154,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
                             float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
                             if (outer_cov > 0.0f && inner_cov > 0.0f) {
+                                outer_cov = (outer_cov > 1.0f ? 1.0f : outer_cov);
+                                inner_cov = (inner_cov > 1.0f ? 1.0f : inner_cov);
+                                cov_buf[x - x0] = outer_cov * inner_cov;
                                 if (first_in < 0) first_in = x;
                                 last_in = x;
+                            } else {
+                                cov_buf[x - x0] = 0.0f;
                             }
                         }
                         if (first_in < 0) {
@@ -6829,23 +7172,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             continue;
                         }
                         for (int x = first_in; x <= last_in; x++) {
-                            float cx = (float)x + 0.5f;
-                            float fx = (cx - qminx) / qw;
-                            float u1 = (1.0f - fx) * (1.0f - fy) * u1_tl + fx * (1.0f - fy) * u1_tr +
-                                       (1.0f - fx) * fy * u1_bl + fx * fy * u1_br;
-                            float v1 = (1.0f - fx) * (1.0f - fy) * v1_tl + fx * (1.0f - fy) * v1_tr +
-                                       (1.0f - fx) * fy * v1_bl + fx * fy * v1_br;
-                            float u2 = (1.0f - fx) * (1.0f - fy) * u2_tl + fx * (1.0f - fy) * u2_tr +
-                                       (1.0f - fx) * fy * u2_bl + fx * fy * u2_br;
-                            float v2 = (1.0f - fx) * (1.0f - fy) * v2_tl + fx * (1.0f - fy) * v2_tr +
-                                       (1.0f - fx) * fy * v2_bl + fx * fy * v2_br;
-                            float r1 = sqrtf(u1 * u1 + v1 * v1);
-                            float r2 = sqrtf(u2 * u2 + v2 * v2);
-                            float outer_cov = 0.5f - (r1 - 1.0f) / scale1;
-                            float inner_cov = 0.5f + (r2 - 1.0f) / scale2;
-                            outer_cov = (outer_cov < 0.0f) ? 0.0f : (outer_cov > 1.0f ? 1.0f : outer_cov);
-                            inner_cov = (inner_cov < 0.0f) ? 0.0f : (inner_cov > 1.0f ? 1.0f : inner_cov);
-                            float cov = outer_cov * inner_cov;
+                            float cov = cov_buf[x - x0];
                             if (cov > 0.0f) {
                                 uint32_t a = (uint32_t)lroundf((float)base_a * cov);
                                 uint32_t b = (uint32_t)lroundf((float)base_b * cov);
@@ -7005,6 +7332,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 float cy = (float)y + 0.5f;
                                 float py = cy - lp0[1];
                                 int first_in = -1, last_in = -1;
+                                float cov_buf[640];
                                 for (int x = x0; x < x1; x++) {
                                     float cx = (float)x + 0.5f;
                                     float px = cx - lp0[0];
@@ -7013,14 +7341,20 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                     float min_end = (t < (L - t)) ? t : (L - t);
                                     float cov_par = min_end + 0.5f;
                                     if (cov_par <= 0.0f) {
+                                        cov_buf[x - x0] = 0.0f;
                                         continue;
                                     }
                                     float cross = dx * py - dy * px;
                                     float dist_perp = fabsf(cross) * inv_L;
                                     float cov_perp = half_w + 0.5f - dist_perp;
                                     if (cov_perp > 0.0f) {
+                                        cov_par = (cov_par > 1.0f) ? 1.0f : cov_par;
+                                        cov_perp = (cov_perp > 1.0f) ? 1.0f : cov_perp;
+                                        cov_buf[x - x0] = cov_perp * cov_par;
                                         if (first_in < 0) first_in = x;
                                         last_in = x;
+                                    } else {
+                                        cov_buf[x - x0] = 0.0f;
                                     }
                                 }
                                 if (first_in < 0) {
@@ -7036,18 +7370,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 uint32_t g = (colour >> 8) & 0xff;
                                 uint32_t b = colour & 0xff;
                                 for (int x = first_in; x <= last_in; x++) {
-                                    float cx = (float)x + 0.5f;
-                                    float px = cx - lp0[0];
-                                    float dot = px * dx + py * dy;
-                                    float t = dot * inv_L;
-                                    float min_end = (t < (L - t)) ? t : (L - t);
-                                    float cov_par = min_end + 0.5f;
-                                    cov_par = (cov_par < 0.0f) ? 0.0f : ((cov_par > 1.0f) ? 1.0f : cov_par);
-                                    float cross = dx * py - dy * px;
-                                    float dist_perp = fabsf(cross) * inv_L;
-                                    float cov_perp = half_w + 0.5f - dist_perp;
-                                    cov_perp = (cov_perp < 0.0f) ? 0.0f : ((cov_perp > 1.0f) ? 1.0f : cov_perp);
-                                    float cov = cov_perp * cov_par;
+                                    float cov = cov_buf[x - x0];
                                     if (cov > 0.0f) {
                                         uint32_t ca = (uint32_t)lroundf((float)a * cov);
                                         uint32_t cr = (uint32_t)lroundf((float)r * cov);
@@ -7118,8 +7441,23 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         if (agx_ctx_read(s, cat, buf + (uint64_t)t * stride + 16, &tri_colour, 4)) {
                             tri_colour = (tri_colour & 0xff00ff00u) | ((tri_colour >> 16) & 0xff) | ((tri_colour & 0xff) << 16);
                         }
+                        uint32_t a = tri_colour >> 24;
+                        uint32_t r = (tri_colour >> 16) & 0xff;
+                        uint32_t g = (tri_colour >> 8) & 0xff;
+                        uint32_t b = tri_colour & 0xff;
+                        uint32_t src_table[17];
+                        src_table[0] = 0;
+                        for (unsigned c = 1; c <= 16; c++) {
+                            float cov = (float)c * 0.0625f;
+                            uint32_t ca = (uint32_t)lroundf((float)a * cov);
+                            uint32_t cr = (uint32_t)lroundf((float)r * cov);
+                            uint32_t cg = (uint32_t)lroundf((float)g * cov);
+                            uint32_t cb = (uint32_t)lroundf((float)b * cov);
+                            src_table[c] = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                        }
                         for (int y = y0; y < y1; y++) {
                             int first_in = -1, last_in = -1;
+                            uint8_t cnt_buf[640];
                             for (int x = x0; x < x1; x++) {
                                 unsigned cnt = 0;
                                 for (unsigned si = 0; si < 4; si++) {
@@ -7136,6 +7474,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                         }
                                     }
                                 }
+                                cnt_buf[x - x0] = (uint8_t)cnt;
                                 if (cnt > 0) {
                                     if (first_in < 0) first_in = x;
                                     last_in = x;
@@ -7149,33 +7488,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             if (!agx_ctx_read(s, cat, agx_surface_gva(&sf, first_in, y), row, span_w * 4)) {
                                 continue;
                             }
-                            uint32_t a = tri_colour >> 24;
-                            uint32_t r = (tri_colour >> 16) & 0xff;
-                            uint32_t g = (tri_colour >> 8) & 0xff;
-                            uint32_t b = tri_colour & 0xff;
                             for (int x = first_in; x <= last_in; x++) {
-                                unsigned cnt = 0;
-                                for (unsigned si = 0; si < 4; si++) {
-                                    float sx = (float)x + (float)(2 * si + 1) * 0.125f;
-                                    for (unsigned sj = 0; sj < 4; sj++) {
-                                        float sy = (float)y + (float)(2 * sj + 1) * 0.125f;
-                                        float e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0]);
-                                        float e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0]);
-                                        float e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0]);
-                                        bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
-                                                                   : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
-                                        if (inside) {
-                                            cnt++;
-                                        }
-                                    }
-                                }
+                                unsigned cnt = cnt_buf[x - x0];
                                 if (cnt > 0) {
-                                    float cov = (float)cnt * 0.0625f;
-                                    uint32_t ca = (uint32_t)lroundf((float)a * cov);
-                                    uint32_t cr = (uint32_t)lroundf((float)r * cov);
-                                    uint32_t cg = (uint32_t)lroundf((float)g * cov);
-                                    uint32_t cb = (uint32_t)lroundf((float)b * cov);
-                                    uint32_t src = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+                                    uint32_t src = src_table[cnt];
                                     row[x - first_in] = (prog == AGX_USC_COPY) ? src
                                                                                 : agx_blend_over(row[x - first_in], src);
                                 }
@@ -7360,10 +7676,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     if ((uint64_t)tex.w * tex.h > 4096 * 4096) {
                         continue;
                     }
-                    quad_tex = g_malloc((size_t)tex.w * tex.h * 4);
+                    quad_tex = agx_get_scratch1((size_t)tex.w * tex.h);
                     for (unsigned ty = 0; ty < tex.h; ty++) {
                         if (!agx_texture_row(s, cat, &tex, ty, quad_tex + (size_t)ty * tex.w)) {
-                            g_free(quad_tex);
                             quad_tex = NULL;
                             break;
                         }
@@ -7373,6 +7688,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     sample_tex = quad_tex;
                 }
+                uint32_t tint_a = tint >> 24;
+                uint32_t tint_r = (tint >> 16) & 0xff;
+                uint32_t tint_g = (tint >> 8) & 0xff;
+                uint32_t tint_b = tint & 0xff;
+                bool rounded_caps = (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87)));
+                bool simple_blend = !dest_in && !vibrancy && (prog != AGX_USC_PLUS_L) && (prog != AGX_USC_PLUS_L2);
+
                 int cached_y0 = -1, cached_y1 = -1, cached_mask_y = -1;
                 bool mask_row_ok = false;
 
@@ -7389,6 +7711,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     uint32_t ty0 = 0, ty1 = 0;
                     float fy = 0.0f;
+                    int wy = 0;
                     if (!sample_tex) {
                         if (is_scaled || tex.linear_filter) {
                             float v_sample = fv * sv - 0.5f;
@@ -7397,6 +7720,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             ty0 = (uint32_t)v_sample;
                             ty1 = ty0 + 1 < tex.h ? ty0 + 1 : ty0;
                             fy = v_sample - (float)ty0;
+                            wy = (int)(fy * 256.0f + 0.5f);
 
                             if ((int)ty0 != cached_y0) {
                                 if (!agx_texture_row(s, cat, &tex, ty0, texrow)) {
@@ -7445,9 +7769,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             float fx = u_sample - (float)tx0;
                             uint32_t c00 = texrow[tx0];
                             uint32_t c10 = texrow[tx1];
-                            uint32_t c01 = (ty1 == ty0) ? texrow[tx0] : texrow1[tx0];
-                            uint32_t c11 = (ty1 == ty0) ? texrow[tx1] : texrow1[tx1];
-                            src = agx_bilinear_interpolate(c00, c10, c01, c11, fx, fy);
+                            uint32_t c01 = (ty1 == ty0) ? c00 : texrow1[tx0];
+                            uint32_t c11 = (ty1 == ty0) ? c10 : texrow1[tx1];
+                            src = agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, wy);
                         } else {
                             src = texrow[tx];
                         }
@@ -7471,31 +7795,36 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             b = MAX(0, MIN(255, b));
                             src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                         }
-                        uint32_t dst = row[x - x0], out = 0;
-                        if (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87))) {
+                        uint32_t dst = row[x - x0];
+                        if (rounded_caps) {
                             uint32_t cov = (((src >> 16) & 0xff) * (src >> 24)) / 255;
-                            uint32_t ta = (tint >> 24) & 0xff;
-                            uint32_t tr = (tint >> 16) & 0xff;
-                            uint32_t tg = (tint >> 8) & 0xff;
-                            uint32_t tb = tint & 0xff;
-                            uint32_t a = (ta * cov) / 255;
-                            uint32_t r = (tr * a) / 255;
-                            uint32_t g = (tg * a) / 255;
-                            uint32_t b = (tb * a) / 255;
+                            uint32_t a = (tint_a * cov) / 255;
+                            uint32_t r = (tint_r * a) / 255;
+                            uint32_t g = (tint_g * a) / 255;
+                            uint32_t b = (tint_b * a) / 255;
                             src = (a << 24) | (r << 16) | (g << 8) | b;
                         } else if (tint != 0xffffffff) {
-                            uint32_t m = 0;
-                            for (unsigned c = 0; c < 32; c += 8) {
-                                m |= (((src >> c) & 0xff) * ((tint >> c) & 0xff) / 255) << c;
-                            }
-                            src = m;
+                            uint32_t b = ((src & 0xff) * tint_b) / 255;
+                            uint32_t g = (((src >> 8) & 0xff) * tint_g) / 255;
+                            uint32_t r = (((src >> 16) & 0xff) * tint_r) / 255;
+                            uint32_t a = ((src >> 24) * tint_a) / 255;
+                            src = b | (g << 8) | (r << 16) | (a << 24);
                         }
                         if (dest_in) {
                             uint32_t a = src >> 24;
-                            for (unsigned c = 0; c < 32; c += 8) {
-                                out |= (((dst >> c) & 0xff) * a / 255) << c;
+                            if (a == 255) {
+                                row[x - x0] = dst;
+                            } else if (a == 0) {
+                                row[x - x0] = 0;
+                            } else {
+                                uint32_t b = ((dst & 0xff) * a) / 255;
+                                uint32_t g = (((dst >> 8) & 0xff) * a) / 255;
+                                uint32_t r = (((dst >> 16) & 0xff) * a) / 255;
+                                uint32_t oa = ((dst >> 24) * a) / 255;
+                                row[x - x0] = b | (g << 8) | (r << 16) | (oa << 24);
                             }
-                            row[x - x0] = out;
+                        } else if (simple_blend) {
+                            row[x - x0] = agx_blend_over(dst, src);
                         } else if (vibrancy) {
                             if (stride == 36 && has_mask_tex && mask_row_ok) {
                                 uint32_t m_alpha = (maskrow[tx] >> 24) & 0xff;
@@ -7524,9 +7853,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     }
                     agx_ctx_write(s, cat, agx_surface_gva(&sf, x0, y), row, (x1 - x0) * 4);
                 }
-                g_free(quad_tex);
             }
-            g_free(blurred_tex);
             if (any_drawn) {
                 draws++;
             }
@@ -7549,9 +7876,93 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
 /* AGX_REPLAY_CORE_END */
 
 /* Publish one finished job (main loop, BQL held). */
+static int agx_cmp_int64(const void *a, const void *b)
+{
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static void agx_perf_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    double avg_lat = 0, p50_lat = 0, max_lat = 0;
+    if (s->agx_perf_win_lat_count > 0) {
+        qsort(s->agx_perf_win_lat_samples, s->agx_perf_win_lat_count, sizeof(int64_t), agx_cmp_int64);
+        avg_lat = (double)s->agx_perf_win_lat_us_sum / s->agx_perf_win_lat_count;
+        p50_lat = (double)s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count / 2];
+        max_lat = (double)s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count - 1];
+    }
+
+    double avg_q_wait = s->agx_perf_win_queue_wait_count ?
+        (double)s->agx_perf_win_queue_wait_us_sum / s->agx_perf_win_queue_wait_count : 0.0;
+    double avg_render_ms = s->agx_perf_win_render_count ?
+        (double)s->agx_perf_win_render_us_sum / (s->agx_perf_win_render_count * 1000.0) : 0.0;
+    double avg_bh_delay = s->agx_perf_win_bh_delay_count ?
+        (double)s->agx_perf_win_bh_delay_us_sum / s->agx_perf_win_bh_delay_count : 0.0;
+    double capture_ta_ms = (double)s->agx_perf_win_capture_ta_us / 1000.0;
+
+    fprintf(stderr,
+            "[agx-perf 5s] doorbells=%lu passes=%lu jobs=%lu latency_us(avg/p50/max)=%.1f/%.1f/%.1f "
+            "queue_wait_us=%.1f render_ms=%.2f bh_delay_us=%.1f capture_ta_ms=%.2f repolls_1ms=%lu\n",
+            (unsigned long)s->agx_perf_win_doorbells,
+            (unsigned long)s->agx_perf_win_passes,
+            (unsigned long)s->agx_perf_win_jobs,
+            avg_lat, p50_lat, max_lat,
+            avg_q_wait, avg_render_ms, avg_bh_delay, capture_ta_ms,
+            (unsigned long)s->agx_perf_win_repolls_1ms);
+
+    s->agx_perf_win_doorbells = 0;
+    s->agx_perf_win_passes = 0;
+    s->agx_perf_win_jobs = 0;
+    s->agx_perf_win_repolls_1ms = 0;
+    s->agx_perf_win_capture_ta_us = 0;
+    s->agx_perf_win_queue_wait_us_sum = 0;
+    s->agx_perf_win_queue_wait_count = 0;
+    s->agx_perf_win_render_us_sum = 0;
+    s->agx_perf_win_render_count = 0;
+    s->agx_perf_win_bh_delay_us_sum = 0;
+    s->agx_perf_win_bh_delay_count = 0;
+    s->agx_perf_win_lat_us_sum = 0;
+    s->agx_perf_win_lat_count = 0;
+
+    timer_mod(s->agx_perf_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
+}
+
 static void agx_replay_complete_job(AGXRenderJob *job)
 {
     A7State *s = job->s;
+
+    if (s->agx_perf_enabled) {
+        int64_t now = g_get_monotonic_time();
+        s->agx_perf_total_jobs++;
+        s->agx_perf_win_jobs++;
+        if (job->target != 0) {
+            s->agx_perf_total_passes++;
+            s->agx_perf_win_passes++;
+            if (job->render_end_us > job->render_start_us) {
+                s->agx_perf_win_render_us_sum += (job->render_end_us - job->render_start_us);
+                s->agx_perf_win_render_count++;
+            }
+        }
+        if (job->render_start_us > job->enqueue_time_us) {
+            s->agx_perf_win_queue_wait_us_sum += (job->render_start_us - job->enqueue_time_us);
+            s->agx_perf_win_queue_wait_count++;
+        }
+        if (job->done_enqueue_us > 0) {
+            s->agx_perf_win_bh_delay_us_sum += (now - job->done_enqueue_us);
+            s->agx_perf_win_bh_delay_count++;
+        }
+        if (job->post_completion && job->doorbell_time_us > 0) {
+            int64_t lat = now - job->doorbell_time_us;
+            if (lat >= 0) {
+                s->agx_perf_win_lat_us_sum += lat;
+                if (s->agx_perf_win_lat_count < ARRAY_SIZE(s->agx_perf_win_lat_samples)) {
+                    s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count++] = lat;
+                }
+            }
+        }
+    }
 
     /* Thread-safety: agx_replay_done_bh runs this on the main loop context with
      * the BQL held. Stamp writes, queue control updates, and firmware completion
@@ -7589,9 +8000,12 @@ static void agx_replay_complete_job(AGXRenderJob *job)
     g_free(job);
 }
 
+static void agx_kick_cb(void *opaque);
+
 static void agx_replay_done_bh(void *opaque)
 {
     A7State *s = opaque;
+    bool stamp_updated = false;
     for (;;) {
         qemu_mutex_lock(&s->agx_render_mutex);
         AGXRenderJob *job = s->agx_done_head;
@@ -7603,10 +8017,17 @@ static void agx_replay_done_bh(void *opaque)
         }
         qemu_mutex_unlock(&s->agx_render_mutex);
         if (!job) {
-            return;
+            break;
+        }
+        if (job->has_stamp) {
+            stamp_updated = true;
         }
         job->next = NULL;
         agx_replay_complete_job(job);
+    }
+    if (stamp_updated || s->agx_stamp_wait) {
+        s->agx_stamp_wait = false;
+        agx_kick_cb(s);
     }
 }
 
@@ -7635,6 +8056,10 @@ static void *agx_render_thread_fn(void *opaque)
 
         qemu_mutex_unlock(&s->agx_render_mutex);
 
+        if (s->agx_perf_enabled) {
+            job->render_start_us = g_get_monotonic_time();
+        }
+
         /* Thread-safety: rasterise off the BQL under RCU read lock.
          * Guest RAM access (address_space_read/write on address_space_memory)
          * is permitted without the BQL under RCU. No shared emulator machine
@@ -7646,6 +8071,11 @@ static void *agx_render_thread_fn(void *opaque)
                              job->width, job->height, job->is_clear, job->pitch, job->scissor_base);
             agx_read_snapshot = NULL;
             rcu_read_unlock();
+        }
+
+        if (s->agx_perf_enabled) {
+            job->render_end_us = g_get_monotonic_time();
+            job->done_enqueue_us = job->render_end_us;
         }
 
         /* Stamps and the kick completion are published in order by
@@ -7680,8 +8110,35 @@ static void agx_enqueue_render_jobs(A7State *s, AGXRenderJob *head, AGXRenderJob
     if (!head || !tail) {
         return;
     }
+    int64_t enq_time = s->agx_perf_enabled ? g_get_monotonic_time() : 0;
     for (AGXRenderJob *j = head; j; j = j->next) {
         s->agx_inflight_jobs++;
+        j->enqueue_time_us = enq_time;
+    }
+
+    if (s->agx_async_enabled && s->agx_inflight_jobs <= 3) {
+        for (AGXRenderJob *j = head; j; j = j->next) {
+            if (j->has_stamp) {
+                agx_gpu_access(s, j->stamp_gva, &j->stamp_value, 4, true);
+                j->has_stamp = false;
+            }
+            if (j->has_queue_ctrl) {
+                smp_wmb();
+                agx_gpu_access(s, j->queue_ctrl_gva, &j->queue_read_index, 4, true);
+                for (unsigned i = 0; i < ARRAY_SIZE(s->agx_host_read); i++) {
+                    if (s->agx_host_read[i].valid &&
+                        s->agx_host_read[i].control == j->queue_ctrl_gva &&
+                        s->agx_host_read[i].index == j->queue_read_index) {
+                        s->agx_host_read[i].valid = false;
+                    }
+                }
+                j->has_queue_ctrl = false;
+            }
+            if (j->post_completion) {
+                agx_post_fw_message(s, 1);
+                j->post_completion = false;
+            }
+        }
     }
 
     agx_render_ensure_thread(s);
@@ -7704,6 +8161,9 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     uint8_t raw[0x280];
     hwaddr pa = 0, last_pa = 0;
     bool mapped, last_mapped, contiguous;
+#ifdef QEMU_OSDEP_H
+    agx_tlb_reset();
+#endif
     uint64_t first = UINT64_MAX, actual = 0;
     const char *fill = getenv("VPHONE_AGX_RT_FILL");
 
@@ -8094,8 +8554,15 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
             uint32_t value;
             if (!agx_gpu_access(s, agx_meta_gva(command[1]), &value, 4, false) ||
                 (int32_t)(value - command[2]) < 0) {
+#ifdef QEMU_OSDEP_H
+                if (s->agx_perf_enabled) {
+                    s->agx_perf_total_repolls_1ms++;
+                    s->agx_perf_win_repolls_1ms++;
+                }
+                s->agx_stamp_wait = true;
+#endif
                 timer_mod(s->agx_kick_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000);
                 break;
             }
         }
@@ -8178,7 +8645,15 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                     agx_snapshot_unref(s->agx_ta_snapshot[context][slot]);
                     uint64_t cat = context < ARRAY_SIZE(s->agx_ctx_cat) - 3 && s->agx_ctx_cat[context + 3] ?
                                    s->agx_ctx_cat[context + 3] : s->agx_cat_base;
+#ifdef QEMU_OSDEP_H
+                    int64_t t_cap = s->agx_perf_enabled ? g_get_monotonic_time() : 0;
+#endif
                     s->agx_ta_snapshot[context][slot] = agx_capture_ta(s, cat, ta);
+#ifdef QEMU_OSDEP_H
+                    if (s->agx_perf_enabled) {
+                        s->agx_perf_win_capture_ta_us += (g_get_monotonic_time() - t_cap);
+                    }
+#endif
                     s->agx_last_ta_valid[context] = true;
                     s->agx_last_ta_queue[context] = block;
                 }
@@ -8303,6 +8778,9 @@ static void agx_drain_context_ring(A7State *s)
 static void agx_kick_cb(void *opaque)
 {
     A7State *s = opaque;
+    int64_t db_time = s->agx_doorbell_time_us ? s->agx_doorbell_time_us :
+                      (s->agx_perf_enabled ? g_get_monotonic_time() : 0);
+    s->agx_doorbell_in_flight = false;
     uint32_t rings = s->agx_pending_doorbells;
     s->agx_pending_doorbells = 0;
     agx_drain_context_ring(s);
@@ -8342,6 +8820,11 @@ static void agx_kick_cb(void *opaque)
     for (unsigned q = 0; q < s->agx_queue_count; q++) {
         commands += agx_drain_queue(s, s->agx_queues[q], &stamps, &local_head, &local_tail);
     }
+    for (AGXRenderJob *j = local_head; j; j = j->next) {
+        if (!j->doorbell_time_us) {
+            j->doorbell_time_us = db_time;
+        }
+    }
     if (local_tail) {
         local_tail->post_completion = true;
         local_tail->commands = commands;
@@ -8354,10 +8837,21 @@ static void agx_kick_cb(void *opaque)
             comp_job->post_completion = true;
             comp_job->commands = commands;
             comp_job->stamps = stamps;
+            comp_job->doorbell_time_us = db_time;
             agx_enqueue_render_jobs(s, comp_job, comp_job);
         } else {
             qemu_log_mask(LOG_UNIMP, "AGX META: consumed %u commands, %u stamps\n", commands, stamps);
             agx_post_fw_message(s, 1); /* type 1: work completed */
+            if (s->agx_perf_enabled && db_time > 0) {
+                int64_t now = g_get_monotonic_time();
+                int64_t lat = now - db_time;
+                if (lat >= 0) {
+                    s->agx_perf_win_lat_us_sum += lat;
+                    if (s->agx_perf_win_lat_count < ARRAY_SIZE(s->agx_perf_win_lat_samples)) {
+                        s->agx_perf_win_lat_samples[s->agx_perf_win_lat_count++] = lat;
+                    }
+                }
+            }
         }
     }
 }
@@ -8368,7 +8862,15 @@ static void agx_doorbell(A7State *s, uint64_t value)
         return;
     }
     s->agx_pending_doorbells |= 1U << (value & 3);
-    timer_mod(s->agx_kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
+    if (s->agx_perf_enabled) {
+        s->agx_perf_total_doorbells++;
+        s->agx_perf_win_doorbells++;
+        if (!s->agx_doorbell_in_flight) {
+            s->agx_doorbell_time_us = g_get_monotonic_time();
+            s->agx_doorbell_in_flight = true;
+        }
+    }
+    qemu_bh_schedule(s->agx_kick_bh);
 }
 
 static void agx_sequencer_run(A7Peripheral *p)
@@ -8555,7 +9057,7 @@ static void vblank_timer_cb(void *opaque)
                  * synthesize it as a successful swap completion. */
                 *status |= (1U << 8);
                 *(uint32_t *)(p->regs + 0x1048) = s->disp_token;
-                fprintf(stderr, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
+                qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;
@@ -8635,6 +9137,7 @@ static void a7_reset(void *opaque)
     }
     s->agx_cat_base = 0;
     s->disp_mmu_table = 0;
+    s->disp_mapping_valid = false;
     memset(s->agx_ctx_cat, 0, sizeof(s->agx_ctx_cat));
     memset(s->agx_last_ta, 0, sizeof(s->agx_last_ta));
     memset(s->agx_last_ta_queue, 0, sizeof(s->agx_last_ta_queue));
@@ -8758,37 +9261,93 @@ static bool display_update(void *opaque)
 {
     A7State *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
+    if (!surface) {
+        return false;
+    }
     uint8_t *ram = memory_region_get_ram_ptr(MACHINE(s)->ram);
-    uint8_t *src = ram + s->framebuffer - RAM_BASE;
+    uint32_t dst_stride = surface_stride(surface);
+    uint8_t *dst_base = surface_data(surface);
+
     if (s->disp_mmu_table) {
-        /* Gather the plane through the display MMU page table. */
-        /* Display surfaces are linear 640 * 4-byte rows (the /vram carveout
-         * is exactly 2560 * 1136); 0x4040 (0x1000) is not the row pitch. */
-        uint32_t stride = 2560;
-        for (unsigned y = 0; y < 1136; y++) {
-            uint8_t *dst = surface_data(surface) + y * surface_stride(surface);
-            uint64_t o = s->disp_offset + (uint64_t)y * stride;
-            for (unsigned x = 0; x < 2560;) {
-                unsigned chunk = MIN(2560 - x, 0x1000 - ((o + x) & 0xfff));
+        if (!s->disp_mapping_valid || s->disp_cached_mmu_table != s->disp_mmu_table ||
+            s->disp_cached_offset != s->disp_offset) {
+            uint32_t start_page = s->disp_offset >> 12;
+            uint32_t end_page = (s->disp_offset + 2560 * 1136 + 0xfff) >> 12;
+            bool contiguous = true;
+            bool all_valid = true;
+            uint64_t prev_pa = 0;
+
+            for (uint32_t p = start_page; p < end_page && p < ARRAY_SIZE(s->disp_page_ram_offset); p++) {
                 MemTxResult r;
                 uint32_t e = address_space_ldl_le(&address_space_memory,
-                                                  s->disp_mmu_table + ((o + x) >> 12) * 4,
+                                                  s->disp_mmu_table + p * 4,
                                                   MEMTXATTRS_UNSPECIFIED, &r);
-                uint64_t pa = ((uint64_t)(e & ~0xfU) << 4) + ((o + x) & 0xfff);
-                if (r == MEMTX_OK && (e & 1) && pa >= RAM_BASE && pa + chunk <= RAM_BASE + GiB) {
-                    memcpy(dst + x, ram + pa - RAM_BASE, chunk);
+                uint64_t pa = (uint64_t)(e & ~0xfU) << 4;
+                if (r == MEMTX_OK && (e & 1) && pa >= RAM_BASE && pa + 0x1000 <= RAM_BASE + GiB) {
+                    s->disp_page_ram_offset[p] = (uint32_t)(pa - RAM_BASE);
                 } else {
-                    memset(dst + x, 0, chunk);
+                    s->disp_page_ram_offset[p] = 0;
+                    all_valid = false;
+                }
+                if (p == start_page) {
+                    prev_pa = pa;
+                } else {
+                    if (pa != prev_pa + 0x1000) {
+                        contiguous = false;
+                    }
+                    prev_pa = pa;
+                }
+            }
+            s->disp_mapping_contiguous = (all_valid && contiguous);
+            s->disp_cached_pa_base = (all_valid && contiguous) ?
+                (uint64_t)s->disp_page_ram_offset[start_page] + (s->disp_offset & 0xfff) : 0;
+            s->disp_cached_mmu_table = s->disp_mmu_table;
+            s->disp_cached_offset = s->disp_offset;
+            s->disp_mapping_valid = all_valid;
+        }
+    }
+
+    uint8_t temp_row[2560];
+    int dirty_start = -1;
+
+    for (unsigned y = 0; y < 1136; y++) {
+        const uint8_t *src_row;
+        if (!s->disp_mmu_table) {
+            src_row = ram + s->framebuffer - RAM_BASE + y * 2560;
+        } else if (s->disp_mapping_contiguous) {
+            src_row = ram + s->disp_cached_pa_base + y * 2560;
+        } else {
+            uint64_t o = s->disp_offset + (uint64_t)y * 2560;
+            for (unsigned x = 0; x < 2560;) {
+                uint32_t p = (uint32_t)((o + x) >> 12);
+                uint32_t poff = (uint32_t)((o + x) & 0xfff);
+                unsigned chunk = MIN(2560 - x, 0x1000 - poff);
+                if (p < ARRAY_SIZE(s->disp_page_ram_offset) && s->disp_page_ram_offset[p]) {
+                    memcpy(temp_row + x, ram + s->disp_page_ram_offset[p] + poff, chunk);
+                } else {
+                    memset(temp_row + x, 0, chunk);
                 }
                 x += chunk;
             }
+            src_row = temp_row;
         }
-    } else {
-        for (unsigned y = 0; y < 1136; y++) {
-            memcpy(surface_data(surface) + y * surface_stride(surface), src + y * 2560, 2560);
+
+        uint8_t *dst_row = dst_base + y * dst_stride;
+        if (memcmp(dst_row, src_row, 2560) != 0) {
+            memcpy(dst_row, src_row, 2560);
+            if (dirty_start < 0) {
+                dirty_start = (int)y;
+            }
+        } else {
+            if (dirty_start >= 0) {
+                qemu_console_update(s->con, 0, dirty_start, 640, (int)y - dirty_start);
+                dirty_start = -1;
+            }
         }
     }
-    qemu_console_update(s->con, 0, 0, 640, 1136);
+    if (dirty_start >= 0) {
+        qemu_console_update(s->con, 0, dirty_start, 640, 1136 - dirty_start);
+    }
     return true;
 }
 static const GraphicHwOps display_ops = { .gfx_update = display_update };
@@ -9170,12 +9729,21 @@ static void a7_init(MachineState *ms)
     qemu_mutex_init(&s->agx_render_mutex);
     qemu_cond_init(&s->agx_render_cond);
     s->agx_done_bh = qemu_bh_new(agx_replay_done_bh, s);
+    s->agx_kick_bh = qemu_bh_new(agx_kick_cb, s);
     s->agx_job_head = NULL;
     s->agx_job_tail = NULL;
     s->agx_render_thread_running = false;
     s->agx_render_thread_exit = false;
     s->agx_inflight_jobs = 0;
     agx_render_ensure_thread(s);
+    const char *perf_stats_env = getenv("VPHONE_PERF_STATS");
+    s->agx_perf_enabled = perf_stats_env && strcmp(perf_stats_env, "0") != 0;
+    if (s->agx_perf_enabled) {
+        s->agx_perf_timer = timer_new_ms(QEMU_CLOCK_REALTIME, agx_perf_timer_cb, s);
+        timer_mod(s->agx_perf_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
+    }
+    const char *async_env = getenv("VPHONE_AGX_ASYNC");
+    s->agx_async_enabled = async_env && strcmp(async_env, "0") != 0;
     ans_init_storage(s);
     ans_init_utility(s);
     qemu_register_reset(a7_reset, s);
@@ -9228,6 +9796,15 @@ static void a7_finalize(Object *o)
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
+    if (s->agx_perf_timer) {
+        timer_del(s->agx_perf_timer);
+        timer_free(s->agx_perf_timer);
+        s->agx_perf_timer = NULL;
+    }
+    if (s->agx_kick_bh) {
+        qemu_bh_delete(s->agx_kick_bh);
+        s->agx_kick_bh = NULL;
+    }
     g_free(s->wifi_netdev);
     g_free(s->wifi_ssid);
     g_free(s->system_image);
