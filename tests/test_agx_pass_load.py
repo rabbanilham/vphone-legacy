@@ -155,7 +155,7 @@ class AGXPassLoadTests(unittest.TestCase):
         self.assertIn('bool is_clear, uint32_t pitch, uint64_t scissor_base)', source)
         self.assertIn('if (is_clear) {', source)
         self.assertIn('uint32_t zero_row[ARRAY_SIZE(row)];', source)
-        self.assertIn('agx_ctx_write(s, cat, agx_surface_gva(&sf, 0, y), zero_row, width * 4);', source)
+        self.assertIn('agx_target_write(s, cat, &sf, 0, y, zero_row, width);', source)
 
         # Check agx_trace_rt computes is_clear
         self.assertIn('bool is_clear = ldl_le_p(raw + 0x178) != 0 && !(ldl_le_p(raw + 0x23c) & 1);', source)
