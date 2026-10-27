@@ -20,6 +20,7 @@ def main():
         image=root/'code.bin'; image.write_bytes(struct.pack('<'+'I'*len(code),*code))
         proc=subprocess.Popen([str(BINARY),'-machine','s5l8960x,boot-entry=0x800000000,boot-args=0x800001000',
             '-kernel',str(image),'-accel','tcg','-display','none',
+            '-d','unimp','-D',str(root/'buttons.log'),
             '-qmp',f'unix:{root}/qmp,server=on,wait=off'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+10
@@ -37,8 +38,12 @@ def main():
                         return int(re.search(r': 0x([0-9a-f]+)',output)[1],16)
                     while read(0x20e300008)!=0x20d:
                         assert time.monotonic()<deadline;time.sleep(.01)
+                    round_trips = []
                     for _ in range(3):
+                        start = time.monotonic()
                         command(fp,'input-send-event',{'device':'a7-touch-display','events':[{'type':'key','data':{'down':True,'key':{'type':'qcode','data':'home'}}}]})
+                        command(fp,'input-send-event',{'device':'a7-touch-display','events':[{'type':'key','data':{'down':False,'key':{'type':'qcode','data':'home'}}}]})
+                        round_trips.append((time.monotonic() - start) * 1000)
                         # The edge proves dispatch even if host scheduling misses the short low sample.
                         assert read(0x20e300800)&4
                         time.sleep(.15)
@@ -46,6 +51,11 @@ def main():
                         command(fp,'input-send-event',{'device':'a7-touch-display','events':[{'type':'key','data':{'down':False,'key':{'type':'qcode','data':'home'}}}]})
                     command(fp,'quit')
             assert proc.wait(timeout=5)==0
+            edges = re.findall(r'A7 BUTTON pin=2 pressed=([01]).* ns=(\d+)', (root/'buttons.log').read_text())
+            assert [int(down) for down, _ in edges] == [1, 0] * 3, edges
+            pulses = [(int(edges[i+1][1])-int(edges[i][1]))/1e6 for i in range(0,6,2)]
+            assert all(ms >= 100 for ms in pulses), pulses
+            print(f'Home QMP down/up round trips (host ms): {round_trips}; GPIO pulses (guest ms): {pulses}')
         finally:
             if proc.poll() is None:proc.kill();proc.wait()
             proc.stderr.close()

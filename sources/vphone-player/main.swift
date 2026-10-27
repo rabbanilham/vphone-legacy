@@ -114,7 +114,9 @@ final class RFB {
     func input(_ bytes: [UInt8]) { do { try send(bytes) } catch { failed?(error.localizedDescription) } }
     func home() {
         input([4,1,0,0,0,0,0xff,0x50])
-        DispatchQueue.global().asyncAfter(deadline: .now()+0.1) { self.input([4,0,0,0,0,0,0xff,0x50]) }
+        // The device owns the 100 ms guest-time pulse and lost-key-up guard.
+        // A host timer only delays key-up and can slip under host load.
+        input([4,0,0,0,0,0,0xff,0x50])
     }
     func pointer(_ x: Int, _ y: Int, _ down: Bool) {
         input([5,down ? 1:0,UInt8(x>>8),UInt8(x&255),UInt8(y>>8),UInt8(y&255)])
@@ -315,7 +317,6 @@ final class QMPInput {
                         // Only wake a gated digitizer. Do not leave an active app.
                         for down in [true,false] {
                             try self.execute("input-send-event",["device":"a7-touch-display","events":[["type":"key","data":["down":down,"key":["type":"qcode","data":"home"]]]]])
-                            if down {usleep(100000)}
                         }
                         woke = true
                     }
