@@ -625,7 +625,7 @@ struct A7State {
     MemoryRegion usb_dma_memory, usb_dma_ram;
     AddressSpace usb_dma_as;
     WifiDongle *wifi;
-    char *wifi_netdev, *wifi_ssid;
+    char *wifi_netdev, *wifi_ssid, *wifi_scan_file;
     uint64_t wifi_rom;
     bool wifi_mac_patched;
     MemoryRegion usb_otg;
@@ -9979,6 +9979,7 @@ static void a7_wifi_init(A7State *s, DeviceState *ehci)
     USBDevice *dev = USB_DEVICE(qdev_new(TYPE_WIFI_DONGLE));
     qdev_prop_set_string(DEVICE(dev), "netdev", s->wifi_netdev);
     if (s->wifi_ssid) qdev_prop_set_string(DEVICE(dev), "ssid", s->wifi_ssid);
+    if (s->wifi_scan_file) qdev_prop_set_string(DEVICE(dev), "scan-file", s->wifi_scan_file);
     qdev_prop_set_string(DEVICE(dev), "port", "1");
     if (s->wifi_rom) qdev_prop_set_bit(DEVICE(dev), "rom", true);
     usb_realize_and_unref(dev, &SYS_BUS_EHCI(ehci)->ehci.bus, &error_fatal);
@@ -10423,6 +10424,7 @@ static void a7_finalize(Object *o)
     }
     g_free(s->wifi_netdev);
     g_free(s->wifi_ssid);
+    g_free(s->wifi_scan_file);
     g_free(s->system_image);
     g_free(s->data_image);
     g_free(s->utility_image);
@@ -10452,6 +10454,8 @@ static void a7_instance_init(Object *o)
                         (void *)offsetof(A7State, wifi_netdev));
     object_property_add(o, "wifi-ssid", "str", get_image, set_image, NULL,
                         (void *)offsetof(A7State, wifi_ssid));
+    object_property_add(o, "wifi-scan-file", "str", get_image, set_image, NULL,
+                        (void *)offsetof(A7State, wifi_scan_file));
     object_property_add(o, "wifi-rom", "uint64", get_address, set_address, NULL,
                         (void *)offsetof(A7State, wifi_rom));
     s->boot_el = 1;

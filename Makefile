@@ -2,7 +2,7 @@
 
 PYTHON ?= .venv/bin/python
 
-.PHONY: all setup test check-docs backend vphoned gui clean help
+.PHONY: all setup test check-docs backend vphoned gui clean help wifi-helper
 
 all: setup test
 
@@ -25,13 +25,40 @@ vphoned:
 	make -C scripts/vphoned-legacy host_test
 	make -C scripts/vphoned-legacy ios
 
+wifi-helper: build/host_wifi_scan build/host_wifi_scan.app
+
+build/host_wifi_scan: scripts/host_wifi_scan.swift
+	@mkdir -p build
+	swiftc -O -framework CoreLocation -framework CoreWLAN -framework Foundation $< -o $@
+
+build/host_wifi_scan.app: scripts/host_wifi_scan.swift
+	@mkdir -p build/host_wifi_scan.app/Contents/MacOS
+	@printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0">' \
+		'<dict>' \
+		'  <key>CFBundleIdentifier</key>' \
+		'  <string>com.vphone.host-wifi-scan</string>' \
+		'  <key>CFBundleExecutable</key>' \
+		'  <string>host_wifi_scan</string>' \
+		'  <key>NSLocationUsageDescription</key>' \
+		'  <string>vphone requires Wi-Fi network names to mirror nearby Wi-Fi in the guest iOS settings.</string>' \
+		'  <key>LSUIElement</key>' \
+		'  <true/>' \
+		'</dict>' \
+		'</plist>' > build/host_wifi_scan.app/Contents/Info.plist
+	swiftc -O -framework CoreLocation -framework CoreWLAN -framework Foundation $< -o build/host_wifi_scan.app/Contents/MacOS/host_wifi_scan
+	codesign -s - --force build/host_wifi_scan.app
+	@touch build/host_wifi_scan.app
+
 gui:
 	@echo "Building and launching vphone-legacy.app..."
 	./scripts/build_app.sh
 	open dist/vphone-legacy.app
 
 clean:
-	rm -rf .venv/build build/swift-module-cache
+	rm -rf .venv/build build/swift-module-cache build/host_wifi_scan build/host_wifi_scan.app
 	make -C scripts/vphoned-legacy clean
 
 help:

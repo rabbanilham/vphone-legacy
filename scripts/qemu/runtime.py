@@ -127,7 +127,7 @@ def stop(bundle, force=False):
     raise ValueError("Runtime status is stale; no active launcher owns this VM")
 
 
-def launch(bundle, headless=False, probe_seconds=None, paused=False):
+def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False):
     bundle = Path(bundle).resolve()
     report = validate_bundle(bundle)
     if report["errors"]:
@@ -216,6 +216,11 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
                 command.append("-S")
             # No virtio disks/network: legacy guest drivers do not support them.
             # ANS serves explicit raw partition files; no generic virtio disk.
+            backend_dir = Path(__file__).resolve().parents[2] / "backend"
+            if str(backend_dir) not in sys.path:
+                sys.path.insert(0, str(backend_dir))
+            from host_wifi import configure_wifi
+            child_env = configure_wifi(command, wifi)
             write_json(logs / "command.json", command)
             write_json(bundle / "runtime.json", status)
             print("Launching original secure monitor and XNU on experimental A7; no boot/UI readiness claimed.", flush=True)
@@ -237,7 +242,7 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False):
             verbose_trace = "int" in trace_mask.split(",")
             panic_monitor = PanicMonitor()
             try:
-                process = subprocess.Popen(command, start_new_session=True)
+                process = subprocess.Popen(command, start_new_session=True, env=child_env)
                 status["process"].update(phase="running", pid=process.pid)
                 write_json(bundle / "runtime.json", status)
                 deadline = time.monotonic() + 10
@@ -361,11 +366,12 @@ def main():
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--probe-seconds", type=float)
     parser.add_argument("--paused", action="store_true")
+    parser.add_argument("--wifi", action="store_true", help="Expose host-mirrored Wi-Fi scan list backed by user-mode NAT")
     args = parser.parse_args()
     if args.probe_seconds is not None and not 0 < args.probe_seconds <= 30:
         parser.error("probe-seconds must be greater than 0 and at most 30")
     try:
-        sys.exit(launch(args.bundle, args.headless, args.probe_seconds, args.paused))
+        sys.exit(launch(args.bundle, args.headless, args.probe_seconds, args.paused, args.wifi))
     except (OSError, ValueError, KeyError) as exc:
         parser.exit(1, f"Launch error: {exc}\n")
 

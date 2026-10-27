@@ -361,7 +361,7 @@ def main():
     p.add_argument('--display-state', action='store_true', help='Save display plane registers and MMU tables beside timed QMP captures')
     p.add_argument('--max-hits', action='append', default=[], help='name=N hit cap before a hook is removed (0 keeps it installed)')
     p.add_argument('--user-va-hook', action='append', default=[], help='name=0xVA absolute user-space breakpoint, installed with the user hooks (no cache verification)')
-    p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
+    p.add_argument('--wifi', action='store_true', help='Expose host-mirrored Wi-Fi scan list backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     p.add_argument('--mouse-swipe', help='Simulate mouse drag via QMP: at,x0,y0,x1,y1,dur,steps')

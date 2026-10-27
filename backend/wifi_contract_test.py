@@ -12,7 +12,7 @@ def fixture():
     return runtime_fixture(enumeration_only=True)
 
 
-def runtime_fixture(enumeration_only=False):
+def runtime_fixture(enumeration_only=False, join_second=False, target_ssid=None):
     """TRX -> runtime PID -> CDC -> association -> slirp ARP/DHCP replies."""
     import binascii
     code = move64(4, 0x800018000)
@@ -198,19 +198,38 @@ def runtime_fixture(enumeration_only=False):
     transfer(2,1,2048)
     read(ram+buf+32,67<<24)
     read(ram+buf+36,8<<24)
+    first_ssid = target_ssid if target_ssid is not None else b'vphone-wifi'
+    first_ie_len = 2 + len(first_ssid) + 19
     read_bytes(ram+buf+84,bytes.fromhex('34120100'))
     read(ram+buf+88,109)
+    read_bytes(ram+buf+106, bytes([len(first_ssid)]) + first_ssid)
     read_bytes(ram+buf+164,struct.pack('<h',-45))
-    read_bytes(ram+buf+204,struct.pack('<H',32))
+    read_bytes(ram+buf+204,struct.pack('<H',first_ie_len))
     read(ram+buf+208,128)
+    if join_second:
+        transfer(2,1,2048)
+        read(ram+buf+32,67<<24)
+        read(ram+buf+36,8<<24)
+        read_bytes(ram+buf+84,bytes.fromhex('34120100'))
+        read(ram+buf+88,109)
+        read_bytes(ram+buf+164,struct.pack('<h',-65))
     transfer(2,1,2048)
     read(ram+buf+36,0)
-    ssid=b'vphone-wifi'
+    ssid=target_ssid if target_ssid is not None else (b'second-wifi' if join_second else b'vphone-wifi')
     ioctl(26,struct.pack('<I',len(ssid))+ssid+bytes(32-len(ssid)))
     for event in (0,1,7,16):
         transfer(2,1,2048)
         read(ram+buf+32,event<<24)
-    read_bytes(ram+buf+30,b'\0\1')  # final WLC_E_LINK flags UP
+    read_bytes(ram+buf+30,b'\0\1')  # WLC_E_LINK flags UP
+    if join_second:
+        # Secured AP: the supplicant reports WLC_E_PSK_SUP / WLC_SUP_KEYED (6),
+        # otherwise Darwin reports an incorrect password.
+        transfer(2,1,2048)
+        read(ram+buf+32,46<<24)
+        read(ram+buf+36,6<<24)
+    # Verify GET_BSS_INFO (cmd 51) reports the joined AP
+    joined_ie_len = 2 + len(ssid) + 19 + (22 if join_second else 0)
+    ioctl(51, output=struct.pack('<III', 12 + 128 + joined_ie_len, 109, 1))
     # A real Ethernet ARP request to slirp's gateway, delivered through BDC.
     mac=bytes.fromhex('024334200002')
     arp = bytes.fromhex('ffffffffffff')+mac+bytes.fromhex('0806')
@@ -248,7 +267,47 @@ def runtime_fixture(enumeration_only=False):
 
 
 if __name__ == '__main__':
+    import json
+    import tempfile
     options=('-netdev', 'user,id=wifi0', '-machine', 'wifi-netdev=wifi0,wifi-ssid=vphone-wifi,wifi-rom=1')
     run_contract(fixture, 'PASS: HOST_READY connection ordering, high-speed reset, native descriptor/string/status/configuration sequence and DL_GETSTATE', options, result_address=0x800018000)
-    run_contract(runtime_fixture, 'PASS: TRX CRC download, runtime re-enumeration, CDC, join, slirp ARP and DHCP offer',
+    run_contract(runtime_fixture, 'PASS: TRX CRC download, runtime re-enumeration, CDC, join, slirp ARP and DHCP offer (fallback single AP)',
                  options, result_address=0x800018000)
+
+    # Multi-AP fixture: scan returns multiple APs, join second SSID, slirp traffic works
+    with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+        scan_data = {
+            "version": 1,
+            "updated": 1700000000,
+            "networks": [
+                {"ssid": "vphone-wifi", "channel": 6, "rssi": -45, "security": "open", "connected": True},
+                {"ssid": "second-wifi", "channel": 1, "rssi": -65, "security": "wpa2", "connected": False}
+            ]
+        }
+        json.dump(scan_data, f)
+        f.flush()
+        multi_options = ('-netdev', 'user,id=wifi0', '-machine', f'wifi-netdev=wifi0,wifi-ssid=vphone-wifi,wifi-rom=1,wifi-scan-file={f.name}')
+        run_contract(lambda: runtime_fixture(join_second=True),
+                     'PASS: Multi-AP scan result count, second SSID join, and slirp data path',
+                     multi_options, result_address=0x800018000)
+
+    # Invalid scan file fallback: invalid JSON falls back to single AP
+    with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+        f.write('{"version": 999, "networks": []}')
+        f.flush()
+        fallback_options = ('-netdev', 'user,id=wifi0', '-machine', f'wifi-netdev=wifi0,wifi-ssid=vphone-wifi,wifi-rom=1,wifi-scan-file={f.name}')
+        run_contract(runtime_fixture,
+                     'PASS: Invalid scan file fallback to single AP',
+                     fallback_options, result_address=0x800018000)
+
+    # Emoji SSID fixture: surrogate pair in JSON decoded to 4-byte UTF-8, scanned, joined, and slirp traffic works
+    with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+        f.write('{"version": 1, "updated": 1700000000, "networks": ['
+                '{"ssid": "\\uD83C\\uDF89-wifi", "channel": 6, "rssi": -45, "security": "open", "connected": true}'
+                ']}')
+        f.flush()
+        emoji_options = ('-netdev', 'user,id=wifi0', '-machine', f'wifi-netdev=wifi0,wifi-ssid=vphone-wifi,wifi-rom=1,wifi-scan-file={f.name}')
+        emoji_ssid = '🎉-wifi'.encode('utf-8')
+        run_contract(lambda: runtime_fixture(target_ssid=emoji_ssid),
+                     'PASS: Emoji SSID via JSON surrogate pair, scan decode, join, GET_BSS_INFO, and slirp data path',
+                     emoji_options, result_address=0x800018000)

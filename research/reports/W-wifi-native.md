@@ -182,3 +182,29 @@ VPHONE_DISPLAY=cocoa VPHONE_TCG_THREAD=multi backend/.venv/bin/python backend/di
   drains touch (`acceptance-touch-7`). Display-off itself was not re-tested on purpose (it would switch off the user's screen).
 - `WIFI escan done` and the `ns=` field on `WIFI iovar` lines are deliberate trace aids; drop them if the trace gets too noisy.
 - Still refused (tolerated by the driver): `pfn_set`, `btc_params`, `event_log_tag_control`, `awdl_*`, `mpc_dur`, `pwrstats`, `tlv`, `rssi_event` and a few PM knobs.
+
+---
+
+## 8. Follow-up: Host-Mirrored Wi-Fi Scan List (`feat/wifi-host-scan`)
+
+The initial native acceptance documented above verified a single synthetic open AP (`vphone-wifi`, channel 6, RSSI -45). Branch `feat/wifi-host-scan` extends this mechanism so the guest iOS 7.1.2 Wi-Fi list dynamically mirrors surrounding physical Wi-Fi networks discovered by the host Mac.
+
+### Architecture & Contract
+1. **JSON Contract (`build/wifi-scan.json`)**:
+   The host scanner produces an atomic JSON file consumed via `-machine wifi-scan-file=PATH`. The emulator re-reads this file on every `WLC_SCAN` / `escan` request:
+   ```json
+   {
+     "version": 1,
+     "updated": <epoch_seconds>,
+     "networks": [
+       {"ssid": "<1..32 UTF-8 bytes>", "channel": 1..14, "rssi": -100..-30, "security": "open|wpa|wpa2|wpa3|enterprise", "connected": bool}
+     ]
+   }
+   ```
+   Up to 16 BSS entries are populated; exactly one network marks `connected: true` (the host's active uplink). 5 GHz and 6 GHz networks are deterministically mapped into 2.4 GHz channels 1..14. Each network receives a stable synthetic BSSID derived from its SSID hash and pre-11ac legacy Darwin chanspec encoding.
+2. **macOS Location Permissions & Fallback**:
+   Querying nearby SSIDs on macOS via CoreWLAN requires Location Services permission. If authorization is absent, denied, or returns `<redacted>` / empty names, `host_wifi.py` automatically falls back to unprivileged discovery (`networksetup`, `wdutil info`, `system_profiler SPAirPortDataType`, or `VPHONE_WIFI_SSID`), providing the legacy single synthetic AP. An invalid or absent contract file also triggers this fallback.
+3. **Slirp NAT & Open Join Semantics**:
+   All internet traffic routes through the host via user-mode slirp NAT (`-netdev user,id=wifi0`), regardless of which network the guest selects. Joining non-connected networks emits standard 802.11 JOIN/ASSOC/LINK events and opens the slirp data path without performing WPA/WPA2/WPA3 4-way authentication.
+4. **Current Status**:
+   Host-mirrored scanning is verified through unit tests and synthetic contracts (`test_host_wifi.py`, `test_wifi_dongle.py`, `wifi_contract_test.py`). Native iOS 7.1.2 acceptance for host-mirrored scanning remains open pending a dedicated native recording.
