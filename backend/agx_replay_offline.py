@@ -233,8 +233,10 @@ def nc_sparse_layout(f, base, w, h):
 
 
 def decode_tsw(f, tsw):
-    if tsw[0] >> 28 != 6:
+    fmt = tsw[0] >> 28
+    if fmt != 6 and fmt != 3:
         return None
+    bpp = 1 if fmt == 3 else 4
     w = ((tsw[1] >> 2) & 0x3fff) + 1
     h = (tsw[1] >> 16) + 1
     q = tsw[2] | (tsw[3] << 32)
@@ -248,13 +250,13 @@ def decode_tsw(f, tsw):
     if strip:
         stride = 2560
     elif (tsw[0] & 7) == 1:
-        stride = ((w + 15) & ~15) * 4
+        stride = ((w + 15) & ~15) * bpp
     else:
-        pitch = ((tsw[2] & 0xffff) + 1) * 4
-        stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
+        pitch = ((tsw[2] & 0xffff) + 1) * bpp
+        stride = pitch if pitch >= w * bpp else ((w + 15) & ~15) * bpp
     nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride,
-                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or nc_sparse),
+    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, bpp=bpp,
+                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or (fmt == 3 and (tsw[0] & 7) == 1) or nc_sparse),
                 nc_sparse=nc_sparse, tsw=tsw)
 
 
@@ -778,6 +780,7 @@ def program(f, ppp):
 
 
 def texel(f, tex, x, y):
+    bpp = tex.get('bpp', 4)
     if tex.get('twiddled', False):
         offset, bit, mask = 0, 0, 1
         while mask < tex['w'] or mask < tex['h']:
@@ -788,15 +791,18 @@ def texel(f, tex, x, y):
                 offset |= bool(x & mask) << bit
                 bit += 1
             mask <<= 1
-        gva = tex['addr'] + offset * 4
+        gva = tex['addr'] + offset * bpp
     elif tex['strip']:
-        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * 4
+        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * bpp
     else:
-        gva = tex['addr'] + y * tex['stride'] + x * 4
+        gva = tex['addr'] + y * tex['stride'] + x * bpp
     try:
+        if bpp == 1:
+            a = f.read(gva, 1)[0]
+            return (0, 0, 0, a)
         return f.read(gva, 4)
     except KeyError:
-        return b'\0\0\0\0'
+        return (0, 0, 0, 0) if bpp == 1 else b'\0\0\0\0'
 
 
 def quad_coordinate(pixel, low, high, uv0, uv1):
@@ -1559,7 +1565,13 @@ def main():
                             b = (tb * a) // 255
                         elif tint != 0xffffffff:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
-                            b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
+                            if (b | g | r) == 0 and a != 0:
+                                a = (a * ta) // 255
+                                r = (tr * a) // 255
+                                g = (tg * a) // 255
+                                b = (tb * a) // 255
+                            else:
+                                b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4
                         if mask:
                             fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
