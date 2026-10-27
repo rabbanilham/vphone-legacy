@@ -640,13 +640,21 @@ final class Screen: NSView {
     override func mouseMoved(with event:NSEvent) {gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));updateOverlay()}
     override func mouseExited(with event:NSEvent) {gestures.hint(nil,option:false);updateOverlay()}
     override func scrollWheel(with event:NSEvent) {
-        guard !held,event.momentumPhase.isEmpty else {return}
+        guard !held else {return}
+        if !event.momentumPhase.isEmpty {
+            if gestures.kind == .scroll {
+                gestures.end()
+                updateOverlay()
+            }
+            return
+        }
         let wheel = event.phase.isEmpty
         let scale = event.hasPreciseScrollingDeltas ? 640/displayRect.width:40
-        let moves = wheel || event.phase.contains(.changed)
+        let moves = wheel || event.phase.contains(.changed) || event.phase.contains(.ended)
+        let isEnd = event.phase.contains(.ended) || event.phase.contains(.cancelled)
         gestures.scroll(guestPoint(event),dx:moves ? event.scrollingDeltaX*scale:0,dy:moves ? event.scrollingDeltaY*scale:0,
             begin:wheel ? gestures.kind == .none:event.phase.contains(.began),
-            end:event.phase.contains(.ended) || event.phase.contains(.cancelled),wheel:wheel)
+            end:isEnd,wheel:wheel)
         if wheel,gestures.kind == .wheel {
             wheelTimer?.invalidate()
             wheelTimer = Timer.scheduledTimer(withTimeInterval:0.15,repeats:false) {[weak self] _ in self?.gestures.end();self?.updateOverlay()}

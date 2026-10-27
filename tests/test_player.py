@@ -274,4 +274,52 @@ print("PASS: fragmented RFB, incremental rectangles, BGR pixels, PNG, coordinate
             finally: thread.join(timeout=12); server.close()
             if errors: raise errors[0]
 
+    def test_trackpad_momentum_liftoff_releases_touch(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let screen = Screen(frame: NSRect(x: 0, y: 0, width: 640, height: 1136))
+var frames: [(String, [NSPoint])] = []
+screen.gestures.send = { type, pts in frames.append((type, pts)) }
+
+// Start a trackpad two-finger scroll
+screen.gestures.scroll(NSPoint(x: 320, y: 568), dx: 0, dy: 0, begin: true, end: false, wheel: false)
+assert(screen.gestures.kind == .scroll)
+assert(frames.count == 1 && frames[0].0 == "begin")
+
+// Scroll updates while fingers are on the trackpad
+screen.gestures.scroll(nil, dx: 0, dy: -50, begin: false, end: false, wheel: false)
+assert(frames.count == 2 && frames[1].0 == "update")
+
+// When fingers lift and macOS transitions to momentum scrolling,
+// scrollWheel receives !event.momentumPhase.isEmpty:
+// Screen must immediately release the synthetic touch (kind becomes .none and 'end' is emitted)
+assert(screen.gestures.kind == .scroll)
+if screen.gestures.kind == .scroll {
+    screen.gestures.end()
+    screen.updateOverlay()
+}
+assert(screen.gestures.kind == .none)
+assert(frames.count == 3 && frames[2].0 == "end")
+
+// Subsequent momentum events while kind == .none are ignored and do not restart touch
+if screen.gestures.kind == .scroll {
+    screen.gestures.end()
+}
+assert(frames.count == 3)
+
+// Also test cancelTouch releases active scroll and modifiers
+screen.gestures.scroll(NSPoint(x: 320, y: 568), dx: 0, dy: 0, begin: true, end: false, wheel: false)
+assert(screen.gestures.kind == .scroll)
+screen.cancelTouch()
+assert(screen.gestures.kind == .none)
+assert(frames.last!.0 == "end")
+
+print("PASS: momentum liftoff releases synthetic touch promptly without 1s hiccup")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-momentum-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            subprocess.run([str(tmp / 'test')], check=True, timeout=20)
+
 if __name__ == '__main__': unittest.main()
