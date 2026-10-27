@@ -339,12 +339,6 @@ static bool multi_touch_active(const MultiTouch *m)
     return false;
 }
 
-static bool multi_touch_moved(const MultiTouchSlot *c)
-{
-    int dx = c->x - c->start_x, dy = c->y - c->start_y;
-    return dx > 10 || dx < -10 || dy > 10 || dy < -10;
-}
-
 static void multi_touch_start(MultiTouchSlot *c)
 {
     c->x = c->start_x = c->host_x;
@@ -357,7 +351,7 @@ static void multi_touch_start(MultiTouchSlot *c)
 static void multi_touch_sync(MultiTouch *m, bool allowed, int64_t now)
 {
     bool was_active = multi_touch_active(m);
-    bool any_pressed = false, moved = false, lifted = false;
+    bool any_pressed = false, lifted = false;
     for (unsigned i = 0; i < MULTI_TOUCH_SLOTS; i++) {
         MultiTouchSlot *c = &m->slot[i];
         if (!c->host_down) {
@@ -379,9 +373,12 @@ static void multi_touch_sync(MultiTouch *m, bool allowed, int64_t now)
             }
         }
         any_pressed |= c->pressed;
-        moved |= c->phase && multi_touch_moved(c);
     }
-    if (lifted && !any_pressed) { m->release_frames = moved ? 18 : 3; }
+    /* Trackpad scroll/pinch lifts with the finger's real velocity. Holding the
+     * contact still for settle frames (the mouse-swipe unlock path needs them)
+     * zeroes UIScrollView's release velocity and freezes the scroll until the
+     * frames drain, then it jumps on. */
+    if (lifted && !any_pressed) { m->release_frames = 0; }
     if (!was_active && multi_touch_active(m)) { m->due = now; }
 }
 

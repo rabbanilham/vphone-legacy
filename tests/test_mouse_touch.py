@@ -280,23 +280,20 @@ int main(void) {
     mtt(INPUT_MULTI_TOUCH_TYPE_END,0,0,0);
     mtt(INPUT_MULTI_TOUCH_TYPE_END,1,0,0);
     mouse_touch_handler.sync(&display);
-    for (int i=0; i<18; i++) {
-        tick(); contact(4+i,2,0,1,4,320,584); contact(4+i,2,1,2,4,320,584);
-    }
-    tick(); contact(22,2,1,2,4,320,584);
-    tick(); contact(23,2,0,1,7,320,584); contact(23,2,1,2,7,320,584);
+    /* Trackpad lifts carry the live velocity: no stationary settle frames. */
+    tick(); contact(4,2,0,1,4,320,584); contact(4,2,1,2,4,320,584);
+    tick(); contact(5,2,0,1,7,320,584); contact(5,2,1,2,7,320,584);
     assert(!multi_touch_active(&s.multi_touch) && deadline==-1);
     /* Re-touch while draining (quick flicks): up now, then a fresh start. */
     reset();
     finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
     tick(); tick();
     finger(0,32767,0,INPUT_MULTI_TOUCH_TYPE_END); mouse_touch_handler.sync(&display);
-    tick(); contact(3,1,0,1,4,640,16); /* settle */
+    tick(); contact(3,1,0,1,4,640,16);
     finger(0,0,32767,INPUT_MULTI_TOUCH_TYPE_BEGIN); mouse_touch_handler.sync(&display);
-    tick(); contact(4,1,0,1,4,640,16);
-    tick(); contact(5,1,0,1,7,640,16);
-    tick(); contact(6,1,0,1,1,0,1136);
-    tick(); contact(7,1,0,1,3,0,1136);
+    tick(); contact(4,1,0,1,7,640,16);
+    tick(); contact(5,1,0,1,1,0,1136);
+    tick(); contact(6,1,0,1,3,0,1136);
     /* A finger leaving a live pinch goes up at once; the other stays. */
     reset();
     finger(0,0,0,INPUT_MULTI_TOUCH_TYPE_BEGIN);
