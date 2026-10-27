@@ -1,0 +1,6 @@
+*.ppm
+*.bin
+*.stdout
+agx_dumps/
+after/
+before/

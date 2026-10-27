@@ -233,8 +233,10 @@ def nc_sparse_layout(f, base, w, h):
 
 
 def decode_tsw(f, tsw):
-    if tsw[0] >> 28 != 6:
+    fmt = tsw[0] >> 28
+    if fmt not in (6, 3):
         return None
+    bpp = 1 if fmt == 3 else 4
     w = ((tsw[1] >> 2) & 0x3fff) + 1
     h = (tsw[1] >> 16) + 1
     q = tsw[2] | (tsw[3] << 32)
@@ -248,13 +250,13 @@ def decode_tsw(f, tsw):
     if strip:
         stride = 2560
     elif (tsw[0] & 7) == 1:
-        stride = ((w + 15) & ~15) * 4
+        stride = ((w + 15) & ~15) * bpp
     else:
-        pitch = ((tsw[2] & 0xffff) + 1) * 4
-        stride = pitch if pitch >= w * 4 else ((w + 15) & ~15) * 4
+        pitch = ((tsw[2] & 0xffff) + 1) * bpp
+        stride = pitch if pitch >= w * bpp else ((w + 15) & ~15) * bpp
     nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride,
-                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or nc_sparse),
+    return dict(w=w, h=h, addr=addr, bpp=bpp, strip=strip, stride=stride,
+                twiddled=not strip and (((tsw[0] & 0x8007) == 0x8001) or ((tsw[0] >> 24) & 0xf) == 8 or nc_sparse),
                 nc_sparse=nc_sparse, tsw=tsw)
 
 
@@ -304,7 +306,7 @@ def texture(f, ppp, prog=None):
                 if tex:
                     # Trailing constants may be the next draw's allocation.
                     tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog == STRIDE36_DUAL_TEX
-                    if prog == STRIDE36_DUAL_TEX and len(ws) >= 8:
+                    if prog in (STRIDE36_DUAL_TEX, CORNER_RESTORE) and len(ws) >= 8:
                         tex['mask_tex'] = decode_tsw(f, ws[4:8])
                     sampler = None
                     if k >= 4:
@@ -343,6 +345,7 @@ PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
 STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
+CORNER_RESTORE = 0x03a2edd2a4d84437  # CA dual-texture corner restore (backdrop + mask)
 
 
 
@@ -778,6 +781,7 @@ def program(f, ppp):
 
 
 def texel(f, tex, x, y):
+    bpp = tex.get('bpp', 4)
     if tex.get('twiddled', False):
         offset, bit, mask = 0, 0, 1
         while mask < tex['w'] or mask < tex['h']:
@@ -788,13 +792,17 @@ def texel(f, tex, x, y):
                 offset |= bool(x & mask) << bit
                 bit += 1
             mask <<= 1
-        gva = tex['addr'] + offset * 4
+        gva = tex['addr'] + offset * bpp
     elif tex['strip']:
-        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * 4
+        gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * bpp
     else:
-        gva = tex['addr'] + y * tex['stride'] + x * 4
+        gva = tex['addr'] + y * tex['stride'] + x * bpp
     try:
-        return f.read(gva, 4)
+        raw = f.read(gva, bpp)
+        if bpp == 1:
+            a = raw[0]
+            return bytes((a, a, a, a))
+        return raw
     except KeyError:
         return b'\0\0\0\0'
 
@@ -997,6 +1005,8 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         if stride == 36 and prog == STRIDE36_DUAL_TEX:
             return 'replayed exactly: dual-texture vibrancy (stride=36)', {'prog': hex(prog)}
         return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
+    elif stride == 36 and prog == CORNER_RESTORE:
+        return 'replayed exactly: corner restore (backdrop + mask)', {'prog': hex(prog)}
     elif prog == COLOR_MATRIX:
         return 'replayed exactly: color matrix (saturation & tint)', {'prog': hex(prog)}
     elif prog == ROUNDED_CAPS:
@@ -1452,6 +1462,14 @@ def main():
                 tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
                 mask = prog == DEST_IN
 
+                uv2_map = None
+                u2_0, u2_1, v2_0, v2_1 = 0, 1, 0, 1
+                if stride == 36 and prog == CORNER_RESTORE:
+                    uv2s = [struct.unpack_from('<2f', v[2], 12) for v in q_vs]
+                    u2_0, u2_1 = min(u for u, _ in uv2s), max(u for u, _ in uv2s)
+                    v2_0, v2_1 = min(v for _, v in uv2s), max(v for _, v in uv2s)
+                    uv2_map = quad_affine(list(zip(xs, ys))[:3], uv2s[:3]) if len(uv2s) >= 3 else None
+
                 sub_w = (u1 - u0) * su
                 sub_h = (v1 - v0) * sv
                 is_scaled = abs((max(xs) - min(xs)) - sub_w) > 0.1 or abs((max(ys) - min(ys)) - sub_h) > 0.1
@@ -1486,6 +1504,8 @@ def main():
                 for y in range(y0, y1):
                     fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
                           quad_coordinate(y, min(ys), max(ys), v0, v1)) * sv
+                    if tex.get('bpp') == 1 and tex['w'] == 256 and tex['h'] == 256:
+                        fv += 0.25 * sv
                     if is_scaled and not blurred_tex:
                         v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
                         ty0 = int(v_sample)
@@ -1564,7 +1584,25 @@ def main():
                         if mask:
                             fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                             continue
-                        if tex.get('vibrancy'):
+                        if stride == 36 and prog == CORNER_RESTORE and tex.get('mask_tex'):
+                            mask_tex = tex['mask_tex']
+                            fu2 = ((uv2_map[0] * (x + 0.5) + uv2_map[1] * (y + 0.5) + uv2_map[2]) if uv2_map else
+                                   quad_coordinate(x, min(xs), max(xs), u2_0, u2_1))
+                            fv2 = ((uv2_map[4] * (y + 0.5) + uv2_map[5]) if uv2_map else
+                                   quad_coordinate(y, min(ys), max(ys), v2_0, v2_1))
+                            tx2 = max(0, min(mask_tex['w'] - 1, int(round(fu2 * mask_tex['w']))))
+                            ty2 = max(0, min(mask_tex['h'] - 1, int(round((fv2 + 0.25) * mask_tex['h']))))
+                            m_b, m_g, m_r, m_a = texel(f, mask_tex, tx2, ty2)
+                            inv_a = 255 - m_a
+                            sb = b * inv_a // 255
+                            sg = g * inv_a // 255
+                            sr = r * inv_a // 255
+                            sa = a * inv_a // 255
+                            fb[d + 0] = min(255, sb + fb[d + 0])
+                            fb[d + 1] = min(255, sg + fb[d + 1])
+                            fb[d + 2] = min(255, sr + fb[d + 2])
+                            fb[d + 3] = min(255, sa + fb[d + 3])
+                        elif tex.get('vibrancy'):
                             if stride == 36 and prog == STRIDE36_DUAL_TEX and tex.get('mask_tex'):
                                 mask_tex = tex['mask_tex']
                                 m_b, m_g, m_r, m_a = texel(f, mask_tex, tx, ty)
