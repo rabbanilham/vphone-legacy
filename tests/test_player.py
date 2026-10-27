@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MODULE_CACHE = Path(tempfile.gettempdir()) / f'vphone-mc-{ROOT.name}'
+MODULE_CACHE.mkdir(exist_ok=True)
 
 class PlayerTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('VPHONE_NATIVE_UI_TESTS') == '1',
@@ -91,7 +93,7 @@ print("PASS: initial window click, native drag/release, resize, letterbox and fo
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-native-') as tmp:
             tmp = Path(tmp)
             (tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),
                             str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test'),str(tmp/'missing-vnc'),str(tmp/'missing-qmp')],check=True,timeout=20)
 
@@ -157,7 +159,7 @@ print("PASS: wt/touch scroll, wheel, mirrored pinch, shifted pan, magnify, cance
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-gestures-') as tmp:
             tmp = Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test')],check=True,timeout=20)
 
     def test_control_center_waits_for_digitizer_and_preserves_active_app(self):
@@ -173,7 +175,7 @@ print("PASS: ready guest keeps app context; gated digitizer gets Home wake and r
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-ready-') as tmp:
             tmp=Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             server=socket.socket(socket.AF_UNIX);server.bind(str(tmp/'qmp'));server.listen()
             errors=[];downs=[]
             def serve():
@@ -232,7 +234,7 @@ print("PASS: fragmented RFB, incremental rectangles, BGR pixels, PNG, coordinate
         with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-test-') as tmp:
             tmp = Path(tmp)
             (tmp / 'main.swift').write_text(source + harness)
-            subprocess.run(['swiftc', '-module-cache-path', str(ROOT/'build/player/module-cache'), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
             errors = []
             server = socket.socket(socket.AF_UNIX)
             server.bind(str(tmp/'vnc')); server.listen()
