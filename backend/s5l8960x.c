@@ -5768,6 +5768,7 @@ static uint64_t agx_surface_gva(const AGXSurface *sf, unsigned x, unsigned y)
 typedef struct AGXTexture {
     uint64_t addr;
     uint32_t w, h, stride;
+    uint32_t bpp;               /* bytes per pixel: 1 (A8 / L8) or 4 (BGRA) */
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
     bool twiddled;              /* layout-1 texture/target, Y-first Morton order */
     bool linear_filter;         /* sampler word 1 bits [5:4] or [7:6] == 1 */
@@ -5786,10 +5787,12 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 {
     uint64_t q = tsw[2] | ((uint64_t)tsw[3] << 32);
     hwaddr pa;
+    uint32_t fmt = tsw[0] >> 28;
 
-    if (tsw[0] >> 28 != 6) {
+    if (fmt != 6 && fmt != 3) {
         return false;
     }
+    tex->bpp = (fmt == 3) ? 1 : 4;
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
@@ -5803,16 +5806,23 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->strip = sf.strip;
     tex->nc_sparse = !sf.strip && (tsw[0] & 0x8007) == 1 &&
                      agx_nc_sparse_layout(s, cat, tex->addr, tex->w, tex->h);
-    tex->twiddled = !sf.strip && ((tsw[0] & 0x8007) == 0x8001 || tex->nc_sparse);
+    tex->twiddled = !sf.strip && ((tsw[0] & 0x8007) == 0x8001 || (fmt == 3 && (tsw[0] & 7) == 1) || tex->nc_sparse);
     if (sf.strip) {
         tex->stride = sf.pitch;
     } else if ((tsw[0] & 7) == 1) {
-        tex->stride = ((tex->w + 15) & ~15u) * 4;
+        tex->stride = tex->bpp == 1 ? ((tex->w + 15) & ~15u) : ((tex->w + 15) & ~15u) * 4;
     } else {
         /* Linear textures carry (pitch in pixels - 1) in word 2 bits [15:0]. */
-        tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
-        if (tex->stride < tex->w * 4) {
-            tex->stride = ((tex->w + 15) & ~15u) * 4;
+        if (tex->bpp == 1) {
+            tex->stride = (tsw[2] & 0xffff) + 1;
+            if (tex->stride < tex->w) {
+                tex->stride = (tex->w + 15) & ~15u;
+            }
+        } else {
+            tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
+            if (tex->stride < tex->w * 4) {
+                tex->stride = ((tex->w + 15) & ~15u) * 4;
+            }
         }
     }
     return tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa);
@@ -5941,6 +5951,7 @@ static bool agx_replay_decode_mask_tsw(A7State *s, uint64_t cat, const uint32_t 
 
 static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
 {
+    unsigned bpp = tex->bpp ? tex->bpp : 4;
     if (tex->twiddled) {
         uint64_t offset = 0;
         unsigned bit = 0;
@@ -5950,12 +5961,12 @@ static uint64_t agx_texel_gva(const AGXTexture *tex, uint32_t x, uint32_t y)
             if (mask < tex->h) { offset |= (uint64_t)!!(y & mask) << bit++; }
             if (mask < tex->w) { offset |= (uint64_t)!!(x & mask) << bit++; }
         }
-        return tex->addr + offset * 4;
+        return tex->addr + offset * bpp;
     }
     if (tex->strip) {
-        return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * 4;
+        return tex->addr + (uint64_t)(y >> 4) * 0x10000 + (y & 15) * tex->stride + x * bpp;
     }
-    return tex->addr + (uint64_t)y * tex->stride + x * 4;
+    return tex->addr + (uint64_t)y * tex->stride + x * bpp;
 }
 
 static __thread uint32_t agx_morton_x_lut[4096];
@@ -5987,7 +5998,19 @@ static void agx_update_morton_lut(uint32_t w, uint32_t h)
 static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
                             unsigned y, uint32_t *out)
 {
+    unsigned bpp = tex->bpp ? tex->bpp : 4;
     if (!tex->twiddled) {
+        if (bpp == 1) {
+            uint8_t row_bytes[4096];
+            if (tex->w > sizeof(row_bytes) ||
+                !agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), row_bytes, tex->w)) {
+                return false;
+            }
+            for (unsigned x = 0; x < tex->w; x++) {
+                out[x] = (uint32_t)row_bytes[x] << 24;
+            }
+            return true;
+        }
         return agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), out, tex->w * 4);
     }
     if (tex->w <= 4096) {
@@ -6004,14 +6027,26 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
         uint8_t page[4096];
         uint64_t cached = UINT64_MAX;
         uint64_t base_addr = tex->addr;
-        for (unsigned x = 0; x < tex->w; x++) {
-            uint64_t gva = base_addr + ((y_offset | (uint64_t)agx_morton_x_lut[x]) << 2);
-            uint64_t base = gva & ~UINT64_C(0xfff);
-            if (base != cached) {
-                if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
-                cached = base;
+        if (bpp == 1) {
+            for (unsigned x = 0; x < tex->w; x++) {
+                uint64_t gva = base_addr + (y_offset | (uint64_t)agx_morton_x_lut[x]);
+                uint64_t base = gva & ~UINT64_C(0xfff);
+                if (base != cached) {
+                    if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+                    cached = base;
+                }
+                out[x] = (uint32_t)page[gva & 0xfff] << 24;
             }
-            out[x] = ldl_le_p(page + (gva & 0xfff));
+        } else {
+            for (unsigned x = 0; x < tex->w; x++) {
+                uint64_t gva = base_addr + ((y_offset | (uint64_t)agx_morton_x_lut[x]) << 2);
+                uint64_t base = gva & ~UINT64_C(0xfff);
+                if (base != cached) {
+                    if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
+                    cached = base;
+                }
+                out[x] = ldl_le_p(page + (gva & 0xfff));
+            }
         }
         return true;
     }
@@ -6023,7 +6058,11 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
             if (!agx_ctx_read(s, cat, base, page, sizeof(page))) { return false; }
             cached = base;
         }
-        out[x] = ldl_le_p(page + (gva & 0xfff));
+        if (bpp == 1) {
+            out[x] = (uint32_t)page[gva & 0xfff] << 24;
+        } else {
+            out[x] = ldl_le_p(page + (gva & 0xfff));
+        }
     }
     return true;
 }
@@ -8377,11 +8416,19 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t b = (tint_b * a) / 255;
                             src = (a << 24) | (r << 16) | (g << 8) | b;
                         } else if (tint != 0xffffffff) {
-                            uint32_t b = ((src & 0xff) * tint_b) / 255;
-                            uint32_t g = (((src >> 8) & 0xff) * tint_g) / 255;
-                            uint32_t r = (((src >> 16) & 0xff) * tint_r) / 255;
-                            uint32_t a = ((src >> 24) * tint_a) / 255;
-                            src = b | (g << 8) | (r << 16) | (a << 24);
+                            if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
+                                uint32_t a = ((src >> 24) * tint_a) / 255;
+                                uint32_t r = (tint_r * a) / 255;
+                                uint32_t g = (tint_g * a) / 255;
+                                uint32_t b = (tint_b * a) / 255;
+                                src = (a << 24) | (r << 16) | (g << 8) | b;
+                            } else {
+                                uint32_t b = ((src & 0xff) * tint_b) / 255;
+                                uint32_t g = (((src >> 8) & 0xff) * tint_g) / 255;
+                                uint32_t r = (((src >> 16) & 0xff) * tint_r) / 255;
+                                uint32_t a = ((src >> 24) * tint_a) / 255;
+                                src = b | (g << 8) | (r << 16) | (a << 24);
+                            }
                         }
                         if (dest_in) {
                             uint32_t a = src >> 24;
