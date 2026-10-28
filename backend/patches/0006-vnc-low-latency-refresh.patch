@@ -1,22 +1,26 @@
 diff --git a/ui/vnc.c b/ui/vnc.c
-index 656768f..00f20d1 100644
 --- a/ui/vnc.c
 +++ b/ui/vnc.c
-@@ -58,8 +58,15 @@
- #include "io/dns-resolver.h"
- #include "monitor/monitor.h"
- 
--#define VNC_REFRESH_INTERVAL_BASE GUI_REFRESH_INTERVAL_DEFAULT
--#define VNC_REFRESH_INTERVAL_INC  50
-+/*
-+ * vphone: poll at 8 ms with no idle back-off. Upstream starts at 30 ms and
-+ * backs off by 50 ms per idle tick up to 3 s; input that arrives over QMP
-+ * (gestures) never resets that, so the first frame after a touch could wait
-+ * seconds. The machine's display_update skips unchanged rows, so an idle
-+ * tick costs one framebuffer compare.
+@@ -3096,3 +3096,22 @@
++/* Called by s5l8960x at vblank, with BQL held. Keep upstream refresh as a
++ * fallback for connect, paused consoles, worker contention and other boards;
++ * do not use an unconditional 8 ms framebuffer poll. Socket input remains
++ * driven by its existing fd handlers, independently of display refresh.
 + */
-+#define VNC_REFRESH_INTERVAL_BASE 8
-+#define VNC_REFRESH_INTERVAL_INC  0
- #define VNC_REFRESH_INTERVAL_MAX  GUI_REFRESH_INTERVAL_IDLE
- static const struct timeval VNC_REFRESH_STATS = { 0, 500000 };
- static const struct timeval VNC_REFRESH_LOSSY = { 2, 0 };
++void vphone_vnc_refresh(QemuConsole *con);
++void vphone_vnc_refresh(QemuConsole *con)
++{
++    VncDisplay *vd;
++
++    QTAILQ_FOREACH(vd, &vnc_displays, next) {
++        if (!QTAILQ_EMPTY(&vd->clients) &&
++            (vd->dcl.con == con ||
++             (!vd->dcl.con && con == qemu_console_lookup_default()))) {
++            vnc_refresh(&vd->dcl);
++        }
++    }
++}
++
+ static void vnc_connect(VncDisplay *vd, QIOChannelSocket *sioc,
+                         bool skipauth, bool websocket)
+ {

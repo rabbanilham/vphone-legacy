@@ -669,6 +669,13 @@ struct A7State {
     uint32_t ipi[2], ipi_mask[2];
     bool timer_level[2][2];
     QEMUTimer *vblank_timer;
+    int64_t vblank_deadline_ns;
+    /* Wall-clock interval histograms: 100 us bins, final bin overflows. */
+    struct {
+        int64_t last_ns;
+        uint64_t bins[1024], count, max_ns;
+    } pacing[2]; /* vblank, completed swap */
+    int64_t pacing_report_ns;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
     uint64_t agx_cat_base;
@@ -9783,9 +9790,60 @@ static void a7_wifi_patch_mac(A7State *s)
     fprintf(stderr, "WIFI DeviceTree: local-mac-address not found in PA 0x8018d0000..0x8018e0000\n");
 }
 
+/* Pacing statistics never feed guest clocks or interrupt decisions. */
+static void pacing_sample(A7State *s, unsigned kind, int64_t now)
+{
+    if (!s->agx_perf_enabled) {
+        return;
+    }
+    if (s->pacing[kind].last_ns) {
+        uint64_t dt = now - s->pacing[kind].last_ns;
+        s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
+        s->pacing[kind].count++;
+        s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
+    }
+    s->pacing[kind].last_ns = now;
+}
+
+static void pacing_report(A7State *s, int64_t now)
+{
+    if (!s->agx_perf_enabled || now - s->pacing_report_ns < 5000000000LL) {
+        return;
+    }
+    s->pacing_report_ns = now;
+    for (unsigned k = 0; k < 2; k++) {
+        uint64_t n = s->pacing[k].count, cumulative = 0;
+        double quantile[3] = { 0 };
+        const unsigned percent[] = { 50, 95, 99 };
+        unsigned q = 0;
+        for (unsigned b = 0; b < 1024; b++) {
+            cumulative += s->pacing[k].bins[b];
+            while (n && q < 3 && cumulative >= (n * percent[q] + 99) / 100) {
+                /* Upper bound of bin; overflow uses the observed maximum. */
+                quantile[q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
+                                                          (b + 1) / 10.0;
+            }
+        }
+        fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
+                " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
+                k ? "swap-complete" : "vblank", n,
+                quantile[0], quantile[1], quantile[2],
+                s->pacing[k].max_ns / 1e6);
+        memset(s->pacing[k].bins, 0, sizeof(s->pacing[k].bins));
+        s->pacing[k].count = s->pacing[k].max_ns = 0;
+    }
+}
+
+#ifdef CONFIG_VNC
+/* Patch 0006: flush VNC after the display producer, under the BQL. */
+void vphone_vnc_refresh(QemuConsole *con);
+#endif
+
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
+    int64_t wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    pacing_sample(s, 0, wall_ns);
     agx_drain_context_ring(s);
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
@@ -9808,6 +9866,7 @@ static void vblank_timer_cb(void *opaque)
                 *(uint32_t *)(p->regs + 0x1048) = s->disp_token;
                 qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
+                pacing_sample(s, 1, wall_ns);
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;
             }
@@ -9827,7 +9886,16 @@ static void vblank_timer_cb(void *opaque)
         a7_wifi_patch_mac(s);
         s->wifi_mac_patched = true;
     }
-    timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
+    /* Preserve phase on the virtual clock, including across WFI. A late
+     * callback must not permanently add host wake-up latency to every frame.
+     * Retain overdue ticks (and IRQ/draw ordering), never jump over them.
+     */
+    s->vblank_deadline_ns += 16666667;
+    timer_mod(s->vblank_timer, s->vblank_deadline_ns);
+    pacing_report(s, wall_ns);
+#ifdef CONFIG_VNC
+    vphone_vnc_refresh(s->con);
+#endif
 }
 
 static void a7_reset(void *opaque)
@@ -9876,7 +9944,10 @@ static void a7_reset(void *opaque)
     s->sep.os_active_timer = sep_os_timer;
     if (s->vblank_timer) {
         timer_del(s->vblank_timer);
-        timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
+        s->vblank_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667;
+        timer_mod(s->vblank_timer, s->vblank_deadline_ns);
+        memset(s->pacing, 0, sizeof(s->pacing));
+        s->pacing_report_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     }
     if (s->agx_meta_timer) {
         timer_del(s->agx_meta_timer);

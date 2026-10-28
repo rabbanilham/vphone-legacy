@@ -127,6 +127,22 @@ def stop(bundle, force=False):
     raise ValueError("Runtime status is stale; no active launcher owns this VM")
 
 
+def host_launch_command(command):
+    """Opt in to clearing inherited Darwin background policy before exec.
+
+    Thread QoS is set in QEMU; taskpolicy -B only clears Darwin background
+    policy and does not grant a QoS class. Keep argv structured (no shell).
+    """
+    policy = os.environ.get("VPHONE_TASKPOLICY", "inherit")
+    if policy not in ("inherit", "foreground"):
+        raise ValueError("VPHONE_TASKPOLICY must be inherit or foreground")
+    if policy == "foreground":
+        if sys.platform != "darwin":
+            raise ValueError("VPHONE_TASKPOLICY=foreground requires macOS")
+        return ["/usr/bin/taskpolicy", "-B", *command]
+    return command
+
+
 def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False):
     bundle = Path(bundle).resolve()
     report = validate_bundle(bundle)
@@ -221,6 +237,7 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
                 sys.path.insert(0, str(backend_dir))
             from host_wifi import configure_wifi
             child_env = configure_wifi(command, wifi)
+            command = host_launch_command(command)
             write_json(logs / "command.json", command)
             write_json(bundle / "runtime.json", status)
             print("Launching original secure monitor and XNU on experimental A7; no boot/UI readiness claimed.", flush=True)
