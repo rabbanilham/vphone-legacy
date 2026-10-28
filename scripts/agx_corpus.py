@@ -443,10 +443,19 @@ def main():
     parser.add_argument('--scene', action='append', choices=list(SCENES))
     parser.add_argument('--per-at', type=int, default=2)
     parser.add_argument('--min-draws', type=int, default=1)
+    parser.add_argument('--texture-audit', type=Path,
+                        help='Print per-draw texture/layout state for one AGXF dump and exit')
     parser.add_argument('--jobs', type=int, default=os.cpu_count())
     parser.add_argument('--single', action='store_true',
                         help='replay each dump on its own memory instead of chaining a scene')
     args = parser.parse_args()
+    if args.texture_audit:
+        sys.path.insert(0, str(BACKEND))
+        from agx_frame import Frame
+        from agx_replay_offline import texture_diagnostics
+        for record in texture_diagnostics(Frame(args.texture_audit)):
+            print(json.dumps(record))
+        return
     if args.command == 'capture':
         capture(args)
     else:

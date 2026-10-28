@@ -234,9 +234,12 @@ def nc_sparse_layout(f, base, w, h):
 
 def decode_tsw(f, tsw):
     fmt = tsw[0] >> 28
-    if fmt != 6 and fmt != 3:
+    # WebKit's U8 coverage atlas replicates the byte into alpha through
+    # swizzle 0x16d00. Do not accept arbitrary format-0 words as descriptors.
+    coverage = fmt == 0 and (tsw[0] & ~7) == 0x16d00
+    if fmt not in (6, 3) and not coverage:
         return None
-    bpp = 1 if fmt == 3 else 4
+    bpp = 1 if fmt == 3 or coverage else 4
     w = ((tsw[1] >> 2) & 0x3fff) + 1
     h = (tsw[1] >> 16) + 1
     q = tsw[2] | (tsw[3] << 32)
@@ -256,7 +259,7 @@ def decode_tsw(f, tsw):
         stride = pitch if pitch >= w * bpp else ((w + 15) & ~15) * bpp
     nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
     return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, bpp=bpp,
-                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or (fmt == 3 and (tsw[0] & 7) == 1) or nc_sparse),
+                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or (bpp == 1 and (tsw[0] & 7) == 1) or nc_sparse),
                 nc_sparse=nc_sparse, tsw=tsw)
 
 
@@ -338,6 +341,8 @@ WALLPAPER = 0x789b8f08a3f3a8cd  # observed CoreImage XY/UV clip-space pass
 COPY = 0x99d4fcf52a8c2ef3  # CA solid source-copy padding clear (including alpha zero)
 DEST_IN = 0x4ee01acc47551344  # USC fingerprint of CA's mask shader: D *= texel alpha
 SPANS = 0x1a20cc29e8fcc15b  # 1-pixel horizontal spans for glyph rows
+WEBKIT_SPANS = 0x84102d511f2a41bb  # rounded image-mask coverage spans
+WEBKIT_STRIPS = 0x4eb8837dc2079f95  # gradient strips consuming the rounded mask
 PLUS_L = 0x5b133ef7e0c3428c  # CoreAnimation plus-lighter compositing filter
 PLUS_L2 = 0xa225a18725e48d5c  # CoreAnimation plus-lighter gradient variant
 SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
@@ -345,6 +350,7 @@ PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
 STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
+WEBKIT_GLYPHS = 0x3064a456731fc3e3  # normalized U8 atlas coverage times RGBA vertex tint
 
 
 
@@ -857,7 +863,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
     nc_normalized = (nc_context and stride == 24 and prog == 0x8eb52cf6fe248b1d and
                      nc_copy_texmat(f, vs_data, copy_texmat_state if copy_texmat_state is not None else {}))
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
-    if stride == 16 and prog == SPANS:
+    if stride == 16 and prog in (SPANS, WEBKIT_SPANS):
         return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
     if stride == 36 and prog == PILL_BORDER:
         return 'replayed exactly: pill border (stride=36)', {'count': count, 'prog': hex(prog)}
@@ -1030,6 +1036,45 @@ def audit_frame(f):
     return outcomes
 
 
+def is_webkit_upload(f, prog, matrix, tex):
+    """Observed padded upload atlases, excluding generated 96x96 masks."""
+    return bool(tex and (tex['tsw'][0] & 7) == 1 and
+                not (tex['w'] & (tex['w'] - 1)) and not (tex['h'] & (tex['h'] - 1)) and
+                f.header.get('context_id', 1) != 1 and matrix and matrix[1] < 0 and
+                prog == 0x8eb52cf6fe248b1d)
+
+
+def texture_diagnostics(f):
+    """Describe the selected texture state per draw without rendering pixels."""
+    retained = [0] * 32
+    last_matrix = None
+    for index, (vs_data, ppp, draw, _) in enumerate(walk(f)):
+        update_ppp_state(retained, ppp)
+        prog = program(f, retained) or program(f, ppp)
+        tex = texture(f, retained, prog) or texture(f, ppp, prog)
+        matrix = find_matrix(f, vs_data)
+        if matrix:
+            last_matrix = matrix
+        elif prog in (WEBKIT_GLYPHS, 0x8eb52cf6fe248b1d):
+            matrix = last_matrix
+        upload = is_webkit_upload(f, prog, matrix, tex)
+        if tex and upload and (tex['tsw'][0] & 7) == 1 and not tex['strip']:
+            tex['twiddled'] = True
+        record = dict(draw=index, program=hex(prog), vertex_stride=f.u32(vs_data),
+                      vertex_count=draw[1], texture=None)
+        if tex:
+            tsw = tex['tsw']
+            record['texture'] = dict(
+                format=tsw[0] >> 28, layout=hex(tsw[0] & 0x8007),
+                width=tex['w'], height=tex['h'], pitch_word=hex(tsw[2]),
+                stride=tex['stride'], bpp=tex['bpp'], address=hex(tex['addr']),
+                twiddled=tex['twiddled'], strip=tex['strip'],
+                nc_sparse=tex['nc_sparse'], tsw=[hex(w) for w in tsw],
+                rgba_upload=upload,
+                sampler=tex['sampler']['words'] if tex.get('sampler') else None)
+        yield record
+
+
 def render_target_texture(f, width, height):
     """Decode PBE layout, changing only the proved sparse NC targets."""
     target = f.header['pbe_target']
@@ -1131,12 +1176,16 @@ def main():
             m = find_matrix(f, vs_data)
             if m:
                 last_m = m
-            elif stride == 16 and prog == SPANS and last_m:
+            elif (stride == 16 and prog in (SPANS, WEBKIT_SPANS) or prog in (WEBKIT_GLYPHS, WEBKIT_STRIPS) or
+                  f.header.get('context_id', 1) != 1 and prog == 0x8eb52cf6fe248b1d) and last_m:
                 m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)
         if not tex:
             tex = texture(f, ppp) or texture(f, retained_ppp)
+        webkit_upload = is_webkit_upload(f, prog, m, tex)
+        if (tex and webkit_upload and (tex['tsw'][0] & 7) == 1 and not tex['strip']):
+            tex['twiddled'] = True
         is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)
         if is_color_matrix:
             cm = extract_color_matrix(f, ppp)
@@ -1144,7 +1193,7 @@ def main():
         if stride == 16:
             if prog == WALLPAPER:
                 m = (1, 1, 0, 0)
-            elif prog == SPANS:
+            elif prog in (SPANS, WEBKIT_SPANS):
                 for k in range(0, count, 2):
                     if k + 1 >= len(vs):
                         break
@@ -1456,6 +1505,8 @@ def main():
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
                 tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
+                if prog == WEBKIT_GLYPHS:
+                    tint = (tint & 0xff00ff00) | ((tint & 0xff) << 16) | ((tint >> 16) & 0xff)
                 mask = prog == DEST_IN
 
                 sub_w = (u1 - u0) * su
@@ -1540,7 +1591,7 @@ def main():
                         else:
                             tx = max(0, min(tex['w'] - 1, int(fu)))
                             b, g, r, a = row0[tx]
-                        if stride == 16 and prog == WALLPAPER:
+                        if stride == 16 and prog == WALLPAPER or webkit_upload:
                             b, r = r, b     # CoreImage wallpaper source is RGBA
                         if is_color_matrix:
                             rin = r / 255.0
@@ -1563,7 +1614,7 @@ def main():
                             r = (tr * a) // 255
                             g = (tg * a) // 255
                             b = (tb * a) // 255
-                        elif tint != 0xffffffff:
+                        elif tint != 0xffffffff or tex.get('bpp') == 1:
                             tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
                             if (b | g | r) == 0 and a != 0:
                                 a = (a * ta) // 255
