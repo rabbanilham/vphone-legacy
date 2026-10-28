@@ -129,7 +129,7 @@ SCENES = {
     # Settings: toggle Airplane Mode (UISwitch off -> on animation and settled).
     'switch': {
         'touch': UNLOCK + '|at=111;tap 600,900|at=119;tap 600,900|at=127;tap 600,900'
-                          '|at=130;tap 245,815|at=145;tap 560,155',
+                          '|at=130;tap 245,815|at=145;tap 560,233',
         'at': [144, 145.3, 145.8, 146.5, 148, 152],
         'per_at': 40,
         'display_only': False,
