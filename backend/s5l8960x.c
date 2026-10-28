@@ -6601,9 +6601,27 @@ static uint32_t agx_sample_downsample(const uint32_t *buf, uint32_t w, uint32_t 
     return src;
 }
 
-static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
+typedef struct AGXBlurTapX {
+    uint32_t x0_p, x1_p;
+    uint32_t x0_n, x1_n;
+    int w_p, w_n;
+} AGXBlurTapX;
+
+typedef struct AGXBlurTapY {
+    size_t row0_p, row1_p;
+    size_t row0_n, row1_n;
+    int w_p, w_n;
+} AGXBlurTapY;
+
+static __thread AGXBlurTapX *agx_blur_taps_x = NULL;
+static __thread size_t agx_blur_taps_x_cap = 0;
+
+static inline __attribute__((always_inline)) uint32_t agx_sample_1d_fast(uint32_t c0, uint32_t c1, int w)
 {
-    int w = (int)(frac * 256.0f + 0.5f);
     if (w == 0 || c0 == c1) {
         return c0;
     }
@@ -6615,6 +6633,12 @@ static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
     return b | (g << 8) | (r << 16) | (a << 24);
 }
 
+static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+{
+    int w = (int)(frac * 256.0f + 0.5f);
+    return agx_sample_1d_fast(c0, c1, w);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
@@ -6622,41 +6646,61 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
     if (!n_taps || !w || !h) return;
     if (is_vertical) {
         for (uint32_t y = 0; y < h; y++) {
-            uint32_t y0_pos[8], y1_pos[8], y0_neg[8], y1_neg[8];
-            float fy_pos[8], fy_neg[8];
+            AGXBlurTapY taps[8];
             for (unsigned t = 0; t < n_taps; t++) {
                 float off = offsets[t];
                 float fv_p = (float)y + off;
                 if (fv_p < 0.0f) fv_p = 0.0f;
                 if (fv_p > (float)(h - 1)) fv_p = (float)(h - 1);
-                y0_pos[t] = (uint32_t)fv_p;
-                y1_pos[t] = y0_pos[t] + 1 < h ? y0_pos[t] + 1 : y0_pos[t];
-                fy_pos[t] = fv_p - (float)y0_pos[t];
+                uint32_t y0_p = (uint32_t)fv_p;
+                uint32_t y1_p = y0_p + 1 < h ? y0_p + 1 : y0_p;
+                taps[t].row0_p = (size_t)y0_p * w;
+                taps[t].row1_p = (size_t)y1_p * w;
+                taps[t].w_p = (int)((fv_p - (float)y0_p) * 256.0f + 0.5f);
 
                 float fv_n = (float)y - off;
                 if (fv_n < 0.0f) fv_n = 0.0f;
                 if (fv_n > (float)(h - 1)) fv_n = (float)(h - 1);
-                y0_neg[t] = (uint32_t)fv_n;
-                y1_neg[t] = y0_neg[t] + 1 < h ? y0_neg[t] + 1 : y0_neg[t];
-                fy_neg[t] = fv_n - (float)y0_neg[t];
+                uint32_t y0_n = (uint32_t)fv_n;
+                uint32_t y1_n = y0_n + 1 < h ? y0_n + 1 : y0_n;
+                taps[t].row0_n = (size_t)y0_n * w;
+                taps[t].row1_n = (size_t)y1_n * w;
+                taps[t].w_n = (int)((fv_n - (float)y0_n) * 256.0f + 0.5f);
             }
             uint32_t *row_out = buf_tmp + (size_t)y * w;
             for (uint32_t x = 0; x < w; x++) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (unsigned t = 0; t < n_taps; t++) {
+                    uint32_t s_pos = agx_sample_1d_fast(buf_in[taps[t].row0_p + x],
+                                                        buf_in[taps[t].row1_p + x],
+                                                        taps[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(buf_in[taps[t].row0_n + x],
+                                                        buf_in[taps[t].row1_n + x],
+                                                        taps[t].w_n);
+                    uint8x8_t p = vcreate_u8((uint64_t)s_pos | ((uint64_t)s_neg << 32));
+                    uint16x8_t p16 = vmovl_u8(p);
+                    uint16x4_t sum16 = vadd_u16(vget_low_u16(p16), vget_high_u16(p16));
+                    float32x4_t sum_f = vcvtq_f32_u32(vmovl_u16(sum16));
+                    acc = vmlaq_n_f32(acc, sum_f, weights[t]);
+                }
+                int32x4_t s32 = vcvtaq_s32_f32(acc);
+                uint16x4_t u16 = vqmovun_s32(s32);
+                uint8x8_t u8 = vqmovn_u16(vcombine_u16(u16, u16));
+                row_out[x] = vget_lane_u32(vreinterpret_u32_u8(u8), 0);
+#else
                 float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 for (unsigned t = 0; t < n_taps; t++) {
-                    float weight = weights[t];
-                    uint32_t c00_p = buf_in[(size_t)y0_pos[t] * w + x];
-                    uint32_t c01_p = buf_in[(size_t)y1_pos[t] * w + x];
-                    uint32_t s_pos = agx_sample_1d(c00_p, c01_p, fy_pos[t]);
-
-                    uint32_t c00_n = buf_in[(size_t)y0_neg[t] * w + x];
-                    uint32_t c01_n = buf_in[(size_t)y1_neg[t] * w + x];
-                    uint32_t s_neg = agx_sample_1d(c00_n, c01_n, fy_neg[t]);
-
-                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
-                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
-                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
-                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                    uint32_t s_pos = agx_sample_1d_fast(buf_in[taps[t].row0_p + x],
+                                                        buf_in[taps[t].row1_p + x],
+                                                        taps[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(buf_in[taps[t].row0_n + x],
+                                                        buf_in[taps[t].row1_n + x],
+                                                        taps[t].w_n);
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weights[t];
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weights[t];
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weights[t];
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weights[t];
                 }
                 int iv0 = (int)lroundf(acc[0]);
                 int iv1 = (int)lroundf(acc[1]);
@@ -6666,38 +6710,76 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                              ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
                              ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
                              ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+#endif
             }
         }
     } else {
+        if ((size_t)w * n_taps > agx_blur_taps_x_cap) {
+            agx_blur_taps_x_cap = (size_t)w * n_taps + 128;
+            agx_blur_taps_x = (AGXBlurTapX *)realloc(agx_blur_taps_x, agx_blur_taps_x_cap * sizeof(AGXBlurTapX));
+        }
+        for (uint32_t x = 0; x < w; x++) {
+            AGXBlurTapX *entry_base = &agx_blur_taps_x[x * n_taps];
+            for (unsigned t = 0; t < n_taps; t++) {
+                float off = offsets[t];
+                float fu_p = (float)x + off;
+                if (fu_p < 0.0f) fu_p = 0.0f;
+                if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
+                uint32_t x0_p = (uint32_t)fu_p;
+                uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
+
+                float fu_n = (float)x - off;
+                if (fu_n < 0.0f) fu_n = 0.0f;
+                if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
+                uint32_t x0_n = (uint32_t)fu_n;
+                uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
+
+                AGXBlurTapX *entry = &entry_base[t];
+                entry->x0_p = x0_p;
+                entry->x1_p = x1_p;
+                entry->w_p = (int)((fu_p - (float)x0_p) * 256.0f + 0.5f);
+                entry->x0_n = x0_n;
+                entry->x1_n = x1_n;
+                entry->w_n = (int)((fu_n - (float)x0_n) * 256.0f + 0.5f);
+            }
+        }
         for (uint32_t y = 0; y < h; y++) {
             const uint32_t *row_in = buf_in + (size_t)y * w;
             uint32_t *row_out = buf_tmp + (size_t)y * w;
             for (uint32_t x = 0; x < w; x++) {
+                const AGXBlurTapX *entry = &agx_blur_taps_x[x * n_taps];
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (unsigned t = 0; t < n_taps; t++) {
+                    uint32_t s_pos = agx_sample_1d_fast(row_in[entry[t].x0_p],
+                                                        row_in[entry[t].x1_p],
+                                                        entry[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(row_in[entry[t].x0_n],
+                                                        row_in[entry[t].x1_n],
+                                                        entry[t].w_n);
+                    uint8x8_t p = vcreate_u8((uint64_t)s_pos | ((uint64_t)s_neg << 32));
+                    uint16x8_t p16 = vmovl_u8(p);
+                    uint16x4_t sum16 = vadd_u16(vget_low_u16(p16), vget_high_u16(p16));
+                    float32x4_t sum_f = vcvtq_f32_u32(vmovl_u16(sum16));
+                    acc = vmlaq_n_f32(acc, sum_f, weights[t]);
+                }
+                int32x4_t s32 = vcvtaq_s32_f32(acc);
+                uint16x4_t u16 = vqmovun_s32(s32);
+                uint8x8_t u8 = vqmovn_u16(vcombine_u16(u16, u16));
+                row_out[x] = vget_lane_u32(vreinterpret_u32_u8(u8), 0);
+#else
                 float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 for (unsigned t = 0; t < n_taps; t++) {
-                    float off = offsets[t];
-                    float weight = weights[t];
-
-                    float fu_p = (float)x + off;
-                    if (fu_p < 0.0f) fu_p = 0.0f;
-                    if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
-                    uint32_t x0_p = (uint32_t)fu_p;
-                    uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
-                    float fx_p = fu_p - (float)x0_p;
-                    uint32_t s_pos = agx_sample_1d(row_in[x0_p], row_in[x1_p], fx_p);
-
-                    float fu_n = (float)x - off;
-                    if (fu_n < 0.0f) fu_n = 0.0f;
-                    if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
-                    uint32_t x0_n = (uint32_t)fu_n;
-                    uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
-                    float fx_n = fu_n - (float)x0_n;
-                    uint32_t s_neg = agx_sample_1d(row_in[x0_n], row_in[x1_n], fx_n);
-
-                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
-                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
-                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
-                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                    uint32_t s_pos = agx_sample_1d_fast(row_in[entry[t].x0_p],
+                                                        row_in[entry[t].x1_p],
+                                                        entry[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(row_in[entry[t].x0_n],
+                                                        row_in[entry[t].x1_n],
+                                                        entry[t].w_n);
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weights[t];
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weights[t];
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weights[t];
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weights[t];
                 }
                 int iv0 = (int)lroundf(acc[0]);
                 int iv1 = (int)lroundf(acc[1]);
@@ -6707,6 +6789,7 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                              ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
                              ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
                              ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+#endif
             }
         }
     }
@@ -8373,8 +8456,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     int by1 = MIN((int)height, y1 + pad);
                     uint32_t bw = (uint32_t)(bx1 - bx0), bh = (uint32_t)(by1 - by0);
                     if (bw > 0 && bh > 0 && bw <= 2048 && bh <= 2048) {
-                        uint32_t *raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
-                        uint32_t *tmp_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        /* Formerly: raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t)); */
+                        uint32_t *raw_tex = agx_get_scratch1((size_t)bw * bh);
+                        uint32_t *tmp_tex = agx_get_scratch2((size_t)bw * bh);
                         if (raw_tex && tmp_tex) {
                             bool read_ok = true;
                             for (uint32_t y = 0; y < bh; y++) {
@@ -8401,8 +8485,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 }
                             }
                         }
-                        g_free(raw_tex);
-                        g_free(tmp_tex);
                     }
                     continue;
                 }
