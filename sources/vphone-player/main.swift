@@ -56,50 +56,163 @@ final class PixelBuffer {
     }
 }
 
-// CALayer.contents only recomposites when it is given a different object, so
-// two surfaces are used in a ping-pong swapchain. Incoming rectangles are
-// received directly into the back buffer without a 2.9MB full-frame memcpy.
+final class RingEntry {
+    let index: Int
+    let buffer: PixelBuffer
+    var version: Int = 0
+    var isDisplayed: Bool = false
+    var isPending: Bool = false
+    var isWriting: Bool = false
+
+    init(index: Int, buffer: PixelBuffer) {
+        self.index = index
+        self.buffer = buffer
+    }
+
+    var isAvailable: Bool {
+        !isDisplayed && !isPending && !isWriting
+    }
+}
+
+private struct FrameDirty {
+    let version: Int
+    let isFullScreen: Bool
+    let rects: [(x: Int, y: Int, w: Int, h: Int)]
+}
+
+// CALayer.contents only recomposites when it is given a different object, and
+// WindowServer composites asynchronously from the displayed IOSurface.
+// A 4-surface ring isolates displayed, pending, writing, and available surfaces.
+// Incoming rectangles are received directly into an available back buffer without
+// a 2.9MB full-frame copy, while dirty rectangles from intervening frames are carried
+// over so every surface stays in sync with the guest framebuffer.
 final class SurfaceRing {
-    let buffers = [PixelBuffer(), PixelBuffer()]
-    private var writeIndex = 0
-    private var lastDirtyRects: [(x: Int, y: Int, w: Int, h: Int)] = []
+    let entries: [RingEntry]
+    var buffers: [PixelBuffer] { entries.map { $0.buffer } }
+    private let lock = NSLock()
+    private var history: [FrameDirty] = []
+    private var currentVersion: Int = 0
+    private var latestCommittedEntry: RingEntry?
+
+    init(count: Int = 4) {
+        var list: [RingEntry] = []
+        for i in 0..<count {
+            list.append(RingEntry(index: i, buffer: PixelBuffer()))
+        }
+        self.entries = list
+    }
 
     var current: PixelBuffer {
-        buffers[writeIndex]
+        lock.lock()
+        defer { lock.unlock() }
+        return latestCommittedEntry?.buffer ?? entries[0].buffer
     }
 
     func prepareNextWrite(isFullScreen: Bool) -> PixelBuffer {
-        let nextIndex = 1 - writeIndex
-        let target = buffers[nextIndex]
-        let prev = buffers[writeIndex]
+        lock.lock()
+        defer { lock.unlock() }
 
-        if !isFullScreen && !lastDirtyRects.isEmpty {
-            target.lock()
-            prev.lock()
-            for r in lastDirtyRects {
-                if r.w == prev.width && r.x == 0 {
-                    memcpy(target.baseAddress.advanced(by: r.y * prev.bytesPerRow),
-                           prev.baseAddress.advanced(by: r.y * prev.bytesPerRow),
-                           r.w * 4 * r.h)
+        var candidates = entries.filter { $0.isAvailable }
+        if candidates.isEmpty {
+            candidates = entries.filter { !$0.isDisplayed && !$0.isWriting }
+        }
+        candidates.sort { $0.version > $1.version }
+        let target = candidates.first ?? entries[0]
+        target.isWriting = true
+
+        if !isFullScreen, let srcEntry = latestCommittedEntry, currentVersion > 0 {
+            let src = srcEntry.buffer
+            let dst = target.buffer
+
+            if target.version == 0 {
+                dst.lock()
+                src.lock()
+                memcpy(dst.baseAddress, src.baseAddress, dst.bytesPerRow * dst.height)
+                src.unlock()
+                dst.unlock()
+                target.version = currentVersion
+            } else if target.version < currentVersion {
+                let missed = history.filter { $0.version > target.version && $0.version <= currentVersion }
+                let hasFullScreen = missed.contains { $0.isFullScreen }
+                dst.lock()
+                src.lock()
+                if hasFullScreen {
+                    memcpy(dst.baseAddress, src.baseAddress, dst.bytesPerRow * dst.height)
                 } else {
-                    for row in 0..<r.h {
-                        let offset = (r.y + row) * prev.bytesPerRow + r.x * 4
-                        memcpy(target.baseAddress.advanced(by: offset),
-                               prev.baseAddress.advanced(by: offset),
-                               r.w * 4)
+                    for f in missed {
+                        for r in f.rects {
+                            if r.w == dst.width && r.x == 0 {
+                                memcpy(dst.baseAddress.advanced(by: r.y * dst.bytesPerRow),
+                                       src.baseAddress.advanced(by: r.y * src.bytesPerRow),
+                                       r.w * 4 * r.h)
+                            } else {
+                                for row in 0..<r.h {
+                                    let offset = (r.y + row) * dst.bytesPerRow + r.x * 4
+                                    memcpy(dst.baseAddress.advanced(by: offset),
+                                           src.baseAddress.advanced(by: offset),
+                                           r.w * 4)
+                                }
+                            }
+                        }
                     }
                 }
+                src.unlock()
+                dst.unlock()
+                target.version = currentVersion
             }
-            prev.unlock()
-            target.unlock()
         }
-        return target
+
+        return target.buffer
     }
 
-    func commit(dirtyRects: [(x: Int, y: Int, w: Int, h: Int)]) -> IOSurface {
-        lastDirtyRects = dirtyRects
-        writeIndex = 1 - writeIndex
-        return buffers[writeIndex].surface
+    func abortWrite() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let writing = entries.first(where: { $0.isWriting }) {
+            writing.isWriting = false
+        }
+    }
+
+    func commit(dirtyRects: [(x: Int, y: Int, w: Int, h: Int)], isFullScreen: Bool = false) -> IOSurface {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let target = entries.first(where: { $0.isWriting }) ?? entries.first else {
+            fatalError("commit called without active writing buffer")
+        }
+
+        currentVersion += 1
+        target.version = currentVersion
+        target.isWriting = false
+        target.isPending = true
+
+        for e in entries where e !== target && e.isPending {
+            e.isPending = false
+        }
+
+        latestCommittedEntry = target
+        history.append(FrameDirty(version: currentVersion, isFullScreen: isFullScreen, rects: dirtyRects))
+
+        let activeVersions = entries.map { $0.version }.filter { $0 > 0 }
+        let minActiveVer = activeVersions.min() ?? currentVersion
+        history.removeAll { $0.version < minActiveVer }
+
+        return target.buffer.surface
+    }
+
+    func markDisplayed(surface: IOSurface) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let newDisp = entries.first(where: { $0.buffer.surface === surface }) else { return }
+        for e in entries {
+            if e === newDisp {
+                e.isDisplayed = true
+                e.isPending = false
+            } else if e.isDisplayed {
+                e.isDisplayed = false
+            }
+        }
     }
 }
 
@@ -244,6 +357,7 @@ final class RFB {
                         let w = Int(scratch[4])*256+Int(scratch[5]), hh = Int(scratch[6])*256+Int(scratch[7])
                         guard scratch[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else {
                             target?.unlock()
+                            ring.abortWrite()
                             throw NSError(domain:"Rectangle RFB tidak valid",code:1)
                         }
                         if target == nil {
@@ -266,7 +380,8 @@ final class RFB {
                     }
                     target?.unlock()
 
-                    let surface = ring.commit(dirtyRects: rectHeaders.map { (x: $0.x, y: $0.y, w: $0.w, h: $0.hh) })
+                    let isFullScreen = count == 1 && rectHeaders.first.map { $0.x == 0 && $0.y == 0 && $0.w == width && $0.hh == height } ?? false
+                    let surface = ring.commit(dirtyRects: rectHeaders.map { (x: $0.x, y: $0.y, w: $0.w, h: $0.hh) }, isFullScreen: isFullScreen)
 
                     totalFrames += 1
                     if statsEnabled {
@@ -1005,6 +1120,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         presentLock.unlock()
 
         screen.present(surface: surface)
+        rfb.ring.markDisplayed(surface: surface)
         recordPresentInterval()
 
         if !inputFailed && gestureError == nil && !status.isHidden {
