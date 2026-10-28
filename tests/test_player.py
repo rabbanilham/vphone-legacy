@@ -430,4 +430,90 @@ print("PASS: momentum liftoff releases synthetic touch promptly without 1s hiccu
             subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
             subprocess.run([str(tmp / 'test')], check=True, timeout=20)
 
+    def test_surface_ring_multibuffer_fidelity_and_isolation(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let ring = SurfaceRing(count: 4)
+assert(ring.entries.count == 4)
+
+// 1. Verify buffer isolation: never write to displayed or pending surface
+let t1 = ring.prepareNextWrite(isFullScreen: true)
+let s1 = ring.commit(dirtyRects: [(0, 0, 640, 1136)], isFullScreen: true)
+ring.markDisplayed(surface: s1)
+
+let t2 = ring.prepareNextWrite(isFullScreen: false)
+assert(t2.surface !== s1, "Writing target must not be the displayed surface!")
+let s2 = ring.commit(dirtyRects: [(10, 10, 40, 40)], isFullScreen: false)
+
+let t3 = ring.prepareNextWrite(isFullScreen: false)
+assert(t3.surface !== s1, "Writing target must not be the displayed surface!")
+assert(t3.surface !== s2, "Writing target must not be the pending surface!")
+let s3 = ring.commit(dirtyRects: [(60, 60, 40, 40)], isFullScreen: false)
+
+// 2. Fidelity test across 100 frames with partial rects and async display
+let groundTruth = UnsafeMutablePointer<UInt32>.allocate(capacity: 640 * 1136)
+groundTruth.initialize(repeating: 0, count: 640 * 1136)
+
+var pending: IOSurface?
+var displayed: IOSurface?
+
+for f in 1...100 {
+    let isFull = (f == 1) || (f % 25 == 0)
+    let rects: [(x: Int, y: Int, w: Int, h: Int)]
+    if isFull {
+        rects = [(0, 0, 640, 1136)]
+    } else {
+        rects = [
+            (20 + (f * 7) % 500, 30 + (f * 13) % 900, 50, 40),
+            (100 + (f * 11) % 400, 200 + (f * 17) % 700, 30, 60)
+        ]
+    }
+
+    let target = ring.prepareNextWrite(isFullScreen: isFull)
+    assert(target.surface !== displayed, "Must never return currently displayed surface")
+    target.lock()
+    let ptr = target.baseAddress.assumingMemoryBound(to: UInt32.self)
+    for r in rects {
+        let color = UInt32(f & 0xFFFFFF) | 0xFF000000
+        for row in r.y..<(r.y + r.h) {
+            for col in r.x..<(r.x + r.w) {
+                ptr[row * 640 + col] = color
+                groundTruth[row * 640 + col] = color
+            }
+        }
+    }
+    target.unlock()
+
+    let committedSurface = ring.commit(dirtyRects: rects, isFullScreen: isFull)
+    pending = committedSurface
+
+    // Intermittent display link
+    if f % 2 == 0 || f == 100 {
+        if let s = pending {
+            displayed = s
+            pending = nil
+            ring.markDisplayed(surface: s)
+        }
+    }
+
+    // Verify current buffer matches ground truth exactly
+    let curr = ring.current
+    curr.lock()
+    let curPtr = curr.baseAddress.assumingMemoryBound(to: UInt32.self)
+    for i in 0..<(640 * 1136) {
+        if curPtr[i] != groundTruth[i] {
+            fatalError("Frame \(f): pixel mismatch at index \(i)! Got \(curPtr[i]), expected \(groundTruth[i])")
+        }
+    }
+    curr.unlock()
+}
+
+print("PASS: surface ring 4-buffer isolation and exact dirty-rect fidelity")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-ring-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            subprocess.run([str(tmp / 'test')], check=True, timeout=20)
+
 if __name__ == '__main__': unittest.main()
