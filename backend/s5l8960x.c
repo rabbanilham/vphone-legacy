@@ -30,6 +30,7 @@
 #include "target/arm/arm-powerctl.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "system/tcg.h"
 #include "chardev/char-fe.h"
@@ -790,6 +791,12 @@ struct A7State {
     int sys_fd;
     int data_fd;
     int utility_fd;
+    /* ANS host write-back state; accessed only under the BQL. */
+    unsigned ans_dirty;
+    QEMUTimer *ans_flush_timer;
+    Notifier ans_exit_notifier, ans_shutdown_notifier;
+    bool ans_notifiers_registered, ans_perf_enabled;
+    uint64_t ans_requests, ans_bytes, ans_fsyncs, ans_handler_ns;
     char *system_image, *data_image, *utility_image;
     uint64_t sys_lbas, data_lbas, data_start, total_lbas;
     int64_t ans_clock_ns;
@@ -3048,17 +3055,24 @@ static bool ans_write_ram(hwaddr addr, const void *buf, size_t length)
                                buf, length) == MEMTX_OK;
 }
 
-static bool ans_file_io(int fd, uint8_t *buf, off_t offset, bool write)
+/* Return the prefix transferred, including on a short/erroring syscall. */
+static size_t ans_file_transfer(int fd, uint8_t *buf, off_t offset,
+                                size_t length, bool write)
 {
     size_t done = 0;
-    while (done < ANS_SECTOR_SIZE) {
-        ssize_t n = write ? pwrite(fd, buf + done, ANS_SECTOR_SIZE - done, offset + done)
-                          : pread(fd, buf + done, ANS_SECTOR_SIZE - done, offset + done);
+    while (done < length) {
+        ssize_t n = write ? pwrite(fd, buf + done, length - done, offset + done)
+                          : pread(fd, buf + done, length - done, offset + done);
         if (n < 0 && errno == EINTR) { continue; }
-        if (n <= 0) { return false; }
+        if (n <= 0) { break; }
         done += n;
     }
-    return true;
+    return done;
+}
+
+static bool ans_file_io(int fd, uint8_t *buf, off_t offset, bool write)
+{
+    return ans_file_transfer(fd, buf, offset, ANS_SECTOR_SIZE, write) == ANS_SECTOR_SIZE;
 }
 
 /* Model-private logical utility container. NOT native NAND metadata.
@@ -3142,12 +3156,92 @@ static const AnsUtilityRegion *ans_utility_region(uint8_t opcode)
     return NULL;
 }
 
+#define ANS_WRITEBACK_MS 300
+
 static bool ans_flush(A7State *s)
 {
-    bool ok = fsync(s->data_fd) == 0;
-    if (s->utility_fd >= 0 && fsync(s->utility_fd) != 0) { ok = false; }
-    if (s->system_writable && fsync(s->sys_fd) != 0) { ok = false; }
+    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
+    bool ok = true;
+    for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
+        if (!(s->ans_dirty & (1U << i))) { continue; }
+        int ret;
+        do {
+            if (s->ans_perf_enabled) { s->ans_fsyncs++; }
+            ret = fsync(fds[i]);
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0) { ok = false; }
+        else { s->ans_dirty &= ~(1U << i); }
+    }
+    if (!s->ans_dirty && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
     return ok;
+}
+
+static void ans_mark_dirty(A7State *s, int fd)
+{
+    bool first = !s->ans_dirty;
+    s->ans_dirty |= fd == s->data_fd ? 1U : fd == s->utility_fd ? 2U : 4U;
+    if (first && s->ans_flush_timer) {
+        timer_mod(s->ans_flush_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
+    }
+}
+
+static void ans_flush_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    if (!ans_flush(s)) {
+        error_report("ANS deferred fsync failed; dirty backings retained for retry");
+        timer_mod(s->ans_flush_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
+    }
+}
+
+/* Reset/close cannot return an ASP status: report failures, retain dirty bits. */
+static void ans_drain(A7State *s)
+{
+    if (!ans_flush(s)) { error_report("ANS lifecycle fsync failed"); }
+    if (s->ans_perf_enabled) {
+        fprintf(stderr, "ANS perf: requests=%" PRIu64 " bytes=%" PRIu64
+                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64 "\n",
+                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns);
+    }
+}
+
+static void ans_exit_notify(Notifier *n, void *data)
+{
+    A7State *s = container_of(n, A7State, ans_exit_notifier);
+    (void)data;
+    ans_drain(s);
+}
+
+static void ans_shutdown_notify(Notifier *n, void *data)
+{
+    A7State *s = container_of(n, A7State, ans_shutdown_notifier);
+    (void)data;
+    ans_drain(s);
+}
+
+/* A contiguous run ends at a backing boundary or a synthetic GPT sector. */
+static int ans_map(A7State *s, const AnsUtilityRegion *region,
+                   uint64_t current, off_t *offset, uint32_t *run)
+{
+    if (region) {
+        *offset = (region->first_page + current) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, region->page_count - current);
+        return s->utility_fd;
+    }
+    if (current >= ANS_SYS_START && current < s->data_start) {
+        *offset = (current - ANS_SYS_START) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, s->data_start - current);
+        return s->sys_fd;
+    }
+    if (current >= s->data_start && current < s->data_start + s->data_lbas) {
+        *offset = (current - s->data_start) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, s->data_start + s->data_lbas - current);
+        return s->data_fd;
+    }
+    *run = 1;
+    return -1;
 }
 
 static bool ans_backings_ready(A7State *s)
@@ -3167,7 +3261,7 @@ static bool ans_backings_ready(A7State *s)
     return true;
 }
 
-static uint32_t ans_execute(A7State *s, uint8_t tag)
+static uint32_t ans_execute_request(A7State *s, uint8_t tag)
 {
     uint32_t status = 0, limit, size;
     hwaddr cmd_addr;
@@ -3280,34 +3374,62 @@ static uint32_t ans_execute(A7State *s, uint8_t tag)
         }
     }
     qemu_log_mask(LOG_UNIMP, "ANS modeled I/O opcode=0x%02x %s page=%u count=%u\n", opcode, write ? "WRITE" : "READ", lba, count);
-    for (uint32_t i = 0; i < count; i++) {
+    /* At most 8 MiB (tag31); gather/scatter preserves page ordering and aliases.
+     * Only complete sectors of a failed read reach guest RAM, as before. */
+    uint8_t *batch = g_malloc((size_t)count * ANS_SECTOR_SIZE);
+    for (uint32_t i = 0; i < count;) {
         uint64_t current = (uint64_t)lba + i;
-        int fd = -1;
+        uint32_t run = count - i;
         off_t offset = 0;
-        if (region) {
-            fd = s->utility_fd; offset = (region->first_page + current) * ANS_SECTOR_SIZE;
-        } else if (current >= ANS_SYS_START && current < s->data_start) {
-            fd = s->sys_fd; offset = (current - ANS_SYS_START) * ANS_SECTOR_SIZE;
-        } else if (current >= s->data_start && current < s->data_start + s->data_lbas) {
-            fd = s->data_fd; offset = (current - s->data_start) * ANS_SECTOR_SIZE;
-        }
+        int fd = ans_map(s, region, current, &offset, &run);
+        size_t length = (size_t)run * ANS_SECTOR_SIZE;
         if (write) {
-            if (!ans_read_ram(pages[i], buf, sizeof(buf)) || !ans_file_io(fd, buf, offset, true)) {
-                status = 5; break;
+            for (uint32_t j = 0; j < run; j++) {
+                if (!ans_read_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
+                                  ANS_SECTOR_SIZE)) { status = 5; break; }
             }
+            if (status) { break; }
+            /* Mark before I/O: a failing pwrite may have modified a prefix. */
+            ans_mark_dirty(s, fd);
+            size_t done = ans_file_transfer(fd, batch, offset, length, true);
+            if (s->ans_perf_enabled) { s->ans_bytes += done; }
+            if (done != length) { status = 5; break; }
         } else {
+            size_t done = length;
             if (fd >= 0) {
-                if (!ans_file_io(fd, buf, offset, false)) { status = 5; break; }
-            } else if (current == 0) { memcpy(buf, s->gpt_lba0, sizeof(buf)); }
-            else if (current == 1) { memcpy(buf, s->gpt_lba1, sizeof(buf)); }
-            else if (current == 2 || current == s->total_lbas - 2) { memcpy(buf, s->gpt_lba2, sizeof(buf)); }
-            else if (current == s->total_lbas - 1) { memcpy(buf, s->gpt_alt_hdr, sizeof(buf)); }
-            else { memset(buf, 0, sizeof(buf)); } /* Explicit reserved virtual sectors. */
-            if (!ans_write_ram(pages[i], buf, sizeof(buf))) { status = 5; break; }
+                done = ans_file_transfer(fd, batch, offset, length, false);
+                if (s->ans_perf_enabled) { s->ans_bytes += done; }
+            } else {
+                if (current == 0) { memcpy(buf, s->gpt_lba0, sizeof(buf)); }
+                else if (current == 1) { memcpy(buf, s->gpt_lba1, sizeof(buf)); }
+                else if (current == 2 || current == s->total_lbas - 2) { memcpy(buf, s->gpt_lba2, sizeof(buf)); }
+                else if (current == s->total_lbas - 1) { memcpy(buf, s->gpt_alt_hdr, sizeof(buf)); }
+                else { memset(buf, 0, sizeof(buf)); }
+                memcpy(batch, buf, sizeof(buf));
+            }
+            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE; j++) {
+                if (!ans_write_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
+                                   ANS_SECTOR_SIZE)) { status = 5; break; }
+            }
+            if (done != length) { status = 5; }
+            if (status) { break; }
         }
+        i += run;
     }
-    /* A completed write is durable; flush even a partially failed host request. */
-    if (write && !ans_flush(s)) { status = 5; }
+    g_free(batch);
+    /* Write completion means host page-cache acceptance. Opcode13 and lifecycle
+     * drains are durability barriers; REALTIME write-back does not retime guest. */
+    return status;
+}
+
+static uint32_t ans_execute(A7State *s, uint8_t tag)
+{
+    int64_t start = s->ans_perf_enabled ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+    uint32_t status = ans_execute_request(s, tag);
+    if (s->ans_perf_enabled) {
+        s->ans_requests++;
+        s->ans_handler_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+    }
     return status;
 }
 
@@ -10142,6 +10264,7 @@ static void vblank_timer_cb(void *opaque)
 static void a7_reset(void *opaque)
 {
     A7State *s = opaque;
+    ans_drain(s);
     s->wifi_mac_patched = false;
     if (s->iop_cpu) {
         cpu_reset(CPU(s->iop_cpu));
@@ -10812,6 +10935,13 @@ static void a7_init(MachineState *ms)
     s->agx_async_enabled = async_env && strcmp(async_env, "0") != 0;
     ans_init_storage(s);
     ans_init_utility(s);
+    s->ans_perf_enabled = perf_stats_env && strcmp(perf_stats_env, "0") != 0;
+    s->ans_flush_timer = timer_new_ms(QEMU_CLOCK_REALTIME, ans_flush_timer_cb, s);
+    s->ans_exit_notifier.notify = ans_exit_notify;
+    s->ans_shutdown_notifier.notify = ans_shutdown_notify;
+    qemu_add_exit_notifier(&s->ans_exit_notifier);
+    qemu_register_shutdown_notifier(&s->ans_shutdown_notifier);
+    s->ans_notifiers_registered = true;
     qemu_register_reset(a7_reset, s);
 }
 
@@ -10859,6 +10989,13 @@ static void a7_finalize(Object *o)
         qemu_mutex_destroy(&s->agx_render_mutex);
         qemu_cond_destroy(&s->agx_render_cond);
     }
+    ans_drain(s);
+    if (s->ans_notifiers_registered) {
+        qemu_unregister_reset(a7_reset, s);
+        notifier_remove(&s->ans_exit_notifier);
+        notifier_remove(&s->ans_shutdown_notifier);
+    }
+    if (s->ans_flush_timer) { timer_free(s->ans_flush_timer); }
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }
