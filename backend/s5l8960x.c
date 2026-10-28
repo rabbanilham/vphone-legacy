@@ -10301,9 +10301,17 @@ static bool display_update(void *opaque)
     uint32_t dst_stride = surface_stride(surface);
     uint8_t *dst_base = surface_data(surface);
 
+    static bool vga_logged = false;
+    if (!vga_logged) {
+        memory_region_set_log(MACHINE(s)->ram, true, DIRTY_MEMORY_VGA);
+        vga_logged = true;
+    }
+
+    bool mapping_changed = false;
     if (s->disp_mmu_table) {
         if (!s->disp_mapping_valid || s->disp_cached_mmu_table != s->disp_mmu_table ||
             s->disp_cached_offset != s->disp_offset) {
+            mapping_changed = true;
             uint32_t start_page = s->disp_offset >> 12;
             uint32_t end_page = (s->disp_offset + 2560 * 1136 + 0xfff) >> 12;
             bool contiguous = true;
@@ -10340,10 +10348,51 @@ static bool display_update(void *opaque)
         }
     }
 
+    uint32_t num_pages = (2560 * 1136 + 0xfff) >> 12;
+    if (num_pages > 715) {
+        num_pages = 715;
+    }
+    bool page_dirty[715];
+    bool any_page_dirty = mapping_changed;
+
+    for (uint32_t p = 0; p < num_pages; p++) {
+        if (mapping_changed) {
+            page_dirty[p] = true;
+        } else {
+            hwaddr pa;
+            if (!s->disp_mmu_table) {
+                pa = (s->framebuffer - RAM_BASE) + ((hwaddr)p << 12);
+            } else if (s->disp_mapping_contiguous) {
+                pa = s->disp_cached_pa_base + ((hwaddr)p << 12);
+            } else {
+                uint32_t pg = (s->disp_offset >> 12) + p;
+                pa = (pg < ARRAY_SIZE(s->disp_page_ram_offset)) ? s->disp_page_ram_offset[pg] : 0;
+            }
+            page_dirty[p] = memory_region_get_dirty(MACHINE(s)->ram, pa, 4096, DIRTY_MEMORY_VGA);
+            if (page_dirty[p]) {
+                any_page_dirty = true;
+            }
+        }
+    }
+
+    if (!any_page_dirty) {
+        return true;
+    }
+
     uint8_t temp_row[2560];
     int dirty_start = -1;
 
     for (unsigned y = 0; y < 1136; y++) {
+        uint32_t p0 = (y * 2560) >> 12;
+        uint32_t p1 = (y * 2560 + 2559) >> 12;
+        if (p0 < num_pages && p1 < num_pages && !page_dirty[p0] && !page_dirty[p1]) {
+            if (dirty_start >= 0) {
+                qemu_console_update(s->con, 0, dirty_start, 640, (int)y - dirty_start);
+                dirty_start = -1;
+            }
+            continue;
+        }
+
         const uint8_t *src_row;
         if (!s->disp_mmu_table) {
             src_row = ram + s->framebuffer - RAM_BASE + y * 2560;
@@ -10381,6 +10430,22 @@ static bool display_update(void *opaque)
     if (dirty_start >= 0) {
         qemu_console_update(s->con, 0, dirty_start, 640, 1136 - dirty_start);
     }
+
+    for (uint32_t p = 0; p < num_pages; p++) {
+        if (page_dirty[p]) {
+            hwaddr pa;
+            if (!s->disp_mmu_table) {
+                pa = (s->framebuffer - RAM_BASE) + ((hwaddr)p << 12);
+            } else if (s->disp_mapping_contiguous) {
+                pa = s->disp_cached_pa_base + ((hwaddr)p << 12);
+            } else {
+                uint32_t pg = (s->disp_offset >> 12) + p;
+                pa = (pg < ARRAY_SIZE(s->disp_page_ram_offset)) ? s->disp_page_ram_offset[pg] : 0;
+            }
+            memory_region_reset_dirty(MACHINE(s)->ram, pa, 4096, DIRTY_MEMORY_VGA);
+        }
+    }
+
     return true;
 }
 static const GraphicHwOps display_ops = { .gfx_update = display_update };
