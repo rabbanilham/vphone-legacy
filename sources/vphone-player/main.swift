@@ -57,17 +57,49 @@ final class PixelBuffer {
 }
 
 // CALayer.contents only recomposites when it is given a different object, so
-// each frame is copied into the next surface of a small ring before present.
-// Re-setting the same IOSurface left updates on screen late (or not at all
-// until something else redrew), and writing the presented surface tore.
+// two surfaces are used in a ping-pong swapchain. Incoming rectangles are
+// received directly into the back buffer without a 2.9MB full-frame memcpy.
 final class SurfaceRing {
-    private let buffers = [PixelBuffer(), PixelBuffer(), PixelBuffer()]
-    private var index = 0
+    let buffers = [PixelBuffer(), PixelBuffer()]
+    private var writeIndex = 0
+    private var lastDirtyRects: [(x: Int, y: Int, w: Int, h: Int)] = []
 
-    func next(from source: PixelBuffer) -> IOSurface {
-        index = (index + 1) % buffers.count
-        source.copy(into: buffers[index])
-        return buffers[index].surface
+    var current: PixelBuffer {
+        buffers[writeIndex]
+    }
+
+    func prepareNextWrite(isFullScreen: Bool) -> PixelBuffer {
+        let nextIndex = 1 - writeIndex
+        let target = buffers[nextIndex]
+        let prev = buffers[writeIndex]
+
+        if !isFullScreen && !lastDirtyRects.isEmpty {
+            target.lock()
+            prev.lock()
+            for r in lastDirtyRects {
+                if r.w == prev.width && r.x == 0 {
+                    memcpy(target.baseAddress.advanced(by: r.y * prev.bytesPerRow),
+                           prev.baseAddress.advanced(by: r.y * prev.bytesPerRow),
+                           r.w * 4 * r.h)
+                } else {
+                    for row in 0..<r.h {
+                        let offset = (r.y + row) * prev.bytesPerRow + r.x * 4
+                        memcpy(target.baseAddress.advanced(by: offset),
+                               prev.baseAddress.advanced(by: offset),
+                               r.w * 4)
+                    }
+                }
+            }
+            prev.unlock()
+            target.unlock()
+        }
+        return target
+    }
+
+    func commit(dirtyRects: [(x: Int, y: Int, w: Int, h: Int)]) -> IOSurface {
+        lastDirtyRects = dirtyRects
+        writeIndex = 1 - writeIndex
+        return buffers[writeIndex].surface
     }
 }
 
@@ -79,19 +111,32 @@ final class RFB {
     var surfaceFrame: ((IOSurface) -> Void)?
     var trace: ((String) -> Void)?
     var failed: ((String) -> Void)?
+    var presentStats: (() -> String)?
     var width = 0, height = 0
-    let pixelBuffer = PixelBuffer()
     let ring = SurfaceRing()
-    func read(_ count: Int) throws -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: count), offset = 0
+    var pixelBuffer: PixelBuffer { ring.current }
+    private var scratch = [UInt8](repeating: 0, count: 65536)
+
+    func readIntoScratch(_ count: Int) throws {
+        if count > scratch.count {
+            scratch = [UInt8](repeating: 0, count: max(count, scratch.count * 2))
+        }
+        var offset = 0
         while offset < count {
-            let n = bytes.withUnsafeMutableBytes { Darwin.recv(fd, $0.baseAddress!.advanced(by: offset), count-offset, 0) }
+            let n = scratch.withUnsafeMutableBytes {
+                Darwin.recv(fd, $0.baseAddress!.advanced(by: offset), count - offset, 0)
+            }
             if n < 0 && errno == EINTR { continue }
             guard n > 0 else { throw NSError(domain: "Koneksi layar terputus", code: 1) }
             offset += n
         }
-        return bytes
     }
+
+    func read(_ count: Int) throws -> [UInt8] {
+        try readIntoScratch(count)
+        return Array(scratch[0..<count])
+    }
+
     func read(into ptr: UnsafeMutableRawPointer, count: Int) throws {
         var offset = 0
         while offset < count {
@@ -174,38 +219,50 @@ final class RFB {
             var statsBytes = 0
             var totalFrames = 0
             while true {
-                let type = try read(1)[0]
+                try readIntoScratch(1)
+                let type = scratch[0]
                 if type == 2 { continue }
                 if type == 3 {
-                    let h = try read(7); let size = h[3...6].reduce(0) { $0*256+Int($1) }
+                    try readIntoScratch(7)
+                    let size = scratch[3...6].reduce(0) { $0*256+Int($1) }
                     guard size <= 1048576 else { throw NSError(domain:"Clipboard terlalu besar",code:1) }
-                    _ = try read(size); continue
+                    try readIntoScratch(size); continue
                 }
                 guard type == 0 else { throw NSError(domain:"Pesan RFB tidak didukung",code:Int(type)) }
-                let h = try read(3); let count = Int(h[1])*256+Int(h[2])
+                try readIntoScratch(3); let count = Int(scratch[1])*256+Int(scratch[2])
                 if count > 0 {
-                    pixelBuffer.lock()
+                    var rectHeaders: [(x: Int, y: Int, w: Int, hh: Int)] = []
+                    rectHeaders.reserveCapacity(count)
                     var frameBytes = 0
                     for _ in 0..<count {
-                        let rect = try read(12)
-                        let x = Int(rect[0])*256+Int(rect[1]), y = Int(rect[2])*256+Int(rect[3])
-                        let w = Int(rect[4])*256+Int(rect[5]), hh = Int(rect[6])*256+Int(rect[7])
-                        guard rect[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else {
-                            pixelBuffer.unlock()
+                        try readIntoScratch(12)
+                        let x = Int(scratch[0])*256+Int(scratch[1]), y = Int(scratch[2])*256+Int(scratch[3])
+                        let w = Int(scratch[4])*256+Int(scratch[5]), hh = Int(scratch[6])*256+Int(scratch[7])
+                        guard scratch[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else {
                             throw NSError(domain:"Rectangle RFB tidak valid",code:1)
                         }
                         frameBytes += w*hh*4
-                        if w == width && x == 0 {
-                            try read(into: pixelBuffer.baseAddress.advanced(by: y * pixelBuffer.bytesPerRow),
-                                     count: width * hh * 4)
+                        rectHeaders.append((x: x, y: y, w: w, hh: hh))
+                    }
+
+                    let isFullScreen = (count == 1 && rectHeaders[0].x == 0 && rectHeaders[0].y == 0 &&
+                                        rectHeaders[0].w == width && rectHeaders[0].hh == height)
+                    let target = ring.prepareNextWrite(isFullScreen: isFullScreen)
+                    target.lock()
+                    for r in rectHeaders {
+                        if r.w == width && r.x == 0 {
+                            try read(into: target.baseAddress.advanced(by: r.y * target.bytesPerRow),
+                                     count: width * r.hh * 4)
                         } else {
-                            for row in 0..<hh {
-                                let dst = pixelBuffer.baseAddress.advanced(by: (y + row) * pixelBuffer.bytesPerRow + x * 4)
-                                try read(into: dst, count: w * 4)
+                            for row in 0..<r.hh {
+                                let dst = target.baseAddress.advanced(by: (r.y + row) * target.bytesPerRow + r.x * 4)
+                                try read(into: dst, count: r.w * 4)
                             }
                         }
                     }
-                    pixelBuffer.unlock()
+                    target.unlock()
+
+                    let surface = ring.commit(dirtyRects: rectHeaders.map { (x: $0.x, y: $0.y, w: $0.w, h: $0.hh) })
 
                     totalFrames += 1
                     if statsEnabled {
@@ -218,8 +275,9 @@ final class RFB {
                             let fps = Double(statsFrames) / dt
                             let rps = Double(statsRects) / dt
                             let kbps = Double(statsBytes) / dt / 1024.0
-                            let msg = String(format: "[player-stats] FPS: %.1f, rects/s: %.1f, kB/s: %.1f (total frames: %d)",
-                                             fps, rps, kbps, totalFrames)
+                            let presentStr = presentStats?() ?? ""
+                            let msg = "[player-stats] " + String(format: "FPS: %.1f, rects/s: %.1f, kB/s: %.1f (total frames: %d)",
+                                                                 fps, rps, kbps, totalFrames) + presentStr
                             fputs("\(msg)\n", stderr)
                             trace?(msg)
                             statsFrames = 0
@@ -230,9 +288,9 @@ final class RFB {
                     }
 
                     if let surfaceHandler = surfaceFrame {
-                        surfaceHandler(ring.next(from: pixelBuffer))
+                        surfaceHandler(surface)
                     } else if let frameHandler = frame {
-                        if let img = pixelBuffer.makeImage() {
+                        if let img = ring.current.makeImage() {
                             frameHandler(img)
                         }
                     }
@@ -605,9 +663,10 @@ final class SleepOverlay: NSView {
 final class Screen: NSView {
     private var cachedImage: CGImage?
     var pixelBuffer: PixelBuffer?
+    var pixelBufferProvider: (() -> PixelBuffer?)?
     var image: CGImage? {
         get {
-            if let pixelBuffer { return pixelBuffer.makeImage() }
+            if let pb = pixelBufferProvider?() ?? pixelBuffer { return pb.makeImage() }
             return cachedImage
         }
         set {
@@ -846,6 +905,16 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var buttons: [NSButton] = []
     var displayTimer: Timer?
     var displayQuery = false
+    private let presentLock = NSLock()
+    private var pendingSurface: IOSurface?
+    private var presentScheduled = false
+    private var displayLink: CADisplayLink?
+    private var buttonsConfigured = false
+    private var lastPresentUptime: TimeInterval = 0
+    private var presentIntervals: [Double] = []
+    private var lastFrameTime: TimeInterval = 0
+    private let statsEnabled = ProcessInfo.processInfo.environment["VPHONE_PLAYER_STATS"] != nil
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
@@ -883,20 +952,33 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             qmp?.touch(type,points)
         }
         qmp.failed = {[weak self] message in DispatchQueue.main.async {self?.handleGestureFailure(message)}}
+        screen.pixelBufferProvider = { [weak self] in self?.rfb.pixelBuffer }
         screen.pixelBuffer = rfb.pixelBuffer
         screen.input = { [weak self] x,y,down in self?.rfb.pointer(x,y,down) }
         screen.rfbKey = { [weak self] sym, down in self?.rfb.key(sym, down) }
         screen.qmpKey = { [weak self] qcode, down in self?.touchInput?.sendKey(qcode, down) }
+        rfb.presentStats = { [weak self] in self?.formatPresentStats() ?? "" }
         rfb.surfaceFrame = { [weak self] surface in
+            self?.schedulePresent(surface: surface)
+        }
+        rfb.failed = { [weak self] message in
             DispatchQueue.main.async {
                 guard let self else {return}
-                self.screen.present(surface: surface)
-                if !self.inputFailed && self.gestureError == nil {self.status.isHidden = true}
-                self.buttons.enumerated().forEach {i,button in button.isEnabled = !self.inputFailed && !(i == 1 && self.controlCenterPending)}
+                self.inputFailed = true
+                self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"
+                self.status.isHidden = false
+                self.updateButtons()
+                self.screen.input = nil
+                self.screen.rfbKey = nil
+                self.screen.qmpKey = nil
             }
         }
-        rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil; self.screen.rfbKey = nil; self.screen.qmpKey = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
+        if let window {
+            let link = window.displayLink(target: self, selector: #selector(vsyncFired(_:)))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
         screen.sleepOverlay.onWake = {[weak self] in self?.home()}
         // Poll the guest's display power so a sleeping device shows as locked
         // instead of a frozen frame that ignores touches.
@@ -904,12 +986,94 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let path = CommandLine.arguments[1]
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
     }
+
+    @objc func vsyncFired(_ link: CADisplayLink) {
+        flushPendingPresent()
+    }
+
+    func flushPendingPresent() {
+        presentLock.lock()
+        guard let surface = pendingSurface else {
+            presentLock.unlock()
+            return
+        }
+        pendingSurface = nil
+        presentLock.unlock()
+
+        screen.present(surface: surface)
+        recordPresentInterval()
+
+        if !inputFailed && gestureError == nil && !status.isHidden {
+            status.isHidden = true
+        }
+        if !buttonsConfigured && !inputFailed {
+            buttonsConfigured = true
+            updateButtons()
+        }
+    }
+
+    func schedulePresent(surface: IOSurface) {
+        lastFrameTime = Date().timeIntervalSince1970
+        presentLock.lock()
+        pendingSurface = surface
+        let hasLink = (displayLink != nil)
+        let scheduled = presentScheduled
+        if !hasLink && !scheduled {
+            presentScheduled = true
+        }
+        presentLock.unlock()
+
+        if !hasLink && !scheduled {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.presentLock.lock()
+                self.presentScheduled = false
+                self.presentLock.unlock()
+                self.flushPendingPresent()
+            }
+        }
+    }
+
+    func recordPresentInterval() {
+        guard statsEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastPresentUptime > 0 {
+            let deltaMs = (now - lastPresentUptime) * 1000.0
+            presentIntervals.append(deltaMs)
+        }
+        lastPresentUptime = now
+    }
+
+    func formatPresentStats() -> String {
+        presentLock.lock()
+        defer { presentLock.unlock() }
+        guard !presentIntervals.isEmpty else {
+            return ", present_ms(p50/p95/p99/max): 0.0/0.0/0.0/0.0"
+        }
+        presentIntervals.sort()
+        let n = presentIntervals.count
+        let p50 = presentIntervals[Int(Double(n - 1) * 0.50)]
+        let p95 = presentIntervals[Int(Double(n - 1) * 0.95)]
+        let p99 = presentIntervals[Int(Double(n - 1) * 0.99)]
+        let maxMs = presentIntervals.last!
+        presentIntervals.removeAll(keepingCapacity: true)
+        return String(format: ", present_ms(p50/p95/p99/max): %.1f/%.1f/%.1f/%.1f",
+                      p50, p95, p99, maxMs)
+    }
+
+    func updateButtons() {
+        buttons.enumerated().forEach { i, button in
+            button.isEnabled = !inputFailed && !(i == 1 && controlCenterPending)
+        }
+    }
+
     func handleGestureFailure(_ message:String) {
         // A gesture transport failure must not disable the independent pointer.
         logInput("QMP failure: \(message)")
         gestureError = message
         status.stringValue = "Gesture gagal: \(message). Klik/drag tetap tersedia."
         status.isHidden = false
+        updateButtons()
         let send = screen.gestures.send
         screen.gestures.send = nil
         screen.cancelTouch()
@@ -928,6 +1092,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func pollDisplay() {
         guard !displayQuery, let touchInput else {return}
+        let now = Date().timeIntervalSince1970
+        // When the guest is actively streaming frames, the display is definitely awake.
+        if !screen.sleeping && (now - lastFrameTime < 1.0) {
+            return
+        }
         displayQuery = true
         touchInput.displayOn {[weak self] on in DispatchQueue.main.async {
             guard let self else {return}
@@ -937,11 +1106,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func controlCenter() {
         guard !controlCenterPending,!screen.held,screen.gestures.kind == .none,let touchInput else {return}
-        controlCenterPending = true;buttons[1].isEnabled = false
+        controlCenterPending = true; updateButtons()
         let epoch = screen.touchEpoch
         touchInput.prepareControlCenter {[weak self] error in DispatchQueue.main.async {
             guard let self else {return}
-            self.controlCenterPending = false;self.buttons[1].isEnabled = !self.inputFailed
+            self.controlCenterPending = false; self.updateButtons()
             guard self.screen.touchEpoch == epoch else {return}
             if let error {self.handleGestureFailure(error);return}
             self.gestureError = nil;self.status.isHidden = true
@@ -963,6 +1132,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func windowDidResignKey(_ notification: Notification) { screen.cancelTouch() }
     func windowWillClose(_ notification:Notification) {
+        displayLink?.invalidate()
+        displayLink = nil
         screen.cancelTouch()
         if let activity {ProcessInfo.processInfo.endActivity(activity)}
         NSApp.terminate(nil)
