@@ -5140,6 +5140,7 @@ static void agx_pbe_scan(const uint8_t *raw, size_t length,
 static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
 {
     static unsigned commands;
+    static int pbe_search_enabled = -1;
     uint64_t seen_gva[16], seen_cat[16];
     unsigned buffers = 0;
     uint32_t ctx = ldl_le_p(raw + 4);
@@ -5147,7 +5148,10 @@ static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
                        s->agx_ctx_cat[ctx + 3] : 0;
     uint8_t bytes[0x10000];
 
-    if (!getenv("VPHONE_AGX_PBE_SEARCH") || commands >= 200) {
+    if (__builtin_expect(pbe_search_enabled < 0, 0)) {
+        pbe_search_enabled = getenv("VPHONE_AGX_PBE_SEARCH") != NULL;
+    }
+    if (!pbe_search_enabled || commands >= 200) {
         return;
     }
     commands++;
@@ -5631,9 +5635,18 @@ typedef struct AGXRenderJob {
 /* AGX_REPLAY_CORE_BEGIN: from here to AGX_REPLAY_CORE_END is also compiled
  * into the offline host harness (backend/agx_replay_host.c), which defines
  * AGX_REPLAY_SKIP to count the draws that replay leaves out. */
+static inline bool agx_replay_audit_enabled(void)
+{
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        cached = getenv("VPHONE_AGX_REPLAY_AUDIT") != NULL;
+    }
+    return cached;
+}
+
 #ifndef AGX_REPLAY_SKIP
 #define AGX_REPLAY_SKIP(reason) do { \
-    if (getenv("VPHONE_AGX_REPLAY_AUDIT")) { \
+    if (agx_replay_audit_enabled()) { \
         qemu_log_mask(LOG_GUEST_ERROR, "AGX replay skip: %s\n", reason); \
     } \
 } while (0)
@@ -7324,7 +7337,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
         }
     }
 #endif
-    bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") != NULL;
+    bool audit = agx_replay_audit_enabled();
     bool audit_clock = audit && target >= UINT64_C(0x400000000);
     unsigned before_clock = audit_clock ? agx_audit_clock(s, cat, &sf) : 0;
 
@@ -8890,7 +8903,12 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     agx_tlb_reset();
 #endif
     uint64_t first = UINT64_MAX, actual = 0;
-    const char *fill = getenv("VPHONE_AGX_RT_FILL");
+    static const char *fill = NULL;
+    static bool fill_checked = false;
+    if (__builtin_expect(!fill_checked, 0)) {
+        fill = getenv("VPHONE_AGX_RT_FILL");
+        fill_checked = true;
+    }
 
     if (!agx_gpu_access(s, agx_meta_gva(address), raw, sizeof(raw), false)) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -9010,21 +9028,31 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     }
     /* The default captures CA/display work; explicit context selection also
      * permits early wallpaper/upload passes before display MMU programming. */
-    const char *dump_context = getenv("VPHONE_AGX_FRAME_DUMP_CONTEXT");
+    static const char *dump_context = NULL;
+    static const char *min_env = NULL;
+    static int dump_offscreen_cached = -1;
+    static int dump_display_cached = -1;
+    static bool dump_env_checked = false;
+    if (__builtin_expect(!dump_env_checked, 0)) {
+        dump_context = getenv("VPHONE_AGX_FRAME_DUMP_CONTEXT");
+        min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
+        dump_offscreen_cached = getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") != NULL;
+        dump_display_cached = getenv("VPHONE_AGX_FRAME_DUMP_DISPLAY") != NULL;
+        dump_env_checked = true;
+    }
     bool capture_context = dump_context ?
         (!strcmp(dump_context, "all") || context_id == strtoul(dump_context, NULL, 0)) :
         (context_id == 1 && s->disp_mmu_table);
     if (capture_context && context_cat && pbe_target) {
         /* Optional: only dump frames with at least MIN_DRAWS draws (CA
          * redraws only dirty regions, so most frames are small). */
-        const char *min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
         const uint8_t *dump_ta = agx_find_ta(s, context_id, raw);
         bool offscreen = (ldl_le_p(raw + 0x74) & 0xffff) != 639 ||
                          (ldl_le_p(raw + 0x70) & 0xffff) != 1135;
         /* OFFSCREEN=1 keeps only offscreen passes, DISPLAY=1 only display ones
          * (load passes, so each replays to the whole screen). */
-        if ((!getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") || offscreen) &&
-            (!getenv("VPHONE_AGX_FRAME_DUMP_DISPLAY") || !offscreen) &&
+        if ((!dump_offscreen_cached || offscreen) &&
+            (!dump_display_cached || !offscreen) &&
             (!min_env || (dump_ta && agx_vdm_draw_count(s, cat_base, dump_ta) >=
                                      strtoul(min_env, NULL, 0)))) {
             agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
@@ -9239,10 +9267,14 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                                 AGXRenderJob **local_head, AGXRenderJob **local_tail)
 {
     static int dump_enabled = -1;
+    static int frame_dump_enabled = -1;
     uint32_t pointers[2], read_index, write_index, size;
 
-    if (dump_enabled < 0) {
+    if (__builtin_expect(dump_enabled < 0, 0)) {
         dump_enabled = getenv("VPHONE_AGX_DUMP") != NULL;
+    }
+    if (__builtin_expect(frame_dump_enabled < 0, 0)) {
+        frame_dump_enabled = getenv("VPHONE_AGX_FRAME_DUMP") != NULL;
     }
     if (!agx_gpu_access(s, agx_meta_gva(block) + 4, pointers, sizeof(pointers), false)) {
         return 0;
@@ -9359,7 +9391,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                 queue_has_job = true;
                 pending_job = NULL;
             }
-            if (command[0] == 0 && (getenv("VPHONE_AGX_FRAME_DUMP") || agx_replay_enabled()) &&
+            if (command[0] == 0 && (frame_dump_enabled || agx_replay_enabled()) &&
                 command[1] < ARRAY_SIZE(s->agx_last_ta)) {
                 uint32_t context = command[1];
                 uint8_t ta[0x280];
