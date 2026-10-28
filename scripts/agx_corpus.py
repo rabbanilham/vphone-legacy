@@ -118,14 +118,13 @@ SCENES = {
         'display_only': False,
         'seconds': 124,
     },
-    # Safari address bar focused: the on-screen keyboard rising and settled.
+    # Spotlight search pulled down over Home: the keyboard rising and settled.
     'keyboard': {
-        'touch': UNLOCK + '|at=106;tap 600,900|at=110;tap 400,1030|at=124;tap 320,50',
-        'at': [125.2, 126, 127.5, 130],
+        'touch': UNLOCK + '|at=106;tap 600,900|at=108;down 320,400;move 320,900 dur=0.5 steps=30;up',
+        'at': [109.2, 110, 111.5, 114],
         'per_at': 40,
         'display_only': False,
-        'wifi': True,
-        'seconds': 134,
+        'seconds': 118,
     },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
