@@ -1950,15 +1950,6 @@ static void mouse_touch_event(DeviceState *dev, QemuConsole *src,
     if (evt->type == INPUT_EVENT_KIND_KEY) {
         if (qemu_input_linux_to_qcode(evt->key.key) == Q_KEY_CODE_HOME) {
             if (evt->key.down && !s->home_pressed) {
-                /* Home must not sit behind a finger still settling from the
-                 * last gesture (up to 18 stationary frames, ~300 ms). */
-                if (s->mouse_touch.phase && !s->mouse_touch.pressed) {
-                    s->mouse_touch.release_frames = 0;
-                }
-                if (!s->multi_touch.slot[0].pressed &&
-                    !s->multi_touch.slot[1].pressed) {
-                    s->multi_touch.release_frames = 0;
-                }
                 home_level(s, true);
                 /* Guest-time release also protects against lost host key-up. */
                 timer_mod(s->home_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);

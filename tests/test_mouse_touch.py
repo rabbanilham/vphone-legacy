@@ -264,12 +264,6 @@ int main(void) {
     tick(); frame(4,1,0,1136);
     tick(); frame(5,3,0,1136);
     tick(); frame(6,4,0,1136);
-    /* Home during a settling swipe cuts the stationary frames short. */
-    reset(); packet(0,0,true); packet(32767,0,false);
-    assert(s.mouse_touch.release_frames==18);
-    { QemuInputEvent h={.type=INPUT_EVENT_KIND_KEY}; h.key.key=Q_KEY_CODE_HOME; h.key.down=true;
-      mouse_touch_handler.event(&display,s.con,&h); }
-    assert(s.home_pressed && s.mouse_touch.release_frames==0);
     /* Motion before the down timer preserves the original start/down point. */
     reset(); packet(0,0,true); packet(32767,32767,true);
     tick(); frame(1,3,0,16); tick(); frame(2,4,640,1136);
