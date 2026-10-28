@@ -1036,6 +1036,14 @@ def audit_frame(f):
     return outcomes
 
 
+def is_webkit_upload(f, prog, matrix, tex):
+    """Observed padded upload atlases, excluding generated 96x96 masks."""
+    return bool(tex and (tex['tsw'][0] & 7) == 1 and
+                not (tex['w'] & (tex['w'] - 1)) and not (tex['h'] & (tex['h'] - 1)) and
+                f.header.get('context_id', 1) != 1 and matrix and matrix[1] < 0 and
+                prog == 0x8eb52cf6fe248b1d)
+
+
 def texture_diagnostics(f):
     """Describe the selected texture state per draw without rendering pixels."""
     retained = [0] * 32
@@ -1049,8 +1057,7 @@ def texture_diagnostics(f):
             last_matrix = matrix
         elif prog in (WEBKIT_GLYPHS, 0x8eb52cf6fe248b1d):
             matrix = last_matrix
-        upload = bool(f.header.get('context_id', 1) != 1 and matrix and matrix[1] < 0 and
-                      prog == 0x8eb52cf6fe248b1d)
+        upload = is_webkit_upload(f, prog, matrix, tex)
         if tex and upload and (tex['tsw'][0] & 7) == 1 and not tex['strip']:
             tex['twiddled'] = True
         record = dict(draw=index, program=hex(prog), vertex_stride=f.u32(vs_data),
@@ -1176,8 +1183,7 @@ def main():
         tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)
         if not tex:
             tex = texture(f, ppp) or texture(f, retained_ppp)
-        webkit_upload = bool(f.header.get('context_id', 1) != 1 and m and m[1] < 0 and
-                             prog == 0x8eb52cf6fe248b1d)
+        webkit_upload = is_webkit_upload(f, prog, m, tex)
         if (tex and webkit_upload and (tex['tsw'][0] & 7) == 1 and not tex['strip']):
             tex['twiddled'] = True
         is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)

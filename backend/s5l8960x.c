@@ -7615,7 +7615,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             /* WebKit's GL upload path uses a flipped pixel-space matrix and
              * Morton source atlases. CA's software-produced layout-1 targets
              * retain their established linear representation. */
-            bool webkit_upload = ldl_le_p(ta + 4) != 1 && transformed && m4[1] < 0 &&
+            /* Uploaded atlases have power-of-two extents. The 96x96
+             * rounded-button source is a software-produced linear target,
+             * despite passing through the same flipped copy shader. */
+            bool webkit_upload = textured && tex.layout1 &&
+                                 !(tex.w & (tex.w - 1)) && !(tex.h & (tex.h - 1)) &&
+                                 ldl_le_p(ta + 4) != 1 && transformed && m4[1] < 0 &&
                                  prog == UINT64_C(0x8eb52cf6fe248b1d);
             if (textured && webkit_upload && tex.layout1 && !tex.strip) {
                 tex.twiddled = true;

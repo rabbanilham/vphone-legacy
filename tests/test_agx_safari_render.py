@@ -124,6 +124,19 @@ class SafariRenderTests(unittest.TestCase):
         self.assertEqual(output[0][(3*8+1)*4:(3*8+6)*4], bytes([255]*20))
         self.assertEqual(output[0][:8*4], bytes(32))
 
+    def test_uploaded_atlases_do_not_reinterpret_generated_masks(self):
+        class Memory:
+            header = {'context_id': 2}
+        matrix = (1, -1, 0, 0)
+        for width, height, expected in [(512, 512, True), (2048, 16, True),
+                                         (96, 96, False), (640, 1152, False)]:
+            tex = dict(w=width, h=height, tsw=[0x60000a61])
+            self.assertEqual(replay.is_webkit_upload(Memory(), 0x8eb52cf6fe248b1d,
+                                                    matrix, tex), expected)
+        Memory.header = {'context_id': 1}
+        self.assertFalse(replay.is_webkit_upload(Memory(), 0x8eb52cf6fe248b1d,
+                                                matrix, dict(w=512,h=512,tsw=[0x60000a61])))
+
     def test_format3_a8_descriptor(self):
         class Memory:
             pages = {0x10000000: bytes(4096)}
