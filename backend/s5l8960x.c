@@ -5632,6 +5632,30 @@ typedef struct AGXRenderJob {
     struct AGXRenderJob *next;
 } AGXRenderJob;
 
+static AGXRenderJob *agx_job_pool = NULL;
+
+static inline AGXRenderJob *agx_job_alloc(void)
+{
+    AGXRenderJob *job;
+    if (agx_job_pool) {
+        job = agx_job_pool;
+        agx_job_pool = job->next;
+        memset(job, 0, sizeof(*job));
+    } else {
+        job = g_new0(AGXRenderJob, 1);
+    }
+    return job;
+}
+
+static inline void agx_job_free(AGXRenderJob *job)
+{
+    if (!job) {
+        return;
+    }
+    job->next = agx_job_pool;
+    agx_job_pool = job;
+}
+
 /* AGX_REPLAY_CORE_BEGIN: from here to AGX_REPLAY_CORE_END is also compiled
  * into the offline host harness (backend/agx_replay_host.c), which defines
  * AGX_REPLAY_SKIP to count the draws that replay leaves out. */
@@ -5659,9 +5683,79 @@ static inline bool agx_replay_audit_enabled(void)
 struct AGXReplaySnapshot {
     gint refs;
     GHashTable *pages;
+    struct AGXReplaySnapshot *next;
 };
 static __thread AGXReplaySnapshot *agx_read_snapshot;
 static __thread bool agx_capture_snapshot;
+
+typedef struct AGXPageNode {
+    struct AGXPageNode *next;
+} AGXPageNode;
+
+static AGXPageNode *agx_page_pool = NULL;
+
+static inline void *agx_page_alloc(void)
+{
+    if (agx_page_pool) {
+        AGXPageNode *node = agx_page_pool;
+        agx_page_pool = node->next;
+        return node;
+    }
+    return g_malloc(4096);
+}
+
+static inline void agx_page_free(void *ptr)
+{
+    if (!ptr) {
+        return;
+    }
+    AGXPageNode *node = ptr;
+    node->next = agx_page_pool;
+    agx_page_pool = node;
+}
+
+typedef struct AGXKeyNode {
+    struct AGXKeyNode *next;
+} AGXKeyNode;
+
+static AGXKeyNode *agx_key_pool = NULL;
+
+static inline uint64_t *agx_key_alloc(void)
+{
+    if (agx_key_pool) {
+        AGXKeyNode *node = agx_key_pool;
+        agx_key_pool = node->next;
+        return (uint64_t *)node;
+    }
+    return g_new(uint64_t, 1);
+}
+
+static inline void agx_key_free(void *ptr)
+{
+    if (!ptr) {
+        return;
+    }
+    AGXKeyNode *node = ptr;
+    node->next = agx_key_pool;
+    agx_key_pool = node;
+}
+
+static AGXReplaySnapshot *agx_snapshot_pool = NULL;
+
+static inline AGXReplaySnapshot *agx_snapshot_alloc(void)
+{
+    if (agx_snapshot_pool) {
+        AGXReplaySnapshot *s = agx_snapshot_pool;
+        agx_snapshot_pool = s->next;
+        s->next = NULL;
+        s->refs = 1;
+        return s;
+    }
+    AGXReplaySnapshot *s = g_new0(AGXReplaySnapshot, 1);
+    s->refs = 1;
+    s->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, agx_key_free, agx_page_free);
+    return s;
+}
 
 static const uint8_t *agx_ta_snapshot_page(A7State *s, uint32_t context,
                                            const uint8_t *raw, uint64_t gva)
@@ -5681,8 +5775,9 @@ static AGXReplaySnapshot *agx_snapshot_ref(AGXReplaySnapshot *snapshot)
 static void agx_snapshot_unref(AGXReplaySnapshot *snapshot)
 {
     if (snapshot && g_atomic_int_dec_and_test(&snapshot->refs)) {
-        g_hash_table_destroy(snapshot->pages);
-        g_free(snapshot);
+        g_hash_table_remove_all(snapshot->pages);
+        snapshot->next = agx_snapshot_pool;
+        agx_snapshot_pool = snapshot;
     }
 }
 
@@ -5698,14 +5793,14 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
             g_hash_table_size(agx_read_snapshot->pages) < 1024) {
             hwaddr page_pa;
             if (agx_gpu_translate_ctx(s, cat, base, &page_pa)) {
-                cached = g_malloc(4096);
+                cached = agx_page_alloc();
                 if (address_space_read(&address_space_memory, page_pa, MEMTXATTRS_UNSPECIFIED,
                                        cached, 4096) == MEMTX_OK) {
-                    uint64_t *key = g_new(uint64_t, 1);
+                    uint64_t *key = agx_key_alloc();
                     *key = base;
                     g_hash_table_insert(agx_read_snapshot->pages, key, cached);
                 } else {
-                    g_free(cached);
+                    agx_page_free(cached);
                     cached = NULL;
                 }
             }
@@ -6923,14 +7018,12 @@ static bool agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
 
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
-    AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
+    AGXReplaySnapshot *snapshot = agx_snapshot_alloc();
 #ifdef QEMU_OSDEP_H
     /* The translation cache is per thread; the main loop must not reuse
      * entries across passes after the guest remaps GPU pages. */
     agx_tlb_reset();
 #endif
-    snapshot->refs = 1;
-    snapshot->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     agx_read_snapshot = snapshot;
     agx_capture_snapshot = true;
     uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
@@ -8735,7 +8828,7 @@ static void agx_replay_complete_job(AGXRenderJob *job)
         s->agx_inflight_jobs--;
     }
     agx_snapshot_unref(job->snapshot);
-    g_free(job);
+    agx_job_free(job);
 }
 
 static void agx_kick_cb(void *opaque);
@@ -9094,15 +9187,18 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
         AGXReplaySnapshot *snapshot = s->agx_ta_snapshot[context_id][ta_slot];
         uint64_t scissor_base = ldl_le_p(raw + 0x50);
         if (snapshot && scissor_base) {
-            uint8_t sc_page[4096];
             hwaddr sc_pa;
             uint64_t sc_base_page = scissor_base & ~UINT64_C(0xfff);
             if (!g_hash_table_lookup(snapshot->pages, &sc_base_page) &&
-                agx_gpu_translate_ctx(s, cat_base, sc_base_page, &sc_pa) &&
-                address_space_read(&address_space_memory, sc_pa, MEMTXATTRS_UNSPECIFIED, sc_page, 4096) == MEMTX_OK) {
-                uint64_t *key = g_new(uint64_t, 1);
-                *key = sc_base_page;
-                g_hash_table_insert(snapshot->pages, key, g_memdup2(sc_page, 4096));
+                agx_gpu_translate_ctx(s, cat_base, sc_base_page, &sc_pa)) {
+                uint8_t *page = agx_page_alloc();
+                if (address_space_read(&address_space_memory, sc_pa, MEMTXATTRS_UNSPECIFIED, page, 4096) == MEMTX_OK) {
+                    uint64_t *key = agx_key_alloc();
+                    *key = sc_base_page;
+                    g_hash_table_insert(snapshot->pages, key, page);
+                } else {
+                    agx_page_free(page);
+                }
             }
         }
         if (!agx_replay_thread_enabled()) {
@@ -9110,7 +9206,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
             agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h, is_clear, pbe_pitch, scissor_base);
             agx_read_snapshot = NULL;
         } else if (out_job) {
-            AGXRenderJob *job = g_new0(AGXRenderJob, 1);
+            AGXRenderJob *job = agx_job_alloc();
             job->s = s;
             job->snapshot = agx_snapshot_ref(snapshot);
             job->cat_base = cat_base;
@@ -9348,7 +9444,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                 continue;
             } else if (agx_replay_thread_enabled() && (s->agx_inflight_jobs > 0 || *local_head)) {
                 /* Preserve FIFO ordering: queue stamp behind in-flight replay */
-                AGXRenderJob *stamp_job = g_new0(AGXRenderJob, 1);
+                AGXRenderJob *stamp_job = agx_job_alloc();
                 stamp_job->s = s;
                 stamp_job->has_stamp = true;
                 stamp_job->stamp_gva = agx_meta_gva(command[1]);
@@ -9462,7 +9558,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
         /* Older jobs of this queue are still in flight: publish this index
          * behind them, or their completion would move the guest's read
          * index backwards. */
-        AGXRenderJob *ctrl_job = g_new0(AGXRenderJob, 1);
+        AGXRenderJob *ctrl_job = agx_job_alloc();
         ctrl_job->s = s;
         ctrl_job->has_queue_ctrl = true;
         ctrl_job->queue_ctrl_gva = control;
@@ -9589,7 +9685,7 @@ static void agx_kick_cb(void *opaque)
         agx_enqueue_render_jobs(s, local_head, local_tail);
     } else if (commands) {
         if (agx_replay_thread_enabled() && s->agx_inflight_jobs > 0) {
-            AGXRenderJob *comp_job = g_new0(AGXRenderJob, 1);
+            AGXRenderJob *comp_job = agx_job_alloc();
             comp_job->s = s;
             comp_job->post_completion = true;
             comp_job->commands = commands;
@@ -9945,7 +10041,7 @@ static void a7_reset(void *opaque)
         while (job) {
             AGXRenderJob *next = job->next;
             agx_snapshot_unref(job->snapshot);
-            g_free(job);
+            agx_job_free(job);
             job = next;
         }
         s->agx_job_head = NULL;
@@ -9953,7 +10049,7 @@ static void a7_reset(void *opaque)
         for (job = s->agx_done_head; job; ) {
             AGXRenderJob *next = job->next;
             agx_snapshot_unref(job->snapshot);
-            g_free(job);
+            agx_job_free(job);
             job = next;
         }
         s->agx_done_head = NULL;
