@@ -1,10 +1,10 @@
 # Live Test Evaluation: Rounded Corners Fix (Commit 3f24a12)
 
 **Test Date:** October 28, 2026  
-**Worktree:** `/Users/bagas/Documents/Projects/vphone/vphone-wt-anim`  
+**Worktree:** `<repo>`  
 **Branch:** `fix/anim` (commit `3f24a12 "agx: support Format 3 A8 masks and dual-texture corner restore"`)  
-**Baseline Binary:** `/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/bin/qemu-system-aarch64` (clean primary checkout)  
-**Candidate Binary:** `/Users/bagas/Documents/Projects/vphone/vphone-wt-anim/backend/bin/qemu-system-aarch64` (with Format 3 / dual-texture restore)  
+**Baseline Binary:** `<repo>/backend/bin/qemu-system-aarch64` (clean primary checkout)  
+**Candidate Binary:** `<repo>/backend/bin/qemu-system-aarch64` (with Format 3 / dual-texture restore)  
 
 ---
 

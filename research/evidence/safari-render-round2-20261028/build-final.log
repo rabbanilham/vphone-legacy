@@ -1,6 +1,6 @@
-python determined to be '/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/.venv/bin/python3'
+python determined to be '<repo>/backend/.venv/bin/python3'
 python version: Python 3.14.6
-mkvenv: Creating isolated virtual environment (with packages from '/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/.venv/lib/python3.14/site-packages') at 'pyvenv'
+mkvenv: Creating isolated virtual environment (with packages from '<repo>/backend/.venv/lib/python3.14/site-packages') at 'pyvenv'
 mkvenv: checking for meson>=1.5.0
 mkvenv: checking for pycotap>=1.1.0
 mkvenv: checking for qemu.qmp>=0.0.5
@@ -8,13 +8,13 @@ mkvenv: checking for setuptools>=44.1.1
 mkvenv: checking for wheel>=0.34.2
 mkvenv: checking for pip>=20.3.4
 mkvenv: installing pip>=20.3.4
-mkvenv: installing /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/upstream/python
+mkvenv: installing <repo>/backend/upstream/python
 Disabling PIE due to missing toolchain support
 Cleaning... 0 files.
 The Meson build system
 Version: 1.12.1
-Source dir: /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream
-Build dir: /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build
+Source dir: <repo>/backend/upstream
+Build dir: <repo>/backend/build
 Build type: native build
 Project name: qemu
 Project version: 11.1.2
@@ -22,9 +22,9 @@ C compiler for the host machine: cc (clang 21.0.0 "Apple clang version 21.0.0 (c
 C linker for the host machine: cc ld64 27106.1
 Host machine cpu family: aarch64
 Host machine cpu: aarch64
-Program scripts/symlink-install-tree.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/symlink-install-tree.py)
+Program scripts/symlink-install-tree.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/symlink-install-tree.py)
 Program sh found: YES (/bin/sh)
-Program python3 found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14)
+Program python3 found: YES (<repo>/backend/build/pyvenv/bin/python3.14)
 Objective-C compiler for the host machine: clang (clang 21.0.0)
 Objective-C linker for the host machine: clang ld64 27106.1
 Compiler for language rust skipped: feature rust disabled
@@ -123,7 +123,7 @@ Library util found: YES
 Run-time dependency appleframeworks found: YES (CoreFoundation)
 Run-time dependency appleframeworks found: YES (IOKit)
 Dependency appleframeworks(modules: ParavirtualizedGraphics, Metal) for host machine skipped: feature pvg disabled
-Found pkg-config: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/.venv/bin/pkg-config) 3.0.7
+Found pkg-config: YES (<repo>/backend/.venv/bin/pkg-config) 3.0.7
 Run-time dependency xencontrol found: NO  (tried pkg-config)
 Library xenstore found: NO
 Library xenctrl found: NO
@@ -140,7 +140,7 @@ to the PKG_CONFIG_PATH environment variable
 Package 'libffi', required by 'gobject-2.0', not found
 
 Run-time dependency gio-2.0 found: NO  (tried pkg-config)
-Program scripts/xml-preprocess.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/xml-preprocess.py)
+Program scripts/xml-preprocess.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/xml-preprocess.py)
 Run-time dependency pixman-1 found: YES 0.46.4
 Found CMake: /opt/homebrew/bin/cmake (4.4.3)
 Run-time dependency zlib found: YES 1.2.12
@@ -223,9 +223,9 @@ dtc| Dependency yaml-0.1 for host machine skipped: feature yaml disabled
 dtc| Run-time dependency valgrind found: NO  (tried pkg-config)
 dtc| Program python found: NO (disabled by: python )
 dtc| Program swig skipped: feature python disabled
-dtc| Found git repository at /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/subprojects/dtc
-dtc| Compiler for C supports link arguments -Wl,--version-script=/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/subprojects/dtc/libfdt/version.lds: NO
-dtc| Found pkg-config: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/.venv/bin/pkg-config) 3.0.7
+dtc| Found git repository at <repo>/backend/upstream/subprojects/dtc
+dtc| Compiler for C supports link arguments -Wl,--version-script=<repo>/backend/upstream/subprojects/dtc/libfdt/version.lds: NO
+dtc| Found pkg-config: YES (<repo>/backend/.venv/bin/pkg-config) 3.0.7
 dtc| Build targets in project: 2
 dtc| Subproject dtc finished.
 
@@ -306,35 +306,35 @@ Checking for type "struct utmpx" : YES
 Checking for type "struct mmsghdr" : NO 
 Header "asm/hwprobe.h" has symbol "RISCV_HWPROBE_EXT_ZBA" : NO 
 Header "linux/vm_sockets.h" has symbol "AF_VSOCK" : NO 
-Program scripts/minikconf.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/minikconf.py)
+Program scripts/minikconf.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/minikconf.py)
 Configuring aarch64-softmmu-config-target.h using configuration
 Configuring aarch64-softmmu-config-devices.mak with command
-Reading depfile: /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/meson-private/aarch64-softmmu-config-devices.mak.d
+Reading depfile: <repo>/backend/build/meson-private/aarch64-softmmu-config-devices.mak.d
 Configuring aarch64-softmmu-config-devices.h using configuration
-Program scripts/make-config-poison.sh found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/make-config-poison.sh)
+Program scripts/make-config-poison.sh found: YES (<repo>/backend/upstream/scripts/make-config-poison.sh)
 Configuring config-host.h using configuration
 Configuring run using configuration
-Program scripts/hxtool found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/hxtool)
-Program scripts/shaderinclude.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/shaderinclude.py)
-Program scripts/qapi-gen.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/qapi-gen.py)
-Program scripts/qemu-version.sh found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/qemu-version.sh)
+Program scripts/hxtool found: YES (<repo>/backend/upstream/scripts/hxtool)
+Program scripts/shaderinclude.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/shaderinclude.py)
+Program scripts/qapi-gen.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/qapi-gen.py)
+Program scripts/qemu-version.sh found: YES (<repo>/backend/upstream/scripts/qemu-version.sh)
 
 Executing subproject keycodemapdb for machine: host 
 
 keycodemapdb| Project name: keycodemapdb
 keycodemapdb| Project version: undefined
-keycodemapdb| Program tools/keymap-gen found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/subprojects/keycodemapdb/tools/keymap-gen)
+keycodemapdb| Program tools/keymap-gen found: YES (<repo>/backend/upstream/subprojects/keycodemapdb/tools/keymap-gen)
 keycodemapdb| Build targets in project: 448
 keycodemapdb| Subproject keycodemapdb finished.
 
-Program scripts/decodetree.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/decodetree.py)
-Program ../scripts/feature_to_c.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/gdbstub/../scripts/feature_to_c.py)
-Program ../scripts/modules/module_block.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/block/../scripts/modules/module_block.py)
-Program ../scripts/block-coroutine-wrapper.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/block/../scripts/block-coroutine-wrapper.py)
-Program scripts/modinfo-collect.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/modinfo-collect.py)
-Program scripts/modinfo-generate.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/modinfo-generate.py)
-Program scripts/rust/rust_root_crate.sh found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/rust/rust_root_crate.sh)
-Program scripts/entitlement.sh found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/entitlement.sh)
+Program scripts/decodetree.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/decodetree.py)
+Program ../scripts/feature_to_c.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/gdbstub/../scripts/feature_to_c.py)
+Program ../scripts/modules/module_block.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/block/../scripts/modules/module_block.py)
+Program ../scripts/block-coroutine-wrapper.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/block/../scripts/block-coroutine-wrapper.py)
+Program scripts/modinfo-collect.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/modinfo-collect.py)
+Program scripts/modinfo-generate.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/modinfo-generate.py)
+Program scripts/rust/rust_root_crate.sh found: YES (<repo>/backend/upstream/scripts/rust/rust_root_crate.sh)
+Program scripts/entitlement.sh found: YES (<repo>/backend/upstream/scripts/entitlement.sh)
 Configuring 50-edk2-i386-secure.json using configuration
 Configuring 50-edk2-x86_64-secure.json using configuration
 Configuring 60-edk2-aarch64.json using configuration
@@ -345,8 +345,8 @@ Configuring 60-edk2-loongarch64.json using configuration
 Configuring 60-edk2-riscv64.json using configuration
 Program dtc found: YES (/opt/homebrew/bin/dtc)
 Program qemu-keymap found: NO
-Program /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/sphinx-build skipped: feature docs disabled
-Program /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/decodetree.py found: YES (/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/decodetree.py)
+Program <repo>/backend/build/pyvenv/bin/sphinx-build skipped: feature docs disabled
+Program <repo>/backend/upstream/scripts/decodetree.py found: YES (<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/decodetree.py)
 
 Executing subproject berkeley-softfloat-3 for machine: host 
 
@@ -376,14 +376,14 @@ Run-time dependency gvnc-1.0 found: NO  (tried pkg-config)
 Run-time dependency sysprof-capture-4 found: NO  (tried pkg-config)
 WARNING: Static library 'iconv' not found for dependency 'glib-2.0', may not be statically linked
 Run-time dependency glib-2.0 found: YES 2.90.1
-Program initrd-stress.sh found: YES (/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/tests/migration-stress/initrd-stress.sh)
+Program initrd-stress.sh found: YES (<repo>/backend/upstream/tests/migration-stress/initrd-stress.sh)
 Build targets in project: 738
 
 qemu 11.1.2
 
   Build environment
-    Build directory                 : /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build
-    Source path                     : /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream
+    Build directory                 : <repo>/backend/build
+    Source path                     : <repo>/backend/upstream
     Download dependencies           : YES
 
   Directories
@@ -401,7 +401,7 @@ qemu 11.1.2
     Doc directory                   : /usr/local/share/doc
 
   Host binaries
-    python                          : /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 (version: 3.14)
+    python                          : <repo>/backend/build/pyvenv/bin/python3.14 (version: 3.14)
     sphinx-build                    : NO
     gdb                             : 
     iasl                            : NO
@@ -614,9 +614,9 @@ qemu 11.1.2
     vnc                             : enabled
     werror                          : false
 
-Found ninja-1.13.2.git.kitware.jobserver-pipe-1 at /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/.venv/bin/ninja
-Running postconf script '/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build/pyvenv/bin/python3.14 /Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/scripts/symlink-install-tree.py'
-ninja: Entering directory `/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/build'
+Found ninja-1.13.2.git.kitware.jobserver-pipe-1 at <repo>/backend/.venv/bin/ninja
+Running postconf script '<repo>/backend/build/pyvenv/bin/python3.14 <repo>/backend/upstream/scripts/symlink-install-tree.py'
+ninja: Entering directory `<repo>/backend/build'
 [1/11] Generating qemu-version.h with a custom command (wrapped by meson to capture output)
 [2/9] Compiling C object libsystem_arm.a.p/target_arm_tcg_tlb-insns.c.o
 [3/9] Compiling C object libqemu-aarch64-softmmu.a.p/target_arm_tcg_helper-a64.c.o
@@ -631,7 +631,7 @@ ninja: Entering directory `/Users/bagas/Documents/Projects/vphone/vphone-wt-safa
       |                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  1176 |                       cpu ? cpu->cc->get_pc(cpu) : 0, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
       |                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/upstream/include/qemu/log.h:96:30: note: expanded from macro 'qemu_log_mask'
+<repo>/backend/upstream/include/qemu/log.h:96:30: note: expanded from macro 'qemu_log_mask'
    96 |             qemu_log(FMT, ## __VA_ARGS__);              \
       |                      ~~~     ^~~~~~~~~~~
 ../../../vphone-legacy/backend/upstream/hw/arm/s5l8960x.c:6613:17: warning: unused function 'agx_replay_program' [-Wunused-function]
@@ -642,5 +642,5 @@ ninja: Entering directory `/Users/bagas/Documents/Projects/vphone/vphone-wt-safa
 ld: warning: ignoring duplicate libraries: '-lgcrypt', '-lgpg-error'
 [9/9] Generating qemu-system-aarch64 with a custom command
 [vphone] emulator App Nap protection active
-Built experimental backend: /Users/bagas/Documents/Projects/vphone/vphone-wt-safari/backend/bin/qemu-system-aarch64
+Built experimental backend: <repo>/backend/bin/qemu-system-aarch64
 No iOS boot compatibility is claimed.

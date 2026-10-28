@@ -1,7 +1,7 @@
-....sss..............s....................s........s..ss..........s.s..s.......s.................s.s.....................................sss..s...s.........../Users/bagas/Documents/Projects/vphone/vphone-wt-safari/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=5>
+....sss..............s....................s........s..ss..........s.s..s.......s.................s.s.....................................sss..s...s...........<repo>/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=5>
   run_service_fixture()
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/Users/bagas/Documents/Projects/vphone/vphone-wt-safari/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=3>
+<repo>/tests/test_backend_lifecycle.py:307: ResourceWarning: unclosed file <_io.BufferedReader name=3>
   run_service_fixture()
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ............................................................s...................................................PASS: ready guest keeps app context; gated digitizer gets Home wake and readiness retry
