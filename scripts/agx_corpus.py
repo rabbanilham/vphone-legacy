@@ -118,6 +118,15 @@ SCENES = {
         'display_only': False,
         'seconds': 124,
     },
+    # Safari address bar focused: the on-screen keyboard rising and settled.
+    'keyboard': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=110;tap 400,1030|at=124;tap 320,50',
+        'at': [125.2, 126, 127.5, 130],
+        'per_at': 40,
+        'display_only': False,
+        'wifi': True,
+        'seconds': 134,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],
