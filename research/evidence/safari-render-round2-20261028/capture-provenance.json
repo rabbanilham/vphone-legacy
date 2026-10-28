@@ -1,0 +1,16 @@
+{
+  "source": "research/evidence/safari-render-round2-20261028/focused/frame-2.bin",
+  "source_sha256": "9f5b2681e77fdff18df60b6de06266448f6ce45785a2004d32dec8bedd5a46b4",
+  "compressed_sha256": "e6d299a22dda194722b5b5c220b3efcc9dc2ea188318e1920528f5f3d6d6f58a",
+  "capture_context": 2,
+  "capture_environment": {
+    "VPHONE_AGX_FRAME_DUMP_CONTEXT": "all",
+    "VPHONE_AGX_FRAME_DUMP_AT": "120,150,180,210,240,270,300",
+    "VPHONE_AGX_FRAME_DUMP_PER_AT": "3",
+    "VPHONE_AGX_FRAME_DUMP_COUNT": "21",
+    "VPHONE_AGX_FRAME_DUMP_MIN_DRAWS": "5",
+    "VPHONE_AGX_FRAME_DUMP_OFFSCREEN": "1"
+  },
+  "baseline_revision": "6ad9f6d",
+  "binary_sha256": "ac80eec2803b9a2063c36a0e54681dd2fee0b41d5e99223d1593b90905cc5d45"
+}

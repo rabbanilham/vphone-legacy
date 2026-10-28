@@ -114,6 +114,14 @@ SCENES = {
         'at': [111, 113, 116, 121, 130],
         'seconds': 138,
     },
+    'safari': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=110;tap 400,1030|at=122;tap 100,250',
+        'at': [113, 117, 121, 125, 130, 135],
+        'per_at': 15,
+        'display_only': False,
+        'wifi': True,
+        'seconds': 140,
+    },
 }
 
 
@@ -143,12 +151,16 @@ def capture(args):
                'VPHONE_AGX_FRAME_DUMP_MIN_DRAWS': str(args.min_draws)}
         if scene.get('display_only', True):
             env['VPHONE_AGX_FRAME_DUMP_DISPLAY'] = '1'
+        if scene.get('dump_context'):
+            env['VPHONE_AGX_FRAME_DUMP_CONTEXT'] = str(scene['dump_context'])
         cmd = [sys.executable, str(BACKEND / 'display_probe.py'),
                '--plan', str(PROFILE / 'boot/boot_plan.json'),
                '--diagnostic-system', str(PROFILE / 'system.raw'),
                '--diagnostic-data', str(PROFILE / 'data.raw'),
                '--seconds', str(scene['seconds']), '--stop-condition', 'duration',
                '--output', str(out / 'probe')]
+        if scene.get('wifi', False):
+            cmd.append('--wifi')
         for t in scene['at']:
             cmd += ['--framebuffer-at', str(round(t))]
         print(f'{name}: boot {scene["seconds"]} s, dump windows {scene["at"]}', flush=True)
@@ -246,20 +258,24 @@ def replay_c(binary, dump, out_png):
 
 def replay_c_chain(binary, frames, report):
     """One scene in dump order: each pass sees what the earlier ones drew."""
-    prefix = report / f'chain-{frames[0]["scene"]}'
+    w = frames[0].get('window')
+    tag = f'{frames[0]["scene"]}-w{w}' if w is not None else frames[0]['scene']
+    prefix = report / f'chain-{tag}'
     result = subprocess.run([str(binary), '--chain', str(prefix), *[str(f['dump']) for f in frames]],
                             capture_output=True, text=True)
     lines = result.stdout.splitlines()
     infos = []
     for i, f in enumerate(frames):
-        if i >= len(lines):
+        rgba = Path(f'{prefix}-{i}.rgba')
+        if i >= len(lines) or not rgba.exists():
             infos.append({'error': (result.stderr or f'exit {result.returncode}').strip()[-400:]})
+            if rgba.exists():
+                rgba.unlink()
             continue
         info = json.loads(lines[i])
-        rgba = Path(f'{prefix}-{i}.rgba')
         data = rgba.read_bytes()
-        w, h = struct.unpack_from('<II', data, 4)
-        (report / f'{f["scene"]}-{f["frame"]}.png').write_bytes(png_bytes(w, h, data[12:]))
+        w_px, h_px = struct.unpack_from('<II', data, 4)
+        (report / f'{f["scene"]}-{f["frame"]}.png').write_bytes(png_bytes(w_px, h_px, data[12:]))
         rgba.unlink()
         infos.append(info)
     return infos
@@ -288,6 +304,8 @@ def replay(args):
     binary = build_harness(args.corpus / '.harness')
     frames = []
     for scene_dir in sorted(p for p in args.corpus.iterdir() if (p / 'dumps').is_dir()):
+        if args.scene and scene_dir.name not in args.scene:
+            continue
         recipe = json.loads((scene_dir / 'recipe.json').read_text()) if (scene_dir / 'recipe.json').exists() else {}
         dumps = sorted((scene_dir / 'dumps').glob('frame-*.bin'), key=lambda p: int(p.stem.split('-')[1]))
         for dump in dumps:
@@ -313,7 +331,8 @@ def replay(args):
         else:
             scenes = {}
             for f in frames:
-                scenes.setdefault(f['scene'], []).append(f)
+                key = (f['scene'], f['window']) if f['window'] else f['scene']
+                scenes.setdefault(key, []).append(f)
             c_jobs = {threads.submit(replay_c_chain, binary, group, report): group
                       for group in scenes.values()}
         py_jobs = {processes.submit(audit_python, f['dump']): f for f in frames}
@@ -424,10 +443,19 @@ def main():
     parser.add_argument('--scene', action='append', choices=list(SCENES))
     parser.add_argument('--per-at', type=int, default=2)
     parser.add_argument('--min-draws', type=int, default=1)
+    parser.add_argument('--texture-audit', type=Path,
+                        help='Print per-draw texture/layout state for one AGXF dump and exit')
     parser.add_argument('--jobs', type=int, default=os.cpu_count())
     parser.add_argument('--single', action='store_true',
                         help='replay each dump on its own memory instead of chaining a scene')
     args = parser.parse_args()
+    if args.texture_audit:
+        sys.path.insert(0, str(BACKEND))
+        from agx_frame import Frame
+        from agx_replay_offline import texture_diagnostics
+        for record in texture_diagnostics(Frame(args.texture_audit)):
+            print(json.dumps(record))
+        return
     if args.command == 'capture':
         capture(args)
     else:

@@ -1,0 +1,30 @@
+PASS: AGX replay pairing: exact guest physical pixels and padding
+PASS: AGX replay pairing-batch: exact guest physical pixels and padding
+PASS: AGX replay wait-stamp: exact guest physical pixels and padding
+PASS: AGX replay geometry-lifetime: exact guest physical pixels and padding
+PASS: AGX replay wallpaper: exact guest physical pixels and padding
+PASS: AGX replay transform: exact guest physical pixels and padding
+PASS: AGX replay dense: exact guest physical pixels and padding
+PASS: AGX replay dest-in: exact guest physical pixels and padding
+PASS: AGX replay gauss-blur: exact guest physical pixels and padding
+PASS: AGX replay clip-top-left: exact guest physical pixels and padding
+PASS: AGX replay clip-bottom-right: exact guest physical pixels and padding
+PASS: AGX replay rotate-uv: exact guest physical pixels and padding
+PASS: AGX replay vibrancy-dark: exact guest physical pixels and padding
+PASS: AGX replay vibrancy-light: exact guest physical pixels and padding
+PASS: AGX replay scissor-clip: exact guest physical pixels and padding
+PASS: AGX replay home-dirty-scissor: exact guest physical pixels and padding
+PASS: AGX replay home-dirty-region: exact guest physical pixels and padding
+PASS: AGX replay copy-border: exact guest physical pixels and padding
+PASS: AGX replay transparent-over: exact guest physical pixels and padding
+PASS: AGX replay home-dirty-scissor: inline pixels and padding
+PASS: AGX replay home-dirty-region: inline pixels and padding
+PASS: AGX replay copy-border: inline pixels and padding
+PASS: AGX replay transparent-over: inline pixels and padding
+PASS: AGX default replay draws exact solid/texture pixels; VPHONE_AGX_REPLAY=0 preserves target
+PASS: AGX replay inline fallback (VPHONE_AGX_REPLAY_THREAD=0) matches threaded replay
+PASS: AGX ring 3 no-doorbell context bind and CAT_BASE0 fallback
+PASS: AGX RT trace; opt-in fill follows noncontiguous GPU mappings and preserves padding
+PASS: AGX META boot program -> one type-0 alive entry on firmware ring 0 and AIC IRQ 84; empty program posts nothing
+PASS: AGX doorbell 0x11 -> channel queue registered, type-4 stamp stored, type-1 completion event and IRQ 84
+Synthetic AGX host-interface and quad replay contract only; no iOS rendering inferred.

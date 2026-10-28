@@ -409,18 +409,81 @@ still captures the final framebuffer and stops on a kernel panic.
 ### Optional BCM43342 HSIC Wi-Fi
 
 Build in this checkout with `python3 scripts/qemu/build_backend.py` (requires
-libslirp). `backend/live_run.py --wifi` and `backend/display_probe.py --wifi`
-add `-netdev user,id=wifi0` and `-machine wifi-netdev=wifi0`. Wi-Fi remains
-absent when this option is omitted. Use a visible Cocoa window for iOS runs:
-`live_run.py` always does; use `VPHONE_DISPLAY=cocoa` with `display_probe.py`.
+libslirp). Wi-Fi is enabled via `--wifi` in:
+- `./vphone-legacy vm launch NAME --wifi`
+- `backend/live_run.py --wifi`
+- `backend/display_probe.py --wifi`
 
-The launcher resolves the Mac's SSID using networksetup, wdutil without sudo,
-and system_profiler, with bounded timeouts. `VPHONE_WIFI_SSID` overrides discovery;
-`vphone-wifi` is the fallback. An explicit `-machine wifi-ssid=NAME` overrides
-the environment. SSIDs contain 1–32 UTF-8 bytes. The single synthetic AP is open,
-channel 6, BSSID `02:43:34:20:00:01`; its name does not imply authentication to
-the physical AP. QEMU uses the Mac's existing routed connection through slirp,
-with DHCP/DNS/NAT supplied by `-netdev user`. No guest network state is seeded.
+These pass `-netdev user,id=wifi0` and append `,wifi-netdev=wifi0` to `-machine`.
+Wi-Fi remains absent when this option is omitted (Wi-Fi is off by default).
+Use a visible Cocoa window for iOS runs: `live_run.py` always does; use
+`VPHONE_DISPLAY=cocoa` with `display_probe.py`.
+
+#### Host-Mirrored Scan List and JSON Contract
+
+When host scanning is available, the guest iOS 7.1.2 Wi-Fi list mirrors the host
+Mac's nearby Wi-Fi networks. The host scanner writes an atomic JSON contract file
+(default: `build/wifi-scan.json`), and QEMU is passed the machine property
+`-machine wifi-scan-file=PATH`. The board re-reads this file dynamically on each
+guest scan request (`WLC_SCAN` / `escan`).
+
+The frozen JSON contract schema is:
+```json
+{
+  "version": 1,
+  "updated": 1729750000,
+  "networks": [
+    {
+      "ssid": "Office-5G",
+      "channel": 6,
+      "rssi": -45,
+      "security": "wpa2",
+      "connected": true
+    },
+    {
+      "ssid": "Guest-WiFi",
+      "channel": 1,
+      "rssi": -72,
+      "security": "open",
+      "connected": false
+    }
+  ]
+}
+```
+
+Contract rules:
+- `networks`: up to 16 networks max.
+- `ssid`: 1..32 UTF-8 bytes.
+- `channel`: 1..14. Host 5 GHz and 6 GHz channels are mapped deterministically into channels 1..14 by `host_wifi.py`.
+- `rssi`: integer in range -100..-30 dBm.
+- `security`: one of `"open"`, `"wpa"`, `"wpa2"`, `"wpa3"`, or `"enterprise"`.
+- `connected`: boolean; exactly one network has `connected: true` (the host's currently connected network).
+- Stable synthetic BSSIDs (`02:43:34:20:XX:XX`) are generated from SSID hashes with pre-11ac legacy Darwin chanspec encoding.
+
+#### macOS Location Permission Requirement and Fallback
+
+CoreWLAN scanning (`CWWiFiClient.shared().interface().scanForNetworks(withSSID:nil)`)
+on modern macOS requires Location Services authorization. Without permission, macOS
+redacts SSIDs (returning empty or `<redacted>`).
+- The helper detects nil, empty, or redacted SSIDs.
+- If Location permission is denied, ungranted, or the scan helper is missing/fails,
+  `host_wifi.py` transparently falls back to the legacy single synthetic AP behavior:
+  the active SSID is resolved unprivileged via `networksetup -getairportnetwork en0`,
+  `wdutil info` (without sudo), `system_profiler SPAirPortDataType -xml`,
+  environment variable `VPHONE_WIFI_SSID`, or the default `vphone-wifi`.
+- An absent or invalid `wifi-scan-file` also causes the emulator to fall back
+  gracefully to the legacy single AP (`wifi-ssid` / `VPHONE_WIFI_SSID`, open, ch 6, RSSI -45).
+
+#### Networking, Slirp NAT, and Join Semantics
+
+- **Internet via slirp**: All guest internet connectivity always routes through
+  the host Mac's existing active network connection via user-mode slirp NAT
+  (`-netdev user,id=wifi0`), supplying DHCP (10.0.2.15), DNS (10.0.2.3), and gateway (10.0.2.2).
+- **Joining non-connected networks and WPA**: The guest can select and join any
+  network from the scan table (whether `connected: true` or `connected: false`).
+  Selecting any entry emits the standard 802.11 JOIN, ASSOC, and LINK-up events.
+  WPA/WPA2/WPA3 authentication is **not** performed; the data path opens directly
+  over slirp regardless of the chosen network or its advertised security type.
 
 The device starts as `0a5c:4334`, validates a streamed TRX length/CRC, and
 re-enumerates as `0a5c:bd21` after DL_GO. Runtime CDC ioctls, subscribed scan/join

@@ -35,6 +35,19 @@ If the linker cannot read the selected SDK, choose a matching installed SDK expl
 
 Continue with [firmware preparation](firmware.md) or [troubleshooting](troubleshooting.md).
 
+## Wi-Fi networking (optional)
+
+Wi-Fi is disabled by default. Pass `--wifi` to `./vphone-legacy vm launch NAME --wifi`, `backend/live_run.py --wifi`, or `backend/display_probe.py --wifi` to attach the modeled BCM43342 HSIC Wi-Fi dongle and slirp user networking (`-netdev user,id=wifi0`).
+
+- **Host-mirrored scan list**: The guest iOS 7.1.2 Wi-Fi list mirrors nearby host Wi-Fi networks discovered by the host Mac via an atomic JSON contract file (`build/wifi-scan.json`, up to 16 networks).
+- **macOS Location permissions and fallback**: macOS CoreWLAN requires Location Services permission to read SSID names. When permission is ungranted or denied, SSIDs are returned as `<redacted>` or empty; the launcher detects this and automatically falls back to unprivileged discovery (`networksetup` / `wdutil` / `system_profiler` / `VPHONE_WIFI_SSID` / default `vphone-wifi`) exposing a single synthetic open AP on channel 6.
+- **Slirp NAT**: All guest internet traffic routes through the host Mac's existing routed connection via slirp NAT.
+- **Network association**: Joining any network in the guest list opens the slirp data path without performing WPA 4-way handshakes.
+- **One-time Location permission grant**: To grant Location permission so nearby SSIDs can be discovered without redaction:
+  1. Build the helper application bundle: `make wifi-helper` (creates `build/host_wifi_scan.app`).
+  2. Run the helper once from Terminal: `build/host_wifi_scan.app/Contents/MacOS/host_wifi_scan`.
+  3. When macOS prompts for Location authorization, click "Allow While Using App" (or grant in System Settings -> Privacy & Security -> Location Services).
+
 
 ## Interactive player (local research profile)
 

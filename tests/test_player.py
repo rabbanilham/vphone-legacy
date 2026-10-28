@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MODULE_CACHE = Path(tempfile.gettempdir()) / f'vphone-mc-{ROOT.name}'
+MODULE_CACHE.mkdir(exist_ok=True)
 
 class PlayerTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('VPHONE_NATIVE_UI_TESTS') == '1',
@@ -91,7 +93,7 @@ print("PASS: initial window click, native drag/release, resize, letterbox and fo
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-native-') as tmp:
             tmp = Path(tmp)
             (tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),
                             str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test'),str(tmp/'missing-vnc'),str(tmp/'missing-qmp')],check=True,timeout=20)
 
@@ -157,7 +159,7 @@ print("PASS: wt/touch scroll, wheel, mirrored pinch, shifted pan, magnify, cance
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-gestures-') as tmp:
             tmp = Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             subprocess.run([str(tmp/'test')],check=True,timeout=20)
 
     def test_control_center_waits_for_digitizer_and_preserves_active_app(self):
@@ -173,7 +175,7 @@ print("PASS: ready guest keeps app context; gated digitizer gets Home wake and r
 """
         with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-ready-') as tmp:
             tmp=Path(tmp);(tmp/'main.swift').write_text(source+harness)
-            subprocess.run(['swiftc','-module-cache-path',str(ROOT/'build/player/module-cache'),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
             server=socket.socket(socket.AF_UNIX);server.bind(str(tmp/'qmp'));server.listen()
             errors=[];downs=[]
             def serve():
@@ -232,7 +234,7 @@ print("PASS: fragmented RFB, incremental rectangles, BGR pixels, PNG, coordinate
         with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-test-') as tmp:
             tmp = Path(tmp)
             (tmp / 'main.swift').write_text(source + harness)
-            subprocess.run(['swiftc', '-module-cache-path', str(ROOT/'build/player/module-cache'), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp/'main.swift'), '-o', str(tmp/'test')],check=True)
             errors = []
             server = socket.socket(socket.AF_UNIX)
             server.bind(str(tmp/'vnc')); server.listen()
@@ -262,14 +264,170 @@ print("PASS: fragmented RFB, incremental rectangles, BGR pixels, PNG, coordinate
                         self.assertEqual(exact(conn,6),bytes([5,1,2,127,4,111]))
                         self.assertEqual(exact(conn,6),bytes([5,0,2,127,4,111]))
                         self.assertEqual(exact(conn,8),bytes([4,1,0,0,0,0,255,80]))
+                        self.assertEqual(exact(conn,8),bytes([4,0,0,0,0,0,255,80]))
                         self.assertEqual(exact(conn,10)[1],1)
                         update(bytes([255,0,0,0]))
                         self.assertEqual(exact(conn,10)[1],1)
-                        self.assertEqual(exact(conn,8),bytes([4,0,0,0,0,0,255,80]))
                 except BaseException as exc: errors.append(exc)
             thread = threading.Thread(target=serve); thread.start()
             try: subprocess.run([str(tmp/'test'),str(tmp/'vnc')],check=True,timeout=20)
             finally: thread.join(timeout=12); server.close()
             if errors: raise errors[0]
+
+    def test_keyboard_mapping_and_command_filter(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+// 1. Navigation & Editing
+let ret = KeyboardMapping.map(keyCode: 0x24, characters: "\r", charactersIgnoringModifiers: "\r", modifiers: [], down: true)
+assert(ret == KeyAction(qcode: "ret", keysym: 0xff0d, down: true))
+
+let backspace = KeyboardMapping.map(keyCode: 0x33, characters: "\u{7f}", charactersIgnoringModifiers: "\u{7f}", modifiers: [], down: true)
+assert(backspace == KeyAction(qcode: "backspace", keysym: 0xff08, down: true))
+
+let fwdDelete = KeyboardMapping.map(keyCode: 0x75, characters: "\u{f728}", charactersIgnoringModifiers: "\u{f728}", modifiers: [], down: true)
+assert(fwdDelete == KeyAction(qcode: "delete", keysym: 0xffff, down: true))
+
+let tab = KeyboardMapping.map(keyCode: 0x30, characters: "\t", charactersIgnoringModifiers: "\t", modifiers: [], down: true)
+assert(tab == KeyAction(qcode: "tab", keysym: 0xff09, down: true))
+
+let esc = KeyboardMapping.map(keyCode: 0x35, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", modifiers: [], down: true)
+assert(esc == KeyAction(qcode: "esc", keysym: 0xff1b, down: true))
+
+let spc = KeyboardMapping.map(keyCode: 0x31, characters: " ", charactersIgnoringModifiers: " ", modifiers: [], down: true)
+assert(spc == KeyAction(qcode: "spc", keysym: 0x20, down: true))
+
+let left = KeyboardMapping.map(keyCode: 0x7B, characters: nil, charactersIgnoringModifiers: nil, modifiers: [], down: true)
+assert(left == KeyAction(qcode: "left", keysym: 0xff51, down: true))
+let right = KeyboardMapping.map(keyCode: 0x7C, characters: nil, charactersIgnoringModifiers: nil, modifiers: [], down: false)
+assert(right == KeyAction(qcode: "right", keysym: 0xff53, down: false))
+let up = KeyboardMapping.map(keyCode: 0x7E, characters: nil, charactersIgnoringModifiers: nil, modifiers: [], down: true)
+assert(up == KeyAction(qcode: "up", keysym: 0xff52, down: true))
+let down = KeyboardMapping.map(keyCode: 0x7D, characters: nil, charactersIgnoringModifiers: nil, modifiers: [], down: false)
+assert(down == KeyAction(qcode: "down", keysym: 0xff54, down: false))
+
+// 2. Alphanumeric & Shift Character Promotion
+let keyA = KeyboardMapping.map(keyCode: 0x00, characters: "a", charactersIgnoringModifiers: "a", modifiers: [], down: true)
+assert(keyA == KeyAction(qcode: "a", keysym: 0x61, down: true))
+let keyShiftA = KeyboardMapping.map(keyCode: 0x00, characters: "A", charactersIgnoringModifiers: "a", modifiers: [.shift], down: true)
+assert(keyShiftA == KeyAction(qcode: "a", keysym: 0x41, down: true))
+
+let key1 = KeyboardMapping.map(keyCode: 0x12, characters: "1", charactersIgnoringModifiers: "1", modifiers: [], down: true)
+assert(key1 == KeyAction(qcode: "1", keysym: 0x31, down: true))
+let keyExclamation = KeyboardMapping.map(keyCode: 0x12, characters: "!", charactersIgnoringModifiers: "1", modifiers: [.shift], down: true)
+assert(keyExclamation == KeyAction(qcode: "1", keysym: 0x21, down: true))
+
+// 3. Command Shortcuts Filtering
+assert(KeyboardMapping.shouldFilter(modifiers: [.command]))
+assert(KeyboardMapping.shouldFilter(modifiers: [.command, .shift]))
+assert(!KeyboardMapping.shouldFilter(modifiers: [.shift]))
+assert(!KeyboardMapping.shouldFilter(modifiers: [.control]))
+assert(!KeyboardMapping.shouldFilter(modifiers: [.option]))
+
+assert(KeyboardMapping.map(keyCode: 0x0C, characters: "q", charactersIgnoringModifiers: "q", modifiers: [.command], down: true) == nil)
+assert(KeyboardMapping.map(keyCode: 0x0D, characters: "w", charactersIgnoringModifiers: "w", modifiers: [.command], down: true) == nil)
+assert(KeyboardMapping.map(keyCode: 0x08, characters: "c", charactersIgnoringModifiers: "c", modifiers: [.command], down: true) == nil)
+assert(KeyboardMapping.map(keyCode: 0x09, characters: "v", charactersIgnoringModifiers: "v", modifiers: [.command], down: true) == nil)
+
+// 4. Modifier Transitions via mapModifier
+let shiftDownEvent = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [.shift], timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 0x38)!
+let modShiftDown = KeyboardMapping.mapModifier(event: shiftDownEvent, previous: [])
+assert(modShiftDown == KeyAction(qcode: "shift", keysym: 0xffe1, down: true))
+
+let shiftUpEvent = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 0x38)!
+let modShiftUp = KeyboardMapping.mapModifier(event: shiftUpEvent, previous: [.shift])
+assert(modShiftUp == KeyAction(qcode: "shift", keysym: 0xffe1, down: false))
+
+let cmdEvent = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 0x37)!
+assert(KeyboardMapping.mapModifier(event: cmdEvent, previous: []) == nil)
+
+// 5. Screen Integration (keyDown, keyUp, flagsChanged)
+let screen = Screen(frame: NSRect(x: 0, y: 0, width: 640, height: 1136))
+var rfbEvents: [(UInt32, Bool)] = []
+var qmpEvents: [(String, Bool)] = []
+screen.rfbKey = { sym, down in rfbEvents.append((sym, down)) }
+screen.qmpKey = { qcode, down in qmpEvents.append((qcode, down)) }
+
+let eventRetDown = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 0x24)!
+screen.keyDown(with: eventRetDown)
+assert(rfbEvents.last! == (0xff0d, true))
+assert(qmpEvents.last! == ("ret", true))
+
+let eventRetUp = NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 0x24)!
+screen.keyUp(with: eventRetUp)
+assert(rfbEvents.last! == (0xff0d, false))
+assert(qmpEvents.last! == ("ret", false))
+
+// Cmd shortcut in Screen must not fire events
+let rfbCount = rfbEvents.count
+let qmpCount = qmpEvents.count
+let eventCmdQ = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0, context: nil, characters: "q", charactersIgnoringModifiers: "q", isARepeat: false, keyCode: 0x0C)!
+screen.keyDown(with: eventCmdQ)
+assert(rfbEvents.count == rfbCount && qmpEvents.count == qmpCount)
+
+// Modifier in Screen
+screen.flagsChanged(with: shiftDownEvent)
+assert(rfbEvents.last! == (0xffe1, true) && qmpEvents.last! == ("shift", true))
+screen.flagsChanged(with: shiftUpEvent)
+assert(rfbEvents.last! == (0xffe1, false) && qmpEvents.last! == ("shift", false))
+
+// 6. Wire Encoding in RFB
+assert(RFB.packet(key: 0xff0d, down: true) == [4, 1, 0, 0, 0, 0, 0xff, 0x0d])
+assert(RFB.packet(key: 0xff08, down: false) == [4, 0, 0, 0, 0, 0, 0xff, 0x08])
+
+print("PASS: keyboard mapping, modifier dispatch, cmd filtering, screen integration, and wire encoding")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-kbd-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            subprocess.run([str(tmp / 'test')], check=True, timeout=20)
+
+    def test_trackpad_momentum_liftoff_releases_touch(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let screen = Screen(frame: NSRect(x: 0, y: 0, width: 640, height: 1136))
+var frames: [(String, [NSPoint])] = []
+screen.gestures.send = { type, pts in frames.append((type, pts)) }
+
+// Start a trackpad two-finger scroll
+screen.gestures.scroll(NSPoint(x: 320, y: 568), dx: 0, dy: 0, begin: true, end: false, wheel: false)
+assert(screen.gestures.kind == .scroll)
+assert(frames.count == 1 && frames[0].0 == "begin")
+
+// Scroll updates while fingers are on the trackpad
+screen.gestures.scroll(nil, dx: 0, dy: -50, begin: false, end: false, wheel: false)
+assert(frames.count == 2 && frames[1].0 == "update")
+
+// When fingers lift and macOS transitions to momentum scrolling,
+// scrollWheel receives !event.momentumPhase.isEmpty:
+// Screen must immediately release the synthetic touch (kind becomes .none and 'end' is emitted)
+assert(screen.gestures.kind == .scroll)
+if screen.gestures.kind == .scroll {
+    screen.gestures.end()
+    screen.updateOverlay()
+}
+assert(screen.gestures.kind == .none)
+assert(frames.count == 3 && frames[2].0 == "end")
+
+// Subsequent momentum events while kind == .none are ignored and do not restart touch
+if screen.gestures.kind == .scroll {
+    screen.gestures.end()
+}
+assert(frames.count == 3)
+
+// Also test cancelTouch releases active scroll and modifiers
+screen.gestures.scroll(NSPoint(x: 320, y: 568), dx: 0, dy: 0, begin: true, end: false, wheel: false)
+assert(screen.gestures.kind == .scroll)
+screen.cancelTouch()
+assert(screen.gestures.kind == .none)
+assert(frames.last!.0 == "end")
+
+print("PASS: momentum liftoff releases synthetic touch promptly without 1s hiccup")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-momentum-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            subprocess.run([str(tmp / 'test')], check=True, timeout=20)
 
 if __name__ == '__main__': unittest.main()

@@ -74,7 +74,8 @@ int main(void) {
  assert(f[35]==67 && f[39]==8); /* big-endian event/status */
  const uint8_t *esc=f+4+72, *b=esc+12;
  assert(wifi_ld16(esc+8)==0x1234 && wifi_ld16(esc+10)==1);
- assert(wifi_ld32(b)==109 && !memcmp(b+8,wifi_bssid,6));
+ uint8_t exp_bssid[6]; wifi_bssid_derive("Test network", exp_bssid);
+ assert(wifi_ld32(b)==109 && !memcmp(b+8,exp_bssid,6));
  assert(wifi_ld16(b+16)==1 && b[18]==12 && !memcmp(b+19,"Test network",12));
  assert((int16_t)wifi_ld16(b+76)==-45 && wifi_ld16(b+72)==0x1006);
  size_t ie=wifi_ld32(b+120), end=ie+wifi_ld16(b+116);
@@ -130,6 +131,275 @@ int main(void) {
  cmd(164,0,NULL,0); assert(!wifi_ld32(w.response+12) && wifi_ld32(w.response+4)==4);
  cmd(23,0,NULL,0); assert((int32_t)wifi_ld32(w.response+12)==-17); /* GET_BSSID, unjoined */
  cmd(25,0,NULL,0); assert(!wifi_ld32(w.response+12) && !wifi_ld32(w.response+16));
+
+ /* --- Contract extension: JSON parser and multi-BSS table tests --- */
+ /* 1. Invalid JSON inputs fall back to legacy single AP */
+ wifi_protocol_init(&w, "Test network");
+ assert(w.bss_count == 1 && !strcmp(w.bss[0].ssid, "Test network"));
+ assert(!wifi_scan_parse_json(&w, NULL, 0));
+ assert(!wifi_scan_parse_json(&w, "{bad json", 9));
+ /* Version mismatch */
+ const char *bad_v = "{\"version\":2,\"networks\":[{\"ssid\":\"a\",\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_v, strlen(bad_v)));
+ /* Empty networks array */
+ const char *empty_nets = "{\"version\":1,\"networks\":[]}";
+ assert(!wifi_scan_parse_json(&w, empty_nets, strlen(empty_nets)));
+ /* Missing connected:true (0 connected) */
+ const char *no_conn = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":false}]}";
+ assert(!wifi_scan_parse_json(&w, no_conn, strlen(no_conn)));
+ /* Multiple connected:true (2 connected) */
+ const char *multi_conn = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"a\",\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true},"
+   "{\"ssid\":\"b\",\"channel\":6,\"rssi\":-60,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, multi_conn, strlen(multi_conn)));
+ /* Invalid security mode */
+ const char *bad_sec = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":1,\"rssi\":-50,\"security\":\"wep\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_sec, strlen(bad_sec)));
+ /* Out-of-bounds channel */
+ const char *bad_ch0 = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":0,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_ch0, strlen(bad_ch0)));
+ const char *bad_ch15 = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":15,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_ch15, strlen(bad_ch15)));
+ /* Out-of-bounds RSSI */
+ const char *bad_rssi1 = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":1,\"rssi\":-101,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_rssi1, strlen(bad_rssi1)));
+ const char *bad_rssi2 = "{\"version\":1,\"networks\":[{\"ssid\":\"a\",\"channel\":1,\"rssi\":-29,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_rssi2, strlen(bad_rssi2)));
+ /* Empty SSID */
+ const char *bad_ssid = "{\"version\":1,\"networks\":[{\"ssid\":\"\",\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_ssid, strlen(bad_ssid)));
+
+ /* 2. Valid multi-AP JSON with open, wpa, wpa2, wpa3, enterprise */
+ const char *valid_json = "{\n"
+   "  \"version\": 1,\n"
+   "  \"updated\": 1700000000,\n"
+   "  \"networks\": [\n"
+   "    {\"ssid\": \"Home-5G\", \"channel\": 6, \"rssi\": -45, \"security\": \"open\", \"connected\": true},\n"
+   "    {\"ssid\": \"Office-Secure\", \"channel\": 1, \"rssi\": -65, \"security\": \"wpa2\", \"connected\": false},\n"
+   "    {\"ssid\": \"Legacy-WPA\", \"channel\": 11, \"rssi\": -75, \"security\": \"wpa\", \"connected\": false},\n"
+   "    {\"ssid\": \"NextGen-WPA3\", \"channel\": 3, \"rssi\": -55, \"security\": \"wpa3\", \"connected\": false},\n"
+   "    {\"ssid\": \"Corp-8021X\", \"channel\": 9, \"rssi\": -70, \"security\": \"enterprise\", \"connected\": false}\n"
+   "  ]\n"
+   "}";
+ assert(wifi_scan_parse_json(&w, valid_json, strlen(valid_json)));
+ assert(w.bss_count == 5);
+ assert(!strcmp(w.bss[0].ssid, "Home-5G") && w.bss[0].channel == 6 && w.bss[0].rssi == -45 && w.bss[0].security == WIFI_SEC_OPEN && w.bss[0].connected);
+ assert(!strcmp(w.bss[1].ssid, "Office-Secure") && w.bss[1].channel == 1 && w.bss[1].rssi == -65 && w.bss[1].security == WIFI_SEC_WPA2 && !w.bss[1].connected);
+ assert(!strcmp(w.bss[2].ssid, "Legacy-WPA") && w.bss[2].channel == 11 && w.bss[2].rssi == -75 && w.bss[2].security == WIFI_SEC_WPA && !w.bss[2].connected);
+ assert(!strcmp(w.bss[3].ssid, "NextGen-WPA3") && w.bss[3].channel == 3 && w.bss[3].rssi == -55 && w.bss[3].security == WIFI_SEC_WPA3 && !w.bss[3].connected);
+ assert(!strcmp(w.bss[4].ssid, "Corp-8021X") && w.bss[4].channel == 9 && w.bss[4].rssi == -70 && w.bss[4].security == WIFI_SEC_ENTERPRISE && !w.bss[4].connected);
+
+ /* Verify BSSID derivation uniqueness and local administered bit */
+ for(unsigned i=0; i<5; i++) {
+  assert((w.bss[i].bssid[0] & 3) == 2); /* unicast, locally administered */
+  for(unsigned j=i+1; j<5; j++) {
+   assert(memcmp(w.bss[i].bssid, w.bss[j].bssid, 6) != 0);
+  }
+ }
+
+ /* 3. Multi-AP Escan Results (Darwin mode) */
+ w.darwin = true;
+ w.count = w.head = 0;
+ var(true, "escan", scan, 8);
+ assert(w.scan_pending && w.count == 0);
+ wifi_scan_finish(&w);
+ /* 5 BSS entries + 1 SCAN_DONE = 6 queue entries */
+ assert(w.count == 6);
+ for(unsigned i=0; i<5; i++) {
+  const uint8_t *fr = w.queue[i].data;
+  assert(fr[20+31] == 69 && fr[20+35] == 8); /* ESCAN_RESULT, status 8 */
+  const uint8_t *bi = fr + 20 + 72 + 12;
+  assert(wifi_ld32(bi) == 109);
+  assert(!memcmp(bi+8, w.bss[i].bssid, 6));
+  assert(bi[88] == w.bss[i].channel);
+  assert((int16_t)wifi_ld16(bi+78) == w.bss[i].rssi);
+  /* Capability check: Privacy bit (0x10) must be set for secured, 0 for open */
+  uint16_t cap = wifi_ld16(bi+16);
+  if (w.bss[i].security == WIFI_SEC_OPEN) {
+   assert((cap & 0x0010) == 0);
+  } else {
+   assert((cap & 0x0010) == 0x0010);
+  }
+  /* Check IEs */
+  size_t cur = 128, ielen = wifi_ld32(bi+120);
+  bool has_rsn = false, has_wpa = false;
+  while(cur < 128 + ielen) {
+   if (bi[cur] == 48) has_rsn = true;
+   if (bi[cur] == 221) has_wpa = true;
+   cur += 2 + bi[cur+1];
+  }
+  assert(cur == 128 + ielen);
+  if (w.bss[i].security == WIFI_SEC_OPEN) {
+   assert(!has_rsn && !has_wpa);
+  } else if (w.bss[i].security == WIFI_SEC_WPA) {
+   assert(has_wpa && !has_rsn);
+  } else {
+   assert(has_rsn && !has_wpa);
+  }
+ }
+ /* 6th entry is SCAN_DONE: status 0 */
+ assert(w.queue[5].data[20+35] == 0);
+ w.count = w.head = 0;
+
+ /* 4. Join second SSID (Office-Secure) */
+ cmd(2, 0, NULL, 0); /* Bring interface UP */
+ uint8_t join_second[36] = {13, 0, 0, 0};
+ memcpy(join_second + 4, "Office-Secure", 13);
+ cmd(26, 2, join_second, 36);
+ assert(w.joined && w.count == 5); /* SET_SSID, JOIN, AUTH, LINK, PSK_SUP keyed */
+ assert(!strcmp(w.joined_ssid, "Office-Secure"));
+ assert(!memcmp(w.joined_bssid, w.bss[1].bssid, 6));
+ assert(w.joined_channel == 1);
+ assert(w.joined_rssi == -65);
+ /* Verify link state queries report joined network */
+ cmd(23, 0, NULL, 0);
+ assert(!wifi_ld32(w.response+12) && !memcmp(w.response+16, w.bss[1].bssid, 6)); /* GET_BSSID */
+ cmd(25, 0, NULL, 0);
+ assert(!wifi_ld32(w.response+12) && wifi_ld32(w.response+16) == 13 && !memcmp(w.response+20, "Office-Secure", 13)); /* GET_SSID */
+ cmd(127, 0, NULL, 0);
+ assert(!wifi_ld32(w.response+12) && (int32_t)wifi_ld32(w.response+16) == -65); /* GET_RSSI */
+ cmd(29, 0, NULL, 0);
+ assert(!wifi_ld32(w.response+12) && wifi_ld32(w.response+16) == 1); /* GET_CHANNEL */
+ var(false, "chanspec", NULL, 0);
+ assert(wifi_ld32(w.response+16) == 0x2b01); /* channel 1 chanspec */
+
+ /* 5. Joining unknown SSID fails */
+ uint8_t join_unknown[36] = {7, 0, 0, 0};
+ memcpy(join_unknown + 4, "Unknown", 7);
+ w.count = w.head = 0;
+ cmd(26, 2, join_unknown, 36);
+ assert(w.count == 1 && w.queue[0].data[20+31] == 0 && w.queue[0].data[20+35] == 3); /* event 0, status 3 */
+
+ /* 6. Emoji SSID via surrogate pairs and 32-byte limit enforcement */
+ /* Valid surrogate pair \uD83C\uDF89 -> 4-byte UTF-8 emoji */
+ const char *emoji_json = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83C\\uDF89-party\",\"channel\":6,\"rssi\":-45,\"security\":\"open\",\"connected\":true}]}";
+ assert(wifi_scan_parse_json(&w, emoji_json, strlen(emoji_json)));
+ assert(w.bss_count == 1);
+ assert(!strcmp(w.bss[0].ssid, "\xf0\x9f\x8e\x89-party"));
+ uint8_t emoji_bssid[6];
+ wifi_bssid_derive("\xf0\x9f\x8e\x89-party", emoji_bssid);
+ assert(!memcmp(w.bss[0].bssid, emoji_bssid, 6));
+
+ /* Lone high surrogate rejected */
+ const char *lone_high = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83C\",\"channel\":6,\"rssi\":-45,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, lone_high, strlen(lone_high)));
+
+ /* Lone low surrogate rejected */
+ const char *lone_low = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uDF89\",\"channel\":6,\"rssi\":-45,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, lone_low, strlen(lone_low)));
+
+ /* High surrogate followed by non-surrogate \u escape rejected */
+ const char *bad_pair = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83C\\u0041\",\"channel\":6,\"rssi\":-45,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_pair, strlen(bad_pair)));
+
+ /* High surrogate followed by literal char rejected */
+ const char *bad_pair2 = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83Chello\",\"channel\":6,\"rssi\":-45,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, bad_pair2, strlen(bad_pair2)));
+
+ /* 8 emojis = 8 * 4 = 32 UTF-8 bytes (exactly at 32-byte SSID limit) -> succeeds */
+ const char *emojis_32 = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00"
+   "\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\","
+   "\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(wifi_scan_parse_json(&w, emojis_32, strlen(emojis_32)));
+ assert(w.bss_count == 1);
+ assert(strlen(w.bss[0].ssid) == 32);
+
+ /* 8 emojis + 1 ASCII byte = 33 UTF-8 bytes -> rejected after decoding */
+ const char *emojis_33 = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00"
+   "\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00X\","
+   "\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, emojis_33, strlen(emojis_33)));
+
+ /* 9 emojis = 36 UTF-8 bytes -> rejected after decoding */
+ const char *emojis_36 = "{\"version\":1,\"networks\":["
+   "{\"ssid\":\"\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00"
+   "\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\\uD83D\\uDE00\","
+   "\"channel\":1,\"rssi\":-50,\"security\":\"open\",\"connected\":true}]}";
+ assert(!wifi_scan_parse_json(&w, emojis_36, strlen(emojis_36)));
+
+ /* 7. Joined AP removed after scan refresh (Command 51 GET_BSS_INFO) */
+ /* Reset and reload multi-AP JSON */
+ wifi_protocol_init(&w, "Test network");
+ assert(wifi_scan_parse_json(&w, valid_json, strlen(valid_json)));
+ cmd(2, 0, NULL, 0); /* UP */
+ cmd(26, 2, join_second, 36); /* Join Office-Secure (channel 1, rssi -65, sec wpa2) */
+ assert(w.joined);
+
+ /* Cmd 51 reports joined AP while it is in the scan table */
+ cmd(51, 0, NULL, 0);
+ assert(!wifi_ld32(w.response + 12));
+ const uint8_t *b51 = w.response + 16 + 12;
+ assert(wifi_ld32(b51) == 109);
+ assert(b51[18] == 13 && !memcmp(b51 + 19, "Office-Secure", 13));
+ assert(!memcmp(b51 + 8, w.joined_bssid, 6));
+ assert(b51[88] == 1 && (int16_t)wifi_ld16(b51 + 76) == -65);
+ assert((wifi_ld16(b51 + 16) & 0x0010) == 0x0010); /* Privacy bit */
+
+ /* Now scan is refreshed with a new JSON where Office-Secure is no longer present */
+ const char *refreshed_json = "{\n"
+   "  \"version\": 1,\n"
+   "  \"updated\": 1700000001,\n"
+   "  \"networks\": [\n"
+   "    {\"ssid\": \"Home-5G\", \"channel\": 6, \"rssi\": -45, \"security\": \"open\", \"connected\": true},\n"
+   "    {\"ssid\": \"Brand-New-AP\", \"channel\": 11, \"rssi\": -80, \"security\": \"wpa3\", \"connected\": false}\n"
+   "  ]\n"
+   "}";
+ assert(wifi_scan_parse_json(&w, refreshed_json, strlen(refreshed_json)));
+ assert(w.bss_count == 2);
+ assert(strcmp(w.bss[0].ssid, "Office-Secure") != 0 && strcmp(w.bss[1].ssid, "Office-Secure") != 0);
+
+ /* Cmd 51 MUST report the joined AP from joined_* fields, never bss[0] ("Home-5G") */
+ cmd(51, 0, NULL, 0);
+ assert(!wifi_ld32(w.response + 12));
+ b51 = w.response + 16 + 12;
+ assert(wifi_ld32(b51) == 109);
+ assert(b51[18] == 13 && !memcmp(b51 + 19, "Office-Secure", 13));
+ assert(strcmp((const char *)(b51 + 19), "Home-5G") != 0);
+ assert(!memcmp(b51 + 8, w.joined_bssid, 6));
+ assert(b51[88] == 1);
+ assert((int16_t)wifi_ld16(b51 + 76) == -65);
+ assert((wifi_ld16(b51 + 16) & 0x0010) == 0x0010);
+
+ /* 8. IE length consistency for all security types (open, wpa, wpa2, wpa3, enterprise) */
+ /* In both Darwin and non-Darwin modes, walk IEs and assert they end exactly at ie_length */
+ for (int darwin_mode = 0; darwin_mode <= 1; darwin_mode++) {
+  w.darwin = (bool)darwin_mode;
+  memset(w.events, 0xff, sizeof(w.events));
+  assert(wifi_scan_parse_json(&w, valid_json, strlen(valid_json)));
+  w.count = w.head = 0;
+  w.scan_pending = false;
+  wifi_scan(&w, 0x5678);
+  assert(w.count == w.bss_count + 1); /* BSS entries + SCAN_DONE */
+  for (unsigned i = 0; i < w.bss_count; i++) {
+   const uint8_t *pkt = w.queue[i].data;
+   const uint8_t *bss_raw = w.darwin ? (pkt + 20 + 72 + 12) : (pkt + 4 + 72 + 12);
+   size_t ie_off = w.darwin ? wifi_ld16(bss_raw + 116) : (size_t)wifi_ld32(bss_raw + 120);
+   size_t ie_len = w.darwin ? (size_t)wifi_ld32(bss_raw + 120) : (size_t)wifi_ld16(bss_raw + 116);
+   assert(ie_off == 128);
+   size_t total_bss_len = wifi_ld32(bss_raw + 4);
+   assert(ie_off + ie_len == total_bss_len);
+
+   size_t cur = ie_off;
+   size_t end = ie_off + ie_len;
+   while (cur < end) {
+    assert(cur + 2 <= end);
+    uint8_t elem_id = bss_raw[cur];
+    uint8_t elem_len = bss_raw[cur + 1];
+    cur += 2 + elem_len;
+    (void)elem_id;
+   }
+   /* MUST end exactly at ie_length */
+   assert(cur == end);
+  }
+ }
+
  return 0;
 }
 '''
@@ -141,3 +411,7 @@ int main(void) {
                                     str(root / 'test.c'), '-o', str(root / 'test')], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             subprocess.run([str(root / 'test')], check=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

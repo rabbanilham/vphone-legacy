@@ -25,7 +25,7 @@ class WallpaperTests(unittest.TestCase):
         harness = Path(cls.tmp.name) / 'layout.c'
         harness.write_text('''#include <stdint.h>
 #include <stdbool.h>
-typedef struct { uint64_t addr; uint32_t w, h, stride; bool strip, twiddled; } AGXTexture;
+typedef struct { uint64_t addr; uint32_t w, h, stride, bpp; bool strip, twiddled; } AGXTexture;
 ''' + fn + '''
 uint64_t address(unsigned w, unsigned h, unsigned x, unsigned y) {
     AGXTexture t = { .addr = 0x10000000, .w = w, .h = h, .twiddled = true };

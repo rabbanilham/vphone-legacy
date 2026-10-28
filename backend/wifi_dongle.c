@@ -15,6 +15,7 @@ struct WifiDongle {
     NICConf conf;
     NICState *nic;
     char *ssid;
+    char *scan_file;
     WifiProtocol proto;
     QEMUTimer *reenumerate, *scan_done;
     bool detached_for_go, host_ready, rom_mode, resp_notified;
@@ -98,6 +99,43 @@ static void wifi_reenumerate(void *opaque)
         qemu_log_mask(LOG_UNIMP,"WIFI runtime attach 0a5c:bd21 attached=%u\n",dev->attached);
     }
 }
+static void wifi_dongle_reload_scan(WifiDongle *s)
+{
+    if (!s->scan_file || !*s->scan_file) {
+        wifi_protocol_fallback_bss(&s->proto);
+        return;
+    }
+    FILE *f = fopen(s->scan_file, "rb");
+    if (!f) {
+        wifi_protocol_fallback_bss(&s->proto);
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        wifi_protocol_fallback_bss(&s->proto);
+        return;
+    }
+    long len = ftell(f);
+    if (len <= 0 || len > 65536) {
+        fclose(f);
+        wifi_protocol_fallback_bss(&s->proto);
+        return;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        wifi_protocol_fallback_bss(&s->proto);
+        return;
+    }
+    char *buf = g_malloc(len + 1);
+    size_t r = fread(buf, 1, len, f);
+    fclose(f);
+    buf[r] = '\0';
+    if (!wifi_scan_parse_json(&s->proto, buf, r)) {
+        wifi_protocol_fallback_bss(&s->proto);
+    }
+    g_free(buf);
+}
+
 static void wifi_control(USBDevice *dev, USBPacket *p, int request,
                          int value, int index, int length, uint8_t *data)
 {
@@ -193,6 +231,12 @@ static void wifi_control(USBDevice *dev, USBPacket *p, int request,
             if(rpc) w->darwin = true;
             const uint8_t *cmd_data = rpc ? data + 16 : data;
             size_t cmd_len = rpc ? length - 16 : length;
+            if(cmd_len >= 4) {
+                uint32_t cmd = wifi_ld32(cmd_data);
+                if(cmd == 50 || (cmd == 263 && cmd_len >= 22 && !memcmp(cmd_data + 16, "escan", 5))) {
+                    wifi_dongle_reload_scan(s);
+                }
+            }
             if(!wifi_ioctl(w, cmd_data, cmd_len)) goto stall;
             if(w->scan_pending && !timer_pending(s->scan_done))
                 timer_mod(s->scan_done,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+WIFI_ESCAN_NS);
@@ -324,6 +368,7 @@ static void wifi_realize(USBDevice *dev, Error **errp)
     if(!ssid || !*ssid) ssid="vphone-wifi";
     if(strlen(ssid)>32) { error_setg(errp,"Wi-Fi SSID exceeds 32 bytes"); return; }
     wifi_protocol_init(&s->proto,ssid);
+    wifi_dongle_reload_scan(s);
     if(!memcmp(s->conf.macaddr.a,"\0\0\0\0\0\0",6)) memcpy(s->conf.macaddr.a,s->proto.mac,6);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);
     if (s->rom_mode) {
@@ -354,6 +399,7 @@ static void wifi_power_reset(WifiDongle *s)
     timer_del(s->reenumerate); timer_del(s->scan_done);
     if(dev->attached) usb_device_detach(dev);
     wifi_protocol_init(&s->proto,ssid);
+    wifi_dongle_reload_scan(s);
     memcpy(s->proto.mac,s->conf.macaddr.a,6);
     s->detached_for_go=false; s->host_ready=false; s->tx_len=0;
     if (s->rom_mode) {
@@ -367,6 +413,7 @@ static void wifi_power_reset(WifiDongle *s)
 }
 static const Property wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(WifiDongle,conf), DEFINE_PROP_STRING("ssid",WifiDongle,ssid),
+    DEFINE_PROP_STRING("scan-file",WifiDongle,scan_file),
     DEFINE_PROP_BOOL("rom",WifiDongle,rom_mode,false),
 };
 static const VMStateDescription wifi_vmstate = {.name=TYPE_WIFI_DONGLE,.unmigratable=1};

@@ -112,9 +112,21 @@ final class RFB {
         }
     }
     func input(_ bytes: [UInt8]) { do { try send(bytes) } catch { failed?(error.localizedDescription) } }
+    static func packet(key sym: UInt32, down: Bool) -> [UInt8] {
+        [4, down ? 1 : 0, 0, 0,
+         UInt8((sym >> 24) & 0xff),
+         UInt8((sym >> 16) & 0xff),
+         UInt8((sym >> 8) & 0xff),
+         UInt8(sym & 0xff)]
+    }
+    func key(_ sym: UInt32, _ down: Bool) {
+        input(Self.packet(key: sym, down: down))
+    }
     func home() {
-        input([4,1,0,0,0,0,0xff,0x50])
-        DispatchQueue.global().asyncAfter(deadline: .now()+0.1) { self.input([4,0,0,0,0,0,0xff,0x50]) }
+        // The device owns the 100 ms guest-time pulse and lost-key-up guard.
+        // A host timer only delays key-up and can slip under host load.
+        key(0xff50, true)
+        key(0xff50, false)
     }
     func pointer(_ x: Int, _ y: Int, _ down: Bool) {
         input([5,down ? 1:0,UInt8(x>>8),UInt8(x&255),UInt8(y>>8),UInt8(y&255)])
@@ -280,6 +292,23 @@ final class QMPInput {
         if io.fd >= 0 {close(io.fd);io.fd = -1}
         connected = false
     }
+    func sendKey(_ qcode: String, _ down: Bool) {
+        queue.async {
+            do {
+                if !self.connected { try self.connect() }
+                try self.execute("input-send-event", [
+                    "device": "a7-touch-display",
+                    "events": [
+                        ["type": "key", "data": ["down": down, "key": ["type": "qcode", "data": qcode]]]
+                    ]
+                ])
+            } catch {
+                if self.io.fd >= 0 { close(self.io.fd); self.io.fd = -1 }
+                self.connected = false
+                self.failed?(error.localizedDescription)
+            }
+        }
+    }
     // Sleep/wake button: a click locks an awake device or wakes a sleeping one.
     func pressPower(_ completion: @escaping (String?)->Void) {
         queue.async {
@@ -315,7 +344,6 @@ final class QMPInput {
                         // Only wake a gated digitizer. Do not leave an active app.
                         for down in [true,false] {
                             try self.execute("input-send-event",["device":"a7-touch-display","events":[["type":"key","data":["down":down,"key":["type":"qcode","data":"home"]]]]])
-                            if down {usleep(100000)}
                         }
                         woke = true
                     }
@@ -436,6 +464,120 @@ enum ScreenGeometry {
     }
 }
 
+struct KeyAction: Equatable {
+    let qcode: String
+    let keysym: UInt32
+    let down: Bool
+}
+
+enum KeyboardMapping {
+    static let table: [UInt16: (String, UInt32)] = [
+        // Letters
+        0x00: ("a", 0x61), 0x0B: ("b", 0x62), 0x08: ("c", 0x63), 0x02: ("d", 0x64),
+        0x0E: ("e", 0x65), 0x03: ("f", 0x66), 0x05: ("g", 0x67), 0x04: ("h", 0x68),
+        0x22: ("i", 0x69), 0x26: ("j", 0x6a), 0x28: ("k", 0x6b), 0x25: ("l", 0x6c),
+        0x2E: ("m", 0x6d), 0x2D: ("n", 0x6e), 0x1F: ("o", 0x6f), 0x23: ("p", 0x70),
+        0x0C: ("q", 0x71), 0x0F: ("r", 0x72), 0x01: ("s", 0x73), 0x11: ("t", 0x74),
+        0x20: ("u", 0x75), 0x09: ("v", 0x76), 0x0D: ("w", 0x77), 0x07: ("x", 0x78),
+        0x10: ("y", 0x79), 0x06: ("z", 0x7a),
+
+        // Numbers
+        0x1D: ("0", 0x30), 0x12: ("1", 0x31), 0x13: ("2", 0x32), 0x14: ("3", 0x33),
+        0x15: ("4", 0x34), 0x17: ("5", 0x35), 0x16: ("6", 0x36), 0x1A: ("7", 0x37),
+        0x1C: ("8", 0x38), 0x19: ("9", 0x39),
+
+        // Punctuation & symbols
+        0x1B: ("minus", 0x2d), 0x18: ("equal", 0x3d),
+        0x21: ("bracket_left", 0x5b), 0x1E: ("bracket_right", 0x5d),
+        0x2A: ("backslash", 0x5c), 0x29: ("semicolon", 0x3b),
+        0x27: ("apostrophe", 0x27), 0x32: ("grave_accent", 0x60),
+        0x2B: ("comma", 0x2c), 0x2F: ("dot", 0x2e), 0x2C: ("slash", 0x2f),
+
+        // Controls & Whitespace
+        0x24: ("ret", 0xff0d), 0x30: ("tab", 0xff09), 0x31: ("spc", 0x20),
+        0x33: ("backspace", 0xff08), 0x75: ("delete", 0xffff),
+        0x35: ("esc", 0xff1b),
+
+        // Navigation
+        0x7B: ("left", 0xff51), 0x7C: ("right", 0xff53),
+        0x7E: ("up", 0xff52), 0x7D: ("down", 0xff54),
+        0x73: ("home", 0xff50), 0x77: ("end", 0xff57),
+        0x74: ("pgup", 0xff55), 0x79: ("pgdn", 0xff56),
+
+        // Modifiers
+        0x38: ("shift", 0xffe1), 0x3C: ("shift_r", 0xffe2),
+        0x3B: ("ctrl", 0xffe3), 0x3E: ("ctrl_r", 0xffe4),
+        0x3A: ("alt", 0xffe9), 0x3D: ("alt_r", 0xfe03),
+        0x39: ("caps_lock", 0xffe5),
+
+        // Keypad
+        0x41: ("kp_decimal", 0xffae), 0x43: ("kp_multiply", 0xffaa),
+        0x45: ("kp_add", 0xffab), 0x4B: ("kp_divide", 0xffaf),
+        0x4C: ("kp_enter", 0xff8d), 0x4E: ("kp_subtract", 0xffad),
+        0x51: ("kp_equals", 0xffbd),
+        0x52: ("kp_0", 0xffb0), 0x53: ("kp_1", 0xffb1), 0x54: ("kp_2", 0xffb2),
+        0x55: ("kp_3", 0xffb3), 0x56: ("kp_4", 0xffb4), 0x57: ("kp_5", 0xffb5),
+        0x58: ("kp_6", 0xffb6), 0x59: ("kp_7", 0xffb7), 0x5B: ("kp_8", 0xffb8),
+        0x5C: ("kp_9", 0xffb9),
+
+        // Function keys
+        0x7A: ("f1", 0xffbe), 0x78: ("f2", 0xffbf), 0x63: ("f3", 0xffc0),
+        0x76: ("f4", 0xffc1), 0x60: ("f5", 0xffc2), 0x61: ("f6", 0xffc3),
+        0x62: ("f7", 0xffc4), 0x64: ("f8", 0xffc5), 0x65: ("f9", 0xffc6),
+        0x6D: ("f10", 0xffc7), 0x67: ("f11", 0xffc8), 0x6F: ("f12", 0xffc9)
+    ]
+
+    static func shouldFilter(modifiers: NSEvent.ModifierFlags) -> Bool {
+        modifiers.contains(.command)
+    }
+
+    static func map(keyCode: UInt16,
+                    characters: String?,
+                    charactersIgnoringModifiers: String?,
+                    modifiers: NSEvent.ModifierFlags,
+                    down: Bool) -> KeyAction? {
+        if shouldFilter(modifiers: modifiers) {
+            return nil
+        }
+        guard let (qcode, defaultSym) = table[keyCode] else {
+            return nil
+        }
+        var keysym = defaultSym
+        if defaultSym < 0xff00, defaultSym != 0x20, let chars = characters, let first = chars.unicodeScalars.first {
+            let val = first.value
+            if (val >= 0x20 && val <= 0x7e) || (val >= 0xa0 && val <= 0x10ffff) {
+                keysym = val
+            }
+        }
+        return KeyAction(qcode: qcode, keysym: keysym, down: down)
+    }
+
+    static func map(_ event: NSEvent, down: Bool) -> KeyAction? {
+        map(keyCode: event.keyCode,
+            characters: event.characters,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: event.modifierFlags,
+            down: down)
+    }
+
+    static func mapModifier(event: NSEvent, previous: NSEvent.ModifierFlags) -> KeyAction? {
+        let code = event.keyCode
+        let flags = event.modifierFlags
+        let flag: NSEvent.ModifierFlags
+        switch code {
+        case 0x38, 0x3C: flag = .shift
+        case 0x3B, 0x3E: flag = .control
+        case 0x3A, 0x3D: flag = .option
+        case 0x39: flag = .capsLock
+        default: return nil
+        }
+        let isDown = flags.contains(flag)
+        let wasDown = previous.contains(flag)
+        guard isDown != wasDown, let (qcode, sym) = table[code] else { return nil }
+        return KeyAction(qcode: qcode, keysym: sym, down: isDown)
+    }
+}
+
 // Shown over the screen while the guest has its display off (sleep/locked).
 final class SleepOverlay: NSView {
     var onWake: (() -> Void)?
@@ -483,6 +625,9 @@ final class Screen: NSView {
     let sleepOverlay = SleepOverlay()
     private(set) var sleeping = false
     var input: ((Int,Int,Bool)->Void)?
+    var rfbKey: ((UInt32,Bool)->Void)?
+    var qmpKey: ((String,Bool)->Void)?
+    private var currentModifiers: NSEvent.ModifierFlags = []
     let gestures = TouchGestures()
     var wheelTimer: Timer?
     var controlCenterTimer: Timer?
@@ -561,6 +706,7 @@ final class Screen: NSView {
     }
     func cancelTouch() {
         touchEpoch += 1
+        currentModifiers = []
         wheelTimer?.invalidate();wheelTimer = nil
         controlCenterTimer?.invalidate();controlCenterTimer = nil
         gestures.end();gestures.hint(nil,option:false);updateOverlay()
@@ -632,7 +778,27 @@ final class Screen: NSView {
         if gestures.kind == .pinch {gestures.end();gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));updateOverlay()}
         else if held {pointer(event,false)}
     }
+    override func keyDown(with event: NSEvent) {
+        if let action = KeyboardMapping.map(event, down: true) {
+            rfbKey?(action.keysym, true)
+            qmpKey?(action.qcode, true)
+            trace?("keyDown qcode=\(action.qcode) sym=0x\(String(action.keysym, radix: 16))")
+        }
+    }
+    override func keyUp(with event: NSEvent) {
+        if let action = KeyboardMapping.map(event, down: false) {
+            rfbKey?(action.keysym, false)
+            qmpKey?(action.qcode, false)
+            trace?("keyUp qcode=\(action.qcode) sym=0x\(String(action.keysym, radix: 16))")
+        }
+    }
     override func flagsChanged(with event:NSEvent) {
+        if let action = KeyboardMapping.mapModifier(event: event, previous: currentModifiers) {
+            rfbKey?(action.keysym, action.down)
+            qmpKey?(action.qcode, action.down)
+            trace?("modifier \(action.down ? "down" : "up") qcode=\(action.qcode) sym=0x\(String(action.keysym, radix: 16))")
+        }
+        currentModifiers = event.modifierFlags
         let p = window.map {convert($0.mouseLocationOutsideOfEventStream,from:nil)}
         let point = p.flatMap {displayRect.contains($0) ? NSPoint(x:($0.x-displayRect.minX)/displayRect.width*640,y:($0.y-displayRect.minY)/displayRect.height*1136):nil}
         gestures.hint(point,option:event.modifierFlags.contains(.option));updateOverlay()
@@ -640,13 +806,21 @@ final class Screen: NSView {
     override func mouseMoved(with event:NSEvent) {gestures.hint(guestPoint(event),option:event.modifierFlags.contains(.option));updateOverlay()}
     override func mouseExited(with event:NSEvent) {gestures.hint(nil,option:false);updateOverlay()}
     override func scrollWheel(with event:NSEvent) {
-        guard !held,event.momentumPhase.isEmpty else {return}
+        guard !held else {return}
+        if !event.momentumPhase.isEmpty {
+            if gestures.kind == .scroll {
+                gestures.end()
+                updateOverlay()
+            }
+            return
+        }
         let wheel = event.phase.isEmpty
         let scale = event.hasPreciseScrollingDeltas ? 640/displayRect.width:40
-        let moves = wheel || event.phase.contains(.changed)
+        let moves = wheel || event.phase.contains(.changed) || event.phase.contains(.ended)
+        let isEnd = event.phase.contains(.ended) || event.phase.contains(.cancelled)
         gestures.scroll(guestPoint(event),dx:moves ? event.scrollingDeltaX*scale:0,dy:moves ? event.scrollingDeltaY*scale:0,
             begin:wheel ? gestures.kind == .none:event.phase.contains(.began),
-            end:event.phase.contains(.ended) || event.phase.contains(.cancelled),wheel:wheel)
+            end:isEnd,wheel:wheel)
         if wheel,gestures.kind == .wheel {
             wheelTimer?.invalidate()
             wheelTimer = Timer.scheduledTimer(withTimeInterval:0.15,repeats:false) {[weak self] _ in self?.gestures.end();self?.updateOverlay()}
@@ -711,6 +885,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         qmp.failed = {[weak self] message in DispatchQueue.main.async {self?.handleGestureFailure(message)}}
         screen.pixelBuffer = rfb.pixelBuffer
         screen.input = { [weak self] x,y,down in self?.rfb.pointer(x,y,down) }
+        screen.rfbKey = { [weak self] sym, down in self?.rfb.key(sym, down) }
+        screen.qmpKey = { [weak self] qcode, down in self?.touchInput?.sendKey(qcode, down) }
         rfb.surfaceFrame = { [weak self] surface in
             DispatchQueue.main.async {
                 guard let self else {return}
@@ -719,7 +895,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.buttons.enumerated().forEach {i,button in button.isEnabled = !self.inputFailed && !(i == 1 && self.controlCenterPending)}
             }
         }
-        rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil } }
+        rfb.failed = { [weak self] message in DispatchQueue.main.async { guard let self else {return}; self.status.stringValue = "QEMU berhenti / koneksi gagal: \(message)"; self.status.isHidden = false; self.buttons.forEach {$0.isEnabled = false}; self.screen.input = nil; self.screen.rfbKey = nil; self.screen.qmpKey = nil } }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
         screen.sleepOverlay.onWake = {[weak self] in self?.home()}
         // Poll the guest's display power so a sleeping device shows as locked

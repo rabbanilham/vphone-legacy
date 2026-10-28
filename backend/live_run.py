@@ -94,7 +94,8 @@ def main():
     p.add_argument('--keep-images', action='store_true')
     p.add_argument('--collect-crashlogs', action='store_true',
                    help='Collect guest crash reports from data clone before cleanup')
-    p.add_argument('--wifi', action='store_true', help='Expose an open Wi-Fi AP backed by user-mode NAT')
+    p.add_argument('--wifi', action='store_true',
+                   help='Expose host-mirrored Wi-Fi scan list backed by user-mode NAT')
     p.add_argument('--qemu-arg', action='append', default=[])
     args = p.parse_args()
     for path in (args.plan, args.system, args.data):

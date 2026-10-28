@@ -1,0 +1,42 @@
+[
+  {
+    "source": "image-atlas",
+    "tsw": [
+      "0x60000a61",
+      "0x1ff07fc",
+      "0xf0000001",
+      "0x41b"
+    ],
+    "format": 6,
+    "layout": "0x1",
+    "width": 512,
+    "height": 512,
+    "pitch_word": "0xf0000001",
+    "logical_stride": 2048,
+    "effective_webkit_twiddled": true,
+    "strip": false,
+    "nc_sparse": false,
+    "channel_order": "RGBA",
+    "note": "Resident source descriptor, not a separately captured draw"
+  },
+  {
+    "source": "rule-atlas",
+    "tsw": [
+      "0x60000a61",
+      "0xf1ffc",
+      "0xf0000001",
+      "0x410"
+    ],
+    "format": 6,
+    "layout": "0x1",
+    "width": 2048,
+    "height": 16,
+    "pitch_word": "0xf0000001",
+    "logical_stride": 8192,
+    "effective_webkit_twiddled": true,
+    "strip": false,
+    "nc_sparse": false,
+    "channel_order": "RGBA",
+    "note": "Resident source descriptor, not a separately captured draw"
+  }
+]

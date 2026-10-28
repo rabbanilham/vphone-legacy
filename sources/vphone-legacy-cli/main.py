@@ -42,6 +42,7 @@ def main(argv=None):
     launch.add_argument('--headless', action='store_true')
     launch.add_argument('--probe-seconds', type=float, help='Bounded bring-up probe (0 < seconds <= 30), records actual registers and framebuffer')
     launch.add_argument('--paused', action='store_true', help='Start paused for QMP/debugging')
+    launch.add_argument('--wifi', action='store_true', help='Expose host-mirrored Wi-Fi scan list backed by user-mode NAT')
     doctor = vm.add_parser('doctor')
     doctor.add_argument('name')
     doctor.add_argument('--json', action='store_true')
@@ -112,6 +113,8 @@ def main(argv=None):
                 command.append('--paused')
             if args.probe_seconds is not None:
                 command += ['--probe-seconds', str(args.probe_seconds)]
+            if args.wifi:
+                command.append('--wifi')
             # Replace the CLI so GUI signals reach the single owning launcher.
             os.execv(sys.executable, command)
         elif args.action == 'stop':
