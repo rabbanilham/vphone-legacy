@@ -477,6 +477,66 @@ int main() {
                             py_pixels += 1
             self.assertEqual(c_pixels, py_pixels)
 
+    def test_clock_hands_with_dummy_mask_classified_as_vector(self):
+        """Draws with prog 0xba8c50a79810e866 and bound 1bpp mask must classify as solid wide line."""
+        class DummyFrame:
+            def u32(self, addr): return 28
+            def read(self, addr, sz): return b'\0' * sz
+
+        f = DummyFrame()
+        tex_1bpp = {'addr': 0x10d4c000, 'w': 256, 'h': 256, 'bpp': 1}
+        draw = [3 << 29, 6, 0]
+        prog = 0xba8c50a79810e866
+
+        orig_prog = aro.program
+        orig_tex = aro.texture
+        orig_vert = aro.vertices
+        try:
+            aro.program = lambda *_: prog
+            aro.texture = lambda *_: tex_1bpp
+            aro.vertices = lambda *_: (28, [(x, y, struct.pack('<I', 0xff1c3edc)) for x, y in [(10.0, 10.0), (10.0, 10.0), (20.0, 30.0), (20.0, 30.0), (20.0, 30.0), (10.0, 10.0)]])
+            res, _ = aro.classify_draw(f, 0x100, [], draw, (320, 320, 568, 568), 640, 1136, 640, 1136)
+            self.assertEqual(res, 'replayed exactly: solid wide line (stride=28)')
+        finally:
+            aro.program = orig_prog
+            aro.texture = orig_tex
+            aro.vertices = orig_vert
+
+    def test_clock_cap_with_dummy_mask_classified_as_triangles(self):
+        """Draws with prog 0x6c01d033fd937c7c, n=48 and bound 1bpp mask must classify as solid triangles."""
+        class DummyFrame:
+            def u32(self, addr): return 28
+            def read(self, addr, sz): return b'\0' * sz
+
+        f = DummyFrame()
+        tex_1bpp = {'addr': 0x10d4c000, 'w': 256, 'h': 256, 'bpp': 1}
+        draw = [3 << 29, 48, 0]
+        prog = 0x6c01d033fd937c7c
+
+        orig_prog = aro.program
+        orig_tex = aro.texture
+        orig_vert = aro.vertices
+        try:
+            aro.program = lambda *_: prog
+            aro.texture = lambda *_: tex_1bpp
+            pts = [(10.0 + math.cos(i) * 5.0, 10.0 + math.sin(i) * 5.0) for i in range(48)]
+            aro.vertices = lambda *_: (28, [(x, y, struct.pack('<I', 0xff1c3edc)) for x, y in pts])
+            res, _ = aro.classify_draw(f, 0x100, [], draw, (320, 320, 568, 568), 640, 1136, 640, 1136)
+            self.assertEqual(res, 'replayed exactly: solid triangles (stride=28)')
+        finally:
+            aro.program = orig_prog
+            aro.texture = orig_tex
+            aro.vertices = orig_vert
+
+    def test_source_dedicated_nc_scratch_and_clock_vector_gates(self):
+        """Verify s5l8960x.c implements agx_scratch_nc and separates clock vector strokes from textured bounding boxes."""
+        src = SOURCE.read_text()
+        self.assertIn('agx_scratch_nc', src)
+        self.assertIn('agx_get_scratch_nc', src)
+        self.assertIn('is_cg_line', src)
+        self.assertIn('is_clock_cap', src)
+        self.assertIn('tex->addr == UINT64_C(0x10524000)', src)
+
 
 if __name__ == '__main__':
     unittest.main()

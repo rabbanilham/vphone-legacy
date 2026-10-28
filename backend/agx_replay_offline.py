@@ -300,13 +300,15 @@ def texture(f, ppp, prog=None):
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
         # Word 8 is used by ROUNDED_CAPS (two 4-word samplers followed by TSW).
-        offsets = (0, 4, 7, 8) if prog == ROUNDED_CAPS else (0, 4, 7)
+        offsets = (8, 0, 4, 7) if prog == ROUNDED_CAPS else (0, 4, 7)
         for k in offsets:
             if k == 7 and tuple(ws[:3]) != LUMA:
                 continue
             if len(ws) >= k + 4:
                 tex = decode_tsw(f, ws[k:k + 4])
                 if tex:
+                    if k == 8 and prog == ROUNDED_CAPS and not (tex['addr'] == 0x10524000 or (tex['w'] == 114 and tex['h'] == 87)):
+                        continue
                     # Trailing constants may be the next draw's allocation.
                     tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog == STRIDE36_DUAL_TEX
                     if prog in (STRIDE36_DUAL_TEX, CORNER_RESTORE) and len(ws) >= 8:
@@ -893,7 +895,9 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
 
     step = 4 if count == 4 else 6
     is_line = False
-    if count == 6 and not tex and stride in (20, 28):
+    is_cg_line = (prog == 0xba8c50a79810e866 and (not tex or tex.get('bpp') == 1))
+    is_clock_cap = (prog == ROUNDED_CAPS and count == 48 and (not tex or tex.get('bpp') == 1))
+    if count == 6 and (not tex or is_cg_line) and stride in (20, 28):
         vs_coords = []
         for v in vs:
             x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
@@ -940,7 +944,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
                 break
 
     if not is_axis_aligned:
-        if not tex and stride in (20, 28):
+        if (not tex or is_cg_line or is_clock_cap) and stride in (20, 28):
             return f'replayed exactly: solid triangles (stride={stride})', {'count': count}
         if not tex:
             return 'skipped: non-axis-aligned or rotated geometry', {'quad': 0}
@@ -1323,7 +1327,9 @@ def main():
                             fb[d + 3] = min(255, src_a + fb[d + 3] * (255 - src_a) // 255)
             continue
 
-        if not tex and stride in (20, 28):
+        is_cg_line = (prog == 0xba8c50a79810e866 and (not tex or tex.get('bpp') == 1))
+        is_clock_cap = (prog == ROUNDED_CAPS and count == 48 and (not tex or tex.get('bpp') == 1))
+        if (not tex or is_cg_line or is_clock_cap) and stride in (20, 28):
             vs_xy = []
             for v in vs:
                 x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
