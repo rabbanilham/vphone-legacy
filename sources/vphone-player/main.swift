@@ -234,33 +234,37 @@ final class RFB {
                     var rectHeaders: [(x: Int, y: Int, w: Int, hh: Int)] = []
                     rectHeaders.reserveCapacity(count)
                     var frameBytes = 0
+                    var target: PixelBuffer?
+                    // RFB interleaves each rectangle header with its pixel data,
+                    // so read them in order; the back buffer is chosen at the
+                    // first header (a lone full-screen rect needs no carry-over).
                     for _ in 0..<count {
                         try readIntoScratch(12)
                         let x = Int(scratch[0])*256+Int(scratch[1]), y = Int(scratch[2])*256+Int(scratch[3])
                         let w = Int(scratch[4])*256+Int(scratch[5]), hh = Int(scratch[6])*256+Int(scratch[7])
                         guard scratch[8...11].allSatisfy({$0 == 0}), x+w <= width, y+hh <= height else {
+                            target?.unlock()
                             throw NSError(domain:"Rectangle RFB tidak valid",code:1)
                         }
+                        if target == nil {
+                            let isFullScreen = count == 1 && x == 0 && y == 0 && w == width && hh == height
+                            let t = ring.prepareNextWrite(isFullScreen: isFullScreen)
+                            t.lock()
+                            target = t
+                        }
+                        let t = target!
                         frameBytes += w*hh*4
                         rectHeaders.append((x: x, y: y, w: w, hh: hh))
-                    }
-
-                    let isFullScreen = (count == 1 && rectHeaders[0].x == 0 && rectHeaders[0].y == 0 &&
-                                        rectHeaders[0].w == width && rectHeaders[0].hh == height)
-                    let target = ring.prepareNextWrite(isFullScreen: isFullScreen)
-                    target.lock()
-                    for r in rectHeaders {
-                        if r.w == width && r.x == 0 {
-                            try read(into: target.baseAddress.advanced(by: r.y * target.bytesPerRow),
-                                     count: width * r.hh * 4)
+                        if w == width && x == 0 {
+                            try read(into: t.baseAddress.advanced(by: y * t.bytesPerRow), count: width * hh * 4)
                         } else {
-                            for row in 0..<r.hh {
-                                let dst = target.baseAddress.advanced(by: (r.y + row) * target.bytesPerRow + r.x * 4)
-                                try read(into: dst, count: r.w * 4)
+                            for row in 0..<hh {
+                                let dst = t.baseAddress.advanced(by: (y + row) * t.bytesPerRow + x * 4)
+                                try read(into: dst, count: w * 4)
                             }
                         }
                     }
-                    target.unlock()
+                    target?.unlock()
 
                     let surface = ring.commit(dirtyRects: rectHeaders.map { (x: $0.x, y: $0.y, w: $0.w, h: $0.hh) })
 
