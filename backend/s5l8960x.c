@@ -5859,9 +5859,10 @@ static inline void *agx_page_alloc(void)
     if (agx_page_pool) {
         AGXPageNode *node = agx_page_pool;
         agx_page_pool = node->next;
+        memset(node, 0, 4096);
         return node;
     }
-    return g_malloc(4096);
+    return g_malloc0(4096);
 }
 
 static inline void agx_page_free(void *ptr)
@@ -6146,6 +6147,16 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
          * exception is the vibrancy block: luma weights, four sampler words,
          * then the TSW at word 7 (handover section 16), only accepted when
          * the block really starts with the luma weights. */
+        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
+            if (tex->addr == UINT64_C(0x10524000) || (tex->w == 114 && tex->h == 87)) {
+                const uint32_t *sw = blocks[b] + 4;
+                memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
+                tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
+                tex->clamp_to_edge = ((sw[1] >> 9) & 7) == 2 || ((sw[1] >> 12) & 7) == 2 ||
+                                     ((sw[1] >> 16) & 0xff) == 2 || ((sw[1] >> 24) & 0xff) == 2;
+                return AGX_TEX_FOUND;
+            }
+        }
         static const unsigned offsets[] = { 0, 4, 7 };
         for (unsigned o = 0; o < ARRAY_SIZE(offsets); o++) {
             unsigned k = offsets[o];
@@ -6181,15 +6192,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                         prog == AGX_USC_STRIDE36_DUAL_TEX) ?
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
-        }
-        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
-
-            const uint32_t *sw = blocks[b] + 4;
-            memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
-            tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
-            tex->clamp_to_edge = ((sw[1] >> 9) & 7) == 2 || ((sw[1] >> 12) & 7) == 2 ||
-                                 ((sw[1] >> 16) & 0xff) == 2 || ((sw[1] >> 24) & 0xff) == 2;
-            return AGX_TEX_FOUND;
         }
     }
     return AGX_TEX_NONE;
@@ -7613,6 +7615,8 @@ static __thread uint32_t *agx_scratch1 = NULL;
 static __thread size_t agx_scratch1_cap = 0;
 static __thread uint32_t *agx_scratch2 = NULL;
 static __thread size_t agx_scratch2_cap = 0;
+static __thread uint32_t *agx_scratch_nc = NULL;
+static __thread size_t agx_scratch_nc_cap = 0;
 
 static uint32_t *agx_get_scratch1(size_t count)
 {
@@ -7630,6 +7634,15 @@ static uint32_t *agx_get_scratch2(size_t count)
         agx_scratch2_cap = count;
     }
     return agx_scratch2;
+}
+
+static uint32_t *agx_get_scratch_nc(size_t count)
+{
+    if (count > agx_scratch_nc_cap) {
+        agx_scratch_nc = g_realloc(agx_scratch_nc, count * sizeof(uint32_t));
+        agx_scratch_nc_cap = count;
+    }
+    return agx_scratch_nc;
 }
 
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
@@ -7813,7 +7826,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                     &last_copy_normalized, &have_copy_texmat);
             bool region_clear = nc_context && stride == 12 && is_blur_prog &&
                                 agx_extract_region_clear(s, cat, retained_ppp, &clear_colour);
-            bool textured = found != AGX_TEX_NONE && (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
+            bool is_cg_line = (prog == UINT64_C(0xba8c50a79810e866) && (found == AGX_TEX_NONE || tex.bpp == 1));
+            bool is_clock_cap = (prog == AGX_USC_ROUNDED_CAPS && count == 48 && (found == AGX_TEX_NONE || tex.bpp == 1));
+            bool textured = found != AGX_TEX_NONE && !is_cg_line && !is_clock_cap &&
+                            (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
             /* Textured quads are streamed directly from guest memory. The
              * 64-vertex scratch limit only applies to the solid rasterizer;
              * WebKit batches many more glyph vertices into a single draw. */
@@ -7925,7 +7941,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 if (decoded_nc_addr == tex.addr && decoded_nc_w == tex.w && decoded_nc_h == tex.h) {
                     prepared_tex = decoded_nc_pixels;
                 } else {
-                    uint32_t *raw_tex = agx_get_scratch1((size_t)tex.w * tex.h);
+                    uint32_t *raw_tex = agx_get_scratch_nc((size_t)tex.w * tex.h);
                     if (!agx_nc_transfer(s, cat, tex.addr, tex.w, tex.h, raw_tex, false)) {
                         AGX_REPLAY_SKIP("NC source tiles unavailable");
                         continue;
