@@ -245,6 +245,9 @@ typedef struct MouseTouch {
     unsigned phase; /* 0 idle, 1 start, 2 down, 3 drag/final move, 4 up */
     unsigned release_frames;
     int64_t due;
+    /* A press that arrived while the previous contact was draining. */
+    bool queued, queued_up;
+    int queued_x, queued_y;
 } MouseTouch;
 
 /* One reported finger. Path IDs stay stable for a contact's lifetime. */
@@ -276,16 +279,35 @@ static int mouse_touch_scale(int value, int maximum, int pixels)
     return (int)((int64_t)value * pixels / maximum);
 }
 
+static void mouse_touch_start(MouseTouch *m, int x, int y, int64_t now)
+{
+    m->x = m->start_x = x;
+    m->y = m->start_y = y;
+    m->phase = 1;
+    m->pressed = true;
+    m->dirty = false;
+    m->release_frames = 0;
+    m->due = now;
+}
+
 static void mouse_touch_sync(MouseTouch *m, bool allowed, int64_t now)
 {
     if (m->button && !m->last_button && !m->phase && allowed) {
-        m->x = m->start_x = m->host_x;
-        m->y = m->start_y = m->host_y;
-        m->phase = 1;
-        m->pressed = true;
-        m->dirty = false;
+        mouse_touch_start(m, m->host_x, m->host_y, now);
+    } else if (m->button && !m->last_button && m->phase && !m->pressed &&
+               allowed) {
+        /* Back-to-back click while the last contact drains: lift it on the
+         * next tick instead of dropping this press, then start it afresh. */
+        m->queued = true;
+        m->queued_up = false;
+        m->queued_x = m->host_x;
+        m->queued_y = m->host_y;
         m->release_frames = 0;
-        m->due = now;
+    } else if (m->queued && !m->button) {
+        m->queued_up = true;
+    } else if (m->queued && m->button) {
+        m->queued_x = m->host_x;
+        m->queued_y = m->host_y;
     } else if (m->phase && m->pressed) {
         m->dirty |= m->x != m->host_x || m->y != m->host_y;
         m->x = m->host_x;
@@ -326,6 +348,15 @@ static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
     } else {
         f->state = 7;
         m->phase = 0;
+        if (m->queued) {
+            m->queued = false;
+            mouse_touch_start(m, m->queued_x, m->queued_y, now + TOUCH_TICK_NS);
+            if (m->queued_up) {
+                m->pressed = false;
+                m->release_frames = 3;
+            }
+            return true;
+        }
     }
     m->due = now + TOUCH_TICK_NS;
     return true;
