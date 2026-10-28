@@ -1,0 +1,7 @@
+*.ppm
+*.bin
+*.raw
+*.log
+*.stdout
+baseline/
+candidate/

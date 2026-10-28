@@ -365,7 +365,17 @@ def main():
     p.add_argument('--qemu-arg', action='append', default=[], help='Extra QEMU argument, repeatable (e.g. --qemu-arg=-icount --qemu-arg=shift=4,sleep=off)')
     p.add_argument('--collect-crashlogs', action='store_true', help='Collect guest crash reports from data clone before cleanup')
     p.add_argument('--mouse-swipe', help='Simulate mouse drag via QMP: at,x0,y0,x1,y1,dur,steps')
+    p.add_argument('--home-press-at', type=float, action='append', default=[],
+                   help='Guest running seconds at which to press Home key via QMP')
+    p.add_argument('--framebuffer-range', help='start,end,step for automated dense framebuffer captures')
     args = p.parse_args()
+    if args.framebuffer_range:
+        parts = [float(x) for x in args.framebuffer_range.split(',')]
+        r_start, r_end, r_step = parts[0], parts[1], parts[2]
+        cur = r_start
+        while cur <= r_end + 1e-6:
+            args.framebuffer_at.append(round(cur, 3))
+            cur += r_step
     try:
         hook_dumps = parse_hook_dumps(args.hook_dump)
     except ValueError as exc:
@@ -386,8 +396,8 @@ def main():
         if not source.is_file():
             p.error(f'Missing input: {source}. See docs/firmware.md; supply --plan, --diagnostic-system and --diagnostic-data for local artifacts.')
     out = args.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
-    images = out / 'images'; images.mkdir()
+    out.mkdir(parents=True, exist_ok=True)
+    images = out / 'images'; images.mkdir(exist_ok=True)
     save_json(out/'probe-invocation.json',[sys.executable,*sys.argv])
     provenance = dict(plan=str(plan_path), plan_sha256=digest(plan_path), inputs={})
     def clone_or_copy(src, dst):
@@ -500,6 +510,7 @@ def main():
                     framebuffer_captures=[]
                     serial_offset=0; serial_tail=b''; panicked=False
                     mouse_swipe_done = False
+                    home_press_at = sorted(args.home_press_at)
                     if args.mouse_swipe:
                         ms_parts = [float(x) for x in args.mouse_swipe.split(',')]
                         ms_at, ms_x0, ms_y0, ms_x1, ms_y1, ms_dur, ms_steps = (
@@ -569,6 +580,11 @@ def main():
                                 {'type': 'btn', 'data': {'down': False, 'button': 'left'}},
                                 {'type': 'abs', 'data': {'axis': 'x', 'value': int(ms_x1 * 32767 / 640)}},
                                 {'type': 'abs', 'data': {'axis': 'y', 'value': int(ms_y1 * 32767 / 1136)}}
+                            ]})
+                        if home_press_at and clock.elapsed() >= home_press_at[0]:
+                            hp_t = home_press_at.pop(0)
+                            command(fp, 'input-send-event', {'device': 'a7-touch-display', 'events': [
+                                {'type': 'key', 'data': {'down': True, 'key': {'type': 'qcode', 'data': 'home'}}}
                             ]})
                         with (out/'serial.log').open('rb') as serial:
                             serial.seek(serial_offset); update=serial.read()
