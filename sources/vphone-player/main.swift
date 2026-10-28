@@ -355,18 +355,36 @@ final class QMPInput {
         connected = false
     }
     func sendKey(_ qcode: String, _ down: Bool) {
-        queue.async {
+        // Home must not wait behind gesture updates or the digitizer readiness
+        // loop. Keep a separate connection: QMP replies have a single reader.
+        struct HomeInput {
+            static let queue = DispatchQueue(label:"vphone.home.qmp", qos:.userInitiated)
+            static var clients: [String:QMPInput] = [:] // accessed only on queue
+        }
+        let isHome = qcode == "home"
+        let inputQueue = isHome ? HomeInput.queue : queue
+        inputQueue.async {
+            let client: QMPInput
+            if isHome {
+                if let existing = HomeInput.clients[self.path] {
+                    client = existing
+                } else {
+                    client = QMPInput(self.path)
+                    HomeInput.clients[self.path] = client
+                }
+            } else {
+                client = self
+            }
             do {
-                if !self.connected { try self.connect() }
-                try self.execute("input-send-event", [
+                if !client.connected { try client.connect() }
+                try client.execute("input-send-event", [
                     "device": "a7-touch-display",
                     "events": [
                         ["type": "key", "data": ["down": down, "key": ["type": "qcode", "data": qcode]]]
                     ]
                 ])
             } catch {
-                if self.io.fd >= 0 { close(self.io.fd); self.io.fd = -1 }
-                self.connected = false
+                client.reset()
                 self.failed?(error.localizedDescription)
             }
         }
@@ -1086,7 +1104,12 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func logInput(_ text:String) {
         try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
-    @objc func home() { screen.cancelTouch();rfb.home() }
+    @objc func home() {
+        screen.cancelTouch()
+        // Use the independent Home channel, away from VNC framebuffer traffic.
+        touchInput?.sendKey("home", true)
+        touchInput?.sendKey("home", false)
+    }
     @objc func lock() {
         screen.cancelTouch()
         touchInput?.pressPower {[weak self] error in

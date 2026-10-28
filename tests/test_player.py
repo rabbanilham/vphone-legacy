@@ -205,6 +205,57 @@ print("PASS: ready guest keeps app context; gated digitizer gets Home wake and r
             if errors:raise errors[0]
             self.assertEqual(downs,[True,False])
 
+    def test_home_bypasses_blocked_gesture_queue(self):
+        source = (ROOT/'sources/vphone-player/main.swift').read_text()
+        start = source.index('    func sendKey(')
+        end = source.index('    // Sleep/wake button:',start)
+        # Compile the actual dispatch method with a transport double. No VM or
+        # socket is needed: a blocked gesture queue models readiness polling.
+        prelude = r"""
+import Foundation
+final class TestIO {var fd: Int32 = -1}
+let delivered = DispatchSemaphore(value:0)
+let lock = NSLock()
+var downs: [Bool] = []
+final class QMPInput {
+    let path: String
+    let queue = DispatchQueue(label:"test.gestures")
+    let io = TestIO()
+    var connected = false
+    var failed: ((String)->Void)?
+    init(_ path: String) {self.path = path}
+    func connect() throws {connected = true}
+    func reset() {connected = false}
+    func execute(_ command: String, _ arguments: [String:Any]) throws {
+        assert(connected && command == "input-send-event")
+        let events = arguments["events"] as! [[String:Any]]
+        let data = events[0]["data"] as! [String:Any]
+        assert((data["key"] as! [String:String])["data"] == "home")
+        lock.lock();downs.append(data["down"] as! Bool);lock.unlock()
+        delivered.signal()
+    }
+"""
+        harness = r"""
+}
+let qmp = QMPInput("test-home")
+let blocked = DispatchSemaphore(value:0)
+let release = DispatchSemaphore(value:0)
+qmp.queue.async { blocked.signal(); release.wait() }
+assert(blocked.wait(timeout:.now()+2) == .success)
+qmp.failed = { message in fatalError(message) }
+qmp.sendKey("home", true)
+qmp.sendKey("home", false)
+assert(delivered.wait(timeout:.now()+2) == .success)
+assert(delivered.wait(timeout:.now()+2) == .success)
+lock.lock();assert(downs == [true,false]);lock.unlock()
+release.signal()
+print("PASS: Home down/up delivered while gesture queue remains blocked")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp',prefix='vp-home-queue-') as tmp:
+            tmp=Path(tmp);(tmp/'main.swift').write_text(prelude+source[start:end]+harness)
+            subprocess.run(['swiftc','-module-cache-path',str(MODULE_CACHE),str(tmp/'main.swift'),'-o',str(tmp/'test')],check=True)
+            subprocess.run([str(tmp/'test')],check=True,timeout=8)
+
     def test_fragmented_rfb_and_geometry(self):
         source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
         harness = r'''
