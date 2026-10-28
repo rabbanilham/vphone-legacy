@@ -535,7 +535,6 @@ int main() {
         self.assertIn('agx_get_scratch_nc', src)
         self.assertIn('is_cg_line', src)
         self.assertIn('is_clock_cap', src)
-        self.assertIn('tex->addr == UINT64_C(0x10524000)', src)
 
 
 if __name__ == '__main__':

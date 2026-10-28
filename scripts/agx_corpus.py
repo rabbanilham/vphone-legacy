@@ -109,6 +109,15 @@ SCENES = {
         'display_only': False,
         'seconds': 106,
     },
+    # Home page 2: open the Extras folder (flyout, rounded corners, app group).
+    'folder': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=108;down 580,600;move 60,600 dur=0.4 steps=24;up'
+                          '|at=112;tap 92,110',
+        'at': [110, 112.3, 112.8, 113.5, 115, 120],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 124,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],

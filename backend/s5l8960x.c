@@ -6147,16 +6147,6 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
          * exception is the vibrancy block: luma weights, four sampler words,
          * then the TSW at word 7 (handover section 16), only accepted when
          * the block really starts with the luma weights. */
-        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
-            if (tex->addr == UINT64_C(0x10524000) || (tex->w == 114 && tex->h == 87)) {
-                const uint32_t *sw = blocks[b] + 4;
-                memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
-                tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
-                tex->clamp_to_edge = ((sw[1] >> 9) & 7) == 2 || ((sw[1] >> 12) & 7) == 2 ||
-                                     ((sw[1] >> 16) & 0xff) == 2 || ((sw[1] >> 24) & 0xff) == 2;
-                return AGX_TEX_FOUND;
-            }
-        }
         static const unsigned offsets[] = { 0, 4, 7 };
         for (unsigned o = 0; o < ARRAY_SIZE(offsets); o++) {
             unsigned k = offsets[o];
@@ -6192,6 +6182,15 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                         prog == AGX_USC_STRIDE36_DUAL_TEX) ?
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
+        }
+        if (prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)) {
+
+            const uint32_t *sw = blocks[b] + 4;
+            memcpy(tex->sampler_words, sw, sizeof(tex->sampler_words));
+            tex->linear_filter = ((sw[1] >> 4) & 3) == 1 || ((sw[1] >> 6) & 3) == 1;
+            tex->clamp_to_edge = ((sw[1] >> 9) & 7) == 2 || ((sw[1] >> 12) & 7) == 2 ||
+                                 ((sw[1] >> 16) & 0xff) == 2 || ((sw[1] >> 24) & 0xff) == 2;
+            return AGX_TEX_FOUND;
         }
     }
     return AGX_TEX_NONE;
