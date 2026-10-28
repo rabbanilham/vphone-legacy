@@ -1,10 +1,29 @@
+diff --git a/system/runstate.c b/system/runstate.c
+index 08acf80..7159d7f 100644
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -946,6 +946,13 @@ int qemu_main_loop(void)
+ {
+     int status = EXIT_SUCCESS;
+ 
++#ifdef __APPLE__
++    /* Cocoa may move this loop to a separate thread; set QoS here. */
++    int err = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    if (err) {
++        fprintf(stderr, "vphone: main-loop QoS: %s\n", strerror(err));
++    }
++#endif
+     while (!main_loop_should_exit(&status)) {
+         main_loop_wait(false);
+     }
 diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
+index 089606c..42886c5 100644
 --- a/util/qemu-thread-posix.c
 +++ b/util/qemu-thread-posix.c
-@@ -363,6 +363,19 @@ static void *qemu_thread_start(void *args)
-     QemuThreadArgs *qemu_thread_args = args;
-     void *(*start_routine)(void *) = qemu_thread_args->start_routine;
+@@ -388,6 +388,19 @@ static void *qemu_thread_start(void *args)
      void *arg = qemu_thread_args->arg;
+     void *r;
+ 
 +#ifdef __APPLE__
 +    /* Match MTTCG and single-thread TCG CPU thread names.
 +     * Set QoS on the executing thread, before its first guest instruction.
@@ -18,23 +37,6 @@ diff --git a/util/qemu-thread-posix.c b/util/qemu-thread-posix.c
 +        }
 +    }
 +#endif
-     void *r;
      if (qemu_thread_args->name) {
          qemu_thread_set_name(qemu_thread_args->name);
-diff --git a/system/runstate.c b/system/runstate.c
---- a/system/runstate.c
-+++ b/system/runstate.c
-@@ -888,6 +888,13 @@ int qemu_main_loop(void)
- {
-     int status = EXIT_SUCCESS;
- 
-+#ifdef __APPLE__
-+    /* Cocoa may move this loop to a separate thread; set QoS here. */
-+    int err = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-+    if (err) {
-+        fprintf(stderr, "vphone: main-loop QoS: %s\n", strerror(err));
-+    }
-+#endif
-     while (!main_loop_should_exit(&status)) {
-         main_loop_wait(false);
      }
