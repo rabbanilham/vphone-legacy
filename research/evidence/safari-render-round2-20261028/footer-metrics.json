@@ -1,0 +1,35 @@
+{
+  "footer": {
+    "crop": [
+      0,
+      0,
+      640,
+      122
+    ],
+    "before_mae": 12.888738046448088,
+    "after_mae": 0.0,
+    "reference": "corrected Python replay of the same captured submission; not device ground truth"
+  },
+  "upper-text": {
+    "crop": [
+      180,
+      0,
+      460,
+      40
+    ],
+    "before_mae": 21.112440476190475,
+    "after_mae": 0.0,
+    "reference": "corrected Python replay of the same captured submission; not device ground truth"
+  },
+  "lower-text": {
+    "crop": [
+      90,
+      55,
+      550,
+      105
+    ],
+    "before_mae": 17.617565217391306,
+    "after_mae": 0.0,
+    "reference": "corrected Python replay of the same captured submission; not device ground truth"
+  }
+}
