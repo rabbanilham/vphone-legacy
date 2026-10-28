@@ -5768,6 +5768,7 @@ typedef struct AGXTexture {
     uint32_t bpp;               /* bytes per pixel: 1 (A8 / L8) or 4 (BGRA) */
     bool strip;                 /* GPU-rendered surface: 16-row strips per 64 KiB */
     bool twiddled;              /* layout-1 texture/target, Y-first Morton order */
+    bool layout1;               /* descriptor layout, before software-target overrides */
     bool linear_filter;         /* sampler word 1 bits [5:4] or [7:6] == 1 */
     bool nc_sparse;             /* proved sparse NC allocation, not general layout 1 */
     bool clamp_to_edge;         /* sampler word 1 bits [11:9] or [14:12] == 2 */
@@ -5786,10 +5787,14 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     hwaddr pa;
     uint32_t fmt = tsw[0] >> 28;
 
-    if (fmt != 6 && fmt != 3) {
+    /* Captured WebKit U8 coverage atlas, with alpha-replicating swizzle.
+     * Keep format-0 recognition narrow: arbitrary zero words are not TSWs. */
+    bool coverage = fmt == 0 && (tsw[0] & ~7u) == 0x16d00;
+    if (fmt != 6 && fmt != 3 && !coverage) {
         return false;
     }
-    tex->bpp = (fmt == 3) ? 1 : 4;
+    tex->bpp = (fmt == 3 || coverage) ? 1 : 4;
+    tex->layout1 = (tsw[0] & 7) == 1;
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
@@ -5803,7 +5808,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->strip = sf.strip;
     tex->nc_sparse = !sf.strip && (tsw[0] & 0x8007) == 1 &&
                      agx_nc_sparse_layout(s, cat, tex->addr, tex->w, tex->h);
-    tex->twiddled = !sf.strip && ((tsw[0] & 0x8007) == 0x8001 || (fmt == 3 && (tsw[0] & 7) == 1) || tex->nc_sparse);
+    tex->twiddled = !sf.strip && ((tsw[0] & 0x8007) == 0x8001 || (tex->bpp == 1 && (tsw[0] & 7) == 1) || tex->nc_sparse);
     if (sf.strip) {
         tex->stride = sf.pitch;
     } else if ((tsw[0] & 7) == 1) {
@@ -5828,6 +5833,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
 #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
 #define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
+#define AGX_USC_WEBKIT_GLYPHS UINT64_C(0x3064a456731fc3e3)
 
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
  * pointers to blocks holding sampler state, texture state words (TSW) and
@@ -6293,6 +6299,8 @@ static inline __attribute__((always_inline)) uint32_t agx_blend_over(uint32_t ds
  * Its USC program replaces D with S; transparent source-over is a no-op. */
 #define AGX_USC_COPY UINT64_C(0x99d4fcf52a8c2ef3)
 #define AGX_USC_SPANS UINT64_C(0x1a20cc29e8fcc15b)
+#define AGX_USC_WEBKIT_SPANS UINT64_C(0x84102d511f2a41bb)
+#define AGX_USC_WEBKIT_STRIPS UINT64_C(0x4eb8837dc2079f95)
 #define AGX_USC_PLUS_L UINT64_C(0x5b133ef7e0c3428c)
 #define AGX_USC_PLUS_L2 UINT64_C(0xa225a18725e48d5c)
 #define AGX_USC_SOLID_PLUS_L UINT64_C(0xf137b90c25ab5471)
@@ -7422,7 +7430,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 found = agx_replay_texture(s, cat, ppp, ppp_count, prog, &tex);
             }
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
-            bool is_span = stride == 16 && prog == AGX_USC_SPANS;
+            bool is_span = stride == 16 && (prog == AGX_USC_SPANS || prog == AGX_USC_WEBKIT_SPANS);
             bool is_pill = stride == 36 && prog == AGX_USC_PILL_BORDER;
             if ((stride == 16 && !clip_space && !is_span) ||
                 (found == AGX_TEX_NONE && !is_span && !is_pill && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
@@ -7444,6 +7452,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             bool region_clear = nc_context && stride == 12 && is_blur_prog &&
                                 agx_extract_region_clear(s, cat, retained_ppp, &clear_colour);
             bool textured = found != AGX_TEX_NONE && (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
+            /* Textured quads are streamed directly from guest memory. The
+             * 64-vertex scratch limit only applies to the solid rasterizer;
+             * WebKit batches many more glyph vertices into a single draw. */
+            if (textured) {
+                count = MIN(w[1], 16380u);
+            }
             bool vibrancy = found == AGX_TEX_VIBRANCY;
             bool dest_in = textured && prog == AGX_USC_DEST_IN;
             bool is_blur = textured && is_blur_prog;
@@ -7592,10 +7606,19 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     memcpy(last_m4, m4, sizeof(m4));
                     has_last_m4 = true;
                     transformed = true;
-                } else if (is_span && has_last_m4) {
+                } else if ((is_span || prog == AGX_USC_WEBKIT_GLYPHS || prog == AGX_USC_WEBKIT_STRIPS ||
+                            (ldl_le_p(ta + 4) != 1 && prog == UINT64_C(0x8eb52cf6fe248b1d))) && has_last_m4) {
                     memcpy(m4, last_m4, sizeof(m4));
                     transformed = true;
                 }
+            }
+            /* WebKit's GL upload path uses a flipped pixel-space matrix and
+             * Morton source atlases. CA's software-produced layout-1 targets
+             * retain their established linear representation. */
+            bool webkit_upload = ldl_le_p(ta + 4) != 1 && transformed && m4[1] < 0 &&
+                                 prog == UINT64_C(0x8eb52cf6fe248b1d);
+            if (textured && webkit_upload && tex.layout1 && !tex.strip) {
+                tex.twiddled = true;
             }
             if (is_span) {
                 for (unsigned k = 0; k + 1 < count; k += 2) {
@@ -8150,6 +8173,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     u0 = v0 = 1e9; u1 = v1 = -1e9;
                     if (stride == 28 || stride == 36) {
                         agx_ctx_read(s, cat, buf + (uint64_t)q_start * stride + 16, &tint, 4);
+                        if (prog == AGX_USC_WEBKIT_GLYPHS) {
+                            tint = (tint & 0xff00ff00u) | ((tint & 0xff) << 16) | ((tint >> 16) & 0xff);
+                        }
                     }
                     for (unsigned i = q_start; i < q_start + step; i++) {
                         float t[2];
@@ -8384,7 +8410,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                         } else {
                             src = texrow[tx];
                         }
-                        if (clip_space) {
+                        if (clip_space || webkit_upload) {
                             /* CoreImage's wallpaper source is RGBA (stock
                              * 101@2x matches only with R/B exchanged). */
                             src = (src & 0xff00ff00u) | ((src >> 16) & 0xff) | ((src & 0xff) << 16);
@@ -8412,7 +8438,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t g = (tint_g * a) / 255;
                             uint32_t b = (tint_b * a) / 255;
                             src = (a << 24) | (r << 16) | (g << 8) | b;
-                        } else if (tint != 0xffffffff) {
+                        } else if (tint != 0xffffffff || tex.bpp == 1) {
                             if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
                                 uint32_t a = ((src >> 24) * tint_a) / 255;
                                 uint32_t r = (tint_r * a) / 255;

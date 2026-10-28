@@ -161,7 +161,7 @@ class AGXSliderSpansTests(unittest.TestCase):
         self.assertIn('agx_blend_plus_darker(uint32_t dst, uint32_t src)', source)
 
         # Check span recognition in VDM dispatch
-        self.assertIn('bool is_span = stride == 16 && prog == AGX_USC_SPANS;', source)
+        self.assertIn('bool is_span = stride == 16 && (prog == AGX_USC_SPANS || prog == AGX_USC_WEBKIT_SPANS);', source)
         self.assertIn('if (is_span) {', source)
         self.assertIn('count = MIN(w[1], 1024u);', source)
 
