@@ -641,6 +641,127 @@ enum ScreenGeometry {
     }
 }
 
+// Device frame (iphone5s_gold_frame.png, 486x1024). Rects are image pixels with
+// a top-left origin. The PNG has a glare wedge baked into the screen hole, so the
+// frame is drawn BEHIND the guest screen and never over it.
+enum BezelGeometry {
+    enum Target { case home, power }
+    static let imageSize = NSSize(width:486,height:1024)
+    static let screenRect = NSRect(x:40,y:152,width:411,height:729)
+    static let homeCenter = NSPoint(x:246,y:948)
+    static let homeRadius: CGFloat = 46
+    // The gold power-button bump is only ~8 px tall; the hit area is wider.
+    static let powerRect = NSRect(x:316,y:0,width:104,height:26)
+    static func frame(in bounds: NSRect) -> NSRect {
+        let scale = min(bounds.width/imageSize.width,bounds.height/imageSize.height)
+        guard scale > 0 else { return .zero }
+        let size = NSSize(width:imageSize.width*scale,height:imageSize.height*scale)
+        return NSRect(x:bounds.midX-size.width/2,y:bounds.midY-size.height/2,width:size.width,height:size.height)
+    }
+    static func map(_ rect: NSRect, in frame: NSRect) -> NSRect {
+        let scale = frame.width/imageSize.width
+        return NSRect(x:frame.minX+rect.minX*scale,y:frame.minY+rect.minY*scale,width:rect.width*scale,height:rect.height*scale)
+    }
+    static func screen(in bounds: NSRect) -> NSRect { map(screenRect,in:frame(in:bounds)) }
+    static func home(in bounds: NSRect) -> NSRect {
+        map(NSRect(x:homeCenter.x-homeRadius,y:homeCenter.y-homeRadius,width:homeRadius*2,height:homeRadius*2),in:frame(in:bounds))
+    }
+    static func power(in bounds: NSRect) -> NSRect { map(powerRect,in:frame(in:bounds)) }
+    static func target(at point: NSPoint, in bounds: NSRect) -> Target? {
+        let home = self.home(in:bounds)
+        let dx = point.x-home.midX, dy = point.y-home.midY
+        if home.width > 0, dx*dx+dy*dy <= (home.width/2)*(home.width/2) { return .home }
+        return power(in:bounds).contains(point) ? .power : nil
+    }
+}
+
+final class PressHighlight: NSView {
+    var round = true
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.withAlphaComponent(0.22).setFill()
+        (round ? NSBezierPath(ovalIn:bounds) : NSBezierPath(roundedRect:bounds,xRadius:3,yRadius:3)).fill()
+    }
+}
+
+final class BezelView: NSView {
+    let screen: Screen
+    var onHome: (() -> Void)?
+    var onPower: (() -> Void)?
+    private var enabled: [BezelGeometry.Target: Bool] = [.home:false,.power:false]
+    private let frameLayer = CALayer()
+    private let pressView = PressHighlight()
+    private var pressed: BezelGeometry.Target?
+    private let hasFrame: Bool
+    static func loadFrameImage() -> CGImage? {
+        guard let url = Bundle.main.url(forResource:"iphone5s_gold_frame",withExtension:"png"),
+              let image = NSImage(contentsOf:url) else { return nil }
+        return image.cgImage(forProposedRect:nil,context:nil,hints:nil)
+    }
+    init(screen: Screen) {
+        self.screen = screen
+        let image = Self.loadFrameImage()
+        hasFrame = image != nil
+        super.init(frame:.zero)
+        wantsLayer = true
+        if let image {
+            frameLayer.contents = image
+            frameLayer.contentsGravity = .resizeAspect
+            frameLayer.magnificationFilter = .trilinear
+            frameLayer.minificationFilter = .trilinear
+            layer?.addSublayer(frameLayer)
+        }
+        addSubview(screen)
+        pressView.isHidden = true
+        addSubview(pressView)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }
+    func setEnabled(home: Bool, power: Bool) {
+        enabled = [.home:home,.power:power]
+        window?.invalidateCursorRects(for:self)
+    }
+    override func layout() {
+        super.layout()
+        guard hasFrame else { screen.frame = bounds; return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        frameLayer.frame = BezelGeometry.frame(in:bounds)
+        screen.frame = BezelGeometry.screen(in:bounds)
+        CATransaction.commit()
+        window?.invalidateCursorRects(for:self)
+    }
+    override func resetCursorRects() {
+        guard hasFrame else { return }
+        if enabled[.home] == true { addCursorRect(BezelGeometry.home(in:bounds),cursor:.pointingHand) }
+        if enabled[.power] == true { addCursorRect(BezelGeometry.power(in:bounds),cursor:.pointingHand) }
+    }
+    private func target(_ event: NSEvent) -> BezelGeometry.Target? {
+        guard hasFrame, let target = BezelGeometry.target(at:convert(event.locationInWindow,from:nil),in:bounds),
+              enabled[target] == true else { return nil }
+        return target
+    }
+    private func showPress(_ target: BezelGeometry.Target?) {
+        guard let target else { pressView.isHidden = true; return }
+        pressView.round = target == .home
+        pressView.frame = target == .home ? BezelGeometry.home(in:bounds) : BezelGeometry.power(in:bounds)
+        pressView.needsDisplay = true
+        pressView.isHidden = false
+    }
+    override func mouseDown(with event: NSEvent) {
+        pressed = target(event)
+        showPress(pressed)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        showPress(pressed != nil && target(event) == pressed ? pressed : nil)
+    }
+    override func mouseUp(with event: NSEvent) {
+        defer { pressed = nil; showPress(nil) }
+        guard let pressed, target(event) == pressed else { return }
+        if pressed == .home { onHome?() } else { onPower?() }
+    }
+}
+
 struct KeyAction: Equatable {
     let qcode: String
     let keysym: UInt32
@@ -1022,6 +1143,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var inputLog: FileHandle?
     var window: NSWindow!
     var buttons: [NSButton] = []
+    var bezel: BezelView?
     var displayTimer: Timer?
     var displayQuery = false
     private let presentLock = NSLock()
@@ -1043,8 +1165,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let windowMenu = NSMenu(title:"Window"); windowItem.submenu = windowMenu
         windowMenu.addItem(withTitle:"Close",action:#selector(NSWindow.performClose(_:)),keyEquivalent:"w")
         NSApp.mainMenu = menu
-        window = NSWindow(contentRect:NSRect(x:0,y:0,width:360,height:690),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
-        window.title = "vphone — iOS 7.1.2"; window.minSize = NSSize(width:260,height:440); window.delegate = self
+        window = NSWindow(contentRect:NSRect(x:0,y:0,width:390,height:830),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        window.title = "vphone — iOS 7.1.2"; window.minSize = NSSize(width:260,height:520); window.delegate = self
         let root = NSView(); window.contentView = root
         let bar = NSStackView(); bar.orientation = .horizontal; bar.spacing = 16
         for (icon,title,action) in [("house","Home",#selector(home)),("slider.horizontal.3","Control Center",#selector(controlCenter)),("camera","Screen Capture",#selector(capture)),("lock","Lock",#selector(lock))] {
@@ -1052,12 +1174,15 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             button.bezelStyle = .texturedRounded; button.toolTip = title; button.setAccessibilityLabel(title); button.isEnabled = false
             buttons.append(button); bar.addArrangedSubview(button)
         }
-        for view in [screen,bar,status] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
+        let bezel = BezelView(screen:screen); self.bezel = bezel
+        bezel.onHome = {[weak self] in self?.home()}
+        bezel.onPower = {[weak self] in self?.lock()}
+        for view in [bezel,bar,status] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
         status.textColor = .secondaryLabelColor; status.alignment = .center; status.maximumNumberOfLines = 2
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo:root.topAnchor,constant:10),bar.centerXAnchor.constraint(equalTo:root.centerXAnchor),bar.heightAnchor.constraint(equalToConstant:32),
-            screen.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),screen.leadingAnchor.constraint(equalTo:root.leadingAnchor),screen.trailingAnchor.constraint(equalTo:root.trailingAnchor),screen.bottomAnchor.constraint(equalTo:root.bottomAnchor),
-            status.centerXAnchor.constraint(equalTo:screen.centerXAnchor),status.centerYAnchor.constraint(equalTo:screen.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:screen.widthAnchor,constant:-24)])
+            bezel.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),bezel.leadingAnchor.constraint(equalTo:root.leadingAnchor),bezel.trailingAnchor.constraint(equalTo:root.trailingAnchor),bezel.bottomAnchor.constraint(equalTo:root.bottomAnchor),
+            status.centerXAnchor.constraint(equalTo:bezel.centerXAnchor),status.centerYAnchor.constraint(equalTo:bezel.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:bezel.widthAnchor,constant:-24)])
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiatedAllowingIdleSystemSleep,.latencyCritical],reason:"Interactive emulator input")
         let logURL = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("player-input.log")
         _ = FileManager.default.createFile(atPath:logURL.path,contents:nil)
@@ -1185,6 +1310,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buttons.enumerated().forEach { i, button in
             button.isEnabled = !inputFailed && !(i == 1 && controlCenterPending)
         }
+        if buttons.count == 4 { bezel?.setEnabled(home:buttons[0].isEnabled,power:buttons[3].isEnabled) }
     }
 
     func handleGestureFailure(_ message:String) {

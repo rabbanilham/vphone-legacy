@@ -22,7 +22,7 @@ let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let player = Player()
 player.applicationDidFinishLaunching(Notification(name:NSApplication.didFinishLaunchingNotification))
-assert(player.buttons.count == 3)
+assert(player.buttons.count == 4)
 assert(player.buttons[1].toolTip == "Control Center")
 player.status.isHidden = true
 player.window.contentView!.layoutSubtreeIfNeeded()
@@ -204,6 +204,51 @@ print("PASS: ready guest keeps app context; gated digitizer gets Home wake and r
             finally:thread.join(timeout=6);server.close()
             if errors:raise errors[0]
             self.assertEqual(downs,[True,False])
+
+    def test_bezel_geometry_and_frame_asset(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+// Frame fits and stays centred for several window sizes; the screen keeps the
+// guest aspect closely enough that Screen's own letterboxing is under 1 px.
+for size in [NSSize(width:390,height:778), NSSize(width:900,height:500), NSSize(width:260,height:520)] {
+    let bounds = NSRect(origin:.zero,size:size)
+    let frame = BezelGeometry.frame(in:bounds)
+    assert(abs(frame.midX-bounds.midX) < 0.001 && abs(frame.midY-bounds.midY) < 0.001)
+    assert(abs(frame.width/frame.height - 486.0/1024.0) < 0.0001)
+    assert(frame.minX >= -0.001 && frame.maxX <= bounds.maxX+0.001 && frame.minY >= -0.001 && frame.maxY <= bounds.maxY+0.001)
+    let screen = BezelGeometry.screen(in:bounds)
+    assert(frame.contains(screen))
+    let fit = ScreenGeometry.rect(NSRect(origin:.zero,size:screen.size))
+    assert(abs(fit.width-screen.width) < 1.5 && abs(fit.height-screen.height) < 1.5)
+    let home = BezelGeometry.home(in:bounds)
+    assert(!screen.intersects(home) && frame.contains(home))
+    assert(BezelGeometry.target(at:NSPoint(x:home.midX,y:home.midY),in:bounds) == .home)
+    let power = BezelGeometry.power(in:bounds)
+    assert(BezelGeometry.target(at:NSPoint(x:power.midX,y:power.midY),in:bounds) == .power)
+    assert(BezelGeometry.target(at:NSPoint(x:screen.midX,y:screen.midY),in:bounds) == nil)
+}
+// The screen rect must match the transparent hole in the shipped PNG, and the
+// hole's surroundings must be the opaque bezel.
+let image = NSImage(contentsOfFile:CommandLine.arguments[1])!
+let cg = image.cgImage(forProposedRect:nil,context:nil,hints:nil)!
+let bitmap = NSBitmapImageRep(cgImage:cg)
+assert(cg.width == 486 && cg.height == 1024)
+func alpha(_ x: CGFloat, _ y: CGFloat) -> CGFloat { bitmap.colorAt(x:Int(x),y:Int(y))!.alphaComponent }
+let r = BezelGeometry.screenRect
+assert(alpha(r.minX+2,r.minY+2) < 0.05 && alpha(r.minX+2,r.maxY-3) < 0.05 && alpha(r.maxX-3,r.maxY-3) < 0.05)
+assert(alpha(r.minX-3,r.midY) > 0.9 && alpha(r.midX,r.maxY+3) > 0.9)
+let h = BezelGeometry.homeCenter
+assert(alpha(h.x,h.y) > 0.9 || alpha(h.x+BezelGeometry.homeRadius-6,h.y) > 0.9)
+print("PASS: bezel geometry")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-bezel-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp/'main.swift'), '-o', str(tmp/'test')], check=True)
+            frame = ROOT / 'sources/vphone-player/Resources/iphone5s_gold_frame.png'
+            run = subprocess.run([str(tmp/'test'), str(frame)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn('PASS: bezel geometry', run.stdout)
 
     def test_fragmented_rfb_and_geometry(self):
         source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
