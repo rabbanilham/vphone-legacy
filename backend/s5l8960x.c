@@ -6100,6 +6100,9 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     return tex->addr && agx_gpu_translate_ctx(s, cat, tex->addr, &pa);
 }
 
+#define AGX_USC_FOLDER_MASK UINT64_C(0xe344a0f081cc4997)
+#define AGX_USC_FOLDER_RESTORE UINT64_C(0xab6fdb6c250c32c0)
+
 #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
 #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
 #define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
@@ -6147,6 +6150,16 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
          * exception is the vibrancy block: luma weights, four sampler words,
          * then the TSW at word 7 (handover section 16), only accepted when
          * the block really starts with the luma weights. */
+        /* This procedural corner program has two float constants before
+         * its sampler, then a TSW at word 6. Do not reopen arbitrary-offset
+         * scanning: those offsets can name the next draw's allocation. */
+        if (prog == AGX_USC_FOLDER_MASK && b == 0 &&
+            blocks[b][2] == 0x00000fff && blocks[b][3] == 0x00002400 &&
+            blocks[b][4] == 0 && blocks[b][5] == 0 &&
+            agx_replay_decode_tsw(s, cat, blocks[b] + 6, tex)) {
+            memcpy(tex->sampler_words, blocks[b] + 2, sizeof(tex->sampler_words));
+            return AGX_TEX_FOUND;
+        }
         static const unsigned offsets[] = { 0, 4, 7 };
         for (unsigned o = 0; o < ARRAY_SIZE(offsets); o++) {
             unsigned k = offsets[o];
@@ -6587,6 +6600,29 @@ static inline __attribute__((always_inline)) uint32_t agx_blend_over(uint32_t ds
 #define AGX_USC_SOLID_PLUS_L UINT64_C(0xf137b90c25ab5471)
 #define AGX_USC_PILL_BORDER UINT64_C(0x62a99af8d8beb332)
 #define AGX_USC_CORNER_RESTORE UINT64_C(0x03a2edd2a4d84437)
+
+/* Inferred from the paired draws: signed unit-circle coordinates, not texture
+ * coordinates. Mirroring U/V at the vertices selects all four corners. Use
+ * the same pixel-width transition in both legs so D*m + backdrop*(1-m)
+ * retains coverage at the seam. The backdrop itself has independent atlas UVs. */
+static uint32_t agx_folder_coverage(float u, float v, const float map[6])
+{
+    float d = hypotf(u, v);
+    float gx = u * map[0] + v * map[3];
+    float gy = u * map[1] + v * map[4];
+    float fw = d > 1e-8f ? (fabsf(gx) + fabsf(gy)) / d : 1.0f;
+    float a = (1.0f - d) / MAX(fw, 1e-8f) + 0.5f;
+    return (uint32_t)lroundf(MAX(0.0f, MIN(1.0f, a)) * 255.0f);
+}
+
+static uint32_t agx_scale_coverage(uint32_t pixel, unsigned a)
+{
+    uint32_t out = 0;
+    for (unsigned c = 0; c < 32; c += 8) {
+        out |= (((pixel >> c) & 255) * a / 255) << c;
+    }
+    return out;
+}
 
 /* Additive blend (CoreAnimation plusL / plusLighter): clamp(S + D, 0, 255). */
 static inline uint32_t agx_blend_plus_lighter(uint32_t dst, uint32_t src)
@@ -8579,7 +8615,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                         }
                     }
-                    if (stride == 36 && prog == AGX_USC_CORNER_RESTORE) {
+                    if (stride == 36 && (prog == AGX_USC_CORNER_RESTORE || prog == AGX_USC_FOLDER_RESTORE)) {
                         u2_0 = v2_0 = 1e9f; u2_1 = v2_1 = -1e9f;
                         for (unsigned i = q_start; i < q_start + step; i++) {
                             float t2[2];
@@ -8679,6 +8715,21 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
 
+                if (prog == AGX_USC_FOLDER_MASK && stride == 24 && affine) {
+                    for (int y = y0; y < y1; y++) {
+                        if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) {
+                            continue;
+                        }
+                        for (int x = x0; x < x1; x++) {
+                            float u = uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2];
+                            float v = uv_map[3] * (x + 0.5f) + uv_map[4] * (y + 0.5f) + uv_map[5];
+                            row[x - x0] = agx_scale_coverage(row[x - x0], agx_folder_coverage(u, v, uv_map));
+                        }
+                        agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
+                    }
+                    continue;
+                }
+
                 /* Texel-unit coordinates (rectangle textures) exceed 1. */
                 float su = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.w : 1;
                 float sv = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.h : 1;
@@ -8732,7 +8783,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 uint32_t tint_g = (tint >> 8) & 0xff;
                 uint32_t tint_b = tint & 0xff;
                 bool rounded_caps = (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87)));
-                bool simple_blend = !dest_in && !vibrancy && (prog != AGX_USC_PLUS_L) && (prog != AGX_USC_PLUS_L2) && (prog != AGX_USC_CORNER_RESTORE);
+                bool simple_blend = !dest_in && !vibrancy && (prog != AGX_USC_PLUS_L) && (prog != AGX_USC_PLUS_L2) && (prog != AGX_USC_CORNER_RESTORE) && (prog != AGX_USC_FOLDER_RESTORE);
 
                 int cached_y0 = -1, cached_y1 = -1, cached_mask_y = -1;
                 bool mask_row_ok = false;
@@ -8883,6 +8934,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t sb = ((src & 0xff) * inv_a) / 255;
                             src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
                         }
+                        if (stride == 36 && prog == AGX_USC_FOLDER_RESTORE && affine2) {
+                            float u = uv2_map[0] * (x + 0.5f) + uv2_map[1] * (y + 0.5f) + uv2_map[2];
+                            float v = uv2_map[3] * (x + 0.5f) + uv2_map[4] * (y + 0.5f) + uv2_map[5];
+                            src = agx_scale_coverage(src, 255 - agx_folder_coverage(u, v, uv2_map));
+                        }
                         if (dest_in) {
                             uint32_t a = src >> 24;
                             if (a == 255) {
@@ -8918,7 +8974,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             } else {
                                 row[x - x0] = agx_blend_vibrancy(dst, src);
                             }
-                        } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2 || prog == AGX_USC_CORNER_RESTORE) {
+                        } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2 || prog == AGX_USC_CORNER_RESTORE || prog == AGX_USC_FOLDER_RESTORE) {
                             row[x - x0] = agx_blend_plus_lighter(dst, src);
                         } else {
                             row[x - x0] = agx_blend_over(dst, src);
