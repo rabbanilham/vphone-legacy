@@ -561,4 +561,162 @@ print("PASS: surface ring 4-buffer isolation and exact dirty-rect fidelity")
             subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
             subprocess.run([str(tmp / 'test')], check=True, timeout=20)
 
+    def test_player_stats_accumulator_percentiles_and_json(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+// 1. Test Percentiles
+let empty3 = Percentile.calculate3([])
+assert(empty3 == Stats3(p50: 0.0, p95: 0.0, max: 0.0))
+let empty4 = Percentile.calculate4([])
+assert(empty4 == Stats4(p50: 0.0, p95: 0.0, p99: 0.0, max: 0.0))
+
+let single3 = Percentile.calculate3([42.0])
+assert(single3 == Stats3(p50: 42.0, p95: 42.0, max: 42.0))
+let single4 = Percentile.calculate4([42.0])
+assert(single4 == Stats4(p50: 42.0, p95: 42.0, p99: 42.0, max: 42.0))
+
+var seq: [Double] = []
+for i in 1...100 { seq.append(Double(i)) }
+let p3 = Percentile.calculate3(seq)
+assert(p3.p50 == 50.0 && p3.p95 == 95.0 && p3.max == 100.0)
+let p4 = Percentile.calculate4(seq)
+assert(p4.p50 == 50.0 && p4.p95 == 95.0 && p4.p99 == 99.0 && p4.max == 100.0)
+
+// 2. Test PlayerStatsAccumulator
+let stats = PlayerStatsAccumulator()
+stats.recordFrame(rects: 1, bytes: 2048, recvMs: 2.5, updateMs: 4.0)
+stats.recordFrame(rects: 3, bytes: 4096, recvMs: 3.5, updateMs: 6.0)
+stats.recordDropped()
+stats.recordDropped()
+stats.recordArriveToPresent(8.0)
+stats.recordArriveToPresent(12.0)
+stats.recordPresentInterval(16.6)
+stats.recordPresentInterval(16.7)
+
+let snap = stats.snapshotAndReset(dt: 1.0, totalFrames: 2)
+assert(snap.fps == 2.0)
+assert(snap.rectsPerS == 4.0)
+assert(snap.kbPerS == 6.0)
+assert(snap.dropped == 2)
+assert(snap.totalFrames == 2)
+assert(snap.recvMs.p50 == 2.5 && snap.recvMs.max == 3.5)
+assert(snap.updateMs.p50 == 4.0 && snap.updateMs.max == 6.0)
+assert(snap.arriveToPresentMs.p50 == 8.0 && snap.arriveToPresentMs.max == 12.0)
+assert(snap.presentMs.p50 == 16.6 && snap.presentMs.max == 16.7)
+
+// 3. Test Text and JSON Formats
+let text = snap.formattedText()
+assert(text.hasPrefix("[player-stats] FPS: 2.0, rects/s: 4.0, kB/s: 6.0 (total frames: 2)"))
+assert(text.contains("present_ms(p50/p95/p99/max): 16.6/16.6/16.6/16.7"))
+
+let jsonStr = snap.formattedJSON()
+let jsonData = jsonStr.data(using: .utf8)!
+let obj = try JSONSerialization.jsonObject(with: jsonData) as! [String: Any]
+assert(obj["fps"] as? Double == 2.0)
+assert(obj["rects_per_s"] as? Double == 4.0)
+assert(obj["kb_per_s"] as? Double == 6.0)
+assert(obj["dropped"] as? Int == 2)
+assert(obj["total_frames"] as? Int == 2)
+
+let pObj = obj["present_ms"] as! [String: Any]
+assert(pObj["p50"] as? Double == 16.6)
+assert(pObj["p95"] as? Double == 16.6)
+assert(pObj["p99"] as? Double == 16.6)
+assert(pObj["max"] as? Double == 16.7)
+
+let rObj = obj["recv_ms"] as! [String: Any]
+assert(rObj["p50"] as? Double == 2.5)
+assert(rObj["p95"] as? Double == 2.5)
+assert(rObj["max"] as? Double == 3.5)
+
+let uObj = obj["update_ms"] as! [String: Any]
+assert(uObj["p50"] as? Double == 4.0)
+assert(uObj["p95"] as? Double == 4.0)
+assert(uObj["max"] as? Double == 6.0)
+
+let aObj = obj["arrive_to_present_ms"] as! [String: Any]
+assert(aObj["p50"] as? Double == 8.0)
+assert(aObj["p95"] as? Double == 8.0)
+assert(aObj["p99"] as? Double == 8.0)
+assert(aObj["max"] as? Double == 12.0)
+
+// 4. Verify snapshot reset
+let snap2 = stats.snapshotAndReset(dt: 1.0, totalFrames: 2)
+assert(snap2.fps == 0.0 && snap2.dropped == 0)
+assert(snap2.presentMs.p50 == 0.0 && snap2.recvMs.p50 == 0.0)
+
+print("PASS: player stats accumulator percentiles and json")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-stats-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            res = subprocess.run([str(tmp / 'test')], capture_output=True, text=True, check=True, timeout=20)
+            self.assertIn('PASS: player stats accumulator percentiles and json', res.stdout)
+
+    def test_player_stats_concurrent_stress_no_data_race(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let stats = PlayerStatsAccumulator()
+let group = DispatchGroup()
+let queue = DispatchQueue(label: "test.concurrent", attributes: .concurrent)
+
+let iterations = 1000
+for _ in 0..<4 {
+    group.enter()
+    queue.async {
+        for _ in 0..<iterations {
+            stats.recordFrame(rects: 1, bytes: 100, recvMs: 1.0, updateMs: 2.0)
+            stats.recordDropped()
+            stats.recordArriveToPresent(5.0)
+            stats.recordPresentInterval(16.0)
+        }
+        group.leave()
+    }
+}
+group.enter()
+queue.async {
+    for _ in 0..<50 {
+        _ = stats.snapshotAndReset(dt: 0.01, totalFrames: 0)
+        usleep(200)
+    }
+    group.leave()
+}
+
+group.wait()
+print("PASS: player stats concurrent stress no data race")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-race-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            res = subprocess.run([str(tmp / 'test')], capture_output=True, text=True, check=True, timeout=20)
+            self.assertIn('PASS: player stats concurrent stress no data race', res.stdout)
+
+    def test_rfb_rcvbuf_env_configuration(self):
+        source = (ROOT / 'sources/vphone-player/main.swift').read_text().split('guard CommandLine.arguments.count == 3')[0]
+        harness = r"""
+let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+assert(fd >= 0)
+if let rcvBufEnv = ProcessInfo.processInfo.environment["VPHONE_RFB_RCVBUF"],
+   let rcvBufVal = Int32(rcvBufEnv), rcvBufVal > 0 {
+    var rcvBuf = rcvBufVal
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, socklen_t(MemoryLayout<Int32>.size))
+}
+var effective: Int32 = 0
+var len = socklen_t(MemoryLayout<Int32>.size)
+getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &len)
+assert(effective == 262144)
+close(fd)
+print("PASS: rfb rcvbuf configured via env")
+"""
+        with tempfile.TemporaryDirectory(dir='/tmp', prefix='vp-rcvbuf-') as tmp:
+            tmp = Path(tmp)
+            (tmp / 'main.swift').write_text(source + harness)
+            subprocess.run(['swiftc', '-module-cache-path', str(MODULE_CACHE), str(tmp / 'main.swift'), '-o', str(tmp / 'test')], check=True)
+            env = dict(os.environ)
+            env['VPHONE_RFB_RCVBUF'] = '262144'
+            res = subprocess.run([str(tmp / 'test')], env=env, capture_output=True, text=True, check=True, timeout=20)
+            self.assertIn('PASS: rfb rcvbuf configured via env', res.stdout)
+
 if __name__ == '__main__': unittest.main()

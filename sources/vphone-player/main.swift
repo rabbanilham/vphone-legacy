@@ -216,15 +216,173 @@ final class SurfaceRing {
     }
 }
 
+struct Stats3: Equatable {
+    let p50: Double
+    let p95: Double
+    let max: Double
+}
+
+struct Stats4: Equatable {
+    let p50: Double
+    let p95: Double
+    let p99: Double
+    let max: Double
+}
+
+enum Percentile {
+    static func calculate3(_ samples: [Double]) -> Stats3 {
+        guard !samples.isEmpty else { return Stats3(p50: 0.0, p95: 0.0, max: 0.0) }
+        let sorted = samples.sorted()
+        let n = sorted.count
+        let p50 = sorted[Int(Double(n - 1) * 0.50)]
+        let p95 = sorted[Int(Double(n - 1) * 0.95)]
+        let maxVal = sorted.last!
+        return Stats3(p50: p50, p95: p95, max: maxVal)
+    }
+
+    static func calculate4(_ samples: [Double]) -> Stats4 {
+        guard !samples.isEmpty else { return Stats4(p50: 0.0, p95: 0.0, p99: 0.0, max: 0.0) }
+        let sorted = samples.sorted()
+        let n = sorted.count
+        let p50 = sorted[Int(Double(n - 1) * 0.50)]
+        let p95 = sorted[Int(Double(n - 1) * 0.95)]
+        let p99 = sorted[Int(Double(n - 1) * 0.99)]
+        let maxVal = sorted.last!
+        return Stats4(p50: p50, p95: p95, p99: p99, max: maxVal)
+    }
+}
+
+final class PlayerStatsAccumulator {
+    private let lock = NSLock()
+    private var presentIntervals: [Double] = []
+    private var arriveToPresentIntervals: [Double] = []
+    private var recvIntervals: [Double] = []
+    private var updateIntervals: [Double] = []
+    private var droppedCount: Int = 0
+    private var frameCount: Int = 0
+    private var rectCount: Int = 0
+    private var byteCount: Int = 0
+
+    struct Snapshot: Equatable {
+        let fps: Double
+        let rectsPerS: Double
+        let kbPerS: Double
+        let presentMs: Stats4
+        let recvMs: Stats3
+        let updateMs: Stats3
+        let arriveToPresentMs: Stats4
+        let dropped: Int
+        let totalFrames: Int
+
+        func formattedText() -> String {
+            return "[player-stats] " + String(
+                format: "FPS: %.1f, rects/s: %.1f, kB/s: %.1f (total frames: %d), present_ms(p50/p95/p99/max): %.1f/%.1f/%.1f/%.1f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                fps, rectsPerS, kbPerS, totalFrames,
+                presentMs.p50, presentMs.p95, presentMs.p99, presentMs.max
+            )
+        }
+
+        func formattedJSON() -> String {
+            return String(
+                format: "{\"fps\":%.1f,\"rects_per_s\":%.1f,\"kb_per_s\":%.1f,\"present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"recv_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"update_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"arrive_to_present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"dropped\":%d,\"total_frames\":%d}",
+                locale: Locale(identifier: "en_US_POSIX"),
+                fps, rectsPerS, kbPerS,
+                presentMs.p50, presentMs.p95, presentMs.p99, presentMs.max,
+                recvMs.p50, recvMs.p95, recvMs.max,
+                updateMs.p50, updateMs.p95, updateMs.max,
+                arriveToPresentMs.p50, arriveToPresentMs.p95, arriveToPresentMs.p99, arriveToPresentMs.max,
+                dropped, totalFrames
+            )
+        }
+    }
+
+    func recordFrame(rects: Int, bytes: Int, recvMs: Double, updateMs: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        frameCount += 1
+        rectCount += rects
+        byteCount += bytes
+        recvIntervals.append(recvMs)
+        updateIntervals.append(updateMs)
+    }
+
+    func recordDropped() {
+        lock.lock()
+        defer { lock.unlock() }
+        droppedCount += 1
+    }
+
+    func recordArriveToPresent(_ ms: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        arriveToPresentIntervals.append(ms)
+    }
+
+    func recordPresentInterval(_ ms: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        presentIntervals.append(ms)
+    }
+
+    func snapshotAndReset(dt: Double, totalFrames: Int) -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let fps = dt > 0 ? Double(frameCount) / dt : 0.0
+        let rps = dt > 0 ? Double(rectCount) / dt : 0.0
+        let kbps = dt > 0 ? Double(byteCount) / dt / 1024.0 : 0.0
+
+        let pStats = Percentile.calculate4(presentIntervals)
+        let rStats = Percentile.calculate3(recvIntervals)
+        let uStats = Percentile.calculate3(updateIntervals)
+        let aStats = Percentile.calculate4(arriveToPresentIntervals)
+        let dropped = droppedCount
+
+        presentIntervals.removeAll(keepingCapacity: true)
+        arriveToPresentIntervals.removeAll(keepingCapacity: true)
+        recvIntervals.removeAll(keepingCapacity: true)
+        updateIntervals.removeAll(keepingCapacity: true)
+        droppedCount = 0
+        frameCount = 0
+        rectCount = 0
+        byteCount = 0
+
+        return Snapshot(
+            fps: fps,
+            rectsPerS: rps,
+            kbPerS: kbps,
+            presentMs: pStats,
+            recvMs: rStats,
+            updateMs: uStats,
+            arriveToPresentMs: aStats,
+            dropped: dropped,
+            totalFrames: totalFrames
+        )
+    }
+
+    func formatPresentStatsLegacy() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let pStats = Percentile.calculate4(presentIntervals)
+        presentIntervals.removeAll(keepingCapacity: true)
+        return String(format: ", present_ms(p50/p95/p99/max): %.1f/%.1f/%.1f/%.1f",
+                      locale: Locale(identifier: "en_US_POSIX"),
+                      pStats.p50, pStats.p95, pStats.p99, pStats.max)
+    }
+}
+
 // RFB 3.8, raw pixels with persistent pixel buffer. All blocking I/O stays on the worker queue.
 final class RFB {
     var fd: Int32 = -1
     let writes = NSLock()
     var frame: ((CGImage) -> Void)?
     var surfaceFrame: ((IOSurface) -> Void)?
+    var surfaceFrameWithArrival: ((IOSurface, TimeInterval) -> Void)?
     var trace: ((String) -> Void)?
     var failed: ((String) -> Void)?
     var presentStats: (() -> String)?
+    let stats = PlayerStatsAccumulator()
     var width = 0, height = 0
     let ring = SurfaceRing()
     var pixelBuffer: PixelBuffer { ring.current }
@@ -254,6 +412,19 @@ final class RFB {
         var offset = 0
         while offset < count {
             let n = Darwin.recv(fd, ptr.advanced(by: offset), count - offset, 0)
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw NSError(domain: "Koneksi layar terputus", code: 1) }
+            offset += n
+        }
+    }
+
+    func read(into ptr: UnsafeMutableRawPointer, count: Int, timeRecv: inout Double) throws {
+        var offset = 0
+        while offset < count {
+            let t0 = ProcessInfo.processInfo.systemUptime
+            let n = Darwin.recv(fd, ptr.advanced(by: offset), count - offset, 0)
+            let t1 = ProcessInfo.processInfo.systemUptime
+            timeRecv += (t1 - t0)
             if n < 0 && errno == EINTR { continue }
             guard n > 0 else { throw NSError(domain: "Koneksi layar terputus", code: 1) }
             offset += n
@@ -304,6 +475,17 @@ final class RFB {
             }
             var noPipe: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noPipe, socklen_t(MemoryLayout<Int32>.size))
+            if let rcvBufEnv = ProcessInfo.processInfo.environment["VPHONE_RFB_RCVBUF"],
+               let rcvBufVal = Int32(rcvBufEnv), rcvBufVal > 0 {
+                var rcvBuf = rcvBufVal
+                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, socklen_t(MemoryLayout<Int32>.size))
+            }
+            var effectiveRcvBuf: Int32 = 0
+            var optLen = socklen_t(MemoryLayout<Int32>.size)
+            getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effectiveRcvBuf, &optLen)
+            let rcvBufMsg = "RFB SO_RCVBUF: \(effectiveRcvBuf)"
+            trace?(rcvBufMsg)
+            fputs("[player] \(rcvBufMsg)\n", stderr)
             var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
             let pathBytes = Array(path.utf8CString)
             guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { throw NSError(domain: "Socket path terlalu panjang", code: 1) }
@@ -327,9 +509,6 @@ final class RFB {
             try send([2,0,0,1,0,0,0,0]); try request(false)
             let statsEnabled = ProcessInfo.processInfo.environment["VPHONE_PLAYER_STATS"] != nil
             var statsLastTime = Date().timeIntervalSince1970
-            var statsFrames = 0
-            var statsRects = 0
-            var statsBytes = 0
             var totalFrames = 0
             while true {
                 try readIntoScratch(1)
@@ -344,6 +523,8 @@ final class RFB {
                 guard type == 0 else { throw NSError(domain:"Pesan RFB tidak didukung",code:Int(type)) }
                 try readIntoScratch(3); let count = Int(scratch[1])*256+Int(scratch[2])
                 if count > 0 {
+                    let updateStart = statsEnabled ? ProcessInfo.processInfo.systemUptime : 0
+                    var frameRecvSec: Double = 0
                     var rectHeaders: [(x: Int, y: Int, w: Int, hh: Int)] = []
                     rectHeaders.reserveCapacity(count)
                     var frameBytes = 0
@@ -370,11 +551,21 @@ final class RFB {
                         frameBytes += w*hh*4
                         rectHeaders.append((x: x, y: y, w: w, hh: hh))
                         if w == width && x == 0 {
-                            try read(into: t.baseAddress.advanced(by: y * t.bytesPerRow), count: width * hh * 4)
+                            let dst = t.baseAddress.advanced(by: y * t.bytesPerRow)
+                            let totalBytes = width * hh * 4
+                            if statsEnabled {
+                                try read(into: dst, count: totalBytes, timeRecv: &frameRecvSec)
+                            } else {
+                                try read(into: dst, count: totalBytes)
+                            }
                         } else {
                             for row in 0..<hh {
                                 let dst = t.baseAddress.advanced(by: (y + row) * t.bytesPerRow + x * 4)
-                                try read(into: dst, count: w * 4)
+                                if statsEnabled {
+                                    try read(into: dst, count: w * 4, timeRecv: &frameRecvSec)
+                                } else {
+                                    try read(into: dst, count: w * 4)
+                                }
                             }
                         }
                     }
@@ -382,31 +573,31 @@ final class RFB {
 
                     let isFullScreen = count == 1 && rectHeaders.first.map { $0.x == 0 && $0.y == 0 && $0.w == width && $0.hh == height } ?? false
                     let surface = ring.commit(dirtyRects: rectHeaders.map { (x: $0.x, y: $0.y, w: $0.w, h: $0.hh) }, isFullScreen: isFullScreen)
+                    let commitUptime = statsEnabled ? ProcessInfo.processInfo.systemUptime : 0
 
                     totalFrames += 1
                     if statsEnabled {
-                        statsFrames += 1
-                        statsRects += count
-                        statsBytes += frameBytes
+                        let updateMs = (commitUptime - updateStart) * 1000.0
+                        let recvMs = frameRecvSec * 1000.0
+                        stats.recordFrame(rects: count, bytes: frameBytes, recvMs: recvMs, updateMs: updateMs)
+
                         let now = Date().timeIntervalSince1970
                         if now - statsLastTime >= 1.0 {
                             let dt = now - statsLastTime
-                            let fps = Double(statsFrames) / dt
-                            let rps = Double(statsRects) / dt
-                            let kbps = Double(statsBytes) / dt / 1024.0
-                            let presentStr = presentStats?() ?? ""
-                            let msg = "[player-stats] " + String(format: "FPS: %.1f, rects/s: %.1f, kB/s: %.1f (total frames: %d)",
-                                                                 fps, rps, kbps, totalFrames) + presentStr
-                            fputs("\(msg)\n", stderr)
-                            trace?(msg)
-                            statsFrames = 0
-                            statsRects = 0
-                            statsBytes = 0
+                            let snapshot = stats.snapshotAndReset(dt: dt, totalFrames: totalFrames)
+                            let textMsg = snapshot.formattedText()
+                            let jsonMsg = "[player-stats-json] " + snapshot.formattedJSON()
+                            fputs("\(textMsg)\n", stderr)
+                            fputs("\(jsonMsg)\n", stderr)
+                            trace?(textMsg)
+                            trace?(jsonMsg)
                             statsLastTime = now
                         }
                     }
 
-                    if let surfaceHandler = surfaceFrame {
+                    if let surfaceHandlerWithArrival = surfaceFrameWithArrival {
+                        surfaceHandlerWithArrival(surface, commitUptime)
+                    } else if let surfaceHandler = surfaceFrame {
                         surfaceHandler(surface)
                     } else if let frameHandler = frame {
                         if let img = ring.current.makeImage() {
@@ -1148,11 +1339,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var displayQuery = false
     private let presentLock = NSLock()
     private var pendingSurface: IOSurface?
+    private var pendingArrivalUptime: TimeInterval = 0
     private var presentScheduled = false
     private var displayLink: CADisplayLink?
     private var buttonsConfigured = false
     private var lastPresentUptime: TimeInterval = 0
-    private var presentIntervals: [Double] = []
     private var lastFrameTime: TimeInterval = 0
     private let statsEnabled = ProcessInfo.processInfo.environment["VPHONE_PLAYER_STATS"] != nil
 
@@ -1202,8 +1393,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         screen.rfbKey = { [weak self] sym, down in self?.rfb.key(sym, down) }
         screen.qmpKey = { [weak self] qcode, down in self?.touchInput?.sendKey(qcode, down) }
         rfb.presentStats = { [weak self] in self?.formatPresentStats() ?? "" }
+        rfb.surfaceFrameWithArrival = { [weak self] surface, arrival in
+            self?.schedulePresent(surface: surface, arrivalUptime: arrival)
+        }
         rfb.surfaceFrame = { [weak self] surface in
-            self?.schedulePresent(surface: surface)
+            self?.schedulePresent(surface: surface, arrivalUptime: 0)
         }
         rfb.failed = { [weak self] message in
             DispatchQueue.main.async {
@@ -1241,12 +1435,21 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             presentLock.unlock()
             return
         }
+        let arrival = pendingArrivalUptime
         pendingSurface = nil
+        pendingArrivalUptime = 0
         presentLock.unlock()
 
         screen.present(surface: surface)
         rfb.ring.markDisplayed(surface: surface)
-        recordPresentInterval()
+        if statsEnabled {
+            if arrival > 0 {
+                let now = ProcessInfo.processInfo.systemUptime
+                let arriveToPresentMs = (now - arrival) * 1000.0
+                rfb.stats.recordArriveToPresent(arriveToPresentMs)
+            }
+            recordPresentInterval()
+        }
 
         if !inputFailed && gestureError == nil && !status.isHidden {
             status.isHidden = true
@@ -1257,10 +1460,15 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    func schedulePresent(surface: IOSurface) {
-        lastFrameTime = Date().timeIntervalSince1970
+    func schedulePresent(surface: IOSurface, arrivalUptime: TimeInterval = 0) {
+        let now = Date().timeIntervalSince1970
         presentLock.lock()
+        lastFrameTime = now
+        if statsEnabled && pendingSurface != nil {
+            rfb.stats.recordDropped()
+        }
         pendingSurface = surface
+        pendingArrivalUptime = arrivalUptime
         let hasLink = (displayLink != nil)
         let scheduled = presentScheduled
         if !hasLink && !scheduled {
@@ -1282,28 +1490,17 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func recordPresentInterval() {
         guard statsEnabled else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        presentLock.lock()
         if lastPresentUptime > 0 {
             let deltaMs = (now - lastPresentUptime) * 1000.0
-            presentIntervals.append(deltaMs)
+            rfb.stats.recordPresentInterval(deltaMs)
         }
         lastPresentUptime = now
+        presentLock.unlock()
     }
 
     func formatPresentStats() -> String {
-        presentLock.lock()
-        defer { presentLock.unlock() }
-        guard !presentIntervals.isEmpty else {
-            return ", present_ms(p50/p95/p99/max): 0.0/0.0/0.0/0.0"
-        }
-        presentIntervals.sort()
-        let n = presentIntervals.count
-        let p50 = presentIntervals[Int(Double(n - 1) * 0.50)]
-        let p95 = presentIntervals[Int(Double(n - 1) * 0.95)]
-        let p99 = presentIntervals[Int(Double(n - 1) * 0.99)]
-        let maxMs = presentIntervals.last!
-        presentIntervals.removeAll(keepingCapacity: true)
-        return String(format: ", present_ms(p50/p95/p99/max): %.1f/%.1f/%.1f/%.1f",
-                      p50, p95, p99, maxMs)
+        return rfb.stats.formatPresentStatsLegacy()
     }
 
     func updateButtons() {
@@ -1339,8 +1536,11 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func pollDisplay() {
         guard !displayQuery, let touchInput else {return}
         let now = Date().timeIntervalSince1970
+        presentLock.lock()
+        let lastTime = lastFrameTime
+        presentLock.unlock()
         // When the guest is actively streaming frames, the display is definitely awake.
-        if !screen.sleeping && (now - lastFrameTime < 1.0) {
+        if !screen.sleeping && (now - lastTime < 1.0) {
             return
         }
         displayQuery = true
