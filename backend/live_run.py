@@ -38,9 +38,10 @@ def clone_or_copy(src, dst):
 
 def build_player():
     sources = sorted((ROOT / 'sources/vphone-player').glob('*.swift'))
+    resources = sorted(p for p in (ROOT / 'sources/vphone-player/Resources').glob('*') if p.is_file())
     app = ROOT / 'build/player/vphone-player.app'
     binary = app / 'Contents/MacOS/vphone-player'
-    if not binary.exists() or any(p.stat().st_mtime > binary.stat().st_mtime for p in sources):
+    if not binary.exists() or any(p.stat().st_mtime > binary.stat().st_mtime for p in [*sources, *resources]):
         binary.parent.mkdir(parents=True, exist_ok=True)
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
             'CFBundleExecutable': 'vphone-player', 'CFBundleIdentifier': 'com.vphone.legacy.player',
@@ -52,6 +53,11 @@ def build_player():
         subprocess.run(['swiftc', '-O', '-target', f'{platform.machine()}-apple-macosx14.0',
                         '-module-cache-path', str(cache),
                         *map(str, sources), '-o', str(binary)], check=True)
+        # The device frame is loaded with Bundle.main; copy before signing.
+        res_dir = app / 'Contents/Resources'
+        res_dir.mkdir(parents=True, exist_ok=True)
+        for item in resources:
+            shutil.copyfile(item, res_dir / item.name)
         subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
     return binary
 

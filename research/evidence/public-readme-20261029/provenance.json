@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-29",
+  "source_revision": "9b98d89 (feat/player-bezel on top of main f2e3c38)",
+  "machine_source_sha256": "d3cfe1729055974bf8719f5c75db51f0e1ef8d6657254852196d19373a90e368",
+  "binary_sha256": "55eef234cb71b040d83358108ffd066ccf240a7a5c8994d336cbcc21d3d528dd",
+  "player_source_sha256": "fb5c72d2bf580f731fada31b21f6b99d560873f2cce9cac09e4ae824ae44ecbb",
+  "frame_asset_sha256": "8d6a21b4bc2d1340394db83dc9966c7f4a88fe1f2d9dc423dfd301257a5f92c4",
+  "run": "backend/live_run.py with VPHONE_TOUCH_SCRIPT from research/evidence/H-home-live/awake-touch-script.txt",
+  "capture": "macOS screencapture -l <window id> of the vphone-player window, 2x Retina, no retouching; frames sampled every 10 s from about 110 s after launch, then the settled Home and Settings frames were chosen. Guest time at capture was not recorded.",
+  "captures": [
+    {
+      "scene": "home",
+      "image": "home.png",
+      "png_sha256": "f104f1bed4ee89f73e19715d33f8ddf69089ed51373c5114b77532510a4dd999"
+    },
+    {
+      "scene": "settings",
+      "image": "settings.png",
+      "png_sha256": "2d6d86fb23f06f66231b1d0cc192aa965259eaa959a8e1cd0095585d2b587490"
+    }
+  ]
+}

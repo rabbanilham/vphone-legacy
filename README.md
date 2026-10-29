@@ -8,9 +8,9 @@ An experimental iPhone 5s emulator for **iPhone6,2 / n53ap / iOS 7.1.2 (11D257)*
 
 | Home | Settings |
 | --- | --- |
-| ![Original iOS Home after clock rendering fixes](research/evidence/public-readme-20261024/home.png) | ![Original iOS Settings after UISwitch and navigation-bar fixes](research/evidence/public-readme-20261024/settings.png) |
+| <img src="research/evidence/public-readme-20261029/home.png" alt="Original iOS Home in the vphone player window" width="300"> | <img src="research/evidence/public-readme-20261029/settings.png" alt="Original iOS Settings in the vphone player window" width="300"> |
 
-*Latest available normal-speed live captures from `merge-u2-live` (2026-10-24), after the clock, blur, and UISwitch fixes. [Capture provenance](research/evidence/public-readme-20261024/README.md). These are recorded research-profile results, not screenshots produced by the quick start below.*
+*Whole player window from a normal-speed live run of the `feat/player-bezel` build (2026-10-29), with the iPhone 5s frame, toolbar and original iOS 7.1.2 Home and Settings. [Capture provenance](research/evidence/public-readme-20261029/README.md). These are recorded research-profile results, not screenshots produced by the quick start below.*
 
 ## Quick start: setup and tests
 
