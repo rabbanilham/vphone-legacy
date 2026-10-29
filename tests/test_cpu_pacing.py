@@ -99,6 +99,7 @@ int main(void) {
 #define CONFIG_VNC 1
 #define NUM_PERIPHERALS 1
 #define QEMU_CLOCK_REALTIME 1
+#define QEMU_CLOCK_VIRTUAL 2
 #define LOG_UNIMP 0
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
@@ -111,7 +112,7 @@ typedef struct {
     uint32_t device_irq[3], mask[3], soft[3];
     A7Peripheral peripherals[1];
     int64_t vblank_deadline_ns, pacing_report_ns;
-    struct { int64_t last_ns; uint64_t bins[1024], count, max_ns; } pacing[2];
+    struct { int64_t last_ns; uint64_t bins[1024], count, max_ns; } pacing[3];
     int64_t *vblank_timer;
     QemuConsole *con;
 } A7State;
@@ -170,4 +171,10 @@ int main(void) {
             subprocess.run(['cc', '-std=c11', '-Werror', str(c), '-o', str(binary)], check=True)
             result = subprocess.run([binary], check=True, capture_output=True, text=True)
             self.assertIn('vblank n=3', result.stderr)
+            import json
+            payload = json.loads(next(line.split('[pacing-json] ')[1] for line in result.stderr.splitlines() if '[pacing-json]' in line))
+            self.assertEqual(payload['metrics']['vblank-late']['n'], 3)
+            self.assertEqual(sum(payload['metrics']['vblank']['bins_100us']), 3)
+            self.assertEqual(payload['metrics']['vblank']['max'], 6000)
+            self.assertIsNone(payload['swap_request_ms'])
             self.assertIn('6000.00/6000.00/6000.00', result.stderr)
