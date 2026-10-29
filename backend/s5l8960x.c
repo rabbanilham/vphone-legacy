@@ -8742,7 +8742,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :
                                         agx_quad_coordinate(y, miny, maxy, v0, v1);
                     if (tex.bpp == 1 && tex.w == 256 && tex.h == 256) {
-                        fv += 0.25f;
+                        float v_eff = (fv > 0.5f) ? (1.0f - fv) : fv;
+                        fv = v_eff + 0.25f;
                     }
                     if (has_mask_tex && mask_tex.addr) {
                         uint32_t mask_ty;

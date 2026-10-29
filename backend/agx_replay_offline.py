@@ -300,7 +300,7 @@ def texture(f, ppp, prog=None):
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
         # Word 8 is used by ROUNDED_CAPS (two 4-word samplers followed by TSW).
-        offsets = (8, 0, 4, 7) if prog == ROUNDED_CAPS else (0, 4, 7)
+        offsets = (0, 4, 7, 8) if prog == ROUNDED_CAPS else (0, 4, 7)
         for k in offsets:
             if k == 7 and tuple(ws[:3]) != LUMA:
                 continue
@@ -1561,7 +1561,9 @@ def main():
                     fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
                           quad_coordinate(y, min(ys), max(ys), v0, v1)) * sv
                     if tex.get('bpp') == 1 and tex['w'] == 256 and tex['h'] == 256:
-                        fv += 0.25 * sv
+                        v_norm = fv / sv
+                        v_eff = (1.0 - v_norm) if v_norm > 0.5 else v_norm
+                        fv = (v_eff + 0.25) * sv
                     if is_scaled and not blurred_tex:
                         v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
                         ty0 = int(v_sample)
