@@ -30,6 +30,7 @@
 #include "target/arm/arm-powerctl.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "system/tcg.h"
 #include "chardev/char-fe.h"
@@ -245,6 +246,9 @@ typedef struct MouseTouch {
     unsigned phase; /* 0 idle, 1 start, 2 down, 3 drag/final move, 4 up */
     unsigned release_frames;
     int64_t due;
+    /* A press that arrived while the previous contact was draining. */
+    bool queued, queued_up;
+    int queued_x, queued_y;
 } MouseTouch;
 
 /* One reported finger. Path IDs stay stable for a contact's lifetime. */
@@ -276,16 +280,35 @@ static int mouse_touch_scale(int value, int maximum, int pixels)
     return (int)((int64_t)value * pixels / maximum);
 }
 
+static void mouse_touch_start(MouseTouch *m, int x, int y, int64_t now)
+{
+    m->x = m->start_x = x;
+    m->y = m->start_y = y;
+    m->phase = 1;
+    m->pressed = true;
+    m->dirty = false;
+    m->release_frames = 0;
+    m->due = now;
+}
+
 static void mouse_touch_sync(MouseTouch *m, bool allowed, int64_t now)
 {
     if (m->button && !m->last_button && !m->phase && allowed) {
-        m->x = m->start_x = m->host_x;
-        m->y = m->start_y = m->host_y;
-        m->phase = 1;
-        m->pressed = true;
-        m->dirty = false;
+        mouse_touch_start(m, m->host_x, m->host_y, now);
+    } else if (m->button && !m->last_button && m->phase && !m->pressed &&
+               allowed) {
+        /* Back-to-back click while the last contact drains: lift it on the
+         * next tick instead of dropping this press, then start it afresh. */
+        m->queued = true;
+        m->queued_up = false;
+        m->queued_x = m->host_x;
+        m->queued_y = m->host_y;
         m->release_frames = 0;
-        m->due = now;
+    } else if (m->queued && !m->button) {
+        m->queued_up = true;
+    } else if (m->queued && m->button) {
+        m->queued_x = m->host_x;
+        m->queued_y = m->host_y;
     } else if (m->phase && m->pressed) {
         m->dirty |= m->x != m->host_x || m->y != m->host_y;
         m->x = m->host_x;
@@ -326,6 +349,15 @@ static bool mouse_touch_next(MouseTouch *m, int64_t now, bool ready,
     } else {
         f->state = 7;
         m->phase = 0;
+        if (m->queued) {
+            m->queued = false;
+            mouse_touch_start(m, m->queued_x, m->queued_y, now + TOUCH_TICK_NS);
+            if (m->queued_up) {
+                m->pressed = false;
+                m->release_frames = 3;
+            }
+            return true;
+        }
     }
     m->due = now + TOUCH_TICK_NS;
     return true;
@@ -669,6 +701,13 @@ struct A7State {
     uint32_t ipi[2], ipi_mask[2];
     bool timer_level[2][2];
     QEMUTimer *vblank_timer;
+    int64_t vblank_deadline_ns;
+    /* Wall-clock interval histograms: 100 us bins, final bin overflows. */
+    struct {
+        int64_t last_ns;
+        uint64_t bins[1024], count, max_ns;
+    } pacing[2]; /* vblank, completed swap */
+    int64_t pacing_report_ns;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
     uint64_t agx_cat_base;
@@ -752,6 +791,12 @@ struct A7State {
     int sys_fd;
     int data_fd;
     int utility_fd;
+    /* ANS host write-back state; accessed only under the BQL. */
+    unsigned ans_dirty;
+    QEMUTimer *ans_flush_timer;
+    Notifier ans_exit_notifier, ans_shutdown_notifier;
+    bool ans_notifiers_registered, ans_perf_enabled;
+    uint64_t ans_requests, ans_bytes, ans_fsyncs, ans_handler_ns;
     char *system_image, *data_image, *utility_image;
     uint64_t sys_lbas, data_lbas, data_start, total_lbas;
     int64_t ans_clock_ns;
@@ -3010,17 +3055,24 @@ static bool ans_write_ram(hwaddr addr, const void *buf, size_t length)
                                buf, length) == MEMTX_OK;
 }
 
-static bool ans_file_io(int fd, uint8_t *buf, off_t offset, bool write)
+/* Return the prefix transferred, including on a short/erroring syscall. */
+static size_t ans_file_transfer(int fd, uint8_t *buf, off_t offset,
+                                size_t length, bool write)
 {
     size_t done = 0;
-    while (done < ANS_SECTOR_SIZE) {
-        ssize_t n = write ? pwrite(fd, buf + done, ANS_SECTOR_SIZE - done, offset + done)
-                          : pread(fd, buf + done, ANS_SECTOR_SIZE - done, offset + done);
+    while (done < length) {
+        ssize_t n = write ? pwrite(fd, buf + done, length - done, offset + done)
+                          : pread(fd, buf + done, length - done, offset + done);
         if (n < 0 && errno == EINTR) { continue; }
-        if (n <= 0) { return false; }
+        if (n <= 0) { break; }
         done += n;
     }
-    return true;
+    return done;
+}
+
+static bool ans_file_io(int fd, uint8_t *buf, off_t offset, bool write)
+{
+    return ans_file_transfer(fd, buf, offset, ANS_SECTOR_SIZE, write) == ANS_SECTOR_SIZE;
 }
 
 /* Model-private logical utility container. NOT native NAND metadata.
@@ -3104,12 +3156,92 @@ static const AnsUtilityRegion *ans_utility_region(uint8_t opcode)
     return NULL;
 }
 
+#define ANS_WRITEBACK_MS 300
+
 static bool ans_flush(A7State *s)
 {
-    bool ok = fsync(s->data_fd) == 0;
-    if (s->utility_fd >= 0 && fsync(s->utility_fd) != 0) { ok = false; }
-    if (s->system_writable && fsync(s->sys_fd) != 0) { ok = false; }
+    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
+    bool ok = true;
+    for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
+        if (!(s->ans_dirty & (1U << i))) { continue; }
+        int ret;
+        do {
+            if (s->ans_perf_enabled) { s->ans_fsyncs++; }
+            ret = fsync(fds[i]);
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0) { ok = false; }
+        else { s->ans_dirty &= ~(1U << i); }
+    }
+    if (!s->ans_dirty && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
     return ok;
+}
+
+static void ans_mark_dirty(A7State *s, int fd)
+{
+    bool first = !s->ans_dirty;
+    s->ans_dirty |= fd == s->data_fd ? 1U : fd == s->utility_fd ? 2U : 4U;
+    if (first && s->ans_flush_timer) {
+        timer_mod(s->ans_flush_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
+    }
+}
+
+static void ans_flush_timer_cb(void *opaque)
+{
+    A7State *s = opaque;
+    if (!ans_flush(s)) {
+        error_report("ANS deferred fsync failed; dirty backings retained for retry");
+        timer_mod(s->ans_flush_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
+    }
+}
+
+/* Reset/close cannot return an ASP status: report failures, retain dirty bits. */
+static void ans_drain(A7State *s)
+{
+    if (!ans_flush(s)) { error_report("ANS lifecycle fsync failed"); }
+    if (s->ans_perf_enabled) {
+        fprintf(stderr, "ANS perf: requests=%" PRIu64 " bytes=%" PRIu64
+                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64 "\n",
+                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns);
+    }
+}
+
+static void ans_exit_notify(Notifier *n, void *data)
+{
+    A7State *s = container_of(n, A7State, ans_exit_notifier);
+    (void)data;
+    ans_drain(s);
+}
+
+static void ans_shutdown_notify(Notifier *n, void *data)
+{
+    A7State *s = container_of(n, A7State, ans_shutdown_notifier);
+    (void)data;
+    ans_drain(s);
+}
+
+/* A contiguous run ends at a backing boundary or a synthetic GPT sector. */
+static int ans_map(A7State *s, const AnsUtilityRegion *region,
+                   uint64_t current, off_t *offset, uint32_t *run)
+{
+    if (region) {
+        *offset = (region->first_page + current) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, region->page_count - current);
+        return s->utility_fd;
+    }
+    if (current >= ANS_SYS_START && current < s->data_start) {
+        *offset = (current - ANS_SYS_START) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, s->data_start - current);
+        return s->sys_fd;
+    }
+    if (current >= s->data_start && current < s->data_start + s->data_lbas) {
+        *offset = (current - s->data_start) * ANS_SECTOR_SIZE;
+        *run = MIN(*run, s->data_start + s->data_lbas - current);
+        return s->data_fd;
+    }
+    *run = 1;
+    return -1;
 }
 
 static bool ans_backings_ready(A7State *s)
@@ -3129,7 +3261,7 @@ static bool ans_backings_ready(A7State *s)
     return true;
 }
 
-static uint32_t ans_execute(A7State *s, uint8_t tag)
+static uint32_t ans_execute_request(A7State *s, uint8_t tag)
 {
     uint32_t status = 0, limit, size;
     hwaddr cmd_addr;
@@ -3242,34 +3374,62 @@ static uint32_t ans_execute(A7State *s, uint8_t tag)
         }
     }
     qemu_log_mask(LOG_UNIMP, "ANS modeled I/O opcode=0x%02x %s page=%u count=%u\n", opcode, write ? "WRITE" : "READ", lba, count);
-    for (uint32_t i = 0; i < count; i++) {
+    /* At most 8 MiB (tag31); gather/scatter preserves page ordering and aliases.
+     * Only complete sectors of a failed read reach guest RAM, as before. */
+    uint8_t *batch = g_malloc((size_t)count * ANS_SECTOR_SIZE);
+    for (uint32_t i = 0; i < count;) {
         uint64_t current = (uint64_t)lba + i;
-        int fd = -1;
+        uint32_t run = count - i;
         off_t offset = 0;
-        if (region) {
-            fd = s->utility_fd; offset = (region->first_page + current) * ANS_SECTOR_SIZE;
-        } else if (current >= ANS_SYS_START && current < s->data_start) {
-            fd = s->sys_fd; offset = (current - ANS_SYS_START) * ANS_SECTOR_SIZE;
-        } else if (current >= s->data_start && current < s->data_start + s->data_lbas) {
-            fd = s->data_fd; offset = (current - s->data_start) * ANS_SECTOR_SIZE;
-        }
+        int fd = ans_map(s, region, current, &offset, &run);
+        size_t length = (size_t)run * ANS_SECTOR_SIZE;
         if (write) {
-            if (!ans_read_ram(pages[i], buf, sizeof(buf)) || !ans_file_io(fd, buf, offset, true)) {
-                status = 5; break;
+            for (uint32_t j = 0; j < run; j++) {
+                if (!ans_read_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
+                                  ANS_SECTOR_SIZE)) { status = 5; break; }
             }
+            if (status) { break; }
+            /* Mark before I/O: a failing pwrite may have modified a prefix. */
+            ans_mark_dirty(s, fd);
+            size_t done = ans_file_transfer(fd, batch, offset, length, true);
+            if (s->ans_perf_enabled) { s->ans_bytes += done; }
+            if (done != length) { status = 5; break; }
         } else {
+            size_t done = length;
             if (fd >= 0) {
-                if (!ans_file_io(fd, buf, offset, false)) { status = 5; break; }
-            } else if (current == 0) { memcpy(buf, s->gpt_lba0, sizeof(buf)); }
-            else if (current == 1) { memcpy(buf, s->gpt_lba1, sizeof(buf)); }
-            else if (current == 2 || current == s->total_lbas - 2) { memcpy(buf, s->gpt_lba2, sizeof(buf)); }
-            else if (current == s->total_lbas - 1) { memcpy(buf, s->gpt_alt_hdr, sizeof(buf)); }
-            else { memset(buf, 0, sizeof(buf)); } /* Explicit reserved virtual sectors. */
-            if (!ans_write_ram(pages[i], buf, sizeof(buf))) { status = 5; break; }
+                done = ans_file_transfer(fd, batch, offset, length, false);
+                if (s->ans_perf_enabled) { s->ans_bytes += done; }
+            } else {
+                if (current == 0) { memcpy(buf, s->gpt_lba0, sizeof(buf)); }
+                else if (current == 1) { memcpy(buf, s->gpt_lba1, sizeof(buf)); }
+                else if (current == 2 || current == s->total_lbas - 2) { memcpy(buf, s->gpt_lba2, sizeof(buf)); }
+                else if (current == s->total_lbas - 1) { memcpy(buf, s->gpt_alt_hdr, sizeof(buf)); }
+                else { memset(buf, 0, sizeof(buf)); }
+                memcpy(batch, buf, sizeof(buf));
+            }
+            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE; j++) {
+                if (!ans_write_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
+                                   ANS_SECTOR_SIZE)) { status = 5; break; }
+            }
+            if (done != length) { status = 5; }
+            if (status) { break; }
         }
+        i += run;
     }
-    /* A completed write is durable; flush even a partially failed host request. */
-    if (write && !ans_flush(s)) { status = 5; }
+    g_free(batch);
+    /* Write completion means host page-cache acceptance. Opcode13 and lifecycle
+     * drains are durability barriers; REALTIME write-back does not retime guest. */
+    return status;
+}
+
+static uint32_t ans_execute(A7State *s, uint8_t tag)
+{
+    int64_t start = s->ans_perf_enabled ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+    uint32_t status = ans_execute_request(s, tag);
+    if (s->ans_perf_enabled) {
+        s->ans_requests++;
+        s->ans_handler_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+    }
     return status;
 }
 
@@ -5140,6 +5300,7 @@ static void agx_pbe_scan(const uint8_t *raw, size_t length,
 static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
 {
     static unsigned commands;
+    static int pbe_search_enabled = -1;
     uint64_t seen_gva[16], seen_cat[16];
     unsigned buffers = 0;
     uint32_t ctx = ldl_le_p(raw + 4);
@@ -5147,7 +5308,10 @@ static void agx_pbe_search(A7State *s, const uint8_t *raw, uint32_t address)
                        s->agx_ctx_cat[ctx + 3] : 0;
     uint8_t bytes[0x10000];
 
-    if (!getenv("VPHONE_AGX_PBE_SEARCH") || commands >= 200) {
+    if (__builtin_expect(pbe_search_enabled < 0, 0)) {
+        pbe_search_enabled = getenv("VPHONE_AGX_PBE_SEARCH") != NULL;
+    }
+    if (!pbe_search_enabled || commands >= 200) {
         return;
     }
     commands++;
@@ -5628,12 +5792,45 @@ typedef struct AGXRenderJob {
     struct AGXRenderJob *next;
 } AGXRenderJob;
 
+static AGXRenderJob *agx_job_pool = NULL;
+
+static inline AGXRenderJob *agx_job_alloc(void)
+{
+    AGXRenderJob *job;
+    if (agx_job_pool) {
+        job = agx_job_pool;
+        agx_job_pool = job->next;
+        memset(job, 0, sizeof(*job));
+    } else {
+        job = g_new0(AGXRenderJob, 1);
+    }
+    return job;
+}
+
+static inline void agx_job_free(AGXRenderJob *job)
+{
+    if (!job) {
+        return;
+    }
+    job->next = agx_job_pool;
+    agx_job_pool = job;
+}
+
 /* AGX_REPLAY_CORE_BEGIN: from here to AGX_REPLAY_CORE_END is also compiled
  * into the offline host harness (backend/agx_replay_host.c), which defines
  * AGX_REPLAY_SKIP to count the draws that replay leaves out. */
+static inline bool agx_replay_audit_enabled(void)
+{
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        cached = getenv("VPHONE_AGX_REPLAY_AUDIT") != NULL;
+    }
+    return cached;
+}
+
 #ifndef AGX_REPLAY_SKIP
 #define AGX_REPLAY_SKIP(reason) do { \
-    if (getenv("VPHONE_AGX_REPLAY_AUDIT")) { \
+    if (agx_replay_audit_enabled()) { \
         qemu_log_mask(LOG_GUEST_ERROR, "AGX replay skip: %s\n", reason); \
     } \
 } while (0)
@@ -5646,9 +5843,80 @@ typedef struct AGXRenderJob {
 struct AGXReplaySnapshot {
     gint refs;
     GHashTable *pages;
+    struct AGXReplaySnapshot *next;
 };
 static __thread AGXReplaySnapshot *agx_read_snapshot;
 static __thread bool agx_capture_snapshot;
+
+typedef struct AGXPageNode {
+    struct AGXPageNode *next;
+} AGXPageNode;
+
+static AGXPageNode *agx_page_pool = NULL;
+
+static inline void *agx_page_alloc(void)
+{
+    if (agx_page_pool) {
+        AGXPageNode *node = agx_page_pool;
+        agx_page_pool = node->next;
+        memset(node, 0, 4096);
+        return node;
+    }
+    return g_malloc0(4096);
+}
+
+static inline void agx_page_free(void *ptr)
+{
+    if (!ptr) {
+        return;
+    }
+    AGXPageNode *node = ptr;
+    node->next = agx_page_pool;
+    agx_page_pool = node;
+}
+
+typedef struct AGXKeyNode {
+    struct AGXKeyNode *next;
+} AGXKeyNode;
+
+static AGXKeyNode *agx_key_pool = NULL;
+
+static inline uint64_t *agx_key_alloc(void)
+{
+    if (agx_key_pool) {
+        AGXKeyNode *node = agx_key_pool;
+        agx_key_pool = node->next;
+        return (uint64_t *)node;
+    }
+    return g_new(uint64_t, 1);
+}
+
+static inline void agx_key_free(void *ptr)
+{
+    if (!ptr) {
+        return;
+    }
+    AGXKeyNode *node = ptr;
+    node->next = agx_key_pool;
+    agx_key_pool = node;
+}
+
+static AGXReplaySnapshot *agx_snapshot_pool = NULL;
+
+static inline AGXReplaySnapshot *agx_snapshot_alloc(void)
+{
+    if (agx_snapshot_pool) {
+        AGXReplaySnapshot *s = agx_snapshot_pool;
+        agx_snapshot_pool = s->next;
+        s->next = NULL;
+        s->refs = 1;
+        return s;
+    }
+    AGXReplaySnapshot *s = g_new0(AGXReplaySnapshot, 1);
+    s->refs = 1;
+    s->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, agx_key_free, agx_page_free);
+    return s;
+}
 
 static const uint8_t *agx_ta_snapshot_page(A7State *s, uint32_t context,
                                            const uint8_t *raw, uint64_t gva)
@@ -5668,8 +5936,9 @@ static AGXReplaySnapshot *agx_snapshot_ref(AGXReplaySnapshot *snapshot)
 static void agx_snapshot_unref(AGXReplaySnapshot *snapshot)
 {
     if (snapshot && g_atomic_int_dec_and_test(&snapshot->refs)) {
-        g_hash_table_destroy(snapshot->pages);
-        g_free(snapshot);
+        g_hash_table_remove_all(snapshot->pages);
+        snapshot->next = agx_snapshot_pool;
+        agx_snapshot_pool = snapshot;
     }
 }
 
@@ -5685,14 +5954,14 @@ static bool agx_ctx_read(A7State *s, uint64_t cat, uint64_t gva, void *buf, size
             g_hash_table_size(agx_read_snapshot->pages) < 1024) {
             hwaddr page_pa;
             if (agx_gpu_translate_ctx(s, cat, base, &page_pa)) {
-                cached = g_malloc(4096);
+                cached = agx_page_alloc();
                 if (address_space_read(&address_space_memory, page_pa, MEMTXATTRS_UNSPECIFIED,
                                        cached, 4096) == MEMTX_OK) {
-                    uint64_t *key = g_new(uint64_t, 1);
+                    uint64_t *key = agx_key_alloc();
                     *key = base;
                     g_hash_table_insert(agx_read_snapshot->pages, key, cached);
                 } else {
-                    g_free(cached);
+                    agx_page_free(cached);
                     cached = NULL;
                 }
             }
@@ -5833,6 +6102,8 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 
 #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
 #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
+#define AGX_USC_RADIAL_CLIP UINT64_C(0xe344a0f081cc4997)
+#define AGX_USC_RADIAL_RESTORE UINT64_C(0xab6fdb6c250c32c0)
 #define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
 #define AGX_USC_WEBKIT_GLYPHS UINT64_C(0x3064a456731fc3e3)
 
@@ -6082,8 +6353,8 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
     return true;
 }
 
-/* NC allocates these scratch extents sparsely. Require BOTH absent linear
- * row pages and a completely mapped 32x32 Morton-tile footprint. Dense
+/* NC and folder backdrops allocate these scratch extents sparsely. Require
+ * BOTH absent linear row pages and a completely mapped 32x32 Morton-tile footprint. Dense
  * glyph caches and every other extent retain the established addressing. */
 static __thread struct {
     uint64_t cat, base;
@@ -6097,7 +6368,7 @@ static bool agx_nc_sparse_layout(A7State *s, uint64_t cat, uint64_t base,
                                   uint32_t w, uint32_t h)
 {
     if ((base & 4095) || !((w == 128 && h == 96) ||
-        (w == 640 && (h == 224 || h == 288 || h == 320)))) { return false; }
+        (w == 640 && (h == 224 || h == 288 || h == 320 || h == 640)))) { return false; }
     if (agx_nc_layout_active) {
         for (unsigned i = 0; i < agx_nc_layout_count; i++) {
             if (agx_nc_layout_cache[i].cat == cat && agx_nc_layout_cache[i].base == base &&
@@ -6493,9 +6764,27 @@ static uint32_t agx_sample_downsample(const uint32_t *buf, uint32_t w, uint32_t 
     return src;
 }
 
-static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
+typedef struct AGXBlurTapX {
+    uint32_t x0_p, x1_p;
+    uint32_t x0_n, x1_n;
+    int w_p, w_n;
+} AGXBlurTapX;
+
+typedef struct AGXBlurTapY {
+    size_t row0_p, row1_p;
+    size_t row0_n, row1_n;
+    int w_p, w_n;
+} AGXBlurTapY;
+
+static __thread AGXBlurTapX *agx_blur_taps_x = NULL;
+static __thread size_t agx_blur_taps_x_cap = 0;
+
+static inline __attribute__((always_inline)) uint32_t agx_sample_1d_fast(uint32_t c0, uint32_t c1, int w)
 {
-    int w = (int)(frac * 256.0f + 0.5f);
     if (w == 0 || c0 == c1) {
         return c0;
     }
@@ -6507,6 +6796,12 @@ static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
     return b | (g << 8) | (r << 16) | (a << 24);
 }
 
+static inline uint32_t agx_sample_1d(uint32_t c0, uint32_t c1, float frac)
+{
+    int w = (int)(frac * 256.0f + 0.5f);
+    return agx_sample_1d_fast(c0, c1, w);
+}
+
 static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_t h,
                         const float *offsets, const float *weights, unsigned n_taps,
                         bool is_vertical)
@@ -6514,41 +6809,61 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
     if (!n_taps || !w || !h) return;
     if (is_vertical) {
         for (uint32_t y = 0; y < h; y++) {
-            uint32_t y0_pos[8], y1_pos[8], y0_neg[8], y1_neg[8];
-            float fy_pos[8], fy_neg[8];
+            AGXBlurTapY taps[8];
             for (unsigned t = 0; t < n_taps; t++) {
                 float off = offsets[t];
                 float fv_p = (float)y + off;
                 if (fv_p < 0.0f) fv_p = 0.0f;
                 if (fv_p > (float)(h - 1)) fv_p = (float)(h - 1);
-                y0_pos[t] = (uint32_t)fv_p;
-                y1_pos[t] = y0_pos[t] + 1 < h ? y0_pos[t] + 1 : y0_pos[t];
-                fy_pos[t] = fv_p - (float)y0_pos[t];
+                uint32_t y0_p = (uint32_t)fv_p;
+                uint32_t y1_p = y0_p + 1 < h ? y0_p + 1 : y0_p;
+                taps[t].row0_p = (size_t)y0_p * w;
+                taps[t].row1_p = (size_t)y1_p * w;
+                taps[t].w_p = (int)((fv_p - (float)y0_p) * 256.0f + 0.5f);
 
                 float fv_n = (float)y - off;
                 if (fv_n < 0.0f) fv_n = 0.0f;
                 if (fv_n > (float)(h - 1)) fv_n = (float)(h - 1);
-                y0_neg[t] = (uint32_t)fv_n;
-                y1_neg[t] = y0_neg[t] + 1 < h ? y0_neg[t] + 1 : y0_neg[t];
-                fy_neg[t] = fv_n - (float)y0_neg[t];
+                uint32_t y0_n = (uint32_t)fv_n;
+                uint32_t y1_n = y0_n + 1 < h ? y0_n + 1 : y0_n;
+                taps[t].row0_n = (size_t)y0_n * w;
+                taps[t].row1_n = (size_t)y1_n * w;
+                taps[t].w_n = (int)((fv_n - (float)y0_n) * 256.0f + 0.5f);
             }
             uint32_t *row_out = buf_tmp + (size_t)y * w;
             for (uint32_t x = 0; x < w; x++) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (unsigned t = 0; t < n_taps; t++) {
+                    uint32_t s_pos = agx_sample_1d_fast(buf_in[taps[t].row0_p + x],
+                                                        buf_in[taps[t].row1_p + x],
+                                                        taps[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(buf_in[taps[t].row0_n + x],
+                                                        buf_in[taps[t].row1_n + x],
+                                                        taps[t].w_n);
+                    uint8x8_t p = vcreate_u8((uint64_t)s_pos | ((uint64_t)s_neg << 32));
+                    uint16x8_t p16 = vmovl_u8(p);
+                    uint16x4_t sum16 = vadd_u16(vget_low_u16(p16), vget_high_u16(p16));
+                    float32x4_t sum_f = vcvtq_f32_u32(vmovl_u16(sum16));
+                    acc = vmlaq_n_f32(acc, sum_f, weights[t]);
+                }
+                int32x4_t s32 = vcvtaq_s32_f32(acc);
+                uint16x4_t u16 = vqmovun_s32(s32);
+                uint8x8_t u8 = vqmovn_u16(vcombine_u16(u16, u16));
+                row_out[x] = vget_lane_u32(vreinterpret_u32_u8(u8), 0);
+#else
                 float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 for (unsigned t = 0; t < n_taps; t++) {
-                    float weight = weights[t];
-                    uint32_t c00_p = buf_in[(size_t)y0_pos[t] * w + x];
-                    uint32_t c01_p = buf_in[(size_t)y1_pos[t] * w + x];
-                    uint32_t s_pos = agx_sample_1d(c00_p, c01_p, fy_pos[t]);
-
-                    uint32_t c00_n = buf_in[(size_t)y0_neg[t] * w + x];
-                    uint32_t c01_n = buf_in[(size_t)y1_neg[t] * w + x];
-                    uint32_t s_neg = agx_sample_1d(c00_n, c01_n, fy_neg[t]);
-
-                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
-                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
-                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
-                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                    uint32_t s_pos = agx_sample_1d_fast(buf_in[taps[t].row0_p + x],
+                                                        buf_in[taps[t].row1_p + x],
+                                                        taps[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(buf_in[taps[t].row0_n + x],
+                                                        buf_in[taps[t].row1_n + x],
+                                                        taps[t].w_n);
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weights[t];
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weights[t];
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weights[t];
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weights[t];
                 }
                 int iv0 = (int)lroundf(acc[0]);
                 int iv1 = (int)lroundf(acc[1]);
@@ -6558,38 +6873,76 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                              ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
                              ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
                              ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+#endif
             }
         }
     } else {
+        if ((size_t)w * n_taps > agx_blur_taps_x_cap) {
+            agx_blur_taps_x_cap = (size_t)w * n_taps + 128;
+            agx_blur_taps_x = (AGXBlurTapX *)realloc(agx_blur_taps_x, agx_blur_taps_x_cap * sizeof(AGXBlurTapX));
+        }
+        for (uint32_t x = 0; x < w; x++) {
+            AGXBlurTapX *entry_base = &agx_blur_taps_x[x * n_taps];
+            for (unsigned t = 0; t < n_taps; t++) {
+                float off = offsets[t];
+                float fu_p = (float)x + off;
+                if (fu_p < 0.0f) fu_p = 0.0f;
+                if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
+                uint32_t x0_p = (uint32_t)fu_p;
+                uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
+
+                float fu_n = (float)x - off;
+                if (fu_n < 0.0f) fu_n = 0.0f;
+                if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
+                uint32_t x0_n = (uint32_t)fu_n;
+                uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
+
+                AGXBlurTapX *entry = &entry_base[t];
+                entry->x0_p = x0_p;
+                entry->x1_p = x1_p;
+                entry->w_p = (int)((fu_p - (float)x0_p) * 256.0f + 0.5f);
+                entry->x0_n = x0_n;
+                entry->x1_n = x1_n;
+                entry->w_n = (int)((fu_n - (float)x0_n) * 256.0f + 0.5f);
+            }
+        }
         for (uint32_t y = 0; y < h; y++) {
             const uint32_t *row_in = buf_in + (size_t)y * w;
             uint32_t *row_out = buf_tmp + (size_t)y * w;
             for (uint32_t x = 0; x < w; x++) {
+                const AGXBlurTapX *entry = &agx_blur_taps_x[x * n_taps];
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (unsigned t = 0; t < n_taps; t++) {
+                    uint32_t s_pos = agx_sample_1d_fast(row_in[entry[t].x0_p],
+                                                        row_in[entry[t].x1_p],
+                                                        entry[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(row_in[entry[t].x0_n],
+                                                        row_in[entry[t].x1_n],
+                                                        entry[t].w_n);
+                    uint8x8_t p = vcreate_u8((uint64_t)s_pos | ((uint64_t)s_neg << 32));
+                    uint16x8_t p16 = vmovl_u8(p);
+                    uint16x4_t sum16 = vadd_u16(vget_low_u16(p16), vget_high_u16(p16));
+                    float32x4_t sum_f = vcvtq_f32_u32(vmovl_u16(sum16));
+                    acc = vmlaq_n_f32(acc, sum_f, weights[t]);
+                }
+                int32x4_t s32 = vcvtaq_s32_f32(acc);
+                uint16x4_t u16 = vqmovun_s32(s32);
+                uint8x8_t u8 = vqmovn_u16(vcombine_u16(u16, u16));
+                row_out[x] = vget_lane_u32(vreinterpret_u32_u8(u8), 0);
+#else
                 float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 for (unsigned t = 0; t < n_taps; t++) {
-                    float off = offsets[t];
-                    float weight = weights[t];
-
-                    float fu_p = (float)x + off;
-                    if (fu_p < 0.0f) fu_p = 0.0f;
-                    if (fu_p > (float)(w - 1)) fu_p = (float)(w - 1);
-                    uint32_t x0_p = (uint32_t)fu_p;
-                    uint32_t x1_p = x0_p + 1 < w ? x0_p + 1 : x0_p;
-                    float fx_p = fu_p - (float)x0_p;
-                    uint32_t s_pos = agx_sample_1d(row_in[x0_p], row_in[x1_p], fx_p);
-
-                    float fu_n = (float)x - off;
-                    if (fu_n < 0.0f) fu_n = 0.0f;
-                    if (fu_n > (float)(w - 1)) fu_n = (float)(w - 1);
-                    uint32_t x0_n = (uint32_t)fu_n;
-                    uint32_t x1_n = x0_n + 1 < w ? x0_n + 1 : x0_n;
-                    float fx_n = fu_n - (float)x0_n;
-                    uint32_t s_neg = agx_sample_1d(row_in[x0_n], row_in[x1_n], fx_n);
-
-                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weight;
-                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weight;
-                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weight;
-                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weight;
+                    uint32_t s_pos = agx_sample_1d_fast(row_in[entry[t].x0_p],
+                                                        row_in[entry[t].x1_p],
+                                                        entry[t].w_p);
+                    uint32_t s_neg = agx_sample_1d_fast(row_in[entry[t].x0_n],
+                                                        row_in[entry[t].x1_n],
+                                                        entry[t].w_n);
+                    acc[0] += (float)((s_pos & 0xff) + (s_neg & 0xff)) * weights[t];
+                    acc[1] += (float)(((s_pos >> 8) & 0xff) + ((s_neg >> 8) & 0xff)) * weights[t];
+                    acc[2] += (float)(((s_pos >> 16) & 0xff) + ((s_neg >> 16) & 0xff)) * weights[t];
+                    acc[3] += (float)((s_pos >> 24) + (s_neg >> 24)) * weights[t];
                 }
                 int iv0 = (int)lroundf(acc[0]);
                 int iv1 = (int)lroundf(acc[1]);
@@ -6599,6 +6952,7 @@ static void agx_blur_1d(uint32_t *buf_in, uint32_t *buf_tmp, uint32_t w, uint32_
                              ((uint32_t)(iv1 < 0 ? 0 : (iv1 > 255 ? 255 : iv1)) << 8) |
                              ((uint32_t)(iv2 < 0 ? 0 : (iv2 > 255 ? 255 : iv2)) << 16) |
                              ((uint32_t)(iv3 < 0 ? 0 : (iv3 > 255 ? 255 : iv3)) << 24);
+#endif
             }
         }
     }
@@ -6910,14 +7264,12 @@ static bool agx_extract_blur_params(A7State *s, uint64_t cat, uint64_t vs_data,
 
 static AGXReplaySnapshot *agx_capture_ta(A7State *s, uint64_t cat, const uint8_t *ta)
 {
-    AGXReplaySnapshot *snapshot = g_new0(AGXReplaySnapshot, 1);
+    AGXReplaySnapshot *snapshot = agx_snapshot_alloc();
 #ifdef QEMU_OSDEP_H
     /* The translation cache is per thread; the main loop must not reuse
      * entries across passes after the guest remaps GPU pages. */
     agx_tlb_reset();
 #endif
-    snapshot->refs = 1;
-    snapshot->pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     agx_read_snapshot = snapshot;
     agx_capture_snapshot = true;
     uint64_t pc = ldq_le_p(ta + 0x68), vs_data = 0;
@@ -7264,6 +7616,8 @@ static __thread uint32_t *agx_scratch1 = NULL;
 static __thread size_t agx_scratch1_cap = 0;
 static __thread uint32_t *agx_scratch2 = NULL;
 static __thread size_t agx_scratch2_cap = 0;
+static __thread uint32_t *agx_scratch_nc = NULL;
+static __thread size_t agx_scratch_nc_cap = 0;
 
 static uint32_t *agx_get_scratch1(size_t count)
 {
@@ -7281,6 +7635,36 @@ static uint32_t *agx_get_scratch2(size_t count)
         agx_scratch2_cap = count;
     }
     return agx_scratch2;
+}
+
+static uint32_t *agx_get_scratch_nc(size_t count)
+{
+    if (count > agx_scratch_nc_cap) {
+        agx_scratch_nc = g_realloc(agx_scratch_nc, count * sizeof(uint32_t));
+        agx_scratch_nc_cap = count;
+    }
+    return agx_scratch_nc;
+}
+
+/* Approximate the analytic corner shaders from their signed unit-circle
+ * coordinates. Integrate
+ * pixel coverage on a 4x4 grid; unlike rounding the quad this also works for
+ * mirrored corners and keeps the clipping/restoration masks complementary. */
+static unsigned agx_radial_coverage(float u, float v, const float map[6])
+{
+    unsigned inside = 0;
+    for (unsigned j=0; j<4; j++) for (unsigned i=0; i<4; i++) {
+        float dx=(i+0.5f)/4-0.5f, dy=(j+0.5f)/4-0.5f;
+        float a=u+map[0]*dx+map[1]*dy, b=v+map[3]*dx+map[4]*dy;
+        inside += a*a+b*b <= 1;
+    }
+    return (inside*255+8)/16;
+}
+static uint32_t agx_scale_premul(uint32_t colour, unsigned alpha)
+{
+    uint32_t out=0;
+    for (unsigned c=0; c<4; c++) out |= (((colour>>(8*c))&255)*alpha/255)<<(8*c);
+    return out;
 }
 
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
@@ -7324,7 +7708,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
         }
     }
 #endif
-    bool audit = getenv("VPHONE_AGX_REPLAY_AUDIT") != NULL;
+    bool audit = agx_replay_audit_enabled();
     bool audit_clock = audit && target >= UINT64_C(0x400000000);
     unsigned before_clock = audit_clock ? agx_audit_clock(s, cat, &sf) : 0;
 
@@ -7444,9 +7828,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
             bool is_span = stride == 16 && (prog == AGX_USC_SPANS || prog == AGX_USC_WEBKIT_SPANS);
+            bool radial_clip = stride == 24 && prog == AGX_USC_RADIAL_CLIP;
+            bool radial_restore = stride == 36 && prog == AGX_USC_RADIAL_RESTORE;
             bool is_pill = stride == 36 && prog == AGX_USC_PILL_BORDER;
             if ((stride == 16 && !clip_space && !is_span) ||
-                (found == AGX_TEX_NONE && !is_span && !is_pill && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
+                (found == AGX_TEX_NONE && !is_span && !is_pill && !radial_clip && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
                                 found == AGX_TEX_NONE ? (stride == 24 && prog == 0 ? "stride 24 untextured with program 0x0" : "untextured with unsupported stride") :
@@ -7464,7 +7850,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                     &last_copy_normalized, &have_copy_texmat);
             bool region_clear = nc_context && stride == 12 && is_blur_prog &&
                                 agx_extract_region_clear(s, cat, retained_ppp, &clear_colour);
-            bool textured = found != AGX_TEX_NONE && (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
+            bool is_cg_line = (prog == UINT64_C(0xba8c50a79810e866) && (found == AGX_TEX_NONE || tex.bpp == 1));
+            bool is_clock_cap = (prog == AGX_USC_ROUNDED_CAPS && count == 48 && (found == AGX_TEX_NONE || tex.bpp == 1));
+            bool textured = !radial_clip && found != AGX_TEX_NONE && !is_cg_line && !is_clock_cap &&
+                            (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
             /* Textured quads are streamed directly from guest memory. The
              * 64-vertex scratch limit only applies to the solid rasterizer;
              * WebKit batches many more glyph vertices into a single draw. */
@@ -7576,7 +7965,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 if (decoded_nc_addr == tex.addr && decoded_nc_w == tex.w && decoded_nc_h == tex.h) {
                     prepared_tex = decoded_nc_pixels;
                 } else {
-                    uint32_t *raw_tex = agx_get_scratch1((size_t)tex.w * tex.h);
+                    uint32_t *raw_tex = agx_get_scratch_nc((size_t)tex.w * tex.h);
                     if (!agx_nc_transfer(s, cat, tex.addr, tex.w, tex.h, raw_tex, false)) {
                         AGX_REPLAY_SKIP("NC source tiles unavailable");
                         continue;
@@ -7834,7 +8223,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 }
                 continue;
             }
-            if (!textured && !(stride == 12 && is_blur_prog)) {
+            if (!textured && !radial_clip && !(stride == 12 && is_blur_prog)) {
                 float vs_xy[64][2];
                 float m4[4];
                 bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
@@ -8215,7 +8604,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                         }
                     }
-                    if (stride == 36 && prog == AGX_USC_CORNER_RESTORE) {
+                    if (stride == 36 && (prog == AGX_USC_CORNER_RESTORE || radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX)) {
                         u2_0 = v2_0 = 1e9f; u2_1 = v2_1 = -1e9f;
                         for (unsigned i = q_start; i < q_start + step; i++) {
                             float t2[2];
@@ -8244,11 +8633,29 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 if (stride == 36 && prog == AGX_USC_CORNER_RESTORE && (!(u2_1 >= u2_0) || !(v2_1 >= v2_0))) {
                     continue;
                 }
+                if ((radial_clip && !affine) ||
+                    ((radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX) && !affine2)) {
+                    continue;
+                }
                 any_drawn = true;
                 if (audit) {
                     qemu_log_mask(LOG_UNIMP, "AGX AUDIT draw target 0x%llx stride %u prog 0x%llx rect %d,%d-%d,%d texture 0x%llx tint 0x%x uv %g,%g-%g,%g\n",
                                   (unsigned long long)target, stride, (unsigned long long)prog, x0,y0,x1,y1,
                                   (unsigned long long)(textured ? tex.addr : 0), tint, u0,v0,u1,v1);
+                }
+
+                if (radial_clip) {
+                    for (int y = y0; y < y1; y++) {
+                        if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) { continue; }
+                        for (int x = x0; x < x1; x++) {
+                            float u = uv_map[0]*(x+0.5f)+uv_map[1]*(y+0.5f)+uv_map[2];
+                            float v = uv_map[3]*(x+0.5f)+uv_map[4]*(y+0.5f)+uv_map[5];
+                            unsigned a = agx_radial_coverage(u, v, uv_map);
+                            row[x-x0] = agx_scale_premul(row[x-x0], a);
+                        }
+                        agx_target_write(s, cat, &sf, x0, y, row, x1-x0);
+                    }
+                    continue;
                 }
 
                 if (region_clear) {
@@ -8267,8 +8674,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     int by1 = MIN((int)height, y1 + pad);
                     uint32_t bw = (uint32_t)(bx1 - bx0), bh = (uint32_t)(by1 - by0);
                     if (bw > 0 && bh > 0 && bw <= 2048 && bh <= 2048) {
-                        uint32_t *raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
-                        uint32_t *tmp_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t));
+                        /* Formerly: raw_tex = g_malloc((size_t)bw * bh * sizeof(uint32_t)); */
+                        uint32_t *raw_tex = agx_get_scratch1((size_t)bw * bh);
+                        uint32_t *tmp_tex = agx_get_scratch2((size_t)bw * bh);
                         if (raw_tex && tmp_tex) {
                             bool read_ok = true;
                             for (uint32_t y = 0; y < bh; y++) {
@@ -8295,8 +8703,6 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 }
                             }
                         }
-                        g_free(raw_tex);
-                        g_free(tmp_tex);
                     }
                     continue;
                 }
@@ -8379,7 +8785,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :
                                         agx_quad_coordinate(y, miny, maxy, v0, v1);
                     if (tex.bpp == 1 && tex.w == 256 && tex.h == 256) {
-                        fv += 0.25f;
+                        float v_eff = (fv > 0.5f) ? (1.0f - fv) : fv;
+                        fv = 2.0f * v_eff;
                     }
                     if (has_mask_tex && mask_tex.addr) {
                         uint32_t mask_ty;
@@ -8389,7 +8796,15 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             int mty = (int)lroundf((fv2 + 0.25f) * (float)mask_tex.h);
                             mask_ty = MAX(0, MIN((int)mask_tex.h - 1, mty));
                         } else {
-                            mask_ty = MIN(mask_tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                            float fv2 = uv2_map[3]*(x0+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                            /* CA's A8 corner atlas stores the lower half of an
+                             * ellipse. UV1 uses mirrored nine-slice coordinates,
+                             * just like the single-texture A8 path above. */
+                            if (mask_tex.bpp == 1 && mask_tex.w == 256 && mask_tex.h == 256) {
+                                fv2 = 2.0f * (fv2 > 0.5f ? 1.0f-fv2 : fv2);
+                            }
+                            float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.h : 1;
+                            mask_ty = MIN(mask_tex.h-1, (uint32_t)MAX(0.0f, fv2*scale));
                         }
                         if ((int)mask_ty != cached_mask_y) {
                             mask_row_ok = agx_texture_row(s, cat, &mask_tex, mask_ty, maskrow);
@@ -8520,7 +8935,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t sb = ((src & 0xff) * inv_a) / 255;
                             src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
                         }
-                        if (dest_in) {
+                        if (radial_restore && affine2) {
+                            float u = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                            float v = uv2_map[3]*(x+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                            src = agx_scale_premul(src, 255-agx_radial_coverage(u, v, uv2_map));
+                            row[x-x0] = agx_blend_plus_lighter(dst, src);
+                        } else if (dest_in) {
                             uint32_t a = src >> 24;
                             if (a == 255) {
                                 row[x - x0] = dst;
@@ -8537,11 +8957,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             row[x - x0] = agx_blend_over(dst, src);
                         } else if (vibrancy) {
                             if (stride == 36 && has_mask_tex && mask_row_ok) {
-                                uint32_t m_alpha = (maskrow[tx] >> 24) & 0xff;
+                                float fu2 = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                                float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.w : 1;
+                                unsigned mx = MIN(mask_tex.w-1, (uint32_t)MAX(0.0f, fu2*scale));
+                                uint32_t m_alpha = maskrow[mx] >> 24;
                                 if (m_alpha == 0) {
                                     row[x - x0] = dst;
                                 } else {
-                                    uint32_t vib = agx_blend_vibrancy(dst, src);
+                                    /* This two-sampler program has no luma constants: it
+                                     * composites the backdrop through the second alpha texture. */
+                                    uint32_t vib = agx_blend_over(dst, src);
                                     if (m_alpha == 255) {
                                         row[x - x0] = vib;
                                     } else {
@@ -8722,7 +9147,7 @@ static void agx_replay_complete_job(AGXRenderJob *job)
         s->agx_inflight_jobs--;
     }
     agx_snapshot_unref(job->snapshot);
-    g_free(job);
+    agx_job_free(job);
 }
 
 static void agx_kick_cb(void *opaque);
@@ -8890,7 +9315,12 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     agx_tlb_reset();
 #endif
     uint64_t first = UINT64_MAX, actual = 0;
-    const char *fill = getenv("VPHONE_AGX_RT_FILL");
+    static const char *fill = NULL;
+    static bool fill_checked = false;
+    if (__builtin_expect(!fill_checked, 0)) {
+        fill = getenv("VPHONE_AGX_RT_FILL");
+        fill_checked = true;
+    }
 
     if (!agx_gpu_access(s, agx_meta_gva(address), raw, sizeof(raw), false)) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -9010,21 +9440,31 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     }
     /* The default captures CA/display work; explicit context selection also
      * permits early wallpaper/upload passes before display MMU programming. */
-    const char *dump_context = getenv("VPHONE_AGX_FRAME_DUMP_CONTEXT");
+    static const char *dump_context = NULL;
+    static const char *min_env = NULL;
+    static int dump_offscreen_cached = -1;
+    static int dump_display_cached = -1;
+    static bool dump_env_checked = false;
+    if (__builtin_expect(!dump_env_checked, 0)) {
+        dump_context = getenv("VPHONE_AGX_FRAME_DUMP_CONTEXT");
+        min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
+        dump_offscreen_cached = getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") != NULL;
+        dump_display_cached = getenv("VPHONE_AGX_FRAME_DUMP_DISPLAY") != NULL;
+        dump_env_checked = true;
+    }
     bool capture_context = dump_context ?
         (!strcmp(dump_context, "all") || context_id == strtoul(dump_context, NULL, 0)) :
         (context_id == 1 && s->disp_mmu_table);
     if (capture_context && context_cat && pbe_target) {
         /* Optional: only dump frames with at least MIN_DRAWS draws (CA
          * redraws only dirty regions, so most frames are small). */
-        const char *min_env = getenv("VPHONE_AGX_FRAME_DUMP_MIN_DRAWS");
         const uint8_t *dump_ta = agx_find_ta(s, context_id, raw);
         bool offscreen = (ldl_le_p(raw + 0x74) & 0xffff) != 639 ||
                          (ldl_le_p(raw + 0x70) & 0xffff) != 1135;
         /* OFFSCREEN=1 keeps only offscreen passes, DISPLAY=1 only display ones
          * (load passes, so each replays to the whole screen). */
-        if ((!getenv("VPHONE_AGX_FRAME_DUMP_OFFSCREEN") || offscreen) &&
-            (!getenv("VPHONE_AGX_FRAME_DUMP_DISPLAY") || !offscreen) &&
+        if ((!dump_offscreen_cached || offscreen) &&
+            (!dump_display_cached || !offscreen) &&
             (!min_env || (dump_ta && agx_vdm_draw_count(s, cat_base, dump_ta) >=
                                      strtoul(min_env, NULL, 0)))) {
             agx_frame_dump(s, context_id, cat_base, pbe_target, block, raw);
@@ -9066,15 +9506,18 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
         AGXReplaySnapshot *snapshot = s->agx_ta_snapshot[context_id][ta_slot];
         uint64_t scissor_base = ldl_le_p(raw + 0x50);
         if (snapshot && scissor_base) {
-            uint8_t sc_page[4096];
             hwaddr sc_pa;
             uint64_t sc_base_page = scissor_base & ~UINT64_C(0xfff);
             if (!g_hash_table_lookup(snapshot->pages, &sc_base_page) &&
-                agx_gpu_translate_ctx(s, cat_base, sc_base_page, &sc_pa) &&
-                address_space_read(&address_space_memory, sc_pa, MEMTXATTRS_UNSPECIFIED, sc_page, 4096) == MEMTX_OK) {
-                uint64_t *key = g_new(uint64_t, 1);
-                *key = sc_base_page;
-                g_hash_table_insert(snapshot->pages, key, g_memdup2(sc_page, 4096));
+                agx_gpu_translate_ctx(s, cat_base, sc_base_page, &sc_pa)) {
+                uint8_t *page = agx_page_alloc();
+                if (address_space_read(&address_space_memory, sc_pa, MEMTXATTRS_UNSPECIFIED, page, 4096) == MEMTX_OK) {
+                    uint64_t *key = agx_key_alloc();
+                    *key = sc_base_page;
+                    g_hash_table_insert(snapshot->pages, key, page);
+                } else {
+                    agx_page_free(page);
+                }
             }
         }
         if (!agx_replay_thread_enabled()) {
@@ -9082,7 +9525,7 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
             agx_replay_frame(s, cat_base, pass_ta, pbe_target, pass_w, pass_h, is_clear, pbe_pitch, scissor_base);
             agx_read_snapshot = NULL;
         } else if (out_job) {
-            AGXRenderJob *job = g_new0(AGXRenderJob, 1);
+            AGXRenderJob *job = agx_job_alloc();
             job->s = s;
             job->snapshot = agx_snapshot_ref(snapshot);
             job->cat_base = cat_base;
@@ -9239,10 +9682,14 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                                 AGXRenderJob **local_head, AGXRenderJob **local_tail)
 {
     static int dump_enabled = -1;
+    static int frame_dump_enabled = -1;
     uint32_t pointers[2], read_index, write_index, size;
 
-    if (dump_enabled < 0) {
+    if (__builtin_expect(dump_enabled < 0, 0)) {
         dump_enabled = getenv("VPHONE_AGX_DUMP") != NULL;
+    }
+    if (__builtin_expect(frame_dump_enabled < 0, 0)) {
+        frame_dump_enabled = getenv("VPHONE_AGX_FRAME_DUMP") != NULL;
     }
     if (!agx_gpu_access(s, agx_meta_gva(block) + 4, pointers, sizeof(pointers), false)) {
         return 0;
@@ -9316,7 +9763,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                 continue;
             } else if (agx_replay_thread_enabled() && (s->agx_inflight_jobs > 0 || *local_head)) {
                 /* Preserve FIFO ordering: queue stamp behind in-flight replay */
-                AGXRenderJob *stamp_job = g_new0(AGXRenderJob, 1);
+                AGXRenderJob *stamp_job = agx_job_alloc();
                 stamp_job->s = s;
                 stamp_job->has_stamp = true;
                 stamp_job->stamp_gva = agx_meta_gva(command[1]);
@@ -9359,7 +9806,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
                 queue_has_job = true;
                 pending_job = NULL;
             }
-            if (command[0] == 0 && (getenv("VPHONE_AGX_FRAME_DUMP") || agx_replay_enabled()) &&
+            if (command[0] == 0 && (frame_dump_enabled || agx_replay_enabled()) &&
                 command[1] < ARRAY_SIZE(s->agx_last_ta)) {
                 uint32_t context = command[1];
                 uint8_t ta[0x280];
@@ -9430,7 +9877,7 @@ static unsigned agx_drain_queue(A7State *s, uint32_t block, unsigned *stamps,
         /* Older jobs of this queue are still in flight: publish this index
          * behind them, or their completion would move the guest's read
          * index backwards. */
-        AGXRenderJob *ctrl_job = g_new0(AGXRenderJob, 1);
+        AGXRenderJob *ctrl_job = agx_job_alloc();
         ctrl_job->s = s;
         ctrl_job->has_queue_ctrl = true;
         ctrl_job->queue_ctrl_gva = control;
@@ -9557,7 +10004,7 @@ static void agx_kick_cb(void *opaque)
         agx_enqueue_render_jobs(s, local_head, local_tail);
     } else if (commands) {
         if (agx_replay_thread_enabled() && s->agx_inflight_jobs > 0) {
-            AGXRenderJob *comp_job = g_new0(AGXRenderJob, 1);
+            AGXRenderJob *comp_job = agx_job_alloc();
             comp_job->s = s;
             comp_job->post_completion = true;
             comp_job->commands = commands;
@@ -9783,9 +10230,60 @@ static void a7_wifi_patch_mac(A7State *s)
     fprintf(stderr, "WIFI DeviceTree: local-mac-address not found in PA 0x8018d0000..0x8018e0000\n");
 }
 
+/* Pacing statistics never feed guest clocks or interrupt decisions. */
+static void pacing_sample(A7State *s, unsigned kind, int64_t now)
+{
+    if (!s->agx_perf_enabled) {
+        return;
+    }
+    if (s->pacing[kind].last_ns) {
+        uint64_t dt = now - s->pacing[kind].last_ns;
+        s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
+        s->pacing[kind].count++;
+        s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
+    }
+    s->pacing[kind].last_ns = now;
+}
+
+static void pacing_report(A7State *s, int64_t now)
+{
+    if (!s->agx_perf_enabled || now - s->pacing_report_ns < 5000000000LL) {
+        return;
+    }
+    s->pacing_report_ns = now;
+    for (unsigned k = 0; k < 2; k++) {
+        uint64_t n = s->pacing[k].count, cumulative = 0;
+        double quantile[3] = { 0 };
+        const unsigned percent[] = { 50, 95, 99 };
+        unsigned q = 0;
+        for (unsigned b = 0; b < 1024; b++) {
+            cumulative += s->pacing[k].bins[b];
+            while (n && q < 3 && cumulative >= (n * percent[q] + 99) / 100) {
+                /* Upper bound of bin; overflow uses the observed maximum. */
+                quantile[q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
+                                                          (b + 1) / 10.0;
+            }
+        }
+        fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
+                " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
+                k ? "swap-complete" : "vblank", n,
+                quantile[0], quantile[1], quantile[2],
+                s->pacing[k].max_ns / 1e6);
+        memset(s->pacing[k].bins, 0, sizeof(s->pacing[k].bins));
+        s->pacing[k].count = s->pacing[k].max_ns = 0;
+    }
+}
+
+#ifdef CONFIG_VNC
+/* Patch 0006: flush VNC after the display producer, under the BQL. */
+void vphone_vnc_refresh(QemuConsole *con);
+#endif
+
 static void vblank_timer_cb(void *opaque)
 {
     A7State *s = opaque;
+    int64_t wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    pacing_sample(s, 0, wall_ns);
     agx_drain_context_ring(s);
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
@@ -9808,6 +10306,7 @@ static void vblank_timer_cb(void *opaque)
                 *(uint32_t *)(p->regs + 0x1048) = s->disp_token;
                 qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
+                pacing_sample(s, 1, wall_ns);
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;
             }
@@ -9827,12 +10326,22 @@ static void vblank_timer_cb(void *opaque)
         a7_wifi_patch_mac(s);
         s->wifi_mac_patched = true;
     }
-    timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
+    /* Preserve phase on the virtual clock, including across WFI. A late
+     * callback must not permanently add host wake-up latency to every frame.
+     * Retain overdue ticks (and IRQ/draw ordering), never jump over them.
+     */
+    s->vblank_deadline_ns += 16666667;
+    timer_mod(s->vblank_timer, s->vblank_deadline_ns);
+    pacing_report(s, wall_ns);
+#ifdef CONFIG_VNC
+    vphone_vnc_refresh(s->con);
+#endif
 }
 
 static void a7_reset(void *opaque)
 {
     A7State *s = opaque;
+    ans_drain(s);
     s->wifi_mac_patched = false;
     if (s->iop_cpu) {
         cpu_reset(CPU(s->iop_cpu));
@@ -9876,7 +10385,10 @@ static void a7_reset(void *opaque)
     s->sep.os_active_timer = sep_os_timer;
     if (s->vblank_timer) {
         timer_del(s->vblank_timer);
-        timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667);
+        s->vblank_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667;
+        timer_mod(s->vblank_timer, s->vblank_deadline_ns);
+        memset(s->pacing, 0, sizeof(s->pacing));
+        s->pacing_report_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     }
     if (s->agx_meta_timer) {
         timer_del(s->agx_meta_timer);
@@ -9913,7 +10425,7 @@ static void a7_reset(void *opaque)
         while (job) {
             AGXRenderJob *next = job->next;
             agx_snapshot_unref(job->snapshot);
-            g_free(job);
+            agx_job_free(job);
             job = next;
         }
         s->agx_job_head = NULL;
@@ -9921,7 +10433,7 @@ static void a7_reset(void *opaque)
         for (job = s->agx_done_head; job; ) {
             AGXRenderJob *next = job->next;
             agx_snapshot_unref(job->snapshot);
-            g_free(job);
+            agx_job_free(job);
             job = next;
         }
         s->agx_done_head = NULL;
@@ -10500,6 +11012,13 @@ static void a7_init(MachineState *ms)
     s->agx_async_enabled = async_env && strcmp(async_env, "0") != 0;
     ans_init_storage(s);
     ans_init_utility(s);
+    s->ans_perf_enabled = perf_stats_env && strcmp(perf_stats_env, "0") != 0;
+    s->ans_flush_timer = timer_new_ms(QEMU_CLOCK_REALTIME, ans_flush_timer_cb, s);
+    s->ans_exit_notifier.notify = ans_exit_notify;
+    s->ans_shutdown_notifier.notify = ans_shutdown_notify;
+    qemu_add_exit_notifier(&s->ans_exit_notifier);
+    qemu_register_shutdown_notifier(&s->ans_shutdown_notifier);
+    s->ans_notifiers_registered = true;
     qemu_register_reset(a7_reset, s);
 }
 
@@ -10547,6 +11066,13 @@ static void a7_finalize(Object *o)
         qemu_mutex_destroy(&s->agx_render_mutex);
         qemu_cond_destroy(&s->agx_render_cond);
     }
+    ans_drain(s);
+    if (s->ans_notifiers_registered) {
+        qemu_unregister_reset(a7_reset, s);
+        notifier_remove(&s->ans_exit_notifier);
+        notifier_remove(&s->ans_shutdown_notifier);
+    }
+    if (s->ans_flush_timer) { timer_free(s->ans_flush_timer); }
     if (s->sys_fd >= 0) { close(s->sys_fd); }
     if (s->data_fd >= 0) { close(s->data_fd); }
     if (s->utility_fd >= 0) { close(s->utility_fd); }

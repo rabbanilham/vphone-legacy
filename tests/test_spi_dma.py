@@ -128,7 +128,7 @@ static int address_space_write(void *as, hwaddr a, int attrs, const void *b, siz
         harness += extract('static void touch_gpio_update(', 'static const MemoryRegionOps gpio_ops')
         harness += extract('static int spi_index(', '/* Board-owned display device')
         harness += extract('static uint32_t touch_word(', '/* Recovered ABI: 10513ec')
-        harness += extract('static bool ans_ram_range(', 'static bool ans_file_io(')
+        harness += extract('static bool ans_ram_range(', '/* Return the prefix transferred')
         harness += extract('static uint64_t sio_pack_msg(', 'static void sio_update_irq(')
         harness += r'''
 static void sio_outbox_push(A7State *s, uint64_t m) {

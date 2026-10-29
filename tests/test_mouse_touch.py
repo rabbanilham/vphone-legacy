@@ -247,19 +247,23 @@ int main(void) {
     other.btn.button=INPUT_BUTTON_LEFT; other.btn.down=true;
     mouse_touch_handler.event(&display,&display,&other);
     mouse_touch_handler.sync(&display); assert(!s.touch.frame_count);
-    /* A fresh click while the preceding release drains is ignored. */
+    /* A back-to-back click while the release drains is queued: the settle
+     * frames are cut, the old contact lifts, then the click starts afresh. */
     reset(); packet(0,0,true); packet(32767,0,false);
     packet(0,32767,true);
+    frame(0,1,0,16);
     tick(); frame(1,3,0,16);
     tick(); frame(2,4,640,16);
-    for (int i=1; i<18; i++) {
-        tick(); frame(2+i,4,640,16);
-    }
-    tick(); frame(20,4,640,16);
-    tick(); frame(21,7,640,16);
-    assert(!s.mouse_touch.phase && deadline==-1);
-    packet(0,32767,true); assert(s.touch.frame_count==22);
-    packet(0,32767,false); packet(0,32767,true); frame(22,1,0,1136);
+    tick(); frame(3,7,640,16);
+    tick(); frame(4,1,0,1136);
+    tick(); frame(5,3,0,1136);
+    /* A queued click released before it starts still delivers a full tap. */
+    reset(); packet(0,0,true); packet(32767,0,false);
+    packet(0,32767,true); packet(0,32767,false);
+    tick(); tick(); tick(); frame(3,7,640,16);
+    tick(); frame(4,1,0,1136);
+    tick(); frame(5,3,0,1136);
+    tick(); frame(6,4,0,1136);
     /* Motion before the down timer preserves the original start/down point. */
     reset(); packet(0,0,true); packet(32767,32767,true);
     tick(); frame(1,3,0,16); tick(); frame(2,4,640,1136);

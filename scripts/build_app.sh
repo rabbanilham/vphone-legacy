@@ -14,7 +14,7 @@ RESOURCES_DIR="${APP_DIR}/Contents/Resources"
 echo "=== Building vphone-legacy.app ==="
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
-SWIFT_SOURCES=("${(@f)$(rg --files "${PROJECT_ROOT}/sources/vphone-legacy-gui" -g '*.swift')}")
+SWIFT_SOURCES=("${(@f)$(find "${PROJECT_ROOT}/sources/vphone-legacy-gui" -name '*.swift' | sort)}")
 BUILD_CACHE="$(mktemp -d "${TMPDIR:-/private/tmp/}vphone-gui.XXXXXX")"
 trap 'rm -rf "${BUILD_CACHE}"' EXIT
 

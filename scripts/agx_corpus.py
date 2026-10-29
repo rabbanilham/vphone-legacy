@@ -109,6 +109,32 @@ SCENES = {
         'display_only': False,
         'seconds': 106,
     },
+    # Home page 2: open the Extras folder (flyout, rounded corners, app group).
+    'folder': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=108;down 580,600;move 60,600 dur=0.4 steps=24;up'
+                          '|at=112;tap 92,110',
+        'at': [110, 112.3, 112.8, 113.5, 115, 120],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 124,
+    },
+    # Spotlight search pulled down over Home: the keyboard rising and settled.
+    'keyboard': {
+        'touch': UNLOCK + '|at=106;tap 600,900|at=108;down 320,400;move 320,900 dur=0.5 steps=30;up',
+        'at': [109.2, 110, 111.5, 114],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 118,
+    },
+    # Settings: toggle Airplane Mode (UISwitch off -> on animation and settled).
+    'switch': {
+        'touch': UNLOCK + '|at=111;tap 600,900|at=119;tap 600,900|at=127;tap 600,900'
+                          '|at=130;tap 245,815|at=145;tap 560,233',
+        'at': [144, 145.3, 145.8, 146.5, 148, 152],
+        'per_at': 40,
+        'display_only': False,
+        'seconds': 156,
+    },
     'calendar': {
         'touch': UNLOCK + '|at=110;tap 245,100',
         'at': [111, 113, 116, 121, 130],
