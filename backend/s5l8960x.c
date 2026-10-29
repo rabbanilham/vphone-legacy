@@ -791,8 +791,15 @@ struct A7State {
     int sys_fd;
     int data_fd;
     int utility_fd;
-    /* ANS host write-back state; accessed only under the BQL. */
+    /* ANS worker state is protected by ans_mutex; timers/DMA require BQL. */
     unsigned ans_dirty;
+    QemuMutex ans_mutex;
+    QemuCond ans_cond;
+    QemuThread ans_thread;
+    bool ans_worker_started, ans_worker_stop, ans_worker_pending, ans_worker_busy;
+    unsigned ans_worker_errors;
+    uint64_t ans_generation[3];
+    uint64_t ans_hist[64], ans_handler_max_ns;
     QEMUTimer *ans_flush_timer;
     Notifier ans_exit_notifier, ans_shutdown_notifier;
     bool ans_notifiers_registered, ans_perf_enabled;
@@ -3158,28 +3165,101 @@ static const AnsUtilityRegion *ans_utility_region(uint8_t opcode)
 
 #define ANS_WRITEBACK_MS 300
 
+/* Worker never touches guest memory, timers, BQL, or error_report. */
+static void *ans_worker(void *opaque)
+{
+    A7State *s = opaque;
+    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
+    qemu_mutex_lock(&s->ans_mutex);
+    for (;;) {
+        while (!s->ans_worker_pending && !s->ans_worker_stop) {
+            qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
+        }
+        if (s->ans_worker_stop) { break; }
+        s->ans_worker_pending = false;
+        s->ans_worker_busy = true;
+        for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
+            if (!(s->ans_dirty & (1U << i))) { continue; }
+            uint64_t generation = s->ans_generation[i];
+            int ret;
+            do {
+                s->ans_fsyncs++;
+                qemu_mutex_unlock(&s->ans_mutex);
+                ret = fsync(fds[i]);
+                int saved_errno = errno;
+                qemu_mutex_lock(&s->ans_mutex);
+                if (ret >= 0 || saved_errno != EINTR) { break; }
+            } while (true);
+            if (ret < 0) { s->ans_worker_errors |= 1U << i; }
+            else if (generation == s->ans_generation[i]) {
+                s->ans_dirty &= ~(1U << i);
+            }
+        }
+        s->ans_worker_busy = false;
+        qemu_cond_broadcast(&s->ans_cond);
+    }
+    qemu_mutex_unlock(&s->ans_mutex);
+    return NULL;
+}
+
+static void ans_worker_start(A7State *s)
+{
+    if (s->ans_worker_started) { return; }
+    qemu_mutex_init(&s->ans_mutex);
+    qemu_cond_init(&s->ans_cond);
+    s->ans_worker_started = true;
+    qemu_thread_create(&s->ans_thread, "ans-writeback", ans_worker, s,
+                       QEMU_THREAD_JOINABLE);
+}
+
 static bool ans_flush(A7State *s)
 {
-    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
-    bool ok = true;
-    for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
-        if (!(s->ans_dirty & (1U << i))) { continue; }
-        int ret;
-        do {
-            if (s->ans_perf_enabled) { s->ans_fsyncs++; }
-            ret = fsync(fds[i]);
-        } while (ret < 0 && errno == EINTR);
-        if (ret < 0) { ok = false; }
-        else { s->ans_dirty &= ~(1U << i); }
+    if (!s->ans_worker_started) { return true; }
+    qemu_mutex_lock(&s->ans_mutex);
+    while (s->ans_worker_busy || s->ans_worker_pending) {
+        qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
     }
-    if (!s->ans_dirty && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
-    return ok;
+    unsigned errors = s->ans_worker_errors;
+    s->ans_worker_errors = 0;
+    if (s->ans_dirty) {
+        s->ans_worker_pending = true;
+        qemu_cond_signal(&s->ans_cond);
+        while (s->ans_worker_pending || s->ans_worker_busy) {
+            qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
+        }
+    }
+    errors |= s->ans_worker_errors;
+    s->ans_worker_errors = 0;
+    bool clean = !s->ans_dirty;
+    qemu_mutex_unlock(&s->ans_mutex);
+    if (errors) { error_report("ANS fsync failed; barrier reports storage error"); }
+    if (clean && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
+    return clean && !errors;
+}
+
+static void ans_worker_stop(A7State *s)
+{
+    if (!s->ans_worker_started) { return; }
+    ans_flush(s);
+    qemu_mutex_lock(&s->ans_mutex);
+    s->ans_worker_stop = true;
+    qemu_cond_signal(&s->ans_cond);
+    qemu_mutex_unlock(&s->ans_mutex);
+    qemu_thread_join(&s->ans_thread);
+    qemu_mutex_destroy(&s->ans_mutex);
+    qemu_cond_destroy(&s->ans_cond);
+    s->ans_worker_started = false;
 }
 
 static void ans_mark_dirty(A7State *s, int fd)
 {
+    ans_worker_start(s);
+    unsigned i = fd == s->data_fd ? 0 : fd == s->utility_fd ? 1 : 2;
+    qemu_mutex_lock(&s->ans_mutex);
     bool first = !s->ans_dirty;
-    s->ans_dirty |= fd == s->data_fd ? 1U : fd == s->utility_fd ? 2U : 4U;
+    s->ans_generation[i]++;
+    s->ans_dirty |= 1U << i;
+    qemu_mutex_unlock(&s->ans_mutex);
     if (first && s->ans_flush_timer) {
         timer_mod(s->ans_flush_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
@@ -3189,11 +3269,34 @@ static void ans_mark_dirty(A7State *s, int fd)
 static void ans_flush_timer_cb(void *opaque)
 {
     A7State *s = opaque;
-    if (!ans_flush(s)) {
-        error_report("ANS deferred fsync failed; dirty backings retained for retry");
+    if (!s->ans_worker_started) { return; }
+    qemu_mutex_lock(&s->ans_mutex);
+    if (s->ans_worker_errors) {
+        error_report("ANS deferred fsync failed; error retained for barrier");
+    }
+    if (s->ans_dirty) {
+        s->ans_worker_pending = true;
+        qemu_cond_signal(&s->ans_cond);
+    }
+    bool active = s->ans_dirty || s->ans_worker_busy;
+    qemu_mutex_unlock(&s->ans_mutex);
+    if (active) {
         timer_mod(s->ans_flush_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
     }
+}
+
+/* Log2 buckets: percentile values are inclusive upper bounds in ns. */
+static uint64_t ans_percentile(const uint64_t *hist, uint64_t count, unsigned pct)
+{
+    if (!count) { return 0; }
+    uint64_t target = count / 100 * pct + (count % 100 * pct + 99) / 100;
+    uint64_t seen = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        seen += hist[i];
+        if (seen >= target) { return i == 63 ? UINT64_MAX : (UINT64_C(1) << i) - 1; }
+    }
+    return UINT64_MAX;
 }
 
 /* Reset/close cannot return an ASP status: report failures, retain dirty bits. */
@@ -3202,8 +3305,13 @@ static void ans_drain(A7State *s)
     if (!ans_flush(s)) { error_report("ANS lifecycle fsync failed"); }
     if (s->ans_perf_enabled) {
         fprintf(stderr, "ANS perf: requests=%" PRIu64 " bytes=%" PRIu64
-                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64 "\n",
-                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns);
+                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64
+                " handler_p50_ns_le=%" PRIu64 " handler_p95_ns_le=%" PRIu64
+                " handler_max_ns=%" PRIu64 " background_fsync_bql_ns=0\n",
+                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns,
+                ans_percentile(s->ans_hist, s->ans_requests, 50),
+                ans_percentile(s->ans_hist, s->ans_requests, 95),
+                s->ans_handler_max_ns);
     }
 }
 
@@ -3362,10 +3470,10 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
     }
     hwaddr pages[2048];
     /* Validate the entire request before any disk/DMA side effects. Never DMA MMIO. */
+    uint8_t ppns[2048 * 4];
+    if (!ans_read_ram(cmd_addr + 0x30, ppns, count * 4)) { return 1; }
     for (uint32_t i = 0; i < count; i++) {
-        uint8_t ppn[4];
-        if (!ans_read_ram(cmd_addr + 0x30 + i * 4, ppn, 4)) { return 1; }
-        pages[i] = (hwaddr)ldl_le_p(ppn) << 12;
+        pages[i] = (hwaddr)ldl_le_p(ppns + i * 4) << 12;
         if (!ans_ram_range(pages[i], ANS_SECTOR_SIZE)) { return 1; }
         uint64_t current = (uint64_t)lba + i;
         if (write && !region && !((current >= ANS_SYS_START && current < s->data_start && s->system_writable) ||
@@ -3384,14 +3492,19 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
         int fd = ans_map(s, region, current, &offset, &run);
         size_t length = (size_t)run * ANS_SECTOR_SIZE;
         if (write) {
-            for (uint32_t j = 0; j < run; j++) {
+            for (uint32_t j = 0; j < run;) {
+                uint32_t n = 1;
+                while (j + n < run &&
+                       pages[i + j + n] == pages[i + j] + n * ANS_SECTOR_SIZE) { n++; }
                 if (!ans_read_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
-                                  ANS_SECTOR_SIZE)) { status = 5; break; }
+                                   n * ANS_SECTOR_SIZE)) { status = 5; break; }
+                j += n;
             }
             if (status) { break; }
-            /* Mark before I/O: a failing pwrite may have modified a prefix. */
-            ans_mark_dirty(s, fd);
             size_t done = ans_file_transfer(fd, batch, offset, length, true);
+            /* Publish after I/O, including failures that modified a prefix:
+             * an overlapping worker fsync must not clear this generation. */
+            ans_mark_dirty(s, fd);
             if (s->ans_perf_enabled) { s->ans_bytes += done; }
             if (done != length) { status = 5; break; }
         } else {
@@ -3407,9 +3520,13 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
                 else { memset(buf, 0, sizeof(buf)); }
                 memcpy(batch, buf, sizeof(buf));
             }
-            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE; j++) {
+            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE;) {
+                uint32_t n = 1;
+                while (j + n < done / ANS_SECTOR_SIZE &&
+                       pages[i + j + n] == pages[i + j] + n * ANS_SECTOR_SIZE) { n++; }
                 if (!ans_write_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
-                                   ANS_SECTOR_SIZE)) { status = 5; break; }
+                                   n * ANS_SECTOR_SIZE)) { status = 5; break; }
+                j += n;
             }
             if (done != length) { status = 5; }
             if (status) { break; }
@@ -3428,7 +3545,12 @@ static uint32_t ans_execute(A7State *s, uint8_t tag)
     uint32_t status = ans_execute_request(s, tag);
     if (s->ans_perf_enabled) {
         s->ans_requests++;
-        s->ans_handler_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+        uint64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+        s->ans_handler_ns += elapsed;
+        if (elapsed > s->ans_handler_max_ns) { s->ans_handler_max_ns = elapsed; }
+        unsigned bucket = 0;
+        for (uint64_t n = elapsed; n && bucket < 63; n >>= 1) { bucket++; }
+        s->ans_hist[bucket]++;
     }
     return status;
 }
@@ -11067,6 +11189,7 @@ static void a7_finalize(Object *o)
         qemu_cond_destroy(&s->agx_render_cond);
     }
     ans_drain(s);
+    ans_worker_stop(s);
     if (s->ans_notifiers_registered) {
         qemu_unregister_reset(a7_reset, s);
         notifier_remove(&s->ans_exit_notifier);
