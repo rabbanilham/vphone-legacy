@@ -211,8 +211,8 @@ def is_strip_surface(f, base, width):
 
 
 def nc_sparse_layout(f, base, w, h):
-    """Recognize only the proved NC scratch extents with sparse page maps."""
-    if base & 4095 or (w, h) not in ((128, 96), (640, 224), (640, 288), (640, 320)):
+    """Recognize only the proved NC/folder scratch extents with sparse page maps."""
+    if base & 4095 or (w, h) not in ((128, 96), (640, 224), (640, 288), (640, 320), (640, 640)):
         return False
     pitch = ((w + 15) & ~15) * 4
     if all(((base + y * pitch) & ~4095) in f.pages for y in range(h)):
@@ -351,7 +351,9 @@ SOLID_PLUS_L = 0xf137b90c25ab5471  # Solid grey text fill (plus-lighter)
 PILL_BORDER = 0x62a99af8d8beb332  # UISwitch track border (stride 36)
 COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
-STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
+RADIAL_CLIP = 0xe344a0f081cc4997
+RADIAL_RESTORE = 0xab6fdb6c250c32c0
+STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Backdrop through independent alpha-mask UVs
 WEBKIT_GLYPHS = 0x3064a456731fc3e3  # normalized U8 atlas coverage times RGBA vertex tint
 CORNER_RESTORE = 0x03a2edd2a4d84437  # CA dual-texture corner restore (backdrop + mask)
 
@@ -834,6 +836,17 @@ def quad_affine(xy, uv):
     return tuple(out) if all(math.isfinite(v) for v in out) else None
 
 
+def radial_coverage(u, v, mapping):
+    inside = 0
+    for j in range(4):
+        for i in range(4):
+            dx, dy = (i+0.5)/4-0.5, (j+0.5)/4-0.5
+            a = u+mapping[0]*dx+mapping[1]*dy
+            b = v+mapping[3]*dx+mapping[4]*dy
+            inside += a*a+b*b <= 1
+    return (inside*255+8)//16
+
+
 def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None, copy_texmat_state=None):
     """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
     count = draw[1]
@@ -860,6 +873,9 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             tex = texture(f, ppp) or (texture(f, retained_ppp) if retained_ppp else None)
         except TypeError:
             pass
+
+    if (stride, prog) in ((24, RADIAL_CLIP), (36, RADIAL_RESTORE)):
+        return 'approximated: analytic radial corner coverage (4x4 AA)', {'prog': hex(prog)}
 
     nc_context = nc_sparse_layout(f, f.header['pbe_target'], target_w, target_h) if hasattr(f, 'header') else False
     nc_context = nc_context or bool(tex and tex.get('nc_sparse'))
@@ -1012,7 +1028,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
         if stride == 36 and prog == STRIDE36_DUAL_TEX:
-            return 'replayed exactly: dual-texture vibrancy (stride=36)', {'prog': hex(prog)}
+            return 'approximated: dual-texture alpha composite (stride=36)', {'prog': hex(prog)}
         return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
     elif stride == 36 and prog == CORNER_RESTORE:
         return 'replayed exactly: corner restore (backdrop + mask)', {'prog': hex(prog)}
@@ -1502,6 +1518,18 @@ def main():
                                                              for k, v in tex.items() if k != 'tsw'})))
             if x0 >= x1 or y0 >= y1:
                 continue
+            if stride == 24 and prog == RADIAL_CLIP:
+                uvs = [struct.unpack_from('<2f', v[2]) for v in q_vs]
+                mapping = quad_affine(list(zip(xs, ys))[:3], uvs[:3])
+                if mapping:
+                    for y in range(y0, y1):
+                        for x in range(x0, x1):
+                            u = mapping[0]*(x+0.5)+mapping[1]*(y+0.5)+mapping[2]
+                            v = mapping[3]*(x+0.5)+mapping[4]*(y+0.5)+mapping[5]
+                            a = radial_coverage(u, v, mapping)
+                            d = (y*target_w+x)*4
+                            fb[d:d+4] = bytes(c*a//255 for c in fb[d:d+4])
+                continue
             if tex and (stride >= 24 or (stride == 16 and prog == WALLPAPER) or prog == ROUNDED_CAPS):
                 # stride 24: float u,v (normalised) at +16; stride 28/36: BGRA tint at +16,
                 # then u,v in texels at +20.
@@ -1520,7 +1548,7 @@ def main():
 
                 uv2_map = None
                 u2_0, u2_1, v2_0, v2_1 = 0, 1, 0, 1
-                if stride == 36 and prog == CORNER_RESTORE:
+                if stride == 36 and prog in (CORNER_RESTORE, STRIDE36_DUAL_TEX, RADIAL_RESTORE):
                     uv2s = [struct.unpack_from('<2f', v[2], 12) for v in q_vs]
                     u2_0, u2_1 = min(u for u, _ in uv2s), max(u for u, _ in uv2s)
                     v2_0, v2_1 = min(v for _, v in uv2s), max(v for _, v in uv2s)
@@ -1666,13 +1694,24 @@ def main():
                             fb[d + 1] = min(255, sg + fb[d + 1])
                             fb[d + 2] = min(255, sr + fb[d + 2])
                             fb[d + 3] = min(255, sa + fb[d + 3])
+                        elif prog == RADIAL_RESTORE and uv2_map:
+                            mu = uv2_map[0]*(x+0.5)+uv2_map[1]*(y+0.5)+uv2_map[2]
+                            mv = uv2_map[3]*(x+0.5)+uv2_map[4]*(y+0.5)+uv2_map[5]
+                            coverage = 255-radial_coverage(mu, mv, uv2_map)
+                            fb[d:d+4] = bytes(min(255, c*coverage//255+fb[d+i])
+                                              for i,c in enumerate((r,g,b,a)))
                         elif tex.get('vibrancy'):
                             if stride == 36 and prog == STRIDE36_DUAL_TEX and tex.get('mask_tex'):
                                 mask_tex = tex['mask_tex']
-                                m_b, m_g, m_r, m_a = texel(f, mask_tex, tx, ty)
+                                mu = uv2_map[0]*(x+0.5)+uv2_map[1]*(y+0.5)+uv2_map[2]
+                                mv = uv2_map[3]*(x+0.5)+uv2_map[4]*(y+0.5)+uv2_map[5]
+                                msu, msv = (mask_tex['w'], mask_tex['h']) if max(u2_1,v2_1)<=1.0001 else (1,1)
+                                mx = max(0,min(mask_tex['w']-1,int(mu*msu)))
+                                my = max(0,min(mask_tex['h']-1,int(mv*msv)))
+                                m_b, m_g, m_r, m_a = texel(f, mask_tex, mx, my)
                                 if m_a == 0:
                                     continue
-                                vib = blend_vibrancy(tuple(fb[d:d + 4]), (r, g, b, a))
+                                vib = tuple(min(255, c + fb[d+i]*(255-a)//255) for i,c in enumerate((r,g,b,a)))
                                 if m_a == 255:
                                     fb[d:d + 4] = bytes(vib)
                                 else:

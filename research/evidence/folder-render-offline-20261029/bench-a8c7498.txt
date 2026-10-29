@@ -1,0 +1,37 @@
+scene          frames    base ms    cand ms  speedup  diff
+calendar            2       35.8       39.4    0.91x     0
+clock              10       46.5       38.0    1.22x     0
+folder             22       71.5       70.8    1.01x    17
+keyboard          149      360.7      286.9    1.26x   106
+notification-center    105      159.3      139.7    1.14x    92
+safari             33       35.1       29.9    1.18x    10
+safari-google       0        0.0        0.0    0.00x     0
+safari-round2      30       23.0       23.1    1.00x    12
+settings           20        2.7        2.7    1.01x     0
+settings-all       40       30.9       25.6    1.21x    11
+switch             74       16.6       14.6    1.13x    24
+unlock            161      116.6       55.0    2.12x    83
+unlock-flyin       32       13.1        9.7    1.35x     0
+unlock-real        20       78.1       61.2    1.27x    18
+total             698      989.8      796.5    1.24x   373
+slowest candidate frames: calendar/frame-2 21.5 ms, clock/frame-1 19.3 ms, calendar/frame-1 17.9 ms, clock/frame-2 12.8 ms, keyboard/frame-1 11.5 ms
+  DIFF folder/frame-1: 13179 px, max delta 63
+  DIFF folder/frame-2: 17950 px, max delta 67
+  DIFF folder/frame-3: 1089 px, max delta 60
+  DIFF folder/frame-4: 17936 px, max delta 60
+  DIFF folder/frame-5: 86730 px, max delta 42
+  DIFF folder/frame-6: 4118 px, max delta 38
+  DIFF folder/frame-7: 85714 px, max delta 38
+  DIFF folder/frame-8: 248502 px, max delta 1
+  DIFF folder/frame-9: 13806 px, max delta 1
+  DIFF folder/frame-10: 5073 px, max delta 1
+  DIFF folder/frame-13: 14402 px, max delta 255
+  DIFF folder/frame-16: 14668 px, max delta 255
+  DIFF folder/frame-18: 91500 px, max delta 255
+  DIFF folder/frame-19: 88528 px, max delta 255
+  DIFF folder/frame-20: 365519 px, max delta 178
+  DIFF folder/frame-21: 108099 px, max delta 255
+  DIFF folder/frame-22: 338193 px, max delta 211
+  DIFF keyboard/frame-1: 559 px, max delta 212
+  DIFF keyboard/frame-6: 559 px, max delta 212
+  DIFF keyboard/frame-7: 553 px, max delta 212

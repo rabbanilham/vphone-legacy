@@ -86,7 +86,7 @@ class AGXStride36DualTextureTests(unittest.TestCase):
                 'mask_tex': {'w': 640, 'h': 416, 'addr': 0x10254000, 'strip': False, 'stride': 2560}
             }
             res, det = aro.classify_draw(mf, 0x0, ppp, draw_cmd, viewport, 640, 1136, 640, 1136)
-            self.assertEqual(res, 'replayed exactly: dual-texture vibrancy (stride=36)')
+            self.assertEqual(res, 'approximated: dual-texture alpha composite (stride=36)')
             self.assertEqual(det['prog'], hex(aro.STRIDE36_DUAL_TEX))
         finally:
             aro.program = orig_program

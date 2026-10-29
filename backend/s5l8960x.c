@@ -6102,6 +6102,8 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 
 #define AGX_USC_COLOR_MATRIX UINT64_C(0x2353a3fe1ca2b71b)
 #define AGX_USC_ROUNDED_CAPS UINT64_C(0x6c01d033fd937c7c)
+#define AGX_USC_RADIAL_CLIP UINT64_C(0xe344a0f081cc4997)
+#define AGX_USC_RADIAL_RESTORE UINT64_C(0xab6fdb6c250c32c0)
 #define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
 #define AGX_USC_WEBKIT_GLYPHS UINT64_C(0x3064a456731fc3e3)
 
@@ -6351,8 +6353,8 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
     return true;
 }
 
-/* NC allocates these scratch extents sparsely. Require BOTH absent linear
- * row pages and a completely mapped 32x32 Morton-tile footprint. Dense
+/* NC and folder backdrops allocate these scratch extents sparsely. Require
+ * BOTH absent linear row pages and a completely mapped 32x32 Morton-tile footprint. Dense
  * glyph caches and every other extent retain the established addressing. */
 static __thread struct {
     uint64_t cat, base;
@@ -6366,7 +6368,7 @@ static bool agx_nc_sparse_layout(A7State *s, uint64_t cat, uint64_t base,
                                   uint32_t w, uint32_t h)
 {
     if ((base & 4095) || !((w == 128 && h == 96) ||
-        (w == 640 && (h == 224 || h == 288 || h == 320)))) { return false; }
+        (w == 640 && (h == 224 || h == 288 || h == 320 || h == 640)))) { return false; }
     if (agx_nc_layout_active) {
         for (unsigned i = 0; i < agx_nc_layout_count; i++) {
             if (agx_nc_layout_cache[i].cat == cat && agx_nc_layout_cache[i].base == base &&
@@ -7644,6 +7646,27 @@ static uint32_t *agx_get_scratch_nc(size_t count)
     return agx_scratch_nc;
 }
 
+/* Approximate the analytic corner shaders from their signed unit-circle
+ * coordinates. Integrate
+ * pixel coverage on a 4x4 grid; unlike rounding the quad this also works for
+ * mirrored corners and keeps the clipping/restoration masks complementary. */
+static unsigned agx_radial_coverage(float u, float v, const float map[6])
+{
+    unsigned inside = 0;
+    for (unsigned j=0; j<4; j++) for (unsigned i=0; i<4; i++) {
+        float dx=(i+0.5f)/4-0.5f, dy=(j+0.5f)/4-0.5f;
+        float a=u+map[0]*dx+map[1]*dy, b=v+map[3]*dx+map[4]*dy;
+        inside += a*a+b*b <= 1;
+    }
+    return (inside*255+8)/16;
+}
+static uint32_t agx_scale_premul(uint32_t colour, unsigned alpha)
+{
+    uint32_t out=0;
+    for (unsigned c=0; c<4; c++) out |= (((colour>>(8*c))&255)*alpha/255)<<(8*c);
+    return out;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear, uint32_t pitch, uint64_t scissor_base)
@@ -7805,9 +7828,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             bool clip_space = stride == 16 && prog == UINT64_C(0x789b8f08a3f3a8cd);
             bool is_span = stride == 16 && (prog == AGX_USC_SPANS || prog == AGX_USC_WEBKIT_SPANS);
+            bool radial_clip = stride == 24 && prog == AGX_USC_RADIAL_CLIP;
+            bool radial_restore = stride == 36 && prog == AGX_USC_RADIAL_RESTORE;
             bool is_pill = stride == 36 && prog == AGX_USC_PILL_BORDER;
             if ((stride == 16 && !clip_space && !is_span) ||
-                (found == AGX_TEX_NONE && !is_span && !is_pill && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
+                (found == AGX_TEX_NONE && !is_span && !is_pill && !radial_clip && stride != 20 && stride != 28 && !(stride == 12 && is_blur_prog)) ||
                 (found != AGX_TEX_NONE && tex.w * 4 > sizeof(texrow))) {
                 AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
                                 found == AGX_TEX_NONE ? (stride == 24 && prog == 0 ? "stride 24 untextured with program 0x0" : "untextured with unsupported stride") :
@@ -7827,7 +7852,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                                 agx_extract_region_clear(s, cat, retained_ppp, &clear_colour);
             bool is_cg_line = (prog == UINT64_C(0xba8c50a79810e866) && (found == AGX_TEX_NONE || tex.bpp == 1));
             bool is_clock_cap = (prog == AGX_USC_ROUNDED_CAPS && count == 48 && (found == AGX_TEX_NONE || tex.bpp == 1));
-            bool textured = found != AGX_TEX_NONE && !is_cg_line && !is_clock_cap &&
+            bool textured = !radial_clip && found != AGX_TEX_NONE && !is_cg_line && !is_clock_cap &&
                             (stride >= 24 || clip_space || prog == AGX_USC_ROUNDED_CAPS);
             /* Textured quads are streamed directly from guest memory. The
              * 64-vertex scratch limit only applies to the solid rasterizer;
@@ -8198,7 +8223,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 }
                 continue;
             }
-            if (!textured && !(stride == 12 && is_blur_prog)) {
+            if (!textured && !radial_clip && !(stride == 12 && is_blur_prog)) {
                 float vs_xy[64][2];
                 float m4[4];
                 bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
@@ -8579,7 +8604,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                         }
                     }
-                    if (stride == 36 && prog == AGX_USC_CORNER_RESTORE) {
+                    if (stride == 36 && (prog == AGX_USC_CORNER_RESTORE || radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX)) {
                         u2_0 = v2_0 = 1e9f; u2_1 = v2_1 = -1e9f;
                         for (unsigned i = q_start; i < q_start + step; i++) {
                             float t2[2];
@@ -8608,11 +8633,29 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 if (stride == 36 && prog == AGX_USC_CORNER_RESTORE && (!(u2_1 >= u2_0) || !(v2_1 >= v2_0))) {
                     continue;
                 }
+                if ((radial_clip && !affine) ||
+                    ((radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX) && !affine2)) {
+                    continue;
+                }
                 any_drawn = true;
                 if (audit) {
                     qemu_log_mask(LOG_UNIMP, "AGX AUDIT draw target 0x%llx stride %u prog 0x%llx rect %d,%d-%d,%d texture 0x%llx tint 0x%x uv %g,%g-%g,%g\n",
                                   (unsigned long long)target, stride, (unsigned long long)prog, x0,y0,x1,y1,
                                   (unsigned long long)(textured ? tex.addr : 0), tint, u0,v0,u1,v1);
+                }
+
+                if (radial_clip) {
+                    for (int y = y0; y < y1; y++) {
+                        if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) { continue; }
+                        for (int x = x0; x < x1; x++) {
+                            float u = uv_map[0]*(x+0.5f)+uv_map[1]*(y+0.5f)+uv_map[2];
+                            float v = uv_map[3]*(x+0.5f)+uv_map[4]*(y+0.5f)+uv_map[5];
+                            unsigned a = agx_radial_coverage(u, v, uv_map);
+                            row[x-x0] = agx_scale_premul(row[x-x0], a);
+                        }
+                        agx_target_write(s, cat, &sf, x0, y, row, x1-x0);
+                    }
+                    continue;
                 }
 
                 if (region_clear) {
@@ -8753,7 +8796,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             int mty = (int)lroundf((fv2 + 0.25f) * (float)mask_tex.h);
                             mask_ty = MAX(0, MIN((int)mask_tex.h - 1, mty));
                         } else {
-                            mask_ty = MIN(mask_tex.h - 1, (uint32_t)MAX(0.0f, fv * sv));
+                            float fv2 = uv2_map[3]*(x0+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                            float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.h : 1;
+                            mask_ty = MIN(mask_tex.h-1, (uint32_t)MAX(0.0f, fv2*scale));
                         }
                         if ((int)mask_ty != cached_mask_y) {
                             mask_row_ok = agx_texture_row(s, cat, &mask_tex, mask_ty, maskrow);
@@ -8884,7 +8929,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             uint32_t sb = ((src & 0xff) * inv_a) / 255;
                             src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
                         }
-                        if (dest_in) {
+                        if (radial_restore && affine2) {
+                            float u = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                            float v = uv2_map[3]*(x+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                            src = agx_scale_premul(src, 255-agx_radial_coverage(u, v, uv2_map));
+                            row[x-x0] = agx_blend_plus_lighter(dst, src);
+                        } else if (dest_in) {
                             uint32_t a = src >> 24;
                             if (a == 255) {
                                 row[x - x0] = dst;
@@ -8901,11 +8951,16 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             row[x - x0] = agx_blend_over(dst, src);
                         } else if (vibrancy) {
                             if (stride == 36 && has_mask_tex && mask_row_ok) {
-                                uint32_t m_alpha = (maskrow[tx] >> 24) & 0xff;
+                                float fu2 = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                                float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.w : 1;
+                                unsigned mx = MIN(mask_tex.w-1, (uint32_t)MAX(0.0f, fu2*scale));
+                                uint32_t m_alpha = maskrow[mx] >> 24;
                                 if (m_alpha == 0) {
                                     row[x - x0] = dst;
                                 } else {
-                                    uint32_t vib = agx_blend_vibrancy(dst, src);
+                                    /* This two-sampler program has no luma constants: it
+                                     * composites the backdrop through the second alpha texture. */
+                                    uint32_t vib = agx_blend_over(dst, src);
                                     if (m_alpha == 255) {
                                         row[x - x0] = vib;
                                     } else {

@@ -194,11 +194,13 @@ static int replay_one(const char *dump, const char *rgba_path, GHashTable *carri
     if (!sf.strip && pitch >= w * 4) {
         sf.pitch = pitch;
     }
+    sf.w = w; sf.h = h;
+    sf.twiddled = !sf.strip && agx_nc_sparse_layout(&state, cat, target, w, h);
     uint8_t *pixels = g_malloc0((size_t)w * h * 4);
     unsigned missing_rows = 0;
     for (uint32_t y = 0; y < h; y++) {
         uint8_t *row = pixels + (size_t)y * w * 4;
-        if (!agx_ctx_read(&state, cat, agx_surface_gva(&sf, 0, y), row, w * 4)) {
+        if (!agx_target_read(&state, cat, &sf, 0, y, (uint32_t *)row, w)) {
             memset(row, 0, w * 4);
             missing_rows++;
         }
