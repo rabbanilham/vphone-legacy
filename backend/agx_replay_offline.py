@@ -296,17 +296,6 @@ def texture(f, ppp, prog=None):
     if prog is None:
         prog = program(f, ppp)
     words = fragment_words(f, ppp)
-    if prog == FOLDER_MASK:
-        # Two scalar constants, four sampler words, then the backdrop TSW.
-        # Match the C program-specific exception; never scan adjacent blocks.
-        if words:
-            ws = words[0][1]
-            if len(ws) >= 10 and ws[2:6] == [0xfff, 0x2400, 0, 0]:
-                tex = decode_tsw(f, ws[6:10])
-                if tex:
-                    tex.update(vibrancy=False, sampler=decode_sampler(ws[2:6]))
-                    return tex
-        return None
     for _, ws in words:
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
@@ -339,16 +328,6 @@ def texture(f, ppp, prog=None):
     return None
 
 
-def folder_coverage(u, v, mapping):
-    """Pixel-width AA for the inferred procedural unit-circle corner pair."""
-    d = math.hypot(u, v)
-    gx = u * mapping[0] + v * mapping[3]
-    gy = u * mapping[1] + v * mapping[4]
-    fw = (abs(gx) + abs(gy)) / d if d > 1e-8 else 1.0
-    a = (1.0 - d) / max(fw, 1e-8) + 0.5
-    return int(max(0.0, min(1.0, a)) * 255 + 0.5)
-
-
 def blend_vibrancy(d, s):
     """darkenSourceOver/lightenSourceOver (agy C8): scale S by Y^4 or (1-Y)^4 of D, src-over."""
     dr, dg, db, da = d
@@ -374,8 +353,6 @@ COLOR_MATRIX = 0x2353a3fe1ca2b71b  # Navigation bar saturation boost & tint
 ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
 STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Lock-screen grabber/camera dual-texture vibrancy
 WEBKIT_GLYPHS = 0x3064a456731fc3e3  # normalized U8 atlas coverage times RGBA vertex tint
-FOLDER_MASK = 0xe344a0f081cc4997
-FOLDER_RESTORE = 0xab6fdb6c250c32c0
 CORNER_RESTORE = 0x03a2edd2a4d84437  # CA dual-texture corner restore (backdrop + mask)
 
 
@@ -1029,8 +1006,6 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
                 'taps': n,
             }
         return 'approximated: Gaussian blur (separable 6-tap)', {'prog': hex(prog)}
-    elif prog in (FOLDER_MASK, FOLDER_RESTORE):
-        return 'approximated: procedural folder corner ' + ('mask' if prog == FOLDER_MASK else 'restore'), {'prog': hex(prog)}
     elif is_dest_in:
         if is_scaled:
             return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
@@ -1545,21 +1520,11 @@ def main():
 
                 uv2_map = None
                 u2_0, u2_1, v2_0, v2_1 = 0, 1, 0, 1
-                if stride == 36 and prog in (CORNER_RESTORE, FOLDER_RESTORE):
+                if stride == 36 and prog == CORNER_RESTORE:
                     uv2s = [struct.unpack_from('<2f', v[2], 12) for v in q_vs]
                     u2_0, u2_1 = min(u for u, _ in uv2s), max(u for u, _ in uv2s)
                     v2_0, v2_1 = min(v for _, v in uv2s), max(v for _, v in uv2s)
                     uv2_map = quad_affine(list(zip(xs, ys))[:3], uv2s[:3]) if len(uv2s) >= 3 else None
-
-                if prog == FOLDER_MASK and stride == 24 and uv_map:
-                    for y in range(y0, y1):
-                        for x in range(x0, x1):
-                            u = uv_map[0]*(x+0.5) + uv_map[1]*(y+0.5) + uv_map[2]
-                            v = uv_map[3]*(x+0.5) + uv_map[4]*(y+0.5) + uv_map[5]
-                            a = folder_coverage(u, v, uv_map)
-                            dst = (y * target_w + x) * 4
-                            fb[dst:dst+4] = bytes(c*a//255 for c in fb[dst:dst+4])
-                    continue
 
                 sub_w = (u1 - u0) * su
                 sub_h = (v1 - v0) * sv
@@ -1680,13 +1645,6 @@ def main():
                             else:
                                 b, g, r, a = b * tb // 255, g * tg // 255, r * tr // 255, a * ta // 255
                         d = (y * target_w + x) * 4
-                        if prog == FOLDER_RESTORE and stride == 36 and uv2_map:
-                            u = uv2_map[0]*(x+0.5) + uv2_map[1]*(y+0.5) + uv2_map[2]
-                            v = uv2_map[3]*(x+0.5) + uv2_map[4]*(y+0.5) + uv2_map[5]
-                            inv_a = 255 - folder_coverage(u, v, uv2_map)
-                            for c, src in enumerate((r, g, b, a)):
-                                fb[d+c] = min(255, fb[d+c] + src*inv_a//255)
-                            continue
                         if mask:
                             fb[d:d + 4] = bytes(c * a // 255 for c in fb[d:d + 4])
                             continue
