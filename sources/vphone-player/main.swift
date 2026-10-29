@@ -880,8 +880,8 @@ enum KeyboardMapping {
 final class SleepOverlay: NSView {
     var onWake: (() -> Void)?
     private let icon = NSImageView()
-    private let label = NSTextField(labelWithString:"Perangkat terkunci")
-    private let hint = NSTextField(labelWithString:"Klik untuk membangunkan")
+    private let label = NSTextField(labelWithString:"Device locked")
+    private let hint = NSTextField(labelWithString:"Click to wake")
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -894,7 +894,7 @@ final class SleepOverlay: NSView {
         let stack = NSStackView(views:[icon,label,hint]);stack.orientation = .vertical;stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false;addSubview(stack)
         NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo:centerXAnchor),stack.centerYAnchor.constraint(equalTo:centerYAnchor)])
-        setAccessibilityLabel("Perangkat terkunci. Klik untuk membangunkan.")
+        setAccessibilityLabel("Device locked. Click to wake.")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
     override func mouseDown(with event: NSEvent) { onWake?() }
@@ -1165,7 +1165,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let windowMenu = NSMenu(title:"Window"); windowItem.submenu = windowMenu
         windowMenu.addItem(withTitle:"Close",action:#selector(NSWindow.performClose(_:)),keyEquivalent:"w")
         NSApp.mainMenu = menu
-        window = NSWindow(contentRect:NSRect(x:0,y:0,width:390,height:830),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        window = NSWindow(contentRect:NSRect(x:0,y:0,width:390,height:854),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         window.title = "vphone — iOS 7.1.2"; window.minSize = NSSize(width:260,height:520); window.delegate = self
         let root = NSView(); window.contentView = root
         let bar = NSStackView(); bar.orientation = .horizontal; bar.spacing = 16
@@ -1181,7 +1181,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         status.textColor = .secondaryLabelColor; status.alignment = .center; status.maximumNumberOfLines = 2
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo:root.topAnchor,constant:10),bar.centerXAnchor.constraint(equalTo:root.centerXAnchor),bar.heightAnchor.constraint(equalToConstant:32),
-            bezel.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),bezel.leadingAnchor.constraint(equalTo:root.leadingAnchor),bezel.trailingAnchor.constraint(equalTo:root.trailingAnchor),bezel.bottomAnchor.constraint(equalTo:root.bottomAnchor),
+            bezel.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),bezel.leadingAnchor.constraint(equalTo:root.leadingAnchor),bezel.trailingAnchor.constraint(equalTo:root.trailingAnchor),bezel.bottomAnchor.constraint(equalTo:root.bottomAnchor,constant:-24),
             status.centerXAnchor.constraint(equalTo:bezel.centerXAnchor),status.centerYAnchor.constraint(equalTo:bezel.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:bezel.widthAnchor,constant:-24)])
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiatedAllowingIdleSystemSleep,.latencyCritical],reason:"Interactive emulator input")
         let logURL = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("player-input.log")
