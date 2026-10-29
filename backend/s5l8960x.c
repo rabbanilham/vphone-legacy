@@ -706,7 +706,7 @@ struct A7State {
     struct {
         int64_t last_ns;
         uint64_t bins[1024], count, max_ns;
-    } pacing[2]; /* vblank, completed swap */
+    } pacing[3]; /* vblank, completed swap, virtual callback lateness */
     int64_t pacing_report_ns;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
@@ -10245,33 +10245,61 @@ static void pacing_sample(A7State *s, unsigned kind, int64_t now)
     s->pacing[kind].last_ns = now;
 }
 
+static void pacing_duration(A7State *s, unsigned kind, uint64_t dt)
+{
+    if (!s->agx_perf_enabled) {
+        return;
+    }
+    s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
+    s->pacing[kind].count++;
+    s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
+}
+
 static void pacing_report(A7State *s, int64_t now)
 {
     if (!s->agx_perf_enabled || now - s->pacing_report_ns < 5000000000LL) {
         return;
     }
     s->pacing_report_ns = now;
-    for (unsigned k = 0; k < 2; k++) {
+    double quantiles[3][3] = {{0}};
+    const char *names[] = {"vblank", "swap-complete", "vblank-late"};
+    for (unsigned k = 0; k < 3; k++) {
         uint64_t n = s->pacing[k].count, cumulative = 0;
-        double quantile[3] = { 0 };
         const unsigned percent[] = { 50, 95, 99 };
         unsigned q = 0;
         for (unsigned b = 0; b < 1024; b++) {
             cumulative += s->pacing[k].bins[b];
             while (n && q < 3 && cumulative >= (n * percent[q] + 99) / 100) {
                 /* Upper bound of bin; overflow uses the observed maximum. */
-                quantile[q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
-                                                          (b + 1) / 10.0;
+                quantiles[k][q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
+                                                               (b + 1) / 10.0;
             }
         }
-        fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
-                " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
-                k ? "swap-complete" : "vblank", n,
-                quantile[0], quantile[1], quantile[2],
-                s->pacing[k].max_ns / 1e6);
+        if (k < 2) {
+            fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
+                    " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
+                    names[k], n, quantiles[k][0], quantiles[k][1], quantiles[k][2],
+                    s->pacing[k].max_ns / 1e6);
+        }
+    }
+    flockfile(stderr);
+    fprintf(stderr, "[pacing-json] {\"version\":1,\"host_ns\":%" PRId64
+            ",\"virtual_ns\":%" PRId64 ",\"swap_request_ms\":null,\"metrics\":{",
+            now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    for (unsigned k = 0; k < 3; k++) {
+        fprintf(stderr, "%s\"%s\":{\"n\":%" PRIu64
+                ",\"p50\":%.3f,\"p95\":%.3f,\"p99\":%.3f,\"max\":%.3f,\"bins_100us\":[",
+                k ? "," : "", names[k], s->pacing[k].count,
+                quantiles[k][0], quantiles[k][1], quantiles[k][2], s->pacing[k].max_ns / 1e6);
+        for (unsigned b = 0; b < 1024; b++) {
+            fprintf(stderr, "%s%" PRIu64, b ? "," : "", s->pacing[k].bins[b]);
+        }
+        fprintf(stderr, "]}");
         memset(s->pacing[k].bins, 0, sizeof(s->pacing[k].bins));
         s->pacing[k].count = s->pacing[k].max_ns = 0;
     }
+    fprintf(stderr, "}}\n");
+    funlockfile(stderr);
 }
 
 #ifdef CONFIG_VNC
@@ -10284,6 +10312,10 @@ static void vblank_timer_cb(void *opaque)
     A7State *s = opaque;
     int64_t wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     pacing_sample(s, 0, wall_ns);
+    if (s->agx_perf_enabled) {
+        int64_t late = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->vblank_deadline_ns;
+        pacing_duration(s, 2, MAX(late, 0));
+    }
     agx_drain_context_ring(s);
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
