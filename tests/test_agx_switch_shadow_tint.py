@@ -61,6 +61,7 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
         self.assertIn('prog == AGX_USC_ROUNDED_CAPS && agx_replay_decode_tsw(s, cat, blocks[b] + 8, tex)', core)
         self.assertIn('is_color_matrix', core)
         self.assertIn('v_eff = (fv > 0.5f) ? (1.0f - fv) : fv;', core)
+        self.assertIn('fv = 2.0f * v_eff;', core)
 
     def test_tsw_offset_8_gating(self):
         """TSW at offset 8 is decoded when prog is ROUNDED_CAPS, ignored otherwise."""
@@ -181,10 +182,10 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
             aro.texture = orig_tex
 
     def test_switch_track_mask_v_reflection_math(self):
-        """1bpp 256x256 mask mirrors v > 0.5 back across equator (0.5) to sample dome curve symmetrically."""
+        """1bpp 256x256 mask mirrors v > 0.5 back across equator (0.5) and scales by 2.0 to span rows 128..256."""
         # Top cap apex v = 0.25 -> v_eff = 0.25 -> fv = 0.50 (row 128)
-        # Top cap equator v = 0.50 -> v_eff = 0.50 -> fv = 0.75 (row 192)
-        # Bottom cap equator v = 0.50 -> v_eff = 0.50 -> fv = 0.75 (row 192)
+        # Top cap equator v = 0.50 -> v_eff = 0.50 -> fv = 1.00 (row 256)
+        # Bottom cap equator v = 0.50 -> v_eff = 0.50 -> fv = 1.00 (row 256)
         # Bottom cap apex v = 0.75 -> v_eff = 0.25 -> fv = 0.50 (row 128)
         sv = 256.0
         for delta in [0.0, 0.05, 0.1, 0.15, 0.2, 0.25]:
@@ -193,15 +194,19 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
 
             # Top cap calculation
             v_eff_top = (1.0 - v_top) if v_top > 0.5 else v_top
-            fv_top = (v_eff_top + 0.25) * sv
+            fv_top = (2.0 * v_eff_top) * sv
 
             # Bottom cap calculation
             v_eff_bottom = (1.0 - v_bottom) if v_bottom > 0.5 else v_bottom
-            fv_bottom = (v_eff_bottom + 0.25) * sv
+            fv_bottom = (2.0 * v_eff_bottom) * sv
 
             self.assertAlmostEqual(fv_top, fv_bottom)
             self.assertAlmostEqual(v_eff_top, 0.5 - delta)
             self.assertAlmostEqual(v_eff_bottom, 0.5 - delta)
+
+        # Exact row boundaries
+        self.assertAlmostEqual((2.0 * 0.50) * sv, 256.0)  # Equator -> row 256 (full width base of dome)
+        self.assertAlmostEqual((2.0 * 0.25) * sv, 128.0)  # Both apices -> row 128 (narrow apex of dome)
 
     def test_tsw_offset_0_priority_over_8_for_rounded_caps(self):
         """When offset 0 has Format 3 mask and offset 8 has knob texture, offset 0 is prioritized for track mesh."""
@@ -246,6 +251,46 @@ class AGXSwitchShadowTintTests(unittest.TestCase):
         self.assertEqual(tex['w'], 256)
         self.assertEqual(tex['h'], 256)
         self.assertEqual(tex['bpp'], 1)
+
+    def test_switch_track_pill_geometry_symmetry(self):
+        """Verify full pill shape symmetry: equator at row 256, apices at row 128, top and bottom curves match."""
+        # Switch geometry: y in [210, 272], equator at y = 241 (31 px above and below)
+        # Top quad (y in [210, 241]): v in [0.25, 0.50]
+        # Bottom quad (y in [241, 272]): v in [0.50, 0.75]
+        sv = 256.0
+        for dy in range(32):
+            y_top = 241.0 - dy
+            y_bottom = 241.0 + dy
+
+            v_top = 0.50 - (dy / 31.0) * 0.25
+            v_bottom = 0.50 + (dy / 31.0) * 0.25
+
+            # Reflection and 2.0x scaling mapping
+            v_eff_top = (1.0 - v_top) if v_top > 0.5 else v_top
+            fv_top = (2.0 * v_eff_top) * sv
+
+            v_eff_bottom = (1.0 - v_bottom) if v_bottom > 0.5 else v_bottom
+            fv_bottom = (2.0 * v_eff_bottom) * sv
+
+            self.assertAlmostEqual(fv_top, fv_bottom, places=5)
+            # Row index must stay within the upper dome texture domain [128, 256]
+            self.assertGreaterEqual(fv_top, 128.0 - 1e-4)
+            self.assertLessEqual(fv_top, 256.0 + 1e-4)
+
+        # At equator (dy = 0), fv must be 256.0 (full 128-texel width, preventing wedge indentation)
+        v_eq = 0.50
+        v_eff_eq = (1.0 - v_eq) if v_eq > 0.5 else v_eq
+        self.assertAlmostEqual((2.0 * v_eff_eq) * sv, 256.0)
+
+        # At top apex (dy = 31), fv must be 128.0 (row 128 apex)
+        v_top_apex = 0.25
+        v_eff_top_apex = (1.0 - v_top_apex) if v_top_apex > 0.5 else v_top_apex
+        self.assertAlmostEqual((2.0 * v_eff_top_apex) * sv, 128.0)
+
+        # At bottom apex (dy = 31), fv must be 128.0 (row 128 apex, preventing flat cut)
+        v_bottom_apex = 0.75
+        v_eff_bottom_apex = (1.0 - v_bottom_apex) if v_bottom_apex > 0.5 else v_bottom_apex
+        self.assertAlmostEqual((2.0 * v_eff_bottom_apex) * sv, 128.0)
 
 
 if __name__ == '__main__':
