@@ -1707,6 +1707,8 @@ def main():
                                 mv = uv2_map[3]*(x+0.5)+uv2_map[4]*(y+0.5)+uv2_map[5]
                                 msu, msv = (mask_tex['w'], mask_tex['h']) if max(u2_1,v2_1)<=1.0001 else (1,1)
                                 mx = max(0,min(mask_tex['w']-1,int(mu*msu)))
+                                if mask_tex['bpp'] == 1 and (mask_tex['w'], mask_tex['h']) == (256, 256):
+                                    mv = 2 * (1-mv if mv > 0.5 else mv)
                                 my = max(0,min(mask_tex['h']-1,int(mv*msv)))
                                 m_b, m_g, m_r, m_a = texel(f, mask_tex, mx, my)
                                 if m_a == 0:

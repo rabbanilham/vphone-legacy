@@ -121,6 +121,16 @@ int main(int argc,char **argv) {
         # Home corner must show wallpaper rather than the grey square backdrop.
         self.assertLess(max(abs(a-b) for a,b in zip(pixel(1,33,51),pixel(1,31,51))), 8)
         self.assertGreater(pixel(1,92,110)[0]-pixel(1,33,51)[0], 50)
+        # UV1's half-ellipse atlas must be reflected vertically. Direct UV1
+        # sampling leaves the centre dark and paints a bright dome below it.
+        # Check interior rows away from the two miniature app icons, plus
+        # both sides: a rounded square has no horizontal/vertical seam here.
+        for n in (1, 2, 4):
+            centre = pixel(n, 92, 110)
+            for x, y in ((92, 140), (92, 155), (40, 110), (144, 110)):
+                self.assertLess(max(abs(a-b) for a,b in zip(centre, pixel(n,x,y))), 12)
+            self.assertGreater(centre[0], 90)
+            self.assertLess(max(abs(a-b) for a,b in zip(pixel(n,33,51),pixel(n,31,51))), 8)
         for n in (18, 19):
             f = Frame(dumps[n-1])
             self.assertTrue(replay.nc_sparse_layout(f, f.header['pbe_target'], 640, 640))

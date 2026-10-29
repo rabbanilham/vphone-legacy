@@ -8797,6 +8797,12 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             mask_ty = MAX(0, MIN((int)mask_tex.h - 1, mty));
                         } else {
                             float fv2 = uv2_map[3]*(x0+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                            /* CA's A8 corner atlas stores the lower half of an
+                             * ellipse. UV1 uses mirrored nine-slice coordinates,
+                             * just like the single-texture A8 path above. */
+                            if (mask_tex.bpp == 1 && mask_tex.w == 256 && mask_tex.h == 256) {
+                                fv2 = 2.0f * (fv2 > 0.5f ? 1.0f-fv2 : fv2);
+                            }
                             float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.h : 1;
                             mask_ty = MIN(mask_tex.h-1, (uint32_t)MAX(0.0f, fv2*scale));
                         }
