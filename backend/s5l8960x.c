@@ -10616,6 +10616,15 @@ static void vblank_timer_cb(void *opaque)
      * Retain overdue ticks (and IRQ/draw ordering), never jump over them.
      */
     s->vblank_deadline_ns += 16666667;
+    {
+        /* Short hiccups keep their phase (overdue ticks run back to back),
+         * but a long stall (host sleep, SIGSTOP, heavy contention) must not
+         * replay minutes of vblanks in one burst: resync past 8 ticks. */
+        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        if (now_ns - s->vblank_deadline_ns > 8 * INT64_C(16666667)) {
+            s->vblank_deadline_ns = now_ns + 16666667;
+        }
+    }
     timer_mod(s->vblank_timer, s->vblank_deadline_ns);
     pacing_report(s, wall_ns);
 #ifdef CONFIG_VNC

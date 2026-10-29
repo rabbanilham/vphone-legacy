@@ -161,6 +161,10 @@ int main(void) {
     pacing_sample(&s, 0, wall);
     pacing_report(&s, wall);
     assert(s.pacing[0].count == 0);
+    /* A minutes-long stall must not replay thousands of vblanks: resync. */
+    wall += 600000000000LL;
+    vblank_timer_cb(&s);
+    assert(deadline == wall + 16666667);
     return 0;
 }
 '''
