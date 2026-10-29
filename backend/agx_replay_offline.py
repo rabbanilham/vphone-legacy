@@ -1563,7 +1563,7 @@ def main():
                     if tex.get('bpp') == 1 and tex['w'] == 256 and tex['h'] == 256:
                         v_norm = fv / sv
                         v_eff = (1.0 - v_norm) if v_norm > 0.5 else v_norm
-                        fv = (v_eff + 0.25) * sv
+                        fv = (2.0 * v_eff) * sv
                     if is_scaled and not blurred_tex:
                         v_sample = max(0.0, min(float(tex['h'] - 1), fv - 0.5))
                         ty0 = int(v_sample)
