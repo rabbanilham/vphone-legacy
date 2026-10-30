@@ -1,0 +1,1 @@
+ANS perf: requests=5888 bytes=258945024 fsyncs=57 handler_ns=1403576000 handler_p50_ns_le=262143 handler_p95_ns_le=524287 handler_max_ns=105764000 background_fsync_bql_ns=0
