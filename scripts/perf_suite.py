@@ -168,8 +168,10 @@ def run_once(out, binary):
                             samples.append({'host_s': now-live.start, 'guest_s': virtual,
                                             'process': name, 'cpu_pct': cpu, 'rss_bytes': rss*1024})
                     next_sample = now+1
-                if virtual >= 110 and now-last_player_time > 15:
-                    raise RuntimeError('no player receive stats for >15s; check player-input.log/window/display')
+                # A still screen sends no frames, so stats lines are sparse once the
+                # guest is idle; only a long silence indicates a dead player.
+                if virtual >= 110 and now-last_player_time > 75:
+                    raise RuntimeError('no player receive stats for >75s; check player-input.log/window/display')
                 name, at, spec = STEPS[next_step]
                 if virtual >= at:
                     if virtual-at > 10:

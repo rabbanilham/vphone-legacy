@@ -22,8 +22,10 @@ LOCK = Path('/tmp/vphone-perf-live.lock')
 
 def host_preflight():
     load = list(os.getloadavg())
-    if load[0] > 3:
-        raise RuntimeError(f'host load {load[0]:.2f} > 3; measurement refused')
+    limit = float(os.environ.get('VPHONE_PERF_MAX_LOAD', '3'))
+    if load[0] > limit:
+        raise RuntimeError(f'host load {load[0]:.2f} > {limit:g}; measurement refused '
+                           '(override with VPHONE_PERF_MAX_LOAD; results are then noisy)')
     rows = subprocess.run(['ps', '-axo', 'pid=,comm='], capture_output=True, text=True, check=True)
     conflicts = []
     for line in rows.stdout.splitlines():
