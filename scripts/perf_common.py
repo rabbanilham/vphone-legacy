@@ -20,6 +20,48 @@ PROFILE = ROOT / 'build/virtual-activated-profile-v5'
 LOCK = Path('/tmp/vphone-perf-live.lock')
 
 
+def host_preflight():
+    load = list(os.getloadavg())
+    if load[0] > 3:
+        raise RuntimeError(f'host load {load[0]:.2f} > 3; measurement refused')
+    rows = subprocess.run(['ps', '-axo', 'pid=,comm='], capture_output=True, text=True, check=True)
+    conflicts = []
+    for line in rows.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        name = Path(parts[1]).name
+        if name.startswith('qemu-system-') or name in ('vphone-player', 'VPhonePlayer'):
+            conflicts.append(line.strip())
+    if conflicts:
+        raise RuntimeError('other QEMU/player processes running: '+', '.join(conflicts))
+    return load
+
+
+def build_foreground_helper(work):
+    # AppKit's own activation remains primary. Verify foreground state via macOS
+    # process API; failure is fatal rather than silently measuring an occluded app.
+    script = """import AppKit
+import Foundation
+let pid = pid_t(CommandLine.arguments[1])!
+for _ in 0..<25 {
+    if let app = NSRunningApplication(processIdentifier: pid), app.isFinishedLaunching {
+        _ = app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        Thread.sleep(forTimeInterval: 0.2)
+        if app.isActive { exit(0) }
+    }
+    Thread.sleep(forTimeInterval: 0.2)
+}
+exit(1)
+"""
+    source = work/'foreground.swift'
+    source.write_text(script)
+    helper = work/'foreground'
+    subprocess.run(['swiftc', '-module-cache-path', str(work/'module-cache'), str(source), '-o', str(helper)],
+                   check=True, capture_output=True, timeout=60)
+    return helper
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -126,15 +168,17 @@ def stop(process):
 class LiveSession:
     def __init__(self, out, binary=None, touch_script=''):
         self.out, self.binary, self.touch_script = Path(out), binary, touch_script
-        self.qemu = self.player = None
+        self.qemu = self.player = self.caffeinate = None
         self.logs = []
 
     def __enter__(self):
         self.out.mkdir(parents=True, exist_ok=True)
         self.work = Path(tempfile.mkdtemp(prefix='vphone-perf-', dir='/tmp'))
         try:
+            self.caffeinate = subprocess.Popen(['/usr/bin/caffeinate', '-dims', '-w', str(os.getpid())])
             cmd = prepare(self.work, self.binary)
             player = live_run.build_player()
+            foreground = build_foreground_helper(self.work)
             env = environment(self.touch_script)
             self.logs = [(self.out / name).open('wb') for name in ('qemu-stderr.log', 'player-stderr.log')]
             self.start = time.monotonic()
@@ -146,16 +190,26 @@ class LiveSession:
                 time.sleep(.05)
             self.player = subprocess.Popen([str(player), str(self.work / 'vnc'), str(self.work / 'qmp')],
                                            env=env, stderr=self.logs[1])
+            self.foreground_helper = foreground
+            self.foreground()
+            if self.caffeinate.poll() is not None:
+                raise RuntimeError('caffeinate exited; awake-display guarantee unavailable')
             return self
         except BaseException:
             self.__exit__(None, None, None)
             raise
 
+    def foreground(self):
+        subprocess.run([str(self.foreground_helper), str(self.player.pid)],
+                       check=True, capture_output=True, timeout=10)
+
     def __exit__(self, *args):
         stop(self.player)
         stop(self.qemu)
+        stop(self.caffeinate)
         for log in self.logs:
             log.close()
-        if (self.work / 'serial.log').exists():
-            shutil.copyfile(self.work / 'serial.log', self.out / 'serial.log')
+        for name in ('serial.log', 'player-input.log'):
+            if (self.work / name).exists():
+                shutil.copyfile(self.work / name, self.out / name)
         shutil.rmtree(self.work, ignore_errors=True)

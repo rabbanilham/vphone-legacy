@@ -704,9 +704,10 @@ struct A7State {
     int64_t vblank_deadline_ns;
     /* Wall-clock interval histograms: 100 us bins, final bin overflows. */
     struct {
-        int64_t last_ns;
+        int64_t last_ns, first_start_host_ns;
         uint64_t bins[1024], count, max_ns;
-    } pacing[3]; /* vblank, completed swap, virtual callback lateness */
+    } pacing[4]; /* vblank, completed swap, lateness, request-to-complete */
+    int64_t disp_request_host_ns;
     int64_t pacing_report_ns;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
@@ -800,6 +801,8 @@ struct A7State {
     unsigned ans_worker_errors;
     uint64_t ans_generation[3];
     uint64_t ans_hist[64], ans_handler_max_ns;
+    uint64_t ans_window_hist[64], ans_window_max_ns;
+    uint64_t ans_report_requests, ans_report_fsyncs;
     QEMUTimer *ans_flush_timer;
     Notifier ans_exit_notifier, ans_shutdown_notifier;
     bool ans_notifiers_registered, ans_perf_enabled;
@@ -3551,6 +3554,8 @@ static uint32_t ans_execute(A7State *s, uint8_t tag)
         unsigned bucket = 0;
         for (uint64_t n = elapsed; n && bucket < 63; n >>= 1) { bucket++; }
         s->ans_hist[bucket]++;
+        s->ans_window_hist[bucket]++;
+        if (elapsed > s->ans_window_max_ns) { s->ans_window_max_ns = elapsed; }
     }
     return status;
 }
@@ -5079,6 +5084,9 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                         }
                         s->disp_pending_token = s->disp_fifo_token;
                         s->disp_token = s->disp_fifo_token;
+                        if (s->agx_perf_enabled && !s->disp_swap_pending) {
+                            s->disp_request_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                        }
                         s->disp_swap_pending = true;
                         qemu_log_mask(LOG_UNIMP, "DPFIFO applied words=%u token=%u\n", count, s->disp_fifo_token);
                     }
@@ -5089,6 +5097,9 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 qemu_log_mask(LOG_UNIMP, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
                         val, p->owner->disp_pending_token);
                 *(uint32_t *)(p->regs + 0x1044) = 0;
+                if (p->owner->agx_perf_enabled && !p->owner->disp_swap_pending) {
+                    p->owner->disp_request_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                }
                 p->owner->disp_swap_pending = true;
                 p->owner->disp_mapping_valid = false;
                 if (p->owner->disp_pending_token != 0) {
@@ -10491,6 +10502,9 @@ static void pacing_sample(A7State *s, unsigned kind, int64_t now)
     }
     if (s->pacing[kind].last_ns) {
         uint64_t dt = now - s->pacing[kind].last_ns;
+        if (!s->pacing[kind].count) {
+            s->pacing[kind].first_start_host_ns = s->pacing[kind].last_ns;
+        }
         s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
         s->pacing[kind].count++;
         s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
@@ -10503,6 +10517,10 @@ static void pacing_duration(A7State *s, unsigned kind, uint64_t dt)
     if (!s->agx_perf_enabled) {
         return;
     }
+    if (!s->pacing[kind].count) {
+        s->pacing[kind].first_start_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (kind == 3) { s->pacing[kind].first_start_host_ns -= dt; }
+    }
     s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
     s->pacing[kind].count++;
     s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
@@ -10513,10 +10531,11 @@ static void pacing_report(A7State *s, int64_t now)
     if (!s->agx_perf_enabled || now - s->pacing_report_ns < 5000000000LL) {
         return;
     }
+    int64_t window_start = s->pacing_report_ns;
     s->pacing_report_ns = now;
-    double quantiles[3][3] = {{0}};
-    const char *names[] = {"vblank", "swap-complete", "vblank-late"};
-    for (unsigned k = 0; k < 3; k++) {
+    double quantiles[4][3] = {{0}};
+    const char *names[] = {"vblank", "swap-complete", "vblank-late", "swap-request"};
+    for (unsigned k = 0; k < 4; k++) {
         uint64_t n = s->pacing[k].count, cumulative = 0;
         const unsigned percent[] = { 50, 95, 99 };
         unsigned q = 0;
@@ -10536,14 +10555,15 @@ static void pacing_report(A7State *s, int64_t now)
         }
     }
     flockfile(stderr);
-    fprintf(stderr, "[pacing-json] {\"version\":1,\"host_ns\":%" PRId64
+    fprintf(stderr, "[pacing-json] {\"version\":2,\"window_start_host_ns\":%" PRId64
+            ",\"host_ns\":%" PRId64
             ",\"virtual_ns\":%" PRId64 ",\"swap_request_ms\":null,\"metrics\":{",
-            now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    for (unsigned k = 0; k < 3; k++) {
+            window_start, now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    for (unsigned k = 0; k < 4; k++) {
         fprintf(stderr, "%s\"%s\":{\"n\":%" PRIu64
-                ",\"p50\":%.3f,\"p95\":%.3f,\"p99\":%.3f,\"max\":%.3f,\"bins_100us\":[",
+                ",\"first_start_host_ns\":%" PRId64 ",\"p50\":%.3f,\"p95\":%.3f,\"p99\":%.3f,\"max\":%.3f,\"bins_100us\":[",
                 k ? "," : "", names[k], s->pacing[k].count,
-                quantiles[k][0], quantiles[k][1], quantiles[k][2], s->pacing[k].max_ns / 1e6);
+                s->pacing[k].first_start_host_ns, quantiles[k][0], quantiles[k][1], quantiles[k][2], s->pacing[k].max_ns / 1e6);
         for (unsigned b = 0; b < 1024; b++) {
             fprintf(stderr, "%s%" PRIu64, b ? "," : "", s->pacing[k].bins[b]);
         }
@@ -10551,7 +10571,29 @@ static void pacing_report(A7State *s, int64_t now)
         memset(s->pacing[k].bins, 0, sizeof(s->pacing[k].bins));
         s->pacing[k].count = s->pacing[k].max_ns = 0;
     }
-    fprintf(stderr, "}}\n");
+    fprintf(stderr, "}");
+    if (s->ans_perf_enabled) {
+        uint64_t fsyncs = 0;
+        if (s->ans_worker_started) {
+            qemu_mutex_lock(&s->ans_mutex);
+            fsyncs = s->ans_fsyncs;
+            qemu_mutex_unlock(&s->ans_mutex);
+        }
+        fprintf(stderr, ",\"ans\":{\"requests\":%" PRIu64
+                ",\"fsyncs\":%" PRIu64 ",\"background_fsync_bql_ns\":0"
+                ",\"handler_max_ns\":%" PRIu64 ",\"handler_bins_log2_ns\":[",
+                s->ans_requests - s->ans_report_requests,
+                fsyncs - s->ans_report_fsyncs, s->ans_window_max_ns);
+        for (unsigned b = 0; b < 64; b++) {
+            fprintf(stderr, "%s%" PRIu64, b ? "," : "", s->ans_window_hist[b]);
+        }
+        fprintf(stderr, "]}");
+        s->ans_report_requests = s->ans_requests;
+        s->ans_report_fsyncs = fsyncs;
+        memset(s->ans_window_hist, 0, sizeof(s->ans_window_hist));
+        s->ans_window_max_ns = 0;
+    }
+    fprintf(stderr, "}\n");
     funlockfile(stderr);
 }
 
@@ -10592,6 +10634,10 @@ static void vblank_timer_cb(void *opaque)
                 qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
                 pacing_sample(s, 1, wall_ns);
+                if (s->disp_request_host_ns) {
+                    pacing_duration(s, 3, MAX(wall_ns - s->disp_request_host_ns, 0));
+                    s->disp_request_host_ns = 0;
+                }
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;
             }
@@ -10785,6 +10831,7 @@ static void a7_reset(void *opaque)
     s->disp_pending_token = 0;
     s->disp_fifo_count = s->disp_fifo_expected = s->disp_fifo_token = 0;
     s->disp_swap_pending = false;
+    s->disp_request_host_ns = 0;
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
             uint8_t *regs = s->peripherals[i].regs;

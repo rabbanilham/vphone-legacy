@@ -617,6 +617,10 @@ assert(obj["rects_per_s"] as? Double == 4.0)
 assert(obj["kb_per_s"] as? Double == 6.0)
 assert(obj["dropped"] as? Int == 2)
 assert(obj["total_frames"] as? Int == 2)
+let counts = obj["sample_counts"] as! [String: Int]
+assert(counts["present_ms"] == 2 && counts["arrive_to_present_ms"] == 2)
+assert((obj["host_uptime_s"] as! Double) > 0)
+assert(obj["window_s"] as? Double == 1.0)
 
 let pObj = obj["present_ms"] as! [String: Any]
 assert(pObj["p50"] as? Double == 16.6)

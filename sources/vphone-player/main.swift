@@ -273,6 +273,10 @@ final class PlayerStatsAccumulator {
         let arriveToPresentMs: Stats4
         let dropped: Int
         let totalFrames: Int
+        // Empty percentiles are encoded as zero by the legacy formatter.
+        let sampleCounts: [String: Int]
+        let hostUptime: Double
+        let windowSeconds: Double
 
         func formattedText() -> String {
             return "[player-stats] " + String(
@@ -284,8 +288,9 @@ final class PlayerStatsAccumulator {
         }
 
         func formattedJSON() -> String {
-            return String(
-                format: "{\"fps\":%.1f,\"rects_per_s\":%.1f,\"kb_per_s\":%.1f,\"present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"recv_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"update_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"arrive_to_present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"dropped\":%d,\"total_frames\":%d}",
+            let counts = sampleCounts.sorted { $0.key < $1.key }.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
+            return "{\"host_uptime_s\":\(hostUptime),\"window_s\":\(windowSeconds),\"sample_counts\":{\(counts)}," + String(
+                format: "\"fps\":%.1f,\"rects_per_s\":%.1f,\"kb_per_s\":%.1f,\"present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"recv_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"update_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"max\":%.1f},\"arrive_to_present_ms\":{\"p50\":%.1f,\"p95\":%.1f,\"p99\":%.1f,\"max\":%.1f},\"dropped\":%d,\"total_frames\":%d}",
                 locale: Locale(identifier: "en_US_POSIX"),
                 fps, rectsPerS, kbPerS,
                 presentMs.p50, presentMs.p95, presentMs.p99, presentMs.max,
@@ -339,6 +344,8 @@ final class PlayerStatsAccumulator {
         let aStats = Percentile.calculate4(arriveToPresentIntervals)
         let dropped = droppedCount
 
+        let counts = ["present_ms": presentIntervals.count, "arrive_to_present_ms": arriveToPresentIntervals.count,
+                      "recv_ms": recvIntervals.count, "update_ms": updateIntervals.count]
         presentIntervals.removeAll(keepingCapacity: true)
         arriveToPresentIntervals.removeAll(keepingCapacity: true)
         recvIntervals.removeAll(keepingCapacity: true)
@@ -357,7 +364,8 @@ final class PlayerStatsAccumulator {
             updateMs: uStats,
             arriveToPresentMs: aStats,
             dropped: dropped,
-            totalFrames: totalFrames
+            totalFrames: totalFrames, sampleCounts: counts,
+            hostUptime: ProcessInfo.processInfo.systemUptime, windowSeconds: dt
         )
     }
 
@@ -508,7 +516,7 @@ final class RFB {
             try send([0,0,0,0,32,24,0,1,0,255,0,255,0,255,16,8,0,0,0,0])
             try send([2,0,0,1,0,0,0,0]); try request(false)
             let statsEnabled = ProcessInfo.processInfo.environment["VPHONE_PLAYER_STATS"] != nil
-            var statsLastTime = Date().timeIntervalSince1970
+            var statsLastTime = ProcessInfo.processInfo.systemUptime
             var totalFrames = 0
             while true {
                 try readIntoScratch(1)
@@ -581,7 +589,7 @@ final class RFB {
                         let recvMs = frameRecvSec * 1000.0
                         stats.recordFrame(rects: count, bytes: frameBytes, recvMs: recvMs, updateMs: updateMs)
 
-                        let now = Date().timeIntervalSince1970
+                        let now = ProcessInfo.processInfo.systemUptime
                         if now - statsLastTime >= 1.0 {
                             let dt = now - statsLastTime
                             let snapshot = stats.snapshotAndReset(dt: dt, totalFrames: totalFrames)

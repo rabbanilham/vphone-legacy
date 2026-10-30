@@ -111,8 +111,12 @@ typedef struct {
     unsigned disp_token;
     uint32_t device_irq[3], mask[3], soft[3];
     A7Peripheral peripherals[1];
-    int64_t vblank_deadline_ns, pacing_report_ns;
-    struct { int64_t last_ns; uint64_t bins[1024], count, max_ns; } pacing[3];
+    int64_t vblank_deadline_ns, pacing_report_ns, disp_request_host_ns;
+    bool ans_perf_enabled, ans_worker_started;
+    int ans_mutex;
+    uint64_t ans_fsyncs, ans_requests, ans_report_requests, ans_report_fsyncs;
+    uint64_t ans_window_max_ns, ans_window_hist[64];
+    struct { int64_t last_ns, first_start_host_ns; uint64_t bins[1024], count, max_ns; } pacing[4];
     int64_t *vblank_timer;
     QemuConsole *con;
 } A7State;
@@ -124,6 +128,8 @@ static void aic_update(A7State *s) { assert(drains > 0); }
 static void a7_wifi_patch_mac(A7State *s) {}
 static void timer_mod(int64_t *t, int64_t n) { *t = n; }
 #define qemu_log_mask(...) ((void)0)
+#define qemu_mutex_lock(x) ((void)0)
+#define qemu_mutex_unlock(x) ((void)0)
 '''
         harness += callback
         harness += r'''
@@ -140,12 +146,14 @@ int main(void) {
     s.disp_token = 42;
     /* Host wakes late: each overdue tick is retained; deadline never
      * becomes callback-wall-time + period. Render/IRQ path still runs. */
+    s.disp_request_host_ns = 42000000;
     wall = 50000000;
     vblank_timer_cb(&s);
     assert(deadline == 33333334);
     assert((*(uint32_t *)(s.peripherals[0].regs + 0x102c)) == (1 | (1<<8)));
     assert((*(uint32_t *)(s.peripherals[0].regs + 0x1048)) == 42);
     assert(!s.disp_swap_pending);
+    assert(s.pacing[3].count == 1 && s.pacing[3].max_ns == 8000000);
     assert(s.device_irq[2] & 1);
     vblank_timer_cb(&s);
     assert(deadline == 50000001);

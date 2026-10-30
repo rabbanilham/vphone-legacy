@@ -62,56 +62,160 @@ python3 scripts/perf_suite.py --out build/perf/candidate --baseline build/perf/B
 ```
 
 `--out` must be a new directory. Default output is
-`build/perf/<git-hash>-<UTC timestamp>/`. `latest` resolves the newest completed
-`perf.json` before creating the candidate directory. Both processes always get
-`VPHONE_PERF_STATS=1` and `VPHONE_PLAYER_STATS=1`. Each repetition preserves
-`qemu-stderr.log`, `player-stderr.log`, and `serial.log`. Versioned `perf.json`
-contains metadata (git/dirty state, binary SHA256, profile/plan, OS/model, TCG
-thread mode and VPHONE/QEMU environment), raw process samples, input events,
-virtual markers, pacing windows, per-step distributions, run aggregates and
-comparison rows. `summary.txt` reports median and min/max across repetitions.
-Do not share captured environment metadata without checking it for secrets.
+`build/perf/<git-hash>-<UTC timestamp>/`. Runs remain sequential (k=1), with
+unchanged guest actions and disposable disk clones. The suite refuses a start
+when the 1-minute host load exceeds 3 or `ps` finds another QEMU/player. The
+lock is retained. `caffeinate -dims` runs internally and is cleaned up on exit;
+load averages at start/end are recorded, including aborted measurement data.
+Both processes receive `VPHONE_PERF_STATS=1` and `VPHONE_PLAYER_STATS=1`.
 
-The fixed sequence unlocks, swipes Home left and right, opens Settings, toggles
-Airplane Mode, returns Home, swipes left and opens Extras. Settings/switch/folder
-coordinates come from `agx_corpus.SCENES`. Unlock uses the established backend
-virtual-time script; later gestures use the player's QMP `input-send-event/mtt`
-events and scaling. No Python RFB pointer input substitutes for those gestures.
-Markers dispatch at the next 5-second pacing report, so actual virtual start
-and host start are recorded alongside each target. Whole log windows are
-attributed to the step active when read; boundary windows can straddle steps.
-This is sampling granularity, not an exact virtual-time scheduler.
+The player is activated with the macOS application API before measurement and
+at each step. Activation failure aborts. Keep an unlocked, awake desktop with
+the player visible throughout; foreground activation cannot prove continuous
+visibility if the user changes windows. The suite preserves `player-input.log`
+in addition to both stderr logs and serial output, reads player JSON from both
+locations, and deduplicates mirrored records. No player stats for 15 seconds
+during the action phase invalidates the run. No steady-state receive window
+with fps>1 or no presentation samples also invalidates it, with explicit issues.
 
-Metric definitions and limits:
+Schema **2** rejects old baselines. `perf.json` retains raw windows, process
+samples, markers, attempted input events, per-step metrics and run aggregates.
+Missing values stay `null`, with `available_runs` and `total_runs`; a partial
+aggregate must not be read as all repetitions succeeding. Aborted runs preserve
+`run-N/measurement-raw.json` and logs, and have status `failed`; missing player
+coverage yields `invalid`. Neither is eligible for `--baseline latest`.
 
-- Pacing histograms: vblank/swap-complete host intervals and vblank callback
-  lateness against its virtual deadline. Nearest-rank p50/p95/p99/max use 100 us
-  upper-bound bins; overflow uses the observed maximum. JSON includes counts
-  for correct histogram merging; legacy `[pacing 5s]` text remains available.
-- Player `present_ms`: existing p50/p95/p99/max per log window. The comparison
-  uses the **maximum reported window p95**, not a pooled end-to-end percentile.
-  Raw per-frame timestamps are necessary for a true pooled percentile.
-- Input latency: host send time to first changed icon-area row in a separate
-  RFB stream; tap/swipe distributions and timeouts are retained. Unrelated
-  animations can cause false attribution. This measures framebuffer delivery,
-  not physical display scanout or Swift presentation completion.
-- CPU/RSS: per-process `ps %cpu,rss` at approximately 1 Hz; per-step mean/p95
-  and sampled RSS maximum. `%cpu` has the host's averaging semantics. Short
-  RSS peaks can be missed. Overall CPU is the sum of process sample means.
-- Boot: host launch to first update changing at least 30 icon-area rows, plus
-  the latest sampled virtual time (5-second granularity). This is a first
-  meaningful framebuffer proxy, **not verified lock-screen recognition**.
-- Swap-request to completion is explicitly `null`: request timestamps require
-  changes to the display MMIO request sites outside this task's permitted C
-  timer/pacing region. No proxy duration is reported as request latency.
+The fixed sequence unlocks, swipes Home left/right, opens Settings, toggles
+Airplane Mode, returns Home, swipes left and opens Extras. The existing unlock
+script ends at virtual 103s. Boot includes all windows through the first pacing
+report at/after virtual 105s. Entire windows crossing that boundary or an action
+marker are retained as `boundary` and excluded from steady/per-step aggregates.
+Steps are dispatched at pacing reports (5 host seconds resolution); a missed
+schedule by >10 virtual seconds aborts rather than replaying actions rapidly.
+Each producer clock is anchored to its first log receipt on the suite clock
+(approximately 20 ms polling resolution); raw timestamps and offsets remain
+available. A suite polling gap or pacing backend-clock gap >15 seconds, or
+backend/suite elapsed-time disagreement >10 seconds, aborts, preserving
+evidence. Large stalls are **not** deleted and then reported as a healthy run.
 
-A candidate fails if median across runs exceeds baseline by more than 15% for
-present window p95, 20% for median input latency, 15% for combined CPU, or 15%
-for host boot time. Missing/zero baseline values fail comparison; missing
-required candidate metrics or unanswered measured gestures fail completeness.
-These coarse metrics must be inspected with raw windows before claiming a
-performance improvement. Schema mismatches are rejected. Parser, histogram,
-percentile and comparison tests run without firmware or booting QEMU.
+Measurement definitions:
+
+- Pacing: vblank and swap-complete **host** intervals; callback lateness relative
+  to the **virtual** deadline. Merge 100 us histogram counts for p95/p99/max;
+  overflow uses its observed maximum, hence tail quantiles are upper bounds.
+  Count windows whose metric maximum exceeds 50 ms as `jank_windows` (a long
+  swap interval can represent idle display time, not necessarily animation jank).
+  New records include the window start and first interval start; intervals
+  originating in boot or across a marker are excluded per metric. For legacy
+  records, use the previous report as window start and conservatively bound
+  interval start by window start minus its maximum; ambiguous intervals stay
+  excluded. Old ANS lifecycle totals still cannot yield steady ANS metrics.
+- `swap_request_ms.p95`: histogram of the oldest pending DISP0 commit to its
+  modeled swap completion on the host clock. Both FIFO and direct commit paths
+  stamp the request without changing guest decisions or timer scheduling.
+  Repeated requests while pending are coalesced. Histogram name is
+  `metrics.swap-request`; the legacy top-level `swap_request_ms:null` remains
+  for compatibility and is not used by the parser.
+- Player: `fps` means **received** frames/second. `dropped` counts overwritten
+  pending frames in that receive window. Report their window means, and maximum
+  reported window p50/p95/p99/max for recv/update/present/arrival-to-present,
+  explicitly named `window_*_max`; these are not pooled frame quantiles.
+  `present_ms` is the interval between actual present callbacks, including idle
+  gaps, not rendering cost. `arrive_to_present_ms` starts at RFB surface commit,
+  not network packet arrival or physical display scanout. The minimal Swift
+  instrumentation fix adds sample counts, host uptime/window duration, and uses
+  monotonic time for stats. Empty sample arrays and old JSON without counts
+  produce unavailable timings rather than invented zero milliseconds.
+- ANS: periodic pacing JSON now includes window request/fsync counts and a
+  log2-nanosecond handler histogram plus exact observed maximum. Percentiles
+  ending `_le` are inclusive bucket upper bounds. `background_fsync_bql_ns=0`
+  describes only background worker fsync, not explicit barriers. Lifecycle
+  `ANS perf:` lines are parsed separately as `ans-lifetime`; cumulative boot/
+  shutdown totals are never attributed to a step or silently summed twice.
+- CPU/RSS: per-process mean/p95 of approximately 1 Hz `ps %cpu` samples and
+  sampled maximum RSS, for each steady step and the steady run. `%cpu` retains
+  macOS averaging semantics, so this is not instantaneous per-step CPU time.
+  Missing process samples remain unavailable; RSS peaks between samples can
+  be missed. `step.<name>.*` keys participate in aggregation/comparison.
+- Boot time remains the first >=30 changed icon-area rows, a framebuffer proxy,
+  not semantic lock-screen recognition. It is reported separately from steady
+  metrics.
+
+**Input latency is currently unavailable**, with `valid=false`, reason and
+valid/attempted counts for every step. No pooled tap/swipe number is emitted.
+The required definition is host monotonic time from the submitted touch-begin
+(tap/toggle/folder) or first submitted touch-move (swipe) to the first meaningful
+RGB framebuffer change in that action's relevant region. Preconditions must
+identify the current screen and show a quiet region before injection. Proposed
+regions and screen preconditions are recorded in `INPUT_CONTRACTS`: Settings
+content, the Airplane switch, Home icon grid, and expanded folder content.
+These regions are definitions pending live validation, not active validators.
+A digitizer-gated action is recorded and skipped, not silently woken and timed.
+
+The old suite started before the whole blocking gesture and accepted **one
+changed row anywhere in y=120..899**, without quieting, screen identification,
+RGB magnitude/area threshold, or causal validation. Settings, swipes, switch
+and folder shared that detector. It could therefore time unrelated animation,
+queued RFB work or a missing response's next update. `input_latency.py` uses a
+similar icon-area detector but starts at first pointer move, waits for quiet,
+and uses VNC pointer gestures; its numbers are not interchangeable with QMP
+suite numbers. Synthetic tests confirm unvalidated 1.6/1766 ms observations
+cannot become official latency metrics. End-to-end validation still requires
+orchestrator runs with known delayed visual responses, unrelated/status-bar
+animation, no-op input, timeout and per-action screen/ROI checks. Do not enable
+latency reporting until those cases distinguish real responses from noise.
+
+A/A calibration (orchestrator only):
+
+```sh
+python3 scripts/perf_suite.py --self-test --repeat 3 --qemu-binary /path/to/base --out build/perf/aa
+python3 scripts/perf_suite.py --qemu-binary /path/to/candidate --baseline build/perf/aa
+```
+
+`--self-test` uses the **same binary** at least twice, sequentially, and records
+per-metric maximum relative deviation from the median as `aa_noise`. Thresholds
+are the greater of the existing 15% (20% input) floor and twice that A/A
+variation; lower receive FPS is a regression, higher times/resources are
+regressions. All available metrics are compared, including per-step fields.
+Same-binary baselines can supply variation from their repeated runs. Metrics
+without calibration are `uncalibrated`; missing metrics are `unavailable`.
+Neither is falsely labeled a regression or a pass. Two runs only give a coarse
+noise estimate; prefer >=3, on the same profile/host/load conditions. Counts and
+idle-sensitive metrics still require workload inspection.
+
+W0-c investigation of supplied six runs (read-only log excerpts in
+`tests/fixtures/perf/`):
+
+- **Proven:** all runs contain a huge simultaneous host/virtual report gap.
+  Base run 3 jumps 25.04→953.13 virtual seconds, with vblank-late max
+  926027.369 ms; candidate run 3 jumps 25.02→952.19, max 925837.014 ms.
+  However perf.json suite receipt time advances only 25.15→27.47s (base) and
+  25.11→26.55s (candidate). Thus the backend clock domain diverges from Python
+  monotonic time; a 15-minute process suspension is **not proven**. This is not
+  merely an incorrectly initialized virtual deadline. It occurs
+  during boot, before the gesture schedule, and makes that schedule unusable.
+  There is no SIGSTOP/SIGCONT in the suite. Host sleep with differing clock
+  semantics, or a backend clock discontinuity, is plausible; logs do not
+  establish which. Ordinary process suspension alone does not explain the
+  different elapsed times.
+  Sampling via `ps` and the RFB observer do not intentionally suspend QEMU.
+- **Proven:** candidate player logs have only 0–1 JSON receive windows per run,
+  with no fps>1; base run 1 receives frames while dropping pending frames with
+  empty presentation quantiles. Stats environment did reach at least those
+  players; it cannot explain their empty present samples. A non-running display
+  link due to hidden/occluded/sleeping display is a hypothesis requiring live
+  verification. The original scratchpad contains no saved `player-input.log`,
+  so alternate-file coverage cannot be established retroactively.
+- **Proven:** the old four aggregate metrics included empty-array zeros and
+  causally unvalidated input, making the reported base/candidate comparison
+  unsuitable for performance conclusions. New parser tests use exact small
+  source-log excerpts; firmware-free C and Swift tests use known samples.
+
+No VM was booted and no live suite was run for W0-c. Foreground/awake behavior,
+A/A noise on real hardware, input causality and the rebuilt backend's live
+windows remain for orchestrator verification. Instrumentation adds histogram
+updates and periodic logging; its overhead and the extra RFB observer are
+shared measurement costs, not established as negligible.
 
 For an offline, pixel-checked renderer comparison:
 
