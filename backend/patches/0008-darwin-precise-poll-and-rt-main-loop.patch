@@ -1,0 +1,145 @@
+diff --git a/util/main-loop.c b/util/main-loop.c
+index 65e5dbc..1042866 100644
+--- a/util/main-loop.c
++++ b/util/main-loop.c
+@@ -23,6 +23,11 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
++#endif
+ #include "qapi/error.h"
+ #include "qemu/cutils.h"
+ #include "qemu/timer.h"
+@@ -564,6 +569,39 @@ void main_loop_poll_remove_notifier(Notifier *notify)
+ 
+ void main_loop_wait(int nonblocking)
+ {
++#ifdef __APPLE__
++    {
++        /*
++         * Wake the main loop precisely: timer-driven devices (A7 vblank, touch)
++         * lose ~2-5 ms to macOS timer coalescing otherwise. A small
++         * time-constraint reservation (2 ms of work per 16 ms) gives the
++         * thread real-time wakeup latency. VPHONE_MAIN_RT=0 disables it.
++         */
++        static __thread bool rt_applied;
++        if (!rt_applied) {
++            const char *env = getenv("VPHONE_MAIN_RT");
++            rt_applied = true;
++            if (!env || strcmp(env, "0")) {
++                mach_timebase_info_data_t tb;
++                thread_time_constraint_policy_data_t pol;
++                uint64_t ms;
++                mach_timebase_info(&tb);
++                ms = (uint64_t)tb.denom * 1000000ULL / tb.numer;
++                pol.period = (uint32_t)(16 * ms);
++                pol.computation = (uint32_t)(2 * ms);
++                pol.constraint = (uint32_t)(5 * ms);
++                pol.preemptible = 1;
++                if (thread_policy_set(mach_thread_self(),
++                                      THREAD_TIME_CONSTRAINT_POLICY,
++                                      (thread_policy_t)&pol,
++                                      THREAD_TIME_CONSTRAINT_POLICY_COUNT)) {
++                    fprintf(stderr, "vphone: main-loop RT policy failed\n");
++                }
++            }
++        }
++    }
++#endif
++
+     MainLoopPoll mlpoll = {
+         .state = MAIN_LOOP_POLL_FILL,
+         .timeout = UINT32_MAX,
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index d93a020..0756780 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -343,6 +343,84 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
+     }
+ #else
++#ifdef __APPLE__
++    /*
++     * macOS has no ppoll(), and g_poll() rounds the timeout up to whole
++     * milliseconds, which delays every timer-driven wakeup (the A7 vblank
++     * among them). Use pselect() with a nanosecond timeout whenever every fd
++     * fits an fd_set; anything unusual falls back to g_poll().
++     */
++    {
++        fd_set rfds, wfds, efds;
++        int maxfd = -1;
++        bool usable = nfds <= FD_SETSIZE;
++
++        FD_ZERO(&rfds);
++        FD_ZERO(&wfds);
++        FD_ZERO(&efds);
++        for (guint i = 0; usable && i < nfds; i++) {
++            int fd = fds[i].fd;
++            if (fd < 0) {
++                continue;
++            }
++            if (fd >= FD_SETSIZE) {
++                usable = false;
++                break;
++            }
++            if (fds[i].events & G_IO_IN) {
++                FD_SET(fd, &rfds);
++            }
++            if (fds[i].events & G_IO_OUT) {
++                FD_SET(fd, &wfds);
++            }
++            if (fds[i].events & G_IO_PRI) {
++                FD_SET(fd, &efds);
++            }
++            maxfd = MAX(maxfd, fd);
++        }
++        if (usable) {
++            struct timespec ts, *tsp = NULL;
++            int n, ready = 0;
++
++            if (timeout >= 0) {
++                int64_t tvsec = timeout / 1000000000LL;
++                if (tvsec > (int64_t)INT32_MAX) {
++                    tvsec = INT32_MAX;
++                }
++                ts.tv_sec = tvsec;
++                ts.tv_nsec = timeout % 1000000000LL;
++                tsp = &ts;
++            }
++            n = pselect(maxfd + 1, &rfds, &wfds, &efds, tsp, NULL);
++            if (n >= 0) {
++                for (guint i = 0; i < nfds; i++) {
++                    int fd = fds[i].fd;
++                    fds[i].revents = 0;
++                    if (fd < 0) {
++                        continue;
++                    }
++                    if ((fds[i].events & G_IO_IN) && FD_ISSET(fd, &rfds)) {
++                        fds[i].revents |= G_IO_IN;
++                    }
++                    if ((fds[i].events & G_IO_OUT) && FD_ISSET(fd, &wfds)) {
++                        fds[i].revents |= G_IO_OUT;
++                    }
++                    if ((fds[i].events & G_IO_PRI) && FD_ISSET(fd, &efds)) {
++                        fds[i].revents |= G_IO_PRI;
++                    }
++                    if (fds[i].revents) {
++                        ready++;
++                    }
++                }
++                return ready;
++            }
++            if (errno == EINTR) {
++                return -1;
++            }
++            /* EBADF/EINVAL on an fd select() cannot handle: use g_poll(). */
++        }
++    }
++#endif
+     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+ #endif
+ }

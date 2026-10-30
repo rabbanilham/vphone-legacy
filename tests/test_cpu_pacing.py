@@ -86,6 +86,14 @@ int main(void) {
             subprocess.run(['cc', '-std=c11', '-Werror', str(c), '-o', str(binary)], check=True)
             subprocess.run([binary], check=True)
 
+    def test_precise_poll_and_rt_main_loop_patch(self):
+        patch = (ROOT / 'backend/patches/0008-darwin-precise-poll-and-rt-main-loop.patch').read_text()
+        # macOS has no ppoll(); g_poll() rounds timeouts up to whole ms.
+        self.assertIn('pselect(maxfd + 1', patch)
+        self.assertIn('return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));', patch)
+        self.assertIn('THREAD_TIME_CONSTRAINT_POLICY', patch)
+        self.assertIn('VPHONE_MAIN_RT', patch)
+
     def test_delayed_vblank_preserves_phase_and_swap_irq(self):
         source = (ROOT / 'backend/s5l8960x.c').read_text()
         callback = source[source.index('/* Pacing statistics never feed'):source.index('static void a7_reset(')]
