@@ -86,6 +86,14 @@ int main(void) {
             subprocess.run(['cc', '-std=c11', '-Werror', str(c), '-o', str(binary)], check=True)
             subprocess.run([binary], check=True)
 
+    def test_precise_poll_and_rt_main_loop_patch(self):
+        patch = (ROOT / 'backend/patches/0008-darwin-precise-poll-and-rt-main-loop.patch').read_text()
+        # macOS has no ppoll(); g_poll() rounds timeouts up to whole ms.
+        self.assertIn('pselect(maxfd + 1', patch)
+        self.assertIn('return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));', patch)
+        self.assertIn('THREAD_TIME_CONSTRAINT_POLICY', patch)
+        self.assertIn('VPHONE_MAIN_RT', patch)
+
     def test_delayed_vblank_preserves_phase_and_swap_irq(self):
         source = (ROOT / 'backend/s5l8960x.c').read_text()
         callback = source[source.index('/* Pacing statistics never feed'):source.index('static void a7_reset(')]
@@ -99,6 +107,7 @@ int main(void) {
 #define CONFIG_VNC 1
 #define NUM_PERIPHERALS 1
 #define QEMU_CLOCK_REALTIME 1
+#define QEMU_CLOCK_VIRTUAL 2
 #define LOG_UNIMP 0
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
@@ -110,8 +119,12 @@ typedef struct {
     unsigned disp_token;
     uint32_t device_irq[3], mask[3], soft[3];
     A7Peripheral peripherals[1];
-    int64_t vblank_deadline_ns, pacing_report_ns;
-    struct { int64_t last_ns; uint64_t bins[1024], count, max_ns; } pacing[2];
+    int64_t vblank_deadline_ns, pacing_report_ns, disp_request_host_ns;
+    bool ans_perf_enabled, ans_worker_started;
+    int ans_mutex;
+    uint64_t ans_fsyncs, ans_requests, ans_report_requests, ans_report_fsyncs;
+    uint64_t ans_window_max_ns, ans_window_hist[64];
+    struct { int64_t last_ns, first_start_host_ns; uint64_t bins[1024], count, max_ns; } pacing[4];
     int64_t *vblank_timer;
     QemuConsole *con;
 } A7State;
@@ -123,6 +136,8 @@ static void aic_update(A7State *s) { assert(drains > 0); }
 static void a7_wifi_patch_mac(A7State *s) {}
 static void timer_mod(int64_t *t, int64_t n) { *t = n; }
 #define qemu_log_mask(...) ((void)0)
+#define qemu_mutex_lock(x) ((void)0)
+#define qemu_mutex_unlock(x) ((void)0)
 '''
         harness += callback
         harness += r'''
@@ -139,12 +154,14 @@ int main(void) {
     s.disp_token = 42;
     /* Host wakes late: each overdue tick is retained; deadline never
      * becomes callback-wall-time + period. Render/IRQ path still runs. */
+    s.disp_request_host_ns = 42000000;
     wall = 50000000;
     vblank_timer_cb(&s);
     assert(deadline == 33333334);
     assert((*(uint32_t *)(s.peripherals[0].regs + 0x102c)) == (1 | (1<<8)));
     assert((*(uint32_t *)(s.peripherals[0].regs + 0x1048)) == 42);
     assert(!s.disp_swap_pending);
+    assert(s.pacing[3].count == 1 && s.pacing[3].max_ns == 8000000);
     assert(s.device_irq[2] & 1);
     vblank_timer_cb(&s);
     assert(deadline == 50000001);
@@ -160,6 +177,10 @@ int main(void) {
     pacing_sample(&s, 0, wall);
     pacing_report(&s, wall);
     assert(s.pacing[0].count == 0);
+    /* A minutes-long stall must not replay thousands of vblanks: resync. */
+    wall += 600000000000LL;
+    vblank_timer_cb(&s);
+    assert(deadline == wall + 16666667);
     return 0;
 }
 '''
@@ -170,4 +191,10 @@ int main(void) {
             subprocess.run(['cc', '-std=c11', '-Werror', str(c), '-o', str(binary)], check=True)
             result = subprocess.run([binary], check=True, capture_output=True, text=True)
             self.assertIn('vblank n=3', result.stderr)
+            import json
+            payload = json.loads(next(line.split('[pacing-json] ')[1] for line in result.stderr.splitlines() if '[pacing-json]' in line))
+            self.assertEqual(payload['metrics']['vblank-late']['n'], 3)
+            self.assertEqual(sum(payload['metrics']['vblank']['bins_100us']), 3)
+            self.assertEqual(payload['metrics']['vblank']['max'], 6000)
+            self.assertIsNone(payload['swap_request_ms'])
             self.assertIn('6000.00/6000.00/6000.00', result.stderr)

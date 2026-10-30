@@ -15,26 +15,18 @@ sys.path.insert(0, str(ROOT / 'backend'))
 from display_probe import FB  # noqa: E402
 import live_run  # noqa: E402
 
-LOCK_DIR = Path('/tmp/vphone-perf-live.lock')
+from perf_common import LiveLock, prepare, environment, stop
+
+_measure_lock = None
 
 def acquire_lock(out_dir):
-    while True:
-        try:
-            LOCK_DIR.mkdir()
-            (LOCK_DIR / 'owner').write_text(str(out_dir))
-            print(f"[lock] Acquired {LOCK_DIR}")
-            return
-        except FileExistsError:
-            owner = (LOCK_DIR / 'owner').read_text() if (LOCK_DIR / 'owner').exists() else 'unknown'
-            print(f"[lock] Waiting for lock held by {owner}...")
-            time.sleep(10)
+    global _measure_lock
+    _measure_lock = LiveLock(out_dir).acquire()
+    print(f'[lock] Acquired {_measure_lock.path}')
 
 def release_lock():
-    try:
-        shutil.rmtree(LOCK_DIR, ignore_errors=True)
-        print(f"[lock] Released {LOCK_DIR}")
-    except Exception as e:
-        print(f"[lock] Error releasing lock: {e}")
+    _measure_lock.release()
+    print(f'[lock] Released {_measure_lock.path}')
 
 def main():
     out_dir = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / 'build/perf/perf-gpu-present/baseline-player'
@@ -47,45 +39,13 @@ def main():
         release_lock()
 
 def run_measurement(out_dir):
-    plan_path = ROOT / 'build/virtual-activated-profile-v5/boot/boot_plan.json'
-    import json
-    plan = json.loads(plan_path.read_text())
-    storage = ROOT / 'build/ios712-validated'
-    if not storage.exists():
-        storage = ROOT / 'build/virtual-activated-profile-v5/storage-before'
-    binary = ROOT / 'backend/bin/qemu-system-aarch64'
-
     player = live_run.build_player()
-
     work = Path(tempfile.mkdtemp(prefix='vphone-live-measure-', dir='/tmp'))
-    images = work / 'images'
-    images.mkdir()
-    print(f"[measure] Work dir: {work}")
-
-    for kind, src in (('system', ROOT / 'build/virtual-activated-profile-v5/system.raw'),
-                      ('data', ROOT / 'build/virtual-activated-profile-v5/data.raw'),
-                      ('utility', storage / 'utility.raw')):
-        live_run.clone_or_copy(src.resolve(), images / f'{kind}.raw')
-
-    machine = (f"s5l8960x,boot-el=3,boot-entry={plan['initial_entry_pa']:#x},"
-               f"boot-args={plan['initial_boot_args_pa']:#x},framebuffer={FB:#x},"
-               f"system-image={images}/system.raw,data-image={images}/data.raw,"
-               f"utility-image={images}/utility.raw,system-writable=1")
-
-    cmd = [str(binary), '-L', str(ROOT / 'backend/upstream/pc-bios'), '-machine', machine,
-           '-accel', 'tcg,thread=' + os.environ.get('VPHONE_TCG_THREAD', 'multi'),
-           '-smp', str(plan.get('cpu_count', 1)), '-m', '1024M',
-           '-kernel', plan['image'], '-display', 'none',
-           '-vnc', f'unix:{work}/vnc',
-           '-serial', f'file:{work}/serial.log',
-           '-qmp', f'unix:{work}/qmp,server=on,wait=off']
-    for image in plan.get('auxiliary_images', []):
-        cmd += ['-device', f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
-
+    storage = ROOT / 'build/ios712-validated'
+    cmd = prepare(work, storage=storage if storage.exists() else None)
+    print(f'[measure] Work dir: {work}')
     touch_script_path = ROOT / 'research/evidence/H-home-live/awake-touch-script.txt'
-    env = dict(os.environ)
-    env['VPHONE_TOUCH_SCRIPT'] = touch_script_path.read_text()
-    env['VPHONE_PLAYER_STATS'] = '1'
+    env = environment(touch_script_path.read_text())
 
     qemu_log = (work / 'qemu.log').open('wb')
     player_stderr = (out_dir / 'player-stderr.log').open('wb')
@@ -153,18 +113,8 @@ def run_measurement(out_dir):
         time.sleep(5)
 
     finally:
-        if viewer is not None and viewer.poll() is None:
-            viewer.terminate()
-            try:
-                viewer.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                viewer.kill()
-        if qemu.poll() is None:
-            qemu.terminate()
-            try:
-                qemu.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                qemu.kill()
+        stop(viewer)
+        stop(qemu)
         qemu_log.close()
         player_stderr.close()
 

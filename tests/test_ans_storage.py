@@ -3,6 +3,7 @@
 No VM is booted. QEMU RAM, clocks and notifiers are bounded host stubs.
 """
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ class ANSStorageTests(unittest.TestCase):
         harness = r'''
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -35,6 +37,21 @@ class ANSStorageTests(unittest.TestCase):
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+typedef pthread_mutex_t QemuMutex;
+typedef pthread_cond_t QemuCond;
+typedef pthread_t QemuThread;
+#define QEMU_THREAD_JOINABLE 0
+#define qemu_mutex_init(m) pthread_mutex_init(m,NULL)
+#define qemu_mutex_lock pthread_mutex_lock
+#define qemu_mutex_unlock pthread_mutex_unlock
+#define qemu_mutex_destroy pthread_mutex_destroy
+#define qemu_cond_init(c) pthread_cond_init(c,NULL)
+#define qemu_cond_wait pthread_cond_wait
+#define qemu_cond_signal pthread_cond_signal
+#define qemu_cond_broadcast pthread_cond_broadcast
+#define qemu_cond_destroy pthread_cond_destroy
+#define qemu_thread_create(t,n,f,o,j) pthread_create(t,NULL,f,o)
+#define qemu_thread_join(t) pthread_join(*(t),NULL)
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define RAM_BASE UINT64_C(0x800000000)
@@ -100,7 +117,14 @@ static ssize_t test_pwrite(int fd,const void *b,size_t n,off_t off) {
     if(short_io && n>short_io)n=short_io;
     return pwrite(fd,b,n,off);
 }
+static pthread_mutex_t gate_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gate_cond=PTHREAD_COND_INITIALIZER;
+static bool gate_block,gate_entered;
 static int test_fsync(int fd) {
+    pthread_mutex_lock(&gate_mutex);
+    gate_entered=true;pthread_cond_broadcast(&gate_cond);
+    while(gate_block)pthread_cond_wait(&gate_cond,&gate_mutex);
+    pthread_mutex_unlock(&gate_mutex);
     syncs++;
     if(interrupt_sync) {interrupt_sync=false;errno=EINTR;return -1;}
     if(fd==fail_sync) {errno=EIO;return -1;}
@@ -136,6 +160,15 @@ static uint32_t request(A7State *s,unsigned op,unsigned lba,unsigned n) {
 }
 static void pattern(unsigned n) {
     for(unsigned i=0;i<n;i++)memset(ram+0x100000+(i^1)*4096,(i%251)+1,4096);
+}
+static bool barrier_started,barrier_done,barrier_ok;
+static void *barrier_thread(void *opaque) {
+    pthread_mutex_lock(&gate_mutex);barrier_started=true;
+    pthread_cond_broadcast(&gate_cond);pthread_mutex_unlock(&gate_mutex);
+    bool ok=ans_flush(opaque);
+    pthread_mutex_lock(&gate_mutex);barrier_ok=ok;barrier_done=true;
+    pthread_cond_broadcast(&gate_cond);pthread_mutex_unlock(&gate_mutex);
+    return NULL;
 }
 int main(void) {
     QEMUTimer timer={0};
@@ -176,8 +209,14 @@ int main(void) {
     fail_io=true;
     assert(request(&s,0x11,24,2)==5 && s.ans_dirty==1);
     fail_io=false;fail_sync=s.data_fd;
-    ans_flush_timer_cb(&s);assert(errors==1 && s.ans_dirty==1 && timer.pending);
-    fail_sync=-1;ans_flush_timer_cb(&s);assert(!s.ans_dirty && !timer.pending);
+    ans_flush_timer_cb(&s);
+    qemu_mutex_lock(&s.ans_mutex);
+    while(s.ans_worker_busy || s.ans_worker_pending)
+        qemu_cond_wait(&s.ans_cond,&s.ans_mutex);
+    qemu_mutex_unlock(&s.ans_mutex);
+    assert(s.ans_dirty==1 && timer.pending);
+    fail_sync=-1;assert(!ans_flush(&s)); /* sticky background failure */
+    assert(ans_flush(&s) && !s.ans_dirty && !timer.pending);
     /* A failed batched write may have written a prefix: it must stay dirty. */
     pattern(2);short_io=4096;write_budget=1;before=writes;
     assert(request(&s,0x11,24,2)==5 && writes==before+2 && s.ans_dirty==1);
@@ -218,6 +257,42 @@ int main(void) {
     pattern(2048);before=writes;
     assert(request(&s,0x11,24,2048)==0 && writes==before+1);
     ans_drain(&s);
+    /* Freeze fsync and complete a new write/read while the worker is inside it. */
+    ans_mark_dirty(&s,s.data_fd);
+    pthread_mutex_lock(&gate_mutex);gate_block=true;gate_entered=false;
+    pthread_mutex_unlock(&gate_mutex);
+    ans_flush_timer_cb(&s);
+    pthread_mutex_lock(&gate_mutex);
+    while(!gate_entered)pthread_cond_wait(&gate_cond,&gate_mutex);
+    pthread_mutex_unlock(&gate_mutex);
+    pattern(2);assert(request(&s,0x11,24,2)==0);
+    assert(request(&s,0x10,24,2)==0 && ram[0x101000]==1);
+    pthread_mutex_lock(&gate_mutex);gate_block=false;
+    pthread_cond_broadcast(&gate_cond);pthread_mutex_unlock(&gate_mutex);
+    qemu_mutex_lock(&s.ans_mutex);
+    while(s.ans_worker_busy || s.ans_worker_pending)
+        qemu_cond_wait(&s.ans_cond,&s.ans_mutex);
+    assert(s.ans_dirty==1); /* old fsync cannot clear the new generation */
+    qemu_mutex_unlock(&s.ans_mutex);
+    before=syncs;assert(ans_flush(&s) && syncs==before+1);
+    /* Barrier cannot finish until a blocked worker has completed fsync. */
+    ans_mark_dirty(&s,s.data_fd);
+    pthread_mutex_lock(&gate_mutex);gate_block=true;gate_entered=false;
+    pthread_mutex_unlock(&gate_mutex);
+    ans_flush_timer_cb(&s);
+    pthread_mutex_lock(&gate_mutex);
+    while(!gate_entered)pthread_cond_wait(&gate_cond,&gate_mutex);
+    pthread_mutex_unlock(&gate_mutex);
+    pthread_t barrier;assert(!pthread_create(&barrier,NULL,barrier_thread,&s));
+    pthread_mutex_lock(&gate_mutex);
+    while(!barrier_started)pthread_cond_wait(&gate_cond,&gate_mutex);
+    assert(!barrier_done);gate_block=false;
+    pthread_cond_broadcast(&gate_cond);pthread_mutex_unlock(&gate_mutex);
+    assert(!pthread_join(barrier,NULL));assert(barrier_done && barrier_ok);
+    uint64_t hist[64]={0};hist[1]=1;hist[4]=19;
+    assert(ans_percentile(hist,0,50)==0);
+    assert(ans_percentile(hist,20,5)==1 && ans_percentile(hist,20,95)==15);
+    ans_worker_stop(&s);
     close(s.sys_fd);close(s.data_fd);close(s.utility_fd);
     return 0;
 }
@@ -226,8 +301,8 @@ int main(void) {
             root = Path(directory)
             (root / 'test.c').write_text(harness)
             build = subprocess.run([cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
-                                    '-fsanitize=address,undefined', str(root / 'test.c'),
+                                    '-pthread', '-fsanitize=' + os.environ.get('ANS_SANITIZER', 'address,undefined'), str(root / 'test.c'),
                                     '-o', str(root / 'test')], capture_output=True, text=True)
             self.assertEqual(build.returncode, 0, build.stderr)
-            run = subprocess.run([str(root / 'test')], capture_output=True, text=True)
+            run = subprocess.run([str(root / 'test')], capture_output=True, text=True, timeout=30)
             self.assertEqual(run.returncode, 0, run.stderr)

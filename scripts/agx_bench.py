@@ -88,11 +88,16 @@ def main():
     parser.add_argument('--base', default='main', help='git revision of the base core')
     parser.add_argument('--corpus', type=Path, default=agx_corpus.CORPUS)
     parser.add_argument('--scene', action='append')
-    parser.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    parser.add_argument('--jobs', type=int, default=1)
     parser.add_argument('--repeat', type=int, default=1, help='keep the fastest of N runs')
     parser.add_argument('--json', type=Path, help='write per-frame rows here')
     parser.add_argument('--allow-diff', action='store_true')
+    parser.add_argument('--max-slowdown', type=float, help='maximum total candidate/base timing ratio')
     args = parser.parse_args()
+    if args.repeat < 1 or args.jobs < 1:
+        parser.error('--repeat and --jobs must be positive')
+    if args.max_slowdown is not None and (not __import__('math').isfinite(args.max_slowdown) or args.max_slowdown <= 0):
+        parser.error('--max-slowdown must be finite and positive')
 
     with tempfile.TemporaryDirectory(prefix='agx-bench-') as tmp:
         work = Path(tmp)
@@ -126,7 +131,11 @@ def main():
         print(f'  DIFF {r["scene"]}/{r["frame"]}: {r["differing_px"]} px, max delta {r["max_delta"]}')
     if args.json:
         args.json.write_text(json.dumps(rows, indent=1) + '\n')
-    return 1 if diff and not args.allow_diff else 0
+    slowdown = total_c / total_b if total_b > 0 else float('inf')
+    timing_failed = args.max_slowdown is not None and (not rows or slowdown > args.max_slowdown)
+    if args.max_slowdown is not None:
+        print(f'total candidate/base: {slowdown:.3f}; limit: {args.max_slowdown:.3f}')
+    return int(bool(diff and not args.allow_diff) or timing_failed)
 
 
 if __name__ == '__main__':

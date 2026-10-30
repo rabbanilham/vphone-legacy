@@ -704,9 +704,10 @@ struct A7State {
     int64_t vblank_deadline_ns;
     /* Wall-clock interval histograms: 100 us bins, final bin overflows. */
     struct {
-        int64_t last_ns;
+        int64_t last_ns, first_start_host_ns;
         uint64_t bins[1024], count, max_ns;
-    } pacing[2]; /* vblank, completed swap */
+    } pacing[4]; /* vblank, completed swap, lateness, request-to-complete */
+    int64_t disp_request_host_ns;
     int64_t pacing_report_ns;
     QEMUTimer *agx_meta_timer;
     QEMUTimer *agx_kick_timer;
@@ -791,8 +792,17 @@ struct A7State {
     int sys_fd;
     int data_fd;
     int utility_fd;
-    /* ANS host write-back state; accessed only under the BQL. */
+    /* ANS worker state is protected by ans_mutex; timers/DMA require BQL. */
     unsigned ans_dirty;
+    QemuMutex ans_mutex;
+    QemuCond ans_cond;
+    QemuThread ans_thread;
+    bool ans_worker_started, ans_worker_stop, ans_worker_pending, ans_worker_busy;
+    unsigned ans_worker_errors;
+    uint64_t ans_generation[3];
+    uint64_t ans_hist[64], ans_handler_max_ns;
+    uint64_t ans_window_hist[64], ans_window_max_ns;
+    uint64_t ans_report_requests, ans_report_fsyncs;
     QEMUTimer *ans_flush_timer;
     Notifier ans_exit_notifier, ans_shutdown_notifier;
     bool ans_notifiers_registered, ans_perf_enabled;
@@ -3158,28 +3168,101 @@ static const AnsUtilityRegion *ans_utility_region(uint8_t opcode)
 
 #define ANS_WRITEBACK_MS 300
 
+/* Worker never touches guest memory, timers, BQL, or error_report. */
+static void *ans_worker(void *opaque)
+{
+    A7State *s = opaque;
+    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
+    qemu_mutex_lock(&s->ans_mutex);
+    for (;;) {
+        while (!s->ans_worker_pending && !s->ans_worker_stop) {
+            qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
+        }
+        if (s->ans_worker_stop) { break; }
+        s->ans_worker_pending = false;
+        s->ans_worker_busy = true;
+        for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
+            if (!(s->ans_dirty & (1U << i))) { continue; }
+            uint64_t generation = s->ans_generation[i];
+            int ret;
+            do {
+                s->ans_fsyncs++;
+                qemu_mutex_unlock(&s->ans_mutex);
+                ret = fsync(fds[i]);
+                int saved_errno = errno;
+                qemu_mutex_lock(&s->ans_mutex);
+                if (ret >= 0 || saved_errno != EINTR) { break; }
+            } while (true);
+            if (ret < 0) { s->ans_worker_errors |= 1U << i; }
+            else if (generation == s->ans_generation[i]) {
+                s->ans_dirty &= ~(1U << i);
+            }
+        }
+        s->ans_worker_busy = false;
+        qemu_cond_broadcast(&s->ans_cond);
+    }
+    qemu_mutex_unlock(&s->ans_mutex);
+    return NULL;
+}
+
+static void ans_worker_start(A7State *s)
+{
+    if (s->ans_worker_started) { return; }
+    qemu_mutex_init(&s->ans_mutex);
+    qemu_cond_init(&s->ans_cond);
+    s->ans_worker_started = true;
+    qemu_thread_create(&s->ans_thread, "ans-writeback", ans_worker, s,
+                       QEMU_THREAD_JOINABLE);
+}
+
 static bool ans_flush(A7State *s)
 {
-    int fds[] = { s->data_fd, s->utility_fd, s->sys_fd };
-    bool ok = true;
-    for (unsigned i = 0; i < ARRAY_SIZE(fds); i++) {
-        if (!(s->ans_dirty & (1U << i))) { continue; }
-        int ret;
-        do {
-            if (s->ans_perf_enabled) { s->ans_fsyncs++; }
-            ret = fsync(fds[i]);
-        } while (ret < 0 && errno == EINTR);
-        if (ret < 0) { ok = false; }
-        else { s->ans_dirty &= ~(1U << i); }
+    if (!s->ans_worker_started) { return true; }
+    qemu_mutex_lock(&s->ans_mutex);
+    while (s->ans_worker_busy || s->ans_worker_pending) {
+        qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
     }
-    if (!s->ans_dirty && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
-    return ok;
+    unsigned errors = s->ans_worker_errors;
+    s->ans_worker_errors = 0;
+    if (s->ans_dirty) {
+        s->ans_worker_pending = true;
+        qemu_cond_signal(&s->ans_cond);
+        while (s->ans_worker_pending || s->ans_worker_busy) {
+            qemu_cond_wait(&s->ans_cond, &s->ans_mutex);
+        }
+    }
+    errors |= s->ans_worker_errors;
+    s->ans_worker_errors = 0;
+    bool clean = !s->ans_dirty;
+    qemu_mutex_unlock(&s->ans_mutex);
+    if (errors) { error_report("ANS fsync failed; barrier reports storage error"); }
+    if (clean && s->ans_flush_timer) { timer_del(s->ans_flush_timer); }
+    return clean && !errors;
+}
+
+static void ans_worker_stop(A7State *s)
+{
+    if (!s->ans_worker_started) { return; }
+    ans_flush(s);
+    qemu_mutex_lock(&s->ans_mutex);
+    s->ans_worker_stop = true;
+    qemu_cond_signal(&s->ans_cond);
+    qemu_mutex_unlock(&s->ans_mutex);
+    qemu_thread_join(&s->ans_thread);
+    qemu_mutex_destroy(&s->ans_mutex);
+    qemu_cond_destroy(&s->ans_cond);
+    s->ans_worker_started = false;
 }
 
 static void ans_mark_dirty(A7State *s, int fd)
 {
+    ans_worker_start(s);
+    unsigned i = fd == s->data_fd ? 0 : fd == s->utility_fd ? 1 : 2;
+    qemu_mutex_lock(&s->ans_mutex);
     bool first = !s->ans_dirty;
-    s->ans_dirty |= fd == s->data_fd ? 1U : fd == s->utility_fd ? 2U : 4U;
+    s->ans_generation[i]++;
+    s->ans_dirty |= 1U << i;
+    qemu_mutex_unlock(&s->ans_mutex);
     if (first && s->ans_flush_timer) {
         timer_mod(s->ans_flush_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
@@ -3189,11 +3272,34 @@ static void ans_mark_dirty(A7State *s, int fd)
 static void ans_flush_timer_cb(void *opaque)
 {
     A7State *s = opaque;
-    if (!ans_flush(s)) {
-        error_report("ANS deferred fsync failed; dirty backings retained for retry");
+    if (!s->ans_worker_started) { return; }
+    qemu_mutex_lock(&s->ans_mutex);
+    if (s->ans_worker_errors) {
+        error_report("ANS deferred fsync failed; error retained for barrier");
+    }
+    if (s->ans_dirty) {
+        s->ans_worker_pending = true;
+        qemu_cond_signal(&s->ans_cond);
+    }
+    bool active = s->ans_dirty || s->ans_worker_busy;
+    qemu_mutex_unlock(&s->ans_mutex);
+    if (active) {
         timer_mod(s->ans_flush_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ANS_WRITEBACK_MS);
     }
+}
+
+/* Log2 buckets: percentile values are inclusive upper bounds in ns. */
+static uint64_t ans_percentile(const uint64_t *hist, uint64_t count, unsigned pct)
+{
+    if (!count) { return 0; }
+    uint64_t target = count / 100 * pct + (count % 100 * pct + 99) / 100;
+    uint64_t seen = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        seen += hist[i];
+        if (seen >= target) { return i == 63 ? UINT64_MAX : (UINT64_C(1) << i) - 1; }
+    }
+    return UINT64_MAX;
 }
 
 /* Reset/close cannot return an ASP status: report failures, retain dirty bits. */
@@ -3202,8 +3308,13 @@ static void ans_drain(A7State *s)
     if (!ans_flush(s)) { error_report("ANS lifecycle fsync failed"); }
     if (s->ans_perf_enabled) {
         fprintf(stderr, "ANS perf: requests=%" PRIu64 " bytes=%" PRIu64
-                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64 "\n",
-                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns);
+                " fsyncs=%" PRIu64 " handler_ns=%" PRIu64
+                " handler_p50_ns_le=%" PRIu64 " handler_p95_ns_le=%" PRIu64
+                " handler_max_ns=%" PRIu64 " background_fsync_bql_ns=0\n",
+                s->ans_requests, s->ans_bytes, s->ans_fsyncs, s->ans_handler_ns,
+                ans_percentile(s->ans_hist, s->ans_requests, 50),
+                ans_percentile(s->ans_hist, s->ans_requests, 95),
+                s->ans_handler_max_ns);
     }
 }
 
@@ -3362,10 +3473,10 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
     }
     hwaddr pages[2048];
     /* Validate the entire request before any disk/DMA side effects. Never DMA MMIO. */
+    uint8_t ppns[2048 * 4];
+    if (!ans_read_ram(cmd_addr + 0x30, ppns, count * 4)) { return 1; }
     for (uint32_t i = 0; i < count; i++) {
-        uint8_t ppn[4];
-        if (!ans_read_ram(cmd_addr + 0x30 + i * 4, ppn, 4)) { return 1; }
-        pages[i] = (hwaddr)ldl_le_p(ppn) << 12;
+        pages[i] = (hwaddr)ldl_le_p(ppns + i * 4) << 12;
         if (!ans_ram_range(pages[i], ANS_SECTOR_SIZE)) { return 1; }
         uint64_t current = (uint64_t)lba + i;
         if (write && !region && !((current >= ANS_SYS_START && current < s->data_start && s->system_writable) ||
@@ -3384,14 +3495,19 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
         int fd = ans_map(s, region, current, &offset, &run);
         size_t length = (size_t)run * ANS_SECTOR_SIZE;
         if (write) {
-            for (uint32_t j = 0; j < run; j++) {
+            for (uint32_t j = 0; j < run;) {
+                uint32_t n = 1;
+                while (j + n < run &&
+                       pages[i + j + n] == pages[i + j] + n * ANS_SECTOR_SIZE) { n++; }
                 if (!ans_read_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
-                                  ANS_SECTOR_SIZE)) { status = 5; break; }
+                                   n * ANS_SECTOR_SIZE)) { status = 5; break; }
+                j += n;
             }
             if (status) { break; }
-            /* Mark before I/O: a failing pwrite may have modified a prefix. */
-            ans_mark_dirty(s, fd);
             size_t done = ans_file_transfer(fd, batch, offset, length, true);
+            /* Publish after I/O, including failures that modified a prefix:
+             * an overlapping worker fsync must not clear this generation. */
+            ans_mark_dirty(s, fd);
             if (s->ans_perf_enabled) { s->ans_bytes += done; }
             if (done != length) { status = 5; break; }
         } else {
@@ -3407,9 +3523,13 @@ static uint32_t ans_execute_request(A7State *s, uint8_t tag)
                 else { memset(buf, 0, sizeof(buf)); }
                 memcpy(batch, buf, sizeof(buf));
             }
-            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE; j++) {
+            for (uint32_t j = 0; j < done / ANS_SECTOR_SIZE;) {
+                uint32_t n = 1;
+                while (j + n < done / ANS_SECTOR_SIZE &&
+                       pages[i + j + n] == pages[i + j] + n * ANS_SECTOR_SIZE) { n++; }
                 if (!ans_write_ram(pages[i + j], batch + j * ANS_SECTOR_SIZE,
-                                   ANS_SECTOR_SIZE)) { status = 5; break; }
+                                   n * ANS_SECTOR_SIZE)) { status = 5; break; }
+                j += n;
             }
             if (done != length) { status = 5; }
             if (status) { break; }
@@ -3428,7 +3548,14 @@ static uint32_t ans_execute(A7State *s, uint8_t tag)
     uint32_t status = ans_execute_request(s, tag);
     if (s->ans_perf_enabled) {
         s->ans_requests++;
-        s->ans_handler_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+        uint64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+        s->ans_handler_ns += elapsed;
+        if (elapsed > s->ans_handler_max_ns) { s->ans_handler_max_ns = elapsed; }
+        unsigned bucket = 0;
+        for (uint64_t n = elapsed; n && bucket < 63; n >>= 1) { bucket++; }
+        s->ans_hist[bucket]++;
+        s->ans_window_hist[bucket]++;
+        if (elapsed > s->ans_window_max_ns) { s->ans_window_max_ns = elapsed; }
     }
     return status;
 }
@@ -4957,6 +5084,9 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                         }
                         s->disp_pending_token = s->disp_fifo_token;
                         s->disp_token = s->disp_fifo_token;
+                        if (s->agx_perf_enabled && !s->disp_swap_pending) {
+                            s->disp_request_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                        }
                         s->disp_swap_pending = true;
                         qemu_log_mask(LOG_UNIMP, "DPFIFO applied words=%u token=%u\n", count, s->disp_fifo_token);
                     }
@@ -4967,6 +5097,9 @@ static void peripheral_write_impl(void *opaque, hwaddr off, uint64_t val, unsign
                 qemu_log_mask(LOG_UNIMP, "[DISP0] swap commit off=0x1050 val=0x%" PRIx64 ", pending_token=%u\n",
                         val, p->owner->disp_pending_token);
                 *(uint32_t *)(p->regs + 0x1044) = 0;
+                if (p->owner->agx_perf_enabled && !p->owner->disp_swap_pending) {
+                    p->owner->disp_request_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                }
                 p->owner->disp_swap_pending = true;
                 p->owner->disp_mapping_valid = false;
                 if (p->owner->disp_pending_token != 0) {
@@ -6507,7 +6640,7 @@ static bool agx_target_row(A7State *s, uint64_t cat, const AGXSurface *sf,
             cached = base;
         }
         if (write) { memcpy(page + (gva & 0xfff), pixels + i, 4); }
-        else { memcpy(pixels + i, page + (gva & 0xfff), 4); }
+        else { pixels[i] = ldl_le_p(page + (gva & 0xfff)); }
     }
     if (write && cached != UINT64_MAX) {
         ok &= agx_ctx_write(s, cat, cached, page, sizeof(page));
@@ -6532,6 +6665,11 @@ static inline __attribute__((always_inline)) bool agx_target_write(A7State *s, u
 }
 
 
+static inline __attribute__((always_inline)) uint32_t agx_div255(uint32_t v)
+{
+    return ((v + 1) * 257) >> 16;
+}
+
 /* darkenSourceOver / lightenSourceOver: scale the (premultiplied) source by
  * Y^4 of the destination luminance (dark shadows) or (1-Y)^4 (light halos),
  * then src-over. Light sources are recognised by their colour. */
@@ -6541,13 +6679,13 @@ static uint32_t agx_blend_vibrancy(uint32_t dst, uint32_t src)
     uint32_t sb = src & 0xff, sg = (src >> 8) & 0xff, sr = (src >> 16) & 0xff, sa = src >> 24;
     uint32_t y = (54 * dr + 183 * dg + 19 * db) >> 8;
     uint32_t y1 = sr + sg + sb > 384 ? 255 - y : y;
-    uint32_t y2 = y1 * y1 / 255, f = y2 * y2 / 255;
+    uint32_t y2 = agx_div255(y1 * y1), f = agx_div255(y2 * y2);
     uint32_t out = 0;
 
-    sb = sb * f / 255; sg = sg * f / 255; sr = sr * f / 255; sa = sa * f / 255;
+    sb = agx_div255(sb * f); sg = agx_div255(sg * f); sr = agx_div255(sr * f); sa = agx_div255(sa * f);
     const uint32_t s4[4] = { sb, sg, sr, sa }, d4[4] = { db, dg, dr, dst >> 24 };
     for (unsigned c = 0; c < 4; c++) {
-        out |= MIN(s4[c] + d4[c] * (255 - sa) / 255, 255u) << (c * 8);
+        out |= MIN(s4[c] + agx_div255(d4[c] * (255 - sa)), 255u) << (c * 8);
     }
     return out;
 }
@@ -6563,10 +6701,10 @@ static inline __attribute__((always_inline)) uint32_t agx_blend_over(uint32_t ds
         return dst;
     }
     uint32_t inv_a = 255 - a;
-    uint32_t b = (src & 0xff) + ((dst & 0xff) * inv_a) / 255;
-    uint32_t g = ((src >> 8) & 0xff) + (((dst >> 8) & 0xff) * inv_a) / 255;
-    uint32_t r = ((src >> 16) & 0xff) + (((dst >> 16) & 0xff) * inv_a) / 255;
-    uint32_t oa = a + ((dst >> 24) * inv_a) / 255;
+    uint32_t b = (src & 0xff) + agx_div255((dst & 0xff) * inv_a);
+    uint32_t g = ((src >> 8) & 0xff) + agx_div255(((dst >> 8) & 0xff) * inv_a);
+    uint32_t r = ((src >> 16) & 0xff) + agx_div255(((dst >> 16) & 0xff) * inv_a);
+    uint32_t oa = a + agx_div255((dst >> 24) * inv_a);
     return (MIN(b, 255u)) |
            (MIN(g, 255u) << 8) |
            (MIN(r, 255u) << 16) |
@@ -6700,8 +6838,9 @@ static inline __attribute__((always_inline)) uint32_t agx_bilinear_interpolate_w
         uint32_t a = ((c00 >> 24) * w0 + (c10 >> 24) * w1 + 128) >> 8;
         return b | (g << 8) | (r << 16) | (a << 24);
     }
-    int w00 = (256 - wx) * (256 - wy);
-    int w10 = wx * (256 - wy);
+    int wy0 = 256 - wy;
+    int w00 = (256 - wx) * wy0;
+    int w10 = wx * wy0;
     int w01 = (256 - wx) * wy;
     int w11 = wx * wy;
 
@@ -7660,11 +7799,13 @@ static unsigned agx_radial_coverage(float u, float v, const float map[6])
     }
     return (inside*255+8)/16;
 }
-static uint32_t agx_scale_premul(uint32_t colour, unsigned alpha)
+static inline uint32_t agx_scale_premul(uint32_t colour, unsigned alpha)
 {
-    uint32_t out=0;
-    for (unsigned c=0; c<4; c++) out |= (((colour>>(8*c))&255)*alpha/255)<<(8*c);
-    return out;
+    uint32_t b = agx_div255((colour & 0xff) * alpha);
+    uint32_t g = agx_div255(((colour >> 8) & 0xff) * alpha);
+    uint32_t r = agx_div255(((colour >> 16) & 0xff) * alpha);
+    uint32_t a = agx_div255((colour >> 24) * alpha);
+    return b | (g << 8) | (r << 16) | (a << 24);
 }
 
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
@@ -8777,6 +8918,24 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 bool rounded_caps = (prog == AGX_USC_ROUNDED_CAPS && (tex.addr == UINT64_C(0x10524000) || (tex.w == 114 && tex.h == 87)));
                 bool simple_blend = !dest_in && !vibrancy && (prog != AGX_USC_PLUS_L) && (prog != AGX_USC_PLUS_L2) && (prog != AGX_USC_CORNER_RESTORE);
 
+                uint32_t a8_tint_lut[256];
+                if (tex.bpp == 1) {
+                    for (unsigned c = 0; c < 256; c++) {
+                        uint32_t a = agx_div255(c * tint_a);
+                        uint32_t r = agx_div255(tint_r * a);
+                        uint32_t g = agx_div255(tint_g * a);
+                        uint32_t b = agx_div255(tint_b * a);
+                        a8_tint_lut[c] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
+                }
+                bool fast_path = !sample_tex &&
+                                 !clip_space && !webkit_upload &&
+                                 !is_color_matrix &&
+                                 !rounded_caps &&
+                                 !(stride == 36 && prog == AGX_USC_CORNER_RESTORE && has_mask_tex) &&
+                                 !(radial_restore && affine2) &&
+                                 simple_blend;
+
                 int cached_y0 = -1, cached_y1 = -1, cached_mask_y = -1;
                 bool mask_row_ok = false;
 
@@ -8846,144 +9005,249 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     if (!agx_target_read(s, cat, &sf, x0, y, row, x1 - x0)) {
                         continue;
                     }
-                    for (int x = x0; x < x1; x++) {
-                        float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
-                                            agx_quad_coordinate(x, minx, maxx, u0, u1);
-                        float sample_v = affine ? fv + uv_map[3] * (x + 0.5f) : fv;
-                        uint32_t src;
-                        uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
-                        if (downsample && sample_tex) {
-                            src = agx_sample_downsample(sample_tex, tex.w, tex.h,
-                                                        fu * su, sample_v * sv, reduction_offsets);
-                        } else if (sample_tex) {
-                            if (is_blur || is_scaled || tex.linear_filter) {
-                                src = agx_sample_bilinear(sample_tex, tex.w, tex.h,
-                                                          fu * su, sample_v * sv);
-                            } else {
-                                unsigned stx = MIN(tex.w - 1, (unsigned)MAX(0.0f, fu * su));
-                                unsigned sty = MIN(tex.h - 1, (unsigned)MAX(0.0f, sample_v * sv));
-                                src = sample_tex[(size_t)sty * tex.w + stx];
-                            }
-                        } else if (is_scaled || tex.linear_filter) {
-                            float u_sample = fu * su - 0.5f;
-                            if (u_sample < 0.0f) u_sample = 0.0f;
-                            if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
-                            uint32_t tx0 = (uint32_t)u_sample;
-                            uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
-                            float fx = u_sample - (float)tx0;
-                            uint32_t c00 = texrow[tx0];
-                            uint32_t c10 = texrow[tx1];
-                            uint32_t c01 = (ty1 == ty0) ? c00 : texrow1[tx0];
-                            uint32_t c11 = (ty1 == ty0) ? c10 : texrow1[tx1];
-                            src = agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, wy);
-                        } else {
-                            src = texrow[tx];
-                        }
-                        if (clip_space || webkit_upload) {
-                            /* CoreImage's wallpaper source is RGBA (stock
-                             * 101@2x matches only with R/B exchanged). */
-                            src = (src & 0xff00ff00u) | ((src >> 16) & 0xff) | ((src & 0xff) << 16);
-                        }
-                        if (is_color_matrix) {
-                            float rin = (float)((src >> 16) & 0xff) / 255.0f;
-                            float gin = (float)((src >> 8) & 0xff) / 255.0f;
-                            float bin = (float)(src & 0xff) / 255.0f;
-                            float rout = col_mat[0] * rin + col_mat[3] * gin + col_mat[6] * bin + col_bias[0];
-                            float gout = col_mat[1] * rin + col_mat[4] * gin + col_mat[7] * bin + col_bias[1];
-                            float bout = col_mat[2] * rin + col_mat[5] * gin + col_mat[8] * bin + col_bias[2];
-                            int r = (int)lroundf(rout * 255.0f);
-                            int g = (int)lroundf(gout * 255.0f);
-                            int b = (int)lroundf(bout * 255.0f);
-                            r = MAX(0, MIN(255, r));
-                            g = MAX(0, MIN(255, g));
-                            b = MAX(0, MIN(255, b));
-                            src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-                        }
-                        uint32_t dst = row[x - x0];
-                        if (rounded_caps) {
-                            uint32_t cov = (((src >> 16) & 0xff) * (src >> 24)) / 255;
-                            uint32_t a = (tint_a * cov) / 255;
-                            uint32_t r = (tint_r * a) / 255;
-                            uint32_t g = (tint_g * a) / 255;
-                            uint32_t b = (tint_b * a) / 255;
-                            src = (a << 24) | (r << 16) | (g << 8) | b;
-                        } else if (tint != 0xffffffff || tex.bpp == 1) {
-                            if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
-                                uint32_t a = ((src >> 24) * tint_a) / 255;
-                                uint32_t r = (tint_r * a) / 255;
-                                uint32_t g = (tint_g * a) / 255;
-                                uint32_t b = (tint_b * a) / 255;
-                                src = (a << 24) | (r << 16) | (g << 8) | b;
-                            } else {
-                                uint32_t b = ((src & 0xff) * tint_b) / 255;
-                                uint32_t g = (((src >> 8) & 0xff) * tint_g) / 255;
-                                uint32_t r = (((src >> 16) & 0xff) * tint_r) / 255;
-                                uint32_t a = ((src >> 24) * tint_a) / 255;
-                                src = b | (g << 8) | (r << 16) | (a << 24);
-                            }
-                        }
-                        if (stride == 36 && prog == AGX_USC_CORNER_RESTORE && has_mask_tex && mask_row_ok) {
-                            float fu2 = affine2 ? uv2_map[0] * (x + 0.5f) + uv2_map[1] * (y + 0.5f) + uv2_map[2] :
-                                                  agx_quad_coordinate(x, minx, maxx, u2_0, u2_1);
-                            int tx2 = (int)lroundf(fu2 * (float)mask_tex.w);
-                            tx2 = MAX(0, MIN((int)mask_tex.w - 1, tx2));
-                            uint32_t m_a = (maskrow[tx2] >> 24) & 0xff;
-                            uint32_t inv_a = 255 - m_a;
-                            uint32_t sa = ((src >> 24) * inv_a) / 255;
-                            uint32_t sr = (((src >> 16) & 0xff) * inv_a) / 255;
-                            uint32_t sg = (((src >> 8) & 0xff) * inv_a) / 255;
-                            uint32_t sb = ((src & 0xff) * inv_a) / 255;
-                            src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
-                        }
-                        if (radial_restore && affine2) {
-                            float u = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
-                            float v = uv2_map[3]*(x+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
-                            src = agx_scale_premul(src, 255-agx_radial_coverage(u, v, uv2_map));
-                            row[x-x0] = agx_blend_plus_lighter(dst, src);
-                        } else if (dest_in) {
-                            uint32_t a = src >> 24;
-                            if (a == 255) {
-                                row[x - x0] = dst;
-                            } else if (a == 0) {
-                                row[x - x0] = 0;
-                            } else {
-                                uint32_t b = ((dst & 0xff) * a) / 255;
-                                uint32_t g = (((dst >> 8) & 0xff) * a) / 255;
-                                uint32_t r = (((dst >> 16) & 0xff) * a) / 255;
-                                uint32_t oa = ((dst >> 24) * a) / 255;
-                                row[x - x0] = b | (g << 8) | (r << 16) | (oa << 24);
-                            }
-                        } else if (simple_blend) {
-                            row[x - x0] = agx_blend_over(dst, src);
-                        } else if (vibrancy) {
-                            if (stride == 36 && has_mask_tex && mask_row_ok) {
-                                float fu2 = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
-                                float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.w : 1;
-                                unsigned mx = MIN(mask_tex.w-1, (uint32_t)MAX(0.0f, fu2*scale));
-                                uint32_t m_alpha = maskrow[mx] >> 24;
-                                if (m_alpha == 0) {
-                                    row[x - x0] = dst;
-                                } else {
-                                    /* This two-sampler program has no luma constants: it
-                                     * composites the backdrop through the second alpha texture. */
-                                    uint32_t vib = agx_blend_over(dst, src);
-                                    if (m_alpha == 255) {
-                                        row[x - x0] = vib;
-                                    } else {
-                                        uint32_t inv = 255 - m_alpha;
-                                        uint32_t b = (((vib & 0xff) * m_alpha + (dst & 0xff) * inv) / 255);
-                                        uint32_t g = ((((vib >> 8) & 0xff) * m_alpha + ((dst >> 8) & 0xff) * inv) / 255);
-                                        uint32_t r = ((((vib >> 16) & 0xff) * m_alpha + ((dst >> 16) & 0xff) * inv) / 255);
-                                        row[x - x0] = 0xff000000u | (r << 16) | (g << 8) | b;
+                    if (fast_path) {
+                        if (is_scaled || tex.linear_filter) {
+                            const uint32_t *row1 = (ty1 == ty0) ? texrow : texrow1;
+                            if (tex.bpp == 1) {
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    float u_sample = fu * su - 0.5f;
+                                    if (u_sample < 0.0f) u_sample = 0.0f;
+                                    if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                                    uint32_t tx0 = (uint32_t)u_sample;
+                                    uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                                    float fx = u_sample - (float)tx0;
+                                    uint32_t src = agx_bilinear_interpolate_wy(texrow[tx0], texrow[tx1],
+                                                                               row1[tx0], row1[tx1], fx, wy);
+                                    uint8_t a = src >> 24;
+                                    if (a) {
+                                        row[x - x0] = agx_blend_over(row[x - x0], a8_tint_lut[a]);
                                     }
                                 }
+                            } else if (tint != 0xffffffff) {
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    float u_sample = fu * su - 0.5f;
+                                    if (u_sample < 0.0f) u_sample = 0.0f;
+                                    if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                                    uint32_t tx0 = (uint32_t)u_sample;
+                                    uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                                    float fx = u_sample - (float)tx0;
+                                    uint32_t src = agx_bilinear_interpolate_wy(texrow[tx0], texrow[tx1],
+                                                                               row1[tx0], row1[tx1], fx, wy);
+                                    if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
+                                        uint32_t a = agx_div255((src >> 24) * tint_a);
+                                        uint32_t r = agx_div255(tint_r * a);
+                                        uint32_t g = agx_div255(tint_g * a);
+                                        uint32_t b = agx_div255(tint_b * a);
+                                        src = (a << 24) | (r << 16) | (g << 8) | b;
+                                    } else {
+                                        uint32_t b = agx_div255((src & 0xff) * tint_b);
+                                        uint32_t g = agx_div255(((src >> 8) & 0xff) * tint_g);
+                                        uint32_t r = agx_div255(((src >> 16) & 0xff) * tint_r);
+                                        uint32_t a = agx_div255((src >> 24) * tint_a);
+                                        src = b | (g << 8) | (r << 16) | (a << 24);
+                                    }
+                                    row[x - x0] = agx_blend_over(row[x - x0], src);
+                                }
                             } else {
-                                row[x - x0] = agx_blend_vibrancy(dst, src);
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    float u_sample = fu * su - 0.5f;
+                                    if (u_sample < 0.0f) u_sample = 0.0f;
+                                    if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                                    uint32_t tx0 = (uint32_t)u_sample;
+                                    uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                                    float fx = u_sample - (float)tx0;
+                                    uint32_t src = agx_bilinear_interpolate_wy(texrow[tx0], texrow[tx1],
+                                                                               row1[tx0], row1[tx1], fx, wy);
+                                    row[x - x0] = agx_blend_over(row[x - x0], src);
+                                }
                             }
-                        } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2 || prog == AGX_USC_CORNER_RESTORE) {
-                            row[x - x0] = agx_blend_plus_lighter(dst, src);
                         } else {
-                            row[x - x0] = agx_blend_over(dst, src);
+                            if (tex.bpp == 1) {
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                                    uint8_t a = texrow[tx] >> 24;
+                                    if (a) {
+                                        row[x - x0] = agx_blend_over(row[x - x0], a8_tint_lut[a]);
+                                    }
+                                }
+                            } else if (tint != 0xffffffff) {
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                                    uint32_t src = texrow[tx];
+                                    if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
+                                        uint32_t a = agx_div255((src >> 24) * tint_a);
+                                        uint32_t r = agx_div255(tint_r * a);
+                                        uint32_t g = agx_div255(tint_g * a);
+                                        uint32_t b = agx_div255(tint_b * a);
+                                        src = (a << 24) | (r << 16) | (g << 8) | b;
+                                    } else {
+                                        uint32_t b = agx_div255((src & 0xff) * tint_b);
+                                        uint32_t g = agx_div255(((src >> 8) & 0xff) * tint_g);
+                                        uint32_t r = agx_div255(((src >> 16) & 0xff) * tint_r);
+                                        uint32_t a = agx_div255((src >> 24) * tint_a);
+                                        src = b | (g << 8) | (r << 16) | (a << 24);
+                                    }
+                                    row[x - x0] = agx_blend_over(row[x - x0], src);
+                                }
+                            } else {
+                                for (int x = x0; x < x1; x++) {
+                                    float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                        agx_quad_coordinate(x, minx, maxx, u0, u1);
+                                    uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                                    row[x - x0] = agx_blend_over(row[x - x0], texrow[tx]);
+                                }
+                            }
+                        }
+                    } else {
+                        for (int x = x0; x < x1; x++) {
+                            float fu = affine ? uv_map[0] * (x + 0.5f) + uv_map[1] * (y + 0.5f) + uv_map[2] :
+                                                agx_quad_coordinate(x, minx, maxx, u0, u1);
+                            float sample_v = affine ? fv + uv_map[3] * (x + 0.5f) : fv;
+                            uint32_t src;
+                            uint32_t tx = MIN(tex.w - 1, (uint32_t)MAX(0.0f, fu * su));
+                            if (downsample && sample_tex) {
+                                src = agx_sample_downsample(sample_tex, tex.w, tex.h,
+                                                            fu * su, sample_v * sv, reduction_offsets);
+                            } else if (sample_tex) {
+                                if (is_blur || is_scaled || tex.linear_filter) {
+                                    src = agx_sample_bilinear(sample_tex, tex.w, tex.h,
+                                                              fu * su, sample_v * sv);
+                                } else {
+                                    unsigned stx = MIN(tex.w - 1, (unsigned)MAX(0.0f, fu * su));
+                                    unsigned sty = MIN(tex.h - 1, (unsigned)MAX(0.0f, sample_v * sv));
+                                    src = sample_tex[(size_t)sty * tex.w + stx];
+                                }
+                            } else if (is_scaled || tex.linear_filter) {
+                                float u_sample = fu * su - 0.5f;
+                                if (u_sample < 0.0f) u_sample = 0.0f;
+                                if (u_sample > (float)(tex.w - 1)) u_sample = (float)(tex.w - 1);
+                                uint32_t tx0 = (uint32_t)u_sample;
+                                uint32_t tx1 = tx0 + 1 < tex.w ? tx0 + 1 : tx0;
+                                float fx = u_sample - (float)tx0;
+                                uint32_t c00 = texrow[tx0];
+                                uint32_t c10 = texrow[tx1];
+                                uint32_t c01 = (ty1 == ty0) ? c00 : texrow1[tx0];
+                                uint32_t c11 = (ty1 == ty0) ? c10 : texrow1[tx1];
+                                src = agx_bilinear_interpolate_wy(c00, c10, c01, c11, fx, wy);
+                            } else {
+                                src = texrow[tx];
+                            }
+                            if (clip_space || webkit_upload) {
+                                /* CoreImage's wallpaper source is RGBA (stock
+                                 * 101@2x matches only with R/B exchanged). */
+                                src = (src & 0xff00ff00u) | ((src >> 16) & 0xff) | ((src & 0xff) << 16);
+                            }
+                            if (is_color_matrix) {
+                                float rin = (float)((src >> 16) & 0xff) / 255.0f;
+                                float gin = (float)((src >> 8) & 0xff) / 255.0f;
+                                float bin = (float)(src & 0xff) / 255.0f;
+                                float rout = col_mat[0] * rin + col_mat[3] * gin + col_mat[6] * bin + col_bias[0];
+                                float gout = col_mat[1] * rin + col_mat[4] * gin + col_mat[7] * bin + col_bias[1];
+                                float bout = col_mat[2] * rin + col_mat[5] * gin + col_mat[8] * bin + col_bias[2];
+                                int r = (int)lroundf(rout * 255.0f);
+                                int g = (int)lroundf(gout * 255.0f);
+                                int b = (int)lroundf(bout * 255.0f);
+                                r = MAX(0, MIN(255, r));
+                                g = MAX(0, MIN(255, g));
+                                b = MAX(0, MIN(255, b));
+                                src = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                            }
+                            uint32_t dst = row[x - x0];
+                            if (rounded_caps) {
+                                uint32_t cov = agx_div255(((src >> 16) & 0xff) * (src >> 24));
+                                uint32_t a = agx_div255(tint_a * cov);
+                                uint32_t r = agx_div255(tint_r * a);
+                                uint32_t g = agx_div255(tint_g * a);
+                                uint32_t b = agx_div255(tint_b * a);
+                                src = (a << 24) | (r << 16) | (g << 8) | b;
+                            } else if (tint != 0xffffffff || tex.bpp == 1) {
+                                if ((src & 0x00ffffff) == 0 && (src >> 24) != 0) {
+                                    uint32_t a = agx_div255((src >> 24) * tint_a);
+                                    uint32_t r = agx_div255(tint_r * a);
+                                    uint32_t g = agx_div255(tint_g * a);
+                                    uint32_t b = agx_div255(tint_b * a);
+                                    src = (a << 24) | (r << 16) | (g << 8) | b;
+                                } else {
+                                    uint32_t b = agx_div255((src & 0xff) * tint_b);
+                                    uint32_t g = agx_div255(((src >> 8) & 0xff) * tint_g);
+                                    uint32_t r = agx_div255(((src >> 16) & 0xff) * tint_r);
+                                    uint32_t a = agx_div255((src >> 24) * tint_a);
+                                    src = b | (g << 8) | (r << 16) | (a << 24);
+                                }
+                            }
+                            if (stride == 36 && prog == AGX_USC_CORNER_RESTORE && has_mask_tex && mask_row_ok) {
+                                float fu2 = affine2 ? uv2_map[0] * (x + 0.5f) + uv2_map[1] * (y + 0.5f) + uv2_map[2] :
+                                                      agx_quad_coordinate(x, minx, maxx, u2_0, u2_1);
+                                int tx2 = (int)lroundf(fu2 * (float)mask_tex.w);
+                                tx2 = MAX(0, MIN((int)mask_tex.w - 1, tx2));
+                                uint32_t m_a = (maskrow[tx2] >> 24) & 0xff;
+                                uint32_t inv_a = 255 - m_a;
+                                uint32_t sa = agx_div255((src >> 24) * inv_a);
+                                uint32_t sr = agx_div255(((src >> 16) & 0xff) * inv_a);
+                                uint32_t sg = agx_div255(((src >> 8) & 0xff) * inv_a);
+                                uint32_t sb = agx_div255((src & 0xff) * inv_a);
+                                src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
+                            }
+                            if (radial_restore && affine2) {
+                                float u = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                                float v = uv2_map[3]*(x+0.5f)+uv2_map[4]*(y+0.5f)+uv2_map[5];
+                                src = agx_scale_premul(src, 255-agx_radial_coverage(u, v, uv2_map));
+                                row[x-x0] = agx_blend_plus_lighter(dst, src);
+                            } else if (dest_in) {
+                                uint32_t a = src >> 24;
+                                if (a == 255) {
+                                    row[x - x0] = dst;
+                                } else if (a == 0) {
+                                    row[x - x0] = 0;
+                                } else {
+                                    uint32_t b = agx_div255((dst & 0xff) * a);
+                                    uint32_t g = agx_div255(((dst >> 8) & 0xff) * a);
+                                    uint32_t r = agx_div255(((dst >> 16) & 0xff) * a);
+                                    uint32_t oa = agx_div255((dst >> 24) * a);
+                                    row[x - x0] = b | (g << 8) | (r << 16) | (oa << 24);
+                                }
+                            } else if (simple_blend) {
+                                row[x - x0] = agx_blend_over(dst, src);
+                            } else if (vibrancy) {
+                                if (stride == 36 && has_mask_tex && mask_row_ok) {
+                                    float fu2 = uv2_map[0]*(x+0.5f)+uv2_map[1]*(y+0.5f)+uv2_map[2];
+                                    float scale = MAX(u2_1,v2_1) <= 1.0001f ? mask_tex.w : 1;
+                                    unsigned mx = MIN(mask_tex.w-1, (uint32_t)MAX(0.0f, fu2*scale));
+                                    uint32_t m_alpha = maskrow[mx] >> 24;
+                                    if (m_alpha == 0) {
+                                        row[x - x0] = dst;
+                                    } else {
+                                        /* This two-sampler program has no luma constants: it
+                                         * composites the backdrop through the second alpha texture. */
+                                        uint32_t vib = agx_blend_over(dst, src);
+                                        if (m_alpha == 255) {
+                                            row[x - x0] = vib;
+                                        } else {
+                                            uint32_t inv = 255 - m_alpha;
+                                            uint32_t b = agx_div255((vib & 0xff) * m_alpha + (dst & 0xff) * inv);
+                                            uint32_t g = agx_div255(((vib >> 8) & 0xff) * m_alpha + ((dst >> 8) & 0xff) * inv);
+                                            uint32_t r = agx_div255(((vib >> 16) & 0xff) * m_alpha + ((dst >> 16) & 0xff) * inv);
+                                            row[x - x0] = 0xff000000u | (r << 16) | (g << 8) | b;
+                                        }
+                                    }
+                                } else {
+                                    row[x - x0] = agx_blend_vibrancy(dst, src);
+                                }
+                            } else if (prog == AGX_USC_PLUS_L || prog == AGX_USC_PLUS_L2 || prog == AGX_USC_CORNER_RESTORE) {
+                                row[x - x0] = agx_blend_plus_lighter(dst, src);
+                            } else {
+                                row[x - x0] = agx_blend_over(dst, src);
+                            }
                         }
                     }
                     agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
@@ -10238,6 +10502,9 @@ static void pacing_sample(A7State *s, unsigned kind, int64_t now)
     }
     if (s->pacing[kind].last_ns) {
         uint64_t dt = now - s->pacing[kind].last_ns;
+        if (!s->pacing[kind].count) {
+            s->pacing[kind].first_start_host_ns = s->pacing[kind].last_ns;
+        }
         s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
         s->pacing[kind].count++;
         s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
@@ -10245,33 +10512,89 @@ static void pacing_sample(A7State *s, unsigned kind, int64_t now)
     s->pacing[kind].last_ns = now;
 }
 
+static void pacing_duration(A7State *s, unsigned kind, uint64_t dt)
+{
+    if (!s->agx_perf_enabled) {
+        return;
+    }
+    if (!s->pacing[kind].count) {
+        s->pacing[kind].first_start_host_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (kind == 3) { s->pacing[kind].first_start_host_ns -= dt; }
+    }
+    s->pacing[kind].bins[MIN(dt / 100000, 1023)]++;
+    s->pacing[kind].count++;
+    s->pacing[kind].max_ns = MAX(s->pacing[kind].max_ns, dt);
+}
+
 static void pacing_report(A7State *s, int64_t now)
 {
     if (!s->agx_perf_enabled || now - s->pacing_report_ns < 5000000000LL) {
         return;
     }
+    int64_t window_start = s->pacing_report_ns;
     s->pacing_report_ns = now;
-    for (unsigned k = 0; k < 2; k++) {
+    double quantiles[4][3] = {{0}};
+    const char *names[] = {"vblank", "swap-complete", "vblank-late", "swap-request"};
+    for (unsigned k = 0; k < 4; k++) {
         uint64_t n = s->pacing[k].count, cumulative = 0;
-        double quantile[3] = { 0 };
         const unsigned percent[] = { 50, 95, 99 };
         unsigned q = 0;
         for (unsigned b = 0; b < 1024; b++) {
             cumulative += s->pacing[k].bins[b];
             while (n && q < 3 && cumulative >= (n * percent[q] + 99) / 100) {
                 /* Upper bound of bin; overflow uses the observed maximum. */
-                quantile[q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
-                                                          (b + 1) / 10.0;
+                quantiles[k][q++] = b == 1023 ? s->pacing[k].max_ns / 1e6 :
+                                                               (b + 1) / 10.0;
             }
         }
-        fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
-                " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
-                k ? "swap-complete" : "vblank", n,
-                quantile[0], quantile[1], quantile[2],
-                s->pacing[k].max_ns / 1e6);
+        if (k < 2) {
+            fprintf(stderr, "[pacing 5s] %s n=%" PRIu64
+                    " interval_ms(p50/p95/p99/max)=%.2f/%.2f/%.2f/%.2f\n",
+                    names[k], n, quantiles[k][0], quantiles[k][1], quantiles[k][2],
+                    s->pacing[k].max_ns / 1e6);
+        }
+    }
+    flockfile(stderr);
+    fprintf(stderr, "[pacing-json] {\"version\":2,\"window_start_host_ns\":%" PRId64
+            ",\"host_ns\":%" PRId64
+            ",\"virtual_ns\":%" PRId64 ",\"swap_request_ms\":null,\"metrics\":{",
+            window_start, now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    for (unsigned k = 0; k < 4; k++) {
+        fprintf(stderr, "%s\"%s\":{\"n\":%" PRIu64
+                ",\"first_start_host_ns\":%" PRId64 ",\"p50\":%.3f,\"p95\":%.3f,\"p99\":%.3f,\"max\":%.3f,\"bins_100us\":[",
+                k ? "," : "", names[k], s->pacing[k].count,
+                s->pacing[k].first_start_host_ns, quantiles[k][0], quantiles[k][1], quantiles[k][2], s->pacing[k].max_ns / 1e6);
+        for (unsigned b = 0; b < 1024; b++) {
+            fprintf(stderr, "%s%" PRIu64, b ? "," : "", s->pacing[k].bins[b]);
+        }
+        fprintf(stderr, "]}");
         memset(s->pacing[k].bins, 0, sizeof(s->pacing[k].bins));
         s->pacing[k].count = s->pacing[k].max_ns = 0;
     }
+    fprintf(stderr, "}");
+    if (s->ans_perf_enabled) {
+        uint64_t fsyncs = 0;
+        if (s->ans_worker_started) {
+            qemu_mutex_lock(&s->ans_mutex);
+            fsyncs = s->ans_fsyncs;
+            qemu_mutex_unlock(&s->ans_mutex);
+        }
+        fprintf(stderr, ",\"ans\":{\"requests\":%" PRIu64
+                ",\"fsyncs\":%" PRIu64 ",\"background_fsync_bql_ns\":0"
+                ",\"handler_max_ns\":%" PRIu64 ",\"handler_bins_log2_ns\":[",
+                s->ans_requests - s->ans_report_requests,
+                fsyncs - s->ans_report_fsyncs, s->ans_window_max_ns);
+        for (unsigned b = 0; b < 64; b++) {
+            fprintf(stderr, "%s%" PRIu64, b ? "," : "", s->ans_window_hist[b]);
+        }
+        fprintf(stderr, "]}");
+        s->ans_report_requests = s->ans_requests;
+        s->ans_report_fsyncs = fsyncs;
+        memset(s->ans_window_hist, 0, sizeof(s->ans_window_hist));
+        s->ans_window_max_ns = 0;
+    }
+    fprintf(stderr, "}\n");
+    funlockfile(stderr);
 }
 
 #ifdef CONFIG_VNC
@@ -10284,6 +10607,10 @@ static void vblank_timer_cb(void *opaque)
     A7State *s = opaque;
     int64_t wall_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     pacing_sample(s, 0, wall_ns);
+    if (s->agx_perf_enabled) {
+        int64_t late = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->vblank_deadline_ns;
+        pacing_duration(s, 2, MAX(late, 0));
+    }
     agx_drain_context_ring(s);
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
@@ -10307,6 +10634,10 @@ static void vblank_timer_cb(void *opaque)
                 qemu_log_mask(LOG_UNIMP, "[DISP0] vblank swap completed, token=%u, mask=0x%08x\n",
                         s->disp_token, mask);
                 pacing_sample(s, 1, wall_ns);
+                if (s->disp_request_host_ns) {
+                    pacing_duration(s, 3, MAX(wall_ns - s->disp_request_host_ns, 0));
+                    s->disp_request_host_ns = 0;
+                }
                 s->disp_swap_pending = false;
                 assert_irq = (*status & mask) != 0;
             }
@@ -10331,6 +10662,15 @@ static void vblank_timer_cb(void *opaque)
      * Retain overdue ticks (and IRQ/draw ordering), never jump over them.
      */
     s->vblank_deadline_ns += 16666667;
+    {
+        /* Short hiccups keep their phase (overdue ticks run back to back),
+         * but a long stall (host sleep, SIGSTOP, heavy contention) must not
+         * replay minutes of vblanks in one burst: resync past 8 ticks. */
+        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        if (now_ns - s->vblank_deadline_ns > 8 * INT64_C(16666667)) {
+            s->vblank_deadline_ns = now_ns + 16666667;
+        }
+    }
     timer_mod(s->vblank_timer, s->vblank_deadline_ns);
     pacing_report(s, wall_ns);
 #ifdef CONFIG_VNC
@@ -10491,6 +10831,7 @@ static void a7_reset(void *opaque)
     s->disp_pending_token = 0;
     s->disp_fifo_count = s->disp_fifo_expected = s->disp_fifo_token = 0;
     s->disp_swap_pending = false;
+    s->disp_request_host_ns = 0;
     for (unsigned i = 0; i < NUM_PERIPHERALS; i++) {
         if (s->peripherals[i].base == UINT64_C(0x206200000)) {
             uint8_t *regs = s->peripherals[i].regs;
@@ -11067,6 +11408,7 @@ static void a7_finalize(Object *o)
         qemu_cond_destroy(&s->agx_render_cond);
     }
     ans_drain(s);
+    ans_worker_stop(s);
     if (s->ans_notifiers_registered) {
         qemu_unregister_reset(a7_reset, s);
         notifier_remove(&s->ans_exit_notifier);

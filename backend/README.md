@@ -170,17 +170,21 @@ Contiguous sectors on the same backing use a single batched transfer (up to
 8 MiB); scatter/gather DMA order and full-request bounds validation are retained.
 Only dirty backings are fsynced, 300 ms after the first dirty write using a
 REALTIME timer. Further writes do not postpone this deadline. This timer does
-not alter the guest virtual clock or instruction pacing. It still runs fsync
-under the BQL, so a slow host disk can cause a periodic pause.
+not alter the guest virtual clock or instruction pacing. The timer wakes one host worker; background fsync runs without the BQL.
+Per-backing generations retain writes completed during an in-flight fsync.
 
 Opcode `0x13` synchronously flushes every dirty backing and returns status 5 if
-any fsync fails. Failed backings stay dirty; timer failures are reported and
+any fsync fails, including a latched background failure even if retry succeeds.
+The barrier waits for the worker synchronously (and can still pause the guest).
+Failed backings stay dirty; timer failures are reported from the main loop and
 retried. Reset, shutdown, QEMU's exit notifier, and machine finalization also
 synchronously drain dirty backings before close, reporting failures. Host power
 loss before a successful barrier can lose buffered writes; SIGKILL cannot run
 exit hooks. No application-level cache holds unwritten data after completion.
 `VPHONE_PERF_STATS=1` prints cumulative ANS requests, host payload bytes, fsync
-attempts, and total handler nanoseconds at lifecycle drains. Header/readiness
+attempts, total/max handler nanoseconds, and log2 histogram p50/p95 upper bounds
+at lifecycle drains. `background_fsync_bql_ns=0` describes worker fsync only;
+it excludes synchronous barrier waiting and is not a measured live speedup. Header/readiness
 probes are excluded from payload bytes. `tests/test_ans_storage.py` compiles the
 actual handler under ASan/UBSan with syscall counters and injected failures;
 it does not establish live guest performance.
