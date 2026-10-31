@@ -6,11 +6,12 @@ An experimental iPhone 5s emulator for **iPhone6,2 / n53ap / iOS 7.1.2 (11D257)*
 
 **Research software:** recorded local runs reach the original lock screen, Home, and Settings with guest touch input. A fresh IPSW preparation does **not** yet reproduce that configuration: the latest UI profile depends on additional local boot/keybag artifacts. See [current status](docs/status.md) and [firmware preparation](docs/firmware.md) before attempting a boot.
 
-| Home | Settings |
-| --- | --- |
-| <img src="research/evidence/public-readme-20261029/home.png" alt="Original iOS Home in the vphone player window" width="300"> | <img src="research/evidence/public-readme-20261029/settings.png" alt="Original iOS Settings in the vphone player window" width="300"> |
+<video src="https://github.com/user-attachments/assets/0c5e8055-28bf-450a-845f-500cc5e5dcca" width="360" controls autoplay loop muted>
+  <source src="https://github.com/user-attachments/assets/0c5e8055-28bf-450a-845f-500cc5e5dcca" type="video/quicktime">
+  Your browser does not support the video tag.
+</video>
 
-*Whole player window from a normal-speed live run of the `feat/player-bezel` build (2026-10-29), with the iPhone 5s frame, toolbar and original iOS 7.1.2 Home and Settings. [Capture provenance](research/evidence/public-readme-20261029/README.md). These are recorded research-profile results, not screenshots produced by the quick start below.*
+*Whole player window screen recording from a live run, with the iPhone 5s frame, toolbar and original iOS 7.1.2 session. These are recorded research-profile results, not captures produced by the quick start below.*
 
 ## Quick start: setup and tests
 
