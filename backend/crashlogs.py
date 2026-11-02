@@ -71,41 +71,13 @@ def parse_hdiutil_attach_output(stdout: str) -> tuple[str, Path]:
     raise RuntimeError(f"Could not find mounted HFS volume in hdiutil attach output:\n{stdout}")
 
 
-def detach_disk_image(dev: str) -> None:
-    """Detach an attached disk image given its device node or mount point."""
-    if not dev:
-        return
-    res = subprocess.run(["hdiutil", "detach", str(dev)], capture_output=True, text=True)
-    if res.returncode != 0:
-        subprocess.run(["hdiutil", "detach", "-force", str(dev)], capture_output=True, text=True, check=True)
+# Keep the text parser above for callers reading historical hdiutil logs.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from qemu.hfs_mount import attach as _attach, detach as detach_disk_image, mounted
 
 
-def attach_disk_image(image_path: Path | str) -> tuple[str, Path]:
-    """Attach a disk image read-only using hdiutil.
-
-    Uses 'hdiutil attach -readonly -nobrowse -noautoopen -imagekey diskimage-class=CRawDiskImage <file>'.
-    Ensures that if parsing fails, the disk image is detached before raising.
-    """
-    cmd = [
-        "hdiutil", "attach",
-        "-readonly",
-        "-nobrowse",
-        "-noautoopen",
-        "-imagekey", "diskimage-class=CRawDiskImage",
-        str(image_path),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    root_dev = extract_root_device(res.stdout)
-    try:
-        dev, mount_point = parse_hdiutil_attach_output(res.stdout)
-        return dev, mount_point
-    except Exception:
-        if root_dev:
-            try:
-                detach_disk_image(root_dev)
-            except Exception:
-                pass
-        raise
+def attach_disk_image(image_path):
+    return _attach(image_path, readonly=True)
 
 
 def parse_process_name(path: Path) -> str:
@@ -226,8 +198,7 @@ def collect_crashlogs(image_path: Path | str, out_dir: Path | str) -> list[dict]
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dev, mount_point = attach_disk_image(image_path)
-    try:
+    with mounted(image_path, readonly=True) as (dev, mount_point):
         crash_src = mount_point / "mobile/Library/Logs/CrashReporter"
         if crash_src.exists():
             for item in crash_src.iterdir():
@@ -246,8 +217,6 @@ def collect_crashlogs(image_path: Path | str, out_dir: Path | str) -> list[dict]
         index_file = out_dir / "index.json"
         index_file.write_text(json.dumps(index_entries, indent=2) + "\n")
         return index_entries
-    finally:
-        detach_disk_image(dev)
 
 
 if __name__ == "__main__":

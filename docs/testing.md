@@ -229,3 +229,57 @@ the default; retain it for stable timing. `--repeat N` preserves the existing
 fastest-per-frame estimator, rather than reporting a median. Use the same
 corpus and host conditions for both builds. This command replays an existing
 corpus; it does not capture or boot a guest.
+
+## Offline sideload host primitives
+
+Phase 1 provides importable APIs only; no installer or CLI is added. Set
+`PYTHONPATH=scripts` when importing these helpers outside existing scripts:
+
+```python
+from ipa import inspect_ipa, extract_ipa, make_synthetic_ipa, IPAError
+from qemu.hfs_mount import mounted
+from qemu.copy_tree_clean import copy_tree_clean
+from qemu.hfs_ownership import collect_catalog_owners, set_catalog_owner_many
+
+make_synthetic_ipa('/tmp/hello.ipa')  # header-only fixture, not a runnable app
+metadata = inspect_ipa('/tmp/hello.ipa')
+```
+
+`inspect_ipa` returns a dictionary with `bundle_id`, `executable`, `app_path`,
+`minimum_os_version`, `device_family`, `required_capabilities`, and
+`selected_slice` (architecture, CPU IDs, offset, size, file type). It prefers
+arm64, then armv7s, then armv7 for A7. It reports minimum OS and capabilities;
+it does not prove compatibility with iOS 7.1.2, decrypt FairPlay, validate
+signatures, resolve frameworks, or register the app with SpringBoard.
+`IPAError` describes unsafe ZIPs, invalid bundles, and incompatible binaries.
+`extract_ipa(ipa, new_directory, max_total_size=512*1024**2, max_ratio=200,
+max_entries=50000)` validates paths and limits before writing; its destination
+must not exist. Extraction failures may leave partial content: use a temporary
+directory. ZIP symlinks/special files, Unicode/case collisions, traversal,
+control characters, Windows path syntax and encrypted entries are rejected.
+
+`mounted(image, readonly=False)` yields `(device, mount_point)` (also named
+attributes), using raw disk images by default; pass `raw=False` for DMG files.
+The caller must first ensure no VM uses the image and hold any required runtime
+lock. Only use disposable copies for writable operations. The helper detaches
+on body/volume-selection failure, retries once, then forces detach. Detach errors
+are surfaced. Raw images have no checksum, so only raw attaches use `-noverify`.
+
+`copy_tree_clean(src, new_dst)` recursively copies regular files/directories,
+preserving permission bits and dropping xattrs, resource forks and Finder
+sidecars (`._*`, `.DS_Store`); symlinks/special files are rejected. It requires
+stable, caller-controlled source and destination trees during the copy.
+`collect_catalog_owners(mounted_tree, uid=0, gid=0)` includes the tree root and
+all descendants without following symlinks, returning `{cnid: (uid, gid)}`.
+Collect while mounted, detach, then call `set_catalog_owner_many(image, owners)`;
+501:20 is supported for mobile. The result maps CNIDs to before/after records.
+Missing/duplicate IDs and invalid catalogs are rejected before any writes.
+The image must be clean-unmounted; catalog extent overflow remains unsupported.
+These low-level writes are not transactional against host I/O failure.
+
+Run the firmware-free tests with `make test` (or `make test PYTHON=python3`
+without a venv). The new modules are `test_ipa`, `test_hfs_mount`,
+`test_hfs_ownership_bulk`, and `test_copy_tree_clean` under `tests/`.
+The 8 MB HFS+ mount round trip requires `hdiutil`, and skips if process inspection
+cannot establish that no QEMU VM is running. It creates only a temporary image
+and never attaches repository firmware. No test requires firmware or `ldid`.

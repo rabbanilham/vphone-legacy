@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 
+from qemu.hfs_mount import attach, detach, mounted
+
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATED = ROOT / "build/ios712-validated"
 DIAG_DIR = ROOT / "build/diagnostic"
@@ -73,32 +75,13 @@ def seed_migration_preferences(data_mount, build_version="11D257"):
         (prefs / "com.apple.accountsd.plist").write_bytes(accountsd_payload)
 
 
-def attach(image_path, readonly=False):
-    cmd = ["hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nobrowse"]
-    if readonly:
-        cmd.append("-readonly")
-    cmd.append(str(image_path))
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    lines = res.stdout.strip().splitlines()
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 2 and parts[-1].startswith("/Volumes/"):
-            return parts[0], Path(parts[-1])
-    raise RuntimeError(f"Could not find mount point from: {res.stdout}")
-
-
-def detach(dev):
-    subprocess.run(["hdiutil", "detach", str(dev)], check=True, capture_output=True)
-
-
 def prepare_system():
     target = DIAG_DIR / "system-diagnostic-sep.raw"
     if target.exists():
         target.unlink()
     print(f"[*] Creating {target} from {VALIDATED / 'system.raw'}...")
     shutil.copyfile(VALIDATED / "system.raw", target)
-    dev, mount = attach(target)
-    try:
+    with mounted(target) as (dev, mount):
         # Free space by removing unused update ramdisk
         ramdisk = mount / "usr/standalone/update/ramdisk/H6SURamDisk.dmg"
         if ramdisk.exists():
@@ -109,8 +92,6 @@ def prepare_system():
         print(f"[*] Copying SEP firmware to {fw_dest}...")
         shutil.copyfile(SEP_FW, fw_dest)
         fw_dest.chmod(0o644)
-    finally:
-        detach(dev)
     sha = digest(target)
     print(f"[+] Successfully prepared {target} (SHA256: {sha})")
     return target, sha
@@ -124,10 +105,8 @@ def prepare_data():
     shutil.copyfile(VALIDATED / "data.raw", target)
     
     # Mount system.raw read-only to copy the /private/var template
-    sys_dev, sys_mount = attach(VALIDATED / "system.raw", readonly=True)
-    try:
-        data_dev, data_mount = attach(target)
-        try:
+    with mounted(VALIDATED / "system.raw", readonly=True) as (sys_dev, sys_mount):
+        with mounted(target) as (data_dev, data_mount):
             var_src = sys_mount / "private/var"
             print(f"[*] Seeding /private/var template to {data_mount}...")
             for item in var_src.iterdir():
@@ -150,10 +129,6 @@ def prepare_data():
             # Seed migration preferences for backboardd and accountsd
             seed_migration_preferences(data_mount, "11D257")
             print("[*] Wrote com.apple.migration.plist and com.apple.accountsd.plist (11D257)")
-        finally:
-            detach(data_dev)
-    finally:
-        detach(sys_dev)
     sha = digest(target)
     print(f"[+] Successfully prepared {target} (SHA256: {sha})")
     return target, sha
@@ -203,12 +178,9 @@ def prepare_setup_done_variant():
     if target.exists():
         target.unlink()
     shutil.copyfile(source, target)
-    dev, mount = attach(target)
-    try:
+    with mounted(target) as (dev, mount):
         seed_setup_done(mount)
         print("[*] Seeded purplebuddy setup-done preferences")
-    finally:
-        detach(dev)
     sha = digest(target)
     print(f"[+] Prepared {target} (SHA256: {sha})")
     return target, sha
