@@ -95,6 +95,19 @@ class TestCommandBuilders(unittest.TestCase):
         # Must NOT have cocoa display
         self.assertNotIn("cocoa", cmd)
 
+    def test_player_mode_passes_qemu_data_dir_for_vnc_keymaps(self):
+        with tempfile.TemporaryDirectory() as bios:
+            cmd = build_qemu_command(
+                backend_binary=self.qemu_bin, machine=self.machine, accelerator="tcg,thread=multi",
+                cpu_count=2, kernel_image=self.kernel, display_mode="player", qmp_path=self.qmp,
+                vnc_path=self.vnc, serial_log=self.serial, trace_log=self.trace, data_dir=bios)
+            self.assertEqual(cmd[cmd.index("-L") + 1], bios)
+            cocoa = build_qemu_command(
+                backend_binary=self.qemu_bin, machine=self.machine, accelerator="tcg,thread=multi",
+                cpu_count=2, kernel_image=self.kernel, display_mode="cocoa", qmp_path=self.qmp,
+                serial_log=self.serial, trace_log=self.trace, data_dir=bios)
+            self.assertNotIn("-L", cocoa)
+
     def test_qemu_command_player_mode_requires_vnc_path(self):
         with self.assertRaises(ValueError):
             build_qemu_command(

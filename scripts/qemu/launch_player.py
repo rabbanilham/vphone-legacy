@@ -51,6 +51,7 @@ def build_qemu_command(
     auxiliary_images: list[dict] | None = None,
     paused: bool = False,
     probe_seconds: float | None = None,
+    data_dir: str | Path | None = None,
 ) -> list[str]:
     """Pure function constructing QEMU command line arguments."""
     cmd = [
@@ -65,6 +66,10 @@ def build_qemu_command(
         if not vnc_path:
             raise ValueError("vnc_path is required for player display mode")
         cmd += ["-display", "none", "-vnc", f"unix:{vnc_path}"]
+        # VNC needs QEMU's keymap files (pc-bios/keymaps); without -L it exits at startup.
+        bios = Path(data_dir) if data_dir else get_repo_root() / "backend/upstream/pc-bios"
+        if bios.is_dir():
+            cmd += ["-L", str(bios)]
     elif display_mode == "cocoa":
         cmd += ["-display", "cocoa"]
     elif display_mode == "none":
