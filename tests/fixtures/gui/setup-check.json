@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "ok": false,
+  "items": [
+    {
+      "id": "xcode-clt",
+      "title": "Xcode Command Line Tools",
+      "status": "ok",
+      "detail": "/Library/Developer/CommandLineTools",
+      "fix": null
+    },
+    {
+      "id": "homebrew",
+      "title": "Homebrew",
+      "status": "ok",
+      "detail": "/opt/homebrew/bin/brew",
+      "fix": null
+    },
+    {
+      "id": "brew-packages",
+      "title": "Homebrew packages",
+      "status": "fixable",
+      "detail": "missing: keystone, libslirp",
+      "fix": {
+        "kind": "auto",
+        "command": "brew install keystone libslirp",
+        "instructions": null
+      }
+    },
+    {
+      "id": "backend",
+      "title": "QEMU backend",
+      "status": "missing",
+      "detail": "backend/bin/qemu-system-aarch64 not found",
+      "fix": {
+        "kind": "auto",
+        "command": "scripts/qemu/build_backend.py --fetch --install-build-deps",
+        "instructions": null
+      }
+    },
+    {
+      "id": "wifi-helper",
+      "title": "Wi-Fi scan helper (optional)",
+      "status": "missing",
+      "detail": "build/host_wifi_scan.app",
+      "fix": {
+        "kind": "auto",
+        "command": "make wifi-helper",
+        "instructions": null
+      }
+    }
+  ]
+}
