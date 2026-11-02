@@ -16,6 +16,7 @@ from qemu.runtime import stop
 from cli_json import Emitter, error_hint
 from setup_vm import cleanup_stale, delete_bundle, status as vm_status, summary
 import setup_check
+import app_cli
 
 
 def vm_root():
@@ -50,7 +51,18 @@ def main(argv=None):
     launch.add_argument('--headless', action='store_true')
     launch.add_argument('--probe-seconds', type=float, help='Bounded bring-up probe (0 < seconds <= 30), records actual registers and framebuffer')
     launch.add_argument('--paused', action='store_true', help='Start paused for QMP/debugging')
+    launch.add_argument('--display', choices=['player', 'cocoa', 'none'], help='Display backend (default: player for UI profiles, cocoa otherwise)')
     launch.add_argument('--wifi', action='store_true', help='Expose host-mirrored Wi-Fi scan list backed by user-mode NAT')
+    prep = vm.add_parser('prepare-ui')
+    prep.add_argument('name')
+    prep.add_argument('--force', action='store_true')
+    prep.add_argument('--progress-json', action='store_true')
+    prep.add_argument('--ipsw', help='IPSW to extract SEP firmware from (default: recorded in the manifest)')
+    imp = vm.add_parser('import-profile')
+    imp.add_argument('name')
+    imp.add_argument('--from', dest='source', required=True)
+    imp.add_argument('--force', action='store_true')
+    imp.add_argument('--progress-json', action='store_true')
     doctor = vm.add_parser('doctor')
     doctor.add_argument('name')
     doctor.add_argument('--json', action='store_true')
@@ -61,6 +73,20 @@ def main(argv=None):
     shutdown = vm.add_parser('stop')
     shutdown.add_argument('name')
     shutdown.add_argument('--force', action='store_true', help='Terminate through QMP; guest filesystem shutdown is NOT clean')
+    app = groups.add_parser('app').add_subparsers(dest='action', required=True)
+    app_install_p = app.add_parser('install')
+    app_install_p.add_argument('name')
+    app_install_p.add_argument('ipa')
+    app_install_p.add_argument('--enable-unsigned', action='store_true')
+    app_install_p.add_argument('--progress-json', action='store_true')
+    app_install_p.add_argument('--json', action='store_true')
+    app_list_p = app.add_parser('list')
+    app_list_p.add_argument('name')
+    app_list_p.add_argument('--json', action='store_true')
+    app_remove_p = app.add_parser('remove')
+    app_remove_p.add_argument('name')
+    app_remove_p.add_argument('bundle_id')
+    app_remove_p.add_argument('--json', action='store_true')
     fw = groups.add_parser('fw').add_subparsers(dest='action', required=True)
     fw.add_parser('list')
     groups.add_parser('gui')
@@ -82,6 +108,24 @@ def main(argv=None):
                         print(f"{item['id']}: {item['status']} — {item['detail']}")
                 return 0 if report['ok'] else 1
             setup_check.install(args.id, PROJECT_ROOT, vm_root(), emitter)
+        elif args.group == 'app':
+            path = vm_path(args.name)
+            if not path.is_dir():
+                raise ValueError('VM does not exist')
+            if args.action == 'install':
+                report = app_cli.install(path, Path(args.ipa).expanduser().resolve(), args.enable_unsigned, emitter)
+                if emitter:
+                    emitter.result(True, report)
+                elif args.json:
+                    print(json.dumps(dict(schema=1, ok=True, data=report)))
+                else:
+                    print(f"Installed {report['bundle_id']} at {report['app_path']}")
+            elif args.action == 'list':
+                apps = app_cli.list_apps(path)
+                print(json.dumps(dict(schema=1, apps=apps)) if args.json else '\n'.join(f"{a['bundle_id']}  {a['path']}" for a in apps))
+            else:
+                report = app_cli.remove(path, args.bundle_id)
+                print(json.dumps(dict(schema=1, ok=True, data=report)) if args.json else f'Removed {args.bundle_id}')
         elif args.group == 'gui':
             app = PROJECT_ROOT / 'dist/vphone-legacy.app'
             if not app.exists():
@@ -126,6 +170,22 @@ def main(argv=None):
                 return result.returncode
             if not emitter:
                 print(f'Prepared firmware: {path}. iOS boot and UI are not yet verified.')
+        elif args.action in ('prepare-ui', 'import-profile'):
+            path = vm_path(args.name)
+            if not path.is_dir():
+                raise ValueError('VM does not exist')
+            command = [sys.executable, str(SCRIPTS_DIR / 'ui_profile.py'), args.action, str(path)]
+            if args.force:
+                command.append('--force')
+            if getattr(args, 'progress_json', False):
+                command.append('--progress-json')
+            if args.action == 'prepare-ui' and args.ipsw:
+                command += ['--ipsw', str(Path(args.ipsw).expanduser().resolve())]
+            if args.action == 'import-profile':
+                command += ['--from', str(Path(args.source).expanduser().resolve())]
+            result = subprocess.run(command)
+            if result.returncode:
+                return result.returncode
         elif args.action == 'delete':
             path = vm_path(args.name)
             if not path.is_dir():
@@ -157,6 +217,8 @@ def main(argv=None):
                 command += ['--probe-seconds', str(args.probe_seconds)]
             if args.wifi:
                 command.append('--wifi')
+            if args.display:
+                command += ['--display', args.display]
             # Replace the CLI so GUI signals reach the single owning launcher.
             os.execv(sys.executable, command)
         elif args.action == 'stop':
