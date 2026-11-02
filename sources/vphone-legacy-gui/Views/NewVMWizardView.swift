@@ -397,7 +397,7 @@ public struct NewVMWizardView: View {
 
         // Step 2: vm prepare-ui
         currentMessage = "Step 2/2: Preparing UI profile & activation..."
-        let prepareStream = appState.client.vmPrepareUI(name: name, force: force)
+        let prepareStream = appState.client.vmPrepareUI(name: name, force: force, ipswPath: ipswPath)
         for await event in prepareStream {
             if Task.isCancelled { return }
             handleProgressEvent(event)

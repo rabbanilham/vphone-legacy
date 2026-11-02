@@ -235,7 +235,7 @@ public struct FixtureCLIClient: CLIClient, Sendable {
         return streamEvents(from: raw)
     }
 
-    public func vmPrepareUI(name: String, force: Bool) -> AsyncStream<ProgressEvent> {
+    public func vmPrepareUI(name: String, force: Bool, ipswPath: String?) -> AsyncStream<ProgressEvent> {
         let raw = simulateErrors ? rawProgressError() : rawProgressOk()
         return streamEvents(from: raw)
     }

@@ -204,8 +204,11 @@ public struct ProcessCLIClient: CLIClient, @unchecked Sendable {
         return streamCommand(arguments: args)
     }
 
-    public func vmPrepareUI(name: String, force: Bool) -> AsyncStream<ProgressEvent> {
+    public func vmPrepareUI(name: String, force: Bool, ipswPath: String?) -> AsyncStream<ProgressEvent> {
         var args = ["vm", "prepare-ui", name, "--progress-json"]
+        if let ipswPath, !ipswPath.isEmpty {
+            args.append(contentsOf: ["--ipsw", ipswPath])
+        }
         if force {
             args.append("--force")
         }

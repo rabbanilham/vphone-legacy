@@ -26,7 +26,7 @@ public protocol CLIClient: Sendable {
     func vmList() async throws -> VMListResponse
     func vmStatus(name: String) async throws -> VMStatus
     func vmCreate(name: String, ios: String, ipswPath: String, force: Bool) -> AsyncStream<ProgressEvent>
-    func vmPrepareUI(name: String, force: Bool) -> AsyncStream<ProgressEvent>
+    func vmPrepareUI(name: String, force: Bool, ipswPath: String?) -> AsyncStream<ProgressEvent>
     func vmLaunch(name: String, display: String?, wifi: Bool) async throws -> String
     func vmStop(name: String, force: Bool) async throws -> String
     func vmDelete(name: String) async throws -> String
