@@ -10,6 +10,11 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import sys
+import fcntl
+from contextlib import redirect_stdout, nullcontext
+from cli_json import Emitter, error_hint
+from setup_vm import cleanup_stale, delete_bundle
 
 from fw_manifest import resolve_firmware, select_identity, list_supported_versions
 from patchers.patch_kernel import decode_kernel_components
@@ -18,7 +23,7 @@ from patchers.patch_devicetree import decode_devicetree
 from patchers.patch_rootfs import vfdecrypt_dmg, convert_udif_to_raw, create_data_volume
 from macho import inspect_macho
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(os.environ.get('VPHONE_LEGACY_ROOT', Path(__file__).resolve().parents[1])).expanduser().resolve()
 
 
 def ensure_vfdecrypt(project_root):
@@ -53,11 +58,20 @@ def artifact(path, bundle, mutable=False):
     return result
 
 
-def extract_component(archive, member, output):
+def extract_component(archive, member, output, progress=None):
     if archive.namelist().count(member) != 1:
         raise ValueError(f"Missing or duplicated required IPSW member: {member}")
     with archive.open(member) as source, Path(output).open("xb") as destination:
-        shutil.copyfileobj(source, destination, 1024 * 1024)
+        size = archive.getinfo(member).file_size
+        copied = 0
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            destination.write(chunk)
+            copied += len(chunk)
+            if progress:
+                progress(copied / size if size else 1.0)
     if not Path(output).stat().st_size:
         raise ValueError(f"Empty firmware component: {member}")
 
@@ -77,10 +91,33 @@ def monitor_boot_contract(tree_root):
             "source": "iBoot-1940.10.58 decoded loader and original DeviceTree defaults"}
 
 
-def prepare_firmware(version, ipsw_path, out_dir, boot_args=None):
+def prepare_firmware(version, ipsw_path, out_dir, boot_args=None, emitter=None, force=False):
     output = Path(out_dir).resolve()
-    if output.exists():
-        raise ValueError("Output already exists; prepare a fresh bundle rather than overwriting persistent data")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Serialize create/force for this root without leaving management files behind.
+    descriptor = os.open(output.parent, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another VM create holds the preparation lock; retry when it finishes') from None
+        return _prepare_firmware(version, ipsw_path, output, boot_args, emitter, force)
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_firmware(version, ipsw_path, out_dir, boot_args=None, emitter=None, force=False):
+    current = 'preflight'
+    def stage(id, status, message='', fraction=None):
+        nonlocal current
+        current = id
+        if emitter:
+            emitter.stage(id, status, message or id, fraction)
+    stage('preflight', 'start', 'Checking inputs')
+    output = Path(out_dir).resolve()
+    cleanup_stale(output.parent)
+    if output.exists() and not force:
+        raise ValueError("Output already exists; use --force to replace a stopped bundle")
     if not ipsw_path or not Path(ipsw_path).is_file():
         raise ValueError("A real local IPSW is required; missing firmware cannot create a VM")
     meta = resolve_firmware(version, str(ipsw_path))
@@ -89,21 +126,38 @@ def prepare_firmware(version, ipsw_path, out_dir, boot_args=None):
     args = boot_args or "-v serial=3"
     if "\0" in args or len(args.encode()) >= 256:
         raise ValueError("Boot arguments must fit the 256-byte Apple command line")
+    if output.exists():
+        delete_bundle(output)
+    stage('preflight', 'done', 'IPSW is iPhone6,2 7.1.2 11D257', 1.0)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=output.name + ".preparing-", dir=output.parent))
+    preparation_lock = (temporary / 'runtime.lock').open('a+')
+    fcntl.flock(preparation_lock, fcntl.LOCK_EX)
     try:
+        stage('extract', 'start')
         original = temporary / "original"
         original.mkdir()
         with zipfile.ZipFile(ipsw_path) as archive:
             manifest_data = archive.read("BuildManifest.plist")
             identity = select_identity(plistlib.loads(manifest_data))
             (original / "BuildManifest.plist").write_bytes(manifest_data)
-            for field, filename in (("kernelcache_path", "kernelcache.im4p"),
+            components = (("kernelcache_path", "kernelcache.im4p"),
                                     ("devicetree_path", "DeviceTree.im4p"),
                                     ("iboot_path", "iBoot.im4p"),
-                                    ("rootfs_dmg", "RootFS.encrypted.dmg")):
+                                    ("rootfs_dmg", "RootFS.encrypted.dmg"))
+            total_bytes = sum(archive.getinfo(meta[field]).file_size for field, _ in components)
+            extracted = 0
+            for field, filename in components:
                 destination = original / filename
-                extract_component(archive, meta[field], destination)
+                member_size = archive.getinfo(meta[field]).file_size
+                extract_component(archive, meta[field], destination,
+                    lambda fraction: stage('extract', 'progress', 'Extracting ' + filename,
+                                           (extracted + fraction * member_size) / total_bytes))
+                extracted += member_size
+            stage('extract', 'done', 'Extracted firmware components', 1.0)
+            stage('verify', 'start')
+            for field, filename in components:
+                destination = original / filename
                 component = {"kernelcache_path": "KernelCache", "devicetree_path": "DeviceTree",
                              "rootfs_dmg": "OS", "iboot_path": "iBoot"}[field]
                 digest = identity["Manifest"][component].get("Digest")
@@ -112,9 +166,13 @@ def prepare_firmware(version, ipsw_path, out_dir, boot_args=None):
                         raise ValueError(f"Unsupported {component} BuildManifest digest")
                     if hashlib.sha1(destination.read_bytes()).digest() != digest:
                         raise ValueError(f"{component} digest differs from BuildManifest")
+        stage('verify', 'done', 'Verified BuildManifest digests', 1.0)
+        stage('decode-kernel', 'start')
         kernel, monitor = decode_kernel_components((original / "kernelcache.im4p").read_bytes(), meta["kernel_iv"], meta["kernel_key"])
         kernel_info = inspect_macho(kernel)
         monitor_info = inspect_macho(monitor)
+        stage('decode-kernel', 'done', fraction=1.0)
+        stage('decode-ibot', 'start')
         iboot, ans, ans_info = decode_ans_components((original / "iBoot.im4p").read_bytes(),
                                                     meta["iboot_iv"], meta["iboot_key"])
         (original / "iBoot.bin").write_bytes(iboot)
@@ -124,20 +182,30 @@ def prepare_firmware(version, ipsw_path, out_dir, boot_args=None):
         shutil.copyfile(original / "monitor.macho", temporary / "monitor.macho")
         (original / "kernel.macho").write_bytes(kernel)
         shutil.copyfile(original / "kernel.macho", temporary / "kernel.macho")
+        stage('decode-ibot', 'done', fraction=1.0)
+        stage('decode-devicetree', 'start')
         tree, tree_root = decode_devicetree((original / "DeviceTree.im4p").read_bytes(),
                                           meta["devicetree_iv"], meta["devicetree_key"])
         monitor_contract = monitor_boot_contract(tree_root)
         (original / "DeviceTree.raw").write_bytes(tree)
         shutil.copyfile(original / "DeviceTree.raw", temporary / "DeviceTree.raw")
+        stage('decode-devicetree', 'done', fraction=1.0)
+        stage('decrypt-rootfs', 'start')
         helper = ensure_vfdecrypt(PROJECT_ROOT)
         decrypted = original / "RootFS.dmg"
         vfdecrypt_dmg(str(original / "RootFS.encrypted.dmg"), str(decrypted), meta["rootfs_key"], helper)
+        stage('decrypt-rootfs', 'done', fraction=1.0)
+        stage('convert-rootfs', 'start')
         system = temporary / "system.raw"
         system_info = convert_udif_to_raw(decrypted, system)
         if system_info["filesystem"] != "hfsx":
             raise ValueError("This target expects a case-sensitive HFSX system partition")
+        stage('convert-rootfs', 'done', fraction=1.0)
+        stage('create-data', 'start')
         data_disk = temporary / "data.raw"
         data_info = create_data_volume(data_disk)
+        stage('create-data', 'done', fraction=1.0)
+        stage('manifest', 'start')
         report = {"patches": [], "verified": True,
                   "reason": "No runtime-verified kernel, DeviceTree or RootFS compatibility patches are available"}
         (temporary / "patch_report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -166,11 +234,18 @@ def prepare_firmware(version, ipsw_path, out_dir, boot_args=None):
         }
         (temporary / "vm_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         temporary.rename(output)
+        stage('manifest', 'done', 'Wrote vm_manifest.json', 1.0)
+        if emitter:
+            emitter.result(True, {'name': output.name, 'path': str(output)})
         print(f"Validated firmware bundle: {output}; iOS boot/display remain unverified")
         return manifest
-    except Exception:
+    except Exception as error:
+        if emitter and not emitter.finished:
+            emitter.stage(current, 'error', str(error), hint=error_hint(error))
         shutil.rmtree(temporary)
         raise
+    finally:
+        preparation_lock.close()
 
 
 def main():
@@ -179,12 +254,19 @@ def main():
     parser.add_argument("--ipsw", "-i", required=True)
     parser.add_argument("--out-dir", "-o", default=str(PROJECT_ROOT / "build/vm_bundle"))
     parser.add_argument("--boot-args")
+    parser.add_argument('--progress-json', action='store_true')
+    parser.add_argument('--force', action='store_true')
     args = parser.parse_args()
+    emitter = Emitter() if args.progress_json else None
     try:
-        prepare_firmware(args.version, args.ipsw, args.out_dir, args.boot_args)
-    except (ValueError, RuntimeError, OSError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
+        with redirect_stdout(sys.stderr) if emitter else nullcontext():
+            prepare_firmware(args.version, args.ipsw, args.out_dir, args.boot_args, emitter, args.force)
+    except (ValueError, RuntimeError, OSError, zipfile.BadZipFile, KeyError, plistlib.InvalidFileException, subprocess.SubprocessError) as error:
         detail = (error.stderr.decode(errors="replace") if isinstance(error, subprocess.CalledProcessError) and isinstance(error.stderr, bytes) else getattr(error, "stderr", "")) or ""
-        parser.exit(1, f"Firmware preparation failed: {error}\n{detail}")
+        if emitter:
+            emitter.error(str(error), error_hint(error))
+            emitter.result(False, {'exit_code': 1})
+        parser.exit(1, f"Firmware preparation failed: {error}\n{detail}\nHint: {error_hint(error)}\n")
 
 
 if __name__ == "__main__":
