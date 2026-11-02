@@ -133,7 +133,7 @@ func runContractTests() async throws {{
     let vmList = try VMListResponse.decode(from: vmListData)
     assert(vmList.schema == 1)
     assert(vmList.root == "/Users/me/.vphone-legacy/VMs")
-    assert(vmList.vms.count == 2)
+    assert(vmList.vms.count == 3)
 
     let vm0 = vmList.vms[0]
     assert(vm0.name == "ios712")
@@ -153,6 +153,8 @@ func runContractTests() async throws {{
     assert(vm0.apps[0].bundleId == "com.vphone.hello")
     assert(vm0.apps[0].path == "/Applications/Hello.app")
 
+    assert(vmList.vms[0].isLegacy == false)
+    assert(vmList.vms[2].name == "old-ios712" && vmList.vms[2].isLegacy == true)
     let vm1 = vmList.vms[1]
     assert(vm1.name == "baseline")
     assert(vm1.profile == "baseline")
@@ -191,7 +193,7 @@ func runContractTests() async throws {{
     assert(loadedSetup.items.count == 5)
 
     let loadedList = try await fixtureClient.vmList()
-    assert(loadedList.vms.count == 2)
+    assert(loadedList.vms.count == 3)
 
     let loadedStatus = try await fixtureClient.vmStatus(name: "ios712")
     assert(loadedStatus.boot_stage == "home")

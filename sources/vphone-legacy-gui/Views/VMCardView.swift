@@ -56,6 +56,7 @@ public struct VMCardView: View {
                         Text(vm.name)
                             .font(.headline)
                         profileBadge
+                        if vm.isLegacy { legacyBadge }
                     }
                     Text("iOS \(vm.ios) (\(vm.build)) • \(vm.device)")
                         .font(.caption)
@@ -117,6 +118,22 @@ public struct VMCardView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.red)
                         .controlSize(.large)
+                    } else if vm.isLegacy {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("This VM uses an unsupported legacy bundle format and cannot be started. Recreate it from the IPSW; its files stay untouched until you do.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button {
+                                appState.recreateRequest = vm.name
+                            } label: {
+                                Label("Recreate…", systemImage: "arrow.triangle.2.circlepath")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                            .controlSize(.large)
+                        }
                     } else {
                         Button {
                             Task {
@@ -194,6 +211,16 @@ public struct VMCardView: View {
     }
 
     // MARK: - Badges
+
+    private var legacyBadge: some View {
+        Text("Legacy")
+            .font(.caption2)
+            .bold()
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.orange.opacity(0.18)))
+            .foregroundStyle(.orange)
+    }
 
     private var profileBadge: some View {
         Text(vm.isUiProfile ? "UI Profile" : "Baseline")

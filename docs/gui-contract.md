@@ -20,8 +20,10 @@ Long operations (`vm create`, `vm prepare-ui`, `setup install`, `app install`) p
 ## `vm list --json`
 
 ```json
-{"schema":1,"root":"/Users/me/.vphone-legacy/VMs","vms":[{"name":"ios712","path":"...","ios":"7.1.2","build":"11D257","device":"iPhone6,2","profile":"baseline|ui","memory_mb":1024,"disk_bytes":7300000000,"phase":"stopped|starting|running|stopping|failed","pid":null,"boot_stage":"none","apps":[{"bundle_id":"com.vphone.hello","path":"/Applications/Hello.app"}]}]}
+{"schema":1,"root":"/Users/me/.vphone-legacy/VMs","vms":[{"name":"ios712","path":"...","ios":"7.1.2","build":"11D257","device":"iPhone6,2","profile":"baseline|ui","memory_mb":1024,"disk_bytes":7300000000,"phase":"stopped|starting|running|stopping|failed","pid":null,"boot_stage":"none","apps":[{"bundle_id":"com.vphone.hello","path":"/Applications/Hello.app"}],"legacy":false}]}
 ```
+
+`legacy` is true for a bundle whose manifest is not schema 2: `vm launch` refuses it and the only fix is to recreate it (`vm create NAME --force --ipsw ...`). The GUI shows a badge, disables Start and offers Recreate.
 
 ## `vm status NAME --json`
 

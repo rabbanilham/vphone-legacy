@@ -162,6 +162,7 @@ public struct VMInfo: Codable, Identifiable, Equatable, Hashable, Sendable {
     public var pid: Int?
     public var boot_stage: String       // "none" | "kernel" | "userspace" | "lockscreen" | "home" | "panic"
     public var apps: [VMAppInfo]
+    public var legacy: Bool?             // true: unsupported manifest, must be recreated
 
     public init(
         name: String,
@@ -175,7 +176,8 @@ public struct VMInfo: Codable, Identifiable, Equatable, Hashable, Sendable {
         phase: String,
         pid: Int? = nil,
         boot_stage: String = "none",
-        apps: [VMAppInfo] = []
+        apps: [VMAppInfo] = [],
+        legacy: Bool? = nil
     ) {
         self.name = name
         self.path = path
@@ -189,10 +191,12 @@ public struct VMInfo: Codable, Identifiable, Equatable, Hashable, Sendable {
         self.pid = pid
         self.boot_stage = boot_stage
         self.apps = apps
+        self.legacy = legacy
     }
 
     public var isRunning: Bool { phase == "running" }
     public var isUiProfile: Bool { profile == "ui" }
+    public var isLegacy: Bool { legacy ?? false }
     public var memoryMB: Int { memory_mb }
     public var diskBytes: Int64 { disk_bytes }
     public var bootStage: String { boot_stage }

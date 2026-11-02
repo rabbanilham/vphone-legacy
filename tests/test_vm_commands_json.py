@@ -35,6 +35,14 @@ class VMCommands(unittest.TestCase):
         self.manifest = dict(version='7.1.2', build='11D257', device='iPhone6,2', profile='ui', memory_mb=1024, apps=self.example['apps'], schema_version=2)
         (self.bundle / 'vm_manifest.json').write_text(json.dumps(self.manifest))
 
+    def test_summary_flags_legacy_bundles(self):
+        from setup_vm import summary
+        self.assertFalse(summary(self.bundle)['legacy'])
+        legacy = self.root / 'old'
+        legacy.mkdir()
+        (legacy / 'vm_manifest.json').write_text(json.dumps(dict(version='7.1.2', memory_mb=2048)))
+        self.assertTrue(summary(legacy)['legacy'])
+
     def invoke(self, *args):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):

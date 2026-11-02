@@ -101,4 +101,4 @@ def summary(path):
                 profile=manifest.get('profile', 'baseline'), memory_mb=manifest.get('memory_mb', 1024),
                 disk_bytes=disk_bytes(path), phase=runtime['process']['phase'],
                 pid=runtime['process'].get('pid'), boot_stage=runtime.get('boot_stage', 'none'),
-                apps=manifest.get('apps', []))
+                apps=manifest.get('apps', []), legacy=manifest.get('schema_version') != 2)

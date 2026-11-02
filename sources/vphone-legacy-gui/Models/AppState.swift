@@ -31,6 +31,8 @@ public final class AppState {
     public var vmStatuses: [String: VMStatus] = [:]
     public var activeOperations: [String: String] = [:]
     public var errorMessage: String?
+    /// Set by a card's Recreate button; LibraryView opens the New VM sheet prefilled with this name.
+    public var recreateRequest: String?
     public var vmLogs: [String: String] = [:]
 
     // Wi-Fi and AMFI setting toggles per VM name

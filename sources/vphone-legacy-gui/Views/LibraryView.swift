@@ -126,6 +126,9 @@ public struct LibraryView: View {
                 }
             }
         }
+        .onChange(of: appState.recreateRequest) { _, name in
+            if name != nil { showNewVMSheet = true }
+        }
         .sheet(isPresented: $showNewVMSheet) {
             NewVMWizardView(appState: appState, isPresented: $showNewVMSheet)
         }

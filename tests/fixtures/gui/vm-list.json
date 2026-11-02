@@ -19,7 +19,8 @@
           "bundle_id": "com.vphone.hello",
           "path": "/Applications/Hello.app"
         }
-      ]
+      ],
+      "legacy": false
     },
     {
       "name": "baseline",
@@ -33,7 +34,23 @@
       "phase": "running",
       "pid": 4242,
       "boot_stage": "userspace",
-      "apps": []
+      "apps": [],
+      "legacy": false
+    },
+    {
+      "name": "old-ios712",
+      "path": "/Users/me/.vphone-legacy/VMs/old-ios712",
+      "ios": "7.1.2",
+      "build": "11D257",
+      "device": "iPhone6,2",
+      "profile": "baseline",
+      "memory_mb": 2048,
+      "disk_bytes": 1490000000,
+      "phase": "stopped",
+      "pid": null,
+      "boot_stage": "none",
+      "apps": [],
+      "legacy": true
     }
   ]
 }

@@ -30,6 +30,18 @@ public struct NewVMWizardView: View {
     }
 
     public var body: some View {
+        content
+            .onAppear {
+                // Recreate: same name, replacing the unsupported bundle (vm create --force).
+                if let name = appState.recreateRequest {
+                    vmName = name
+                    retryWithForce = true
+                    appState.recreateRequest = nil
+                }
+            }
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             // Header
             HStack {
