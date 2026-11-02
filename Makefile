@@ -2,7 +2,7 @@
 
 PYTHON ?= .venv/bin/python
 
-.PHONY: all setup test check-docs backend vphoned gui clean help wifi-helper
+.PHONY: all setup test check-docs backend vphoned hello gui clean help wifi-helper
 
 all: setup test
 
@@ -24,6 +24,10 @@ vphoned:
 	@echo "Building vphoned-legacy..."
 	make -C scripts/vphoned-legacy host_test
 	make -C scripts/vphoned-legacy ios
+
+hello:
+	@echo "Building Hello guest app and IPA..."
+	./scripts/build_hello_ipa.sh
 
 wifi-helper: build/host_wifi_scan build/host_wifi_scan.app
 
@@ -58,7 +62,7 @@ gui:
 	open dist/vphone-legacy.app
 
 clean:
-	rm -rf .venv/build build/swift-module-cache build/host_wifi_scan build/host_wifi_scan.app
+	rm -rf .venv/build build/swift-module-cache build/host_wifi_scan build/host_wifi_scan.app build/sideload
 	make -C scripts/vphoned-legacy clean
 
 help:
@@ -70,6 +74,7 @@ help:
 	@echo "  make check-docs - Check maintained documentation links"
 	@echo "  make backend   - Build pinned experimental s5l8960x QEMU"
 	@echo "  make vphoned   - Build vphoned-legacy daemon"
+	@echo "  make hello     - Build Hello.ipa guest sideload app"
 	@echo "  make clean     - Remove build artifacts"
 	@echo ""
 	@echo "CLI Usage:"
