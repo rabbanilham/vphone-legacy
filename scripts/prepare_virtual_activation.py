@@ -17,6 +17,7 @@ from pathlib import Path
 from prepare_diagnostic_disks import detach, seed_setup_done
 from patchers.patch_virtual_activation import patch
 from patchers.patch_devicetree import parse_node, serialize_node
+from qemu.hfs_mount import attach, mounted
 from qemu.hfs_ownership import set_catalog_owner
 from patchers.sign_diagnostic_probe import sign_probe
 
@@ -25,21 +26,6 @@ CACHE_OFFSET, CACHE_SIZE = 0x989AC, 0x2760C
 CACHE_SHA256 = "2ea3fdde29a7a15c61a9066b8aae127940361cb9967e644d665f5fa7889de9c6"
 LABEL = "org.vphone.virtual-activation-probe"
 DIAGNOSTIC_ARGS = "amfi_allow_any_signature=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1"
-
-
-def attach(image):
-    result = subprocess.run(["hdiutil", "attach", "-plist", "-nobrowse", "-imagekey",
-                             "diskimage-class=CRawDiskImage", str(image)],
-                            capture_output=True, check=True)
-    entities = plistlib.loads(result.stdout)["system-entities"]
-    devices = [e["dev-entry"] for e in entities if "dev-entry" in e]
-    try:
-        mount = next(e["mount-point"] for e in entities if "mount-point" in e)
-        return devices[0], Path(mount)
-    except (StopIteration, IndexError):
-        if devices:
-            detach(devices[0])
-        raise RuntimeError("Image attached without a mounted filesystem")
 
 
 def digest(path):
@@ -187,8 +173,7 @@ def main():
     system, data = a.output / "system.raw", a.output / "data.raw"
     clone(a.system, system)
     clone(a.data, data)
-    dev, mount = attach(system)
-    try:
+    with mounted(system) as (dev, mount):
         binary = mount / "usr/libexec/lockdownd"
         patched, manifest["lockdownd"] = patch(binary.read_bytes())
         binary.write_bytes(patched)  # Existing inode/guest ownership retained.
@@ -209,14 +194,9 @@ def main():
         manifest["job_cache"] = {"offset": CACHE_OFFSET, "size": CACHE_SIZE,
                                  "before_sha256": CACHE_SHA256,
                                  "after_sha256": hashlib.sha256(patched_cache).hexdigest()}
-    finally:
-        detach(dev)
     manifest["guest_ownership"] = [set_catalog_owner(system, file_id) for file_id in (probe_id, job_id)]
-    dev, mount = attach(data)
-    try:
+    with mounted(data) as (dev, mount):
         seed_setup_done(mount)
-    finally:
-        detach(dev)
     manifest["outputs"] = {str(x): digest(x) for x in (system, data)}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(manifest_path, flush=True)

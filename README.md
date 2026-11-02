@@ -64,6 +64,7 @@ Each change should include relevant [tests](docs/testing.md), before/after evide
 - [Firmware, VM lifecycle, and research profile](docs/firmware.md)
 - [Status and known limitations](docs/status.md)
 - [Architecture](docs/architecture.md) and [backend contracts](backend/README.md)
+- [App sideloading and guest toolchain](docs/sideloading.md)
 - [Testing](docs/testing.md) and [troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 - [Research archive](research/README.md)

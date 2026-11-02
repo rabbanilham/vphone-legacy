@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import plistlib
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -156,11 +157,7 @@ class TestDetachOnFailure(unittest.TestCase):
     def test_detach_always_called_when_copy_fails(self, mock_run):
         # Set up mock attach response
         mock_attach = MagicMock(returncode=0)
-        mock_attach.stdout = (
-            "/dev/disk4          \tApple_partition_scheme         \t\n"
-            "/dev/disk4s1        \tApple_partition_map            \t\n"
-            "/dev/disk4s2        \tApple_HFS                      \t/Volumes/MockData\n"
-        )
+        mock_attach.stdout = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk4"}, {"dev-entry": "/dev/disk4s2", "mount-point": "/Volumes/MockData"}]})
         mock_detach = MagicMock(returncode=0, stdout='"disk4" ejected.')
         mock_run.side_effect = [mock_attach, mock_detach]
 
@@ -175,9 +172,9 @@ class TestDetachOnFailure(unittest.TestCase):
         # Check detach was called on /dev/disk4
         mock_run.assert_has_calls([
             call(
-                ["hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen",
-                 "-imagekey", "diskimage-class=CRawDiskImage", str(fake_path.resolve())],
-                capture_output=True, text=True, check=True
+                ["hdiutil", "attach", "-plist", "-nobrowse", "-noautoopen", "-noverify",
+                 "-imagekey", "diskimage-class=CRawDiskImage", "-readonly", str(fake_path.resolve())],
+                capture_output=True, check=True
             ),
             call(["hdiutil", "detach", "/dev/disk4"], capture_output=True, text=True),
         ])
@@ -185,10 +182,7 @@ class TestDetachOnFailure(unittest.TestCase):
     @patch("subprocess.run")
     def test_detach_called_when_attach_parsing_fails(self, mock_run):
         mock_attach = MagicMock(returncode=0)
-        mock_attach.stdout = (
-            "/dev/disk9          \tApple_partition_scheme         \t\n"
-            "/dev/disk9s1        \tApple_partition_map            \t\n"
-        )  # No HFS mountpoint
+        mock_attach.stdout = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk9"}]})
         mock_detach = MagicMock(returncode=0)
         mock_run.side_effect = [mock_attach, mock_detach]
 
@@ -198,9 +192,9 @@ class TestDetachOnFailure(unittest.TestCase):
         # Detach should have been attempted on /dev/disk9
         mock_run.assert_has_calls([
             call(
-                ["hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen",
-                 "-imagekey", "diskimage-class=CRawDiskImage", "/tmp/fake_data.raw"],
-                capture_output=True, text=True, check=True
+                ["hdiutil", "attach", "-plist", "-nobrowse", "-noautoopen", "-noverify",
+                 "-imagekey", "diskimage-class=CRawDiskImage", "-readonly", "/tmp/fake_data.raw"],
+                capture_output=True, check=True
             ),
             call(["hdiutil", "detach", "/dev/disk9"], capture_output=True, text=True),
         ])
@@ -209,12 +203,13 @@ class TestDetachOnFailure(unittest.TestCase):
     def test_detach_retries_with_force_if_normal_detach_fails(self, mock_run):
         mock_fail = MagicMock(returncode=1, stderr="Resource busy")
         mock_force = MagicMock(returncode=0, stdout='"disk4" ejected.')
-        mock_run.side_effect = [mock_fail, mock_force]
+        mock_run.side_effect = [mock_fail, mock_fail, mock_force]
 
         detach_disk_image("/dev/disk4")
 
-        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(mock_run.call_count, 3)
         mock_run.assert_has_calls([
+            call(["hdiutil", "detach", "/dev/disk4"], capture_output=True, text=True),
             call(["hdiutil", "detach", "/dev/disk4"], capture_output=True, text=True),
             call(["hdiutil", "detach", "-force", "/dev/disk4"], capture_output=True, text=True, check=True),
         ])
@@ -250,11 +245,7 @@ class TestCollectCrashlogsEndToEnd(unittest.TestCase):
 
             # Mock attach output pointing to fake_mount
             mock_attach = MagicMock(returncode=0)
-            mock_attach.stdout = (
-                f"/dev/disk4          \tApple_partition_scheme         \t\n"
-                f"/dev/disk4s1        \tApple_partition_map            \t\n"
-                f"/dev/disk4s2        \tApple_HFS                      \t{fake_mount}\n"
-            )
+            mock_attach.stdout = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk4"}, {"dev-entry": "/dev/disk4s2", "mount-point": str(fake_mount)}]})
             mock_detach = MagicMock(returncode=0, stdout='"disk4" ejected.')
             mock_run.side_effect = [mock_attach, mock_detach]
 
@@ -267,9 +258,9 @@ class TestCollectCrashlogsEndToEnd(unittest.TestCase):
             # Assert attach command used readonly and rawdiskimage class
             mock_run.assert_has_calls([
                 call(
-                    ["hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen",
-                     "-imagekey", "diskimage-class=CRawDiskImage", str(fake_data_raw.resolve())],
-                    capture_output=True, text=True, check=True
+                    ["hdiutil", "attach", "-plist", "-nobrowse", "-noautoopen", "-noverify",
+                     "-imagekey", "diskimage-class=CRawDiskImage", "-readonly", str(fake_data_raw.resolve())],
+                    capture_output=True, check=True
                 ),
                 call(["hdiutil", "detach", "/dev/disk4"], capture_output=True, text=True),
             ])
