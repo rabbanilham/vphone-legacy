@@ -3,12 +3,12 @@
     {
       "field": "$.auxiliary_images[0].path",
       "left": "/private/var/folders/f7/glc574n17sjfsmbhn92bf22m0000gn/T/ui-oracle-5nm1ju9c/ANSRegion.bin",
-      "right": "/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin"
+      "right": "backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin"
     },
     {
       "field": "$.image",
       "left": "/private/var/folders/f7/glc574n17sjfsmbhn92bf22m0000gn/T/ui-oracle-5nm1ju9c/KernelMemory.bin",
-      "right": "/Users/bagas/Documents/Projects/vphone/vphone-legacy/build/virtual-activated-profile-v5/boot/KernelMemory.bin"
+      "right": "build/virtual-activated-profile-v5/boot/KernelMemory.bin"
     },
     {
       "field": "$.image_sha256",
