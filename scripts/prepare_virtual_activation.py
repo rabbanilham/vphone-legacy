@@ -14,7 +14,7 @@ import struct
 import subprocess
 from pathlib import Path
 
-from prepare_diagnostic_disks import detach, seed_setup_done
+from prepare_diagnostic_disks import detach, seed_setup_done, clone
 from patchers.patch_virtual_activation import patch
 from patchers.patch_devicetree import parse_node, serialize_node
 from qemu.hfs_mount import attach, mounted
@@ -31,13 +31,6 @@ DIAGNOSTIC_ARGS = "amfi_allow_any_signature=1 amfi_get_out_of_my_way=1 cs_enforc
 def digest(path):
     with Path(path).open("rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
-
-
-def clone(src, dst):
-    if dst.exists():
-        raise ValueError(f"Refusing to replace {dst}")
-    # macOS APFS clone avoids unnecessary copies of multi-gigabyte images.
-    subprocess.run(["cp", "-c", str(src), str(dst)], check=True)
 
 
 def build_probe(out):
@@ -154,22 +147,43 @@ def prepare_boot(source, out):
             "boot_args": args, "chosen_debug_enabled": True, "kernel_instruction_patches": []}
 
 
+def prepare_profile(system_source, data_source, output, plan=None):
+    from types import SimpleNamespace
+    a = SimpleNamespace(system=Path(system_source), data=Path(data_source),
+                        output=Path(output), plan=Path(plan) if plan else None)
+    return _prepare(a)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--plan", type=Path, required=True)
-    p.add_argument("--system", type=Path, default=ROOT / "build/diagnostic/system-diagnostic-sep.raw")
-    p.add_argument("--data", type=Path, default=ROOT / "build/diagnostic/data-diagnostic-systembag.raw")
+    p.add_argument("--output", "--out", type=Path)
+    p.add_argument("--plan", type=Path)
+    p.add_argument("--bundle", type=Path)
+    p.add_argument("--system", type=Path, default=None)
+    p.add_argument("--data", type=Path, default=None)
     a = p.parse_args()
+    if a.bundle:
+        a.output = a.output or a.bundle / "ui/activation"
+        a.system = a.system or a.bundle / "ui/diagnostic/system-diagnostic-sep.raw"
+        a.data = a.data or a.bundle / "ui/diagnostic/data-diagnostic-systembag.raw"
+    if not a.output:
+        p.error("Supply --bundle or --output")
+    if not a.system or not a.data:
+        p.error("Supply --bundle or both --system and --data")
+    _prepare(a)
+
+
+def _prepare(a):
     a.output.mkdir(parents=True, exist_ok=True)
     manifest_path = a.output / "profile.json"
     if manifest_path.exists() or any((a.output / n).exists() for n in ("system.raw", "data.raw", "boot")):
-        p.error("Output already contains a profile; choose a new directory")
+        raise ValueError("Output already contains a profile; choose a new directory")
     manifest = {"profile": "virtual-activated", "virtual_activation_only": True,
                 "runtime_verified": False, "inputs": {str(x): digest(x) for x in (a.system, a.data)}}
     probe = build_probe(a.output)
     manifest["probe_sha256"] = digest(probe)
-    manifest["boot"] = prepare_boot(a.plan.resolve(), a.output / "boot")
+    if a.plan:
+        manifest["boot"] = prepare_boot(a.plan.resolve(), a.output / "boot")
     system, data = a.output / "system.raw", a.output / "data.raw"
     clone(a.system, system)
     clone(a.data, data)
@@ -199,7 +213,7 @@ def main():
         seed_setup_done(mount)
     manifest["outputs"] = {str(x): digest(x) for x in (system, data)}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    print(manifest_path, flush=True)
+    return manifest
 
 
 if __name__ == "__main__":

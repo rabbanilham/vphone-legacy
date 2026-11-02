@@ -1,0 +1,543 @@
+{
+  "plan_diff": [
+    {
+      "field": "$.auxiliary_images[0].path",
+      "left": "/private/var/folders/f7/glc574n17sjfsmbhn92bf22m0000gn/T/ui-oracle-5nm1ju9c/ANSRegion.bin",
+      "right": "/Users/bagas/Documents/Projects/vphone/vphone-legacy/backend/evidence/keybag-contract-20261015/boot-plan-noeffaceable/ANSRegion.bin"
+    },
+    {
+      "field": "$.image",
+      "left": "/private/var/folders/f7/glc574n17sjfsmbhn92bf22m0000gn/T/ui-oracle-5nm1ju9c/KernelMemory.bin",
+      "right": "/Users/bagas/Documents/Projects/vphone/vphone-legacy/build/virtual-activated-profile-v5/boot/KernelMemory.bin"
+    },
+    {
+      "field": "$.image_sha256",
+      "left": "297e511214ff00d1a10fad89d1ed11c1b4161045e24b87e74e0341201ef9e7f4",
+      "right": "98d34e7517e4ba89dee3125af2c921fe59281b9ebd9335517888f5aee5837add"
+    },
+    {
+      "field": "$.validation",
+      "left": "prepared; guest execution not yet verified",
+      "right": "virtual-activated diagnostic profile; runtime verification pending"
+    }
+  ],
+  "hashes": {
+    "KernelMemory.bin": {
+      "candidate": "297e511214ff00d1a10fad89d1ed11c1b4161045e24b87e74e0341201ef9e7f4",
+      "oracle": "98d34e7517e4ba89dee3125af2c921fe59281b9ebd9335517888f5aee5837add",
+      "identical": false
+    },
+    "DeviceTree.runtime": {
+      "candidate": "bffd5bfe6ede759f1ed17138f94e5a69aedc4016410da8eced96d6a2e784a23c",
+      "oracle": "329c04fc5196ce2ab0e2c526ae2c68f72a2f6e6de79e5c2a55493678b7818ee1",
+      "identical": false
+    },
+    "boot_args.bin": {
+      "candidate": "837e422a48ee12786d56661631bdd14f956e93c2f0b6f7e688a5d99e3d2ee582",
+      "oracle": "b80ef85304a24f9c00384e4ec475783f5bbbfb69ac0d0e501cbefe1e5a5d3157",
+      "identical": false
+    }
+  },
+  "memory_difference_counts": {
+    "boot_args": 2,
+    "devicetree": 35233,
+    "outside_boot_args_and_devicetree": 0
+  },
+  "memory_lengths": [
+    29065216,
+    29065216
+  ],
+  "devicetree_diff": [
+    {
+      "field": "$./device-tree/arm-io/isp:AAPL,phandle",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "71d1a017200e14b3dda3002d8a94dcf4ed14a1b6bbc960355896152048e003f8"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:camera-front",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:camera-rear",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:clock-gates",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "5c26a7e1f3e6a511b754e7311b278fd23407508dfea309c5c716d281039bac33"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:clock-ids",
+      "left": null,
+      "right": {
+        "size": 8,
+        "sha256": "f98152927c5d69a99f8c7de066d00ba280b040886aa78e45c029f45a3abd5455"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:compatible",
+      "left": null,
+      "right": {
+        "size": 13,
+        "sha256": "ebe44d5bfba7aa512eeb3161bb40e872c92da91f52c1d2217a6a9138d0284e4c"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:device_type",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "700add293027bceacc5bfd39f2a649de0e13bb5b15badddaa7448c162411beb3"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:face-detection-support",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-cam0_ldo",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "9d1087d62cc2dd0d91dcc06b1b3722ed3901eb995130bea8aa864a3444ed3cb0"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-cam_avdd_ldo",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "e7799f27c46b89f9e47ceddd23e6b7769e31a0cb91724d6998f21dff9b5e60ef"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-conf_isp_ref0_clk_freq",
+      "left": null,
+      "right": {
+        "size": 20,
+        "sha256": "c501f26ef07397709cd3d1d3e63499aa097f3fc87aeeee253e0c93d3e2303dcb"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-conf_isp_ref1_clk_freq",
+      "left": null,
+      "right": {
+        "size": 20,
+        "sha256": "5db7513ce106fef28b353ca2de4d34e7ac5c2536ece77f29855ae8300698da75"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-device_reset",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "f53581552208dcf6a2f16cc0aae637b28caa2e6ec7b40e3793c2f0a6fa4f86d0"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-focus_ldo",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "0bae22df86378e1e214e06437f9737e4aee06e577d17e31cc087f4173a2a01d1"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-saca0",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "d4c57e3dee86223d755e02792869d44bcea983e965976f7a41cd47617b68bcb3"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-saca1",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "a5b352b25a016fc1b0a1c5ee36e28fd9532381096f2fe84617abb953359eac9c"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-sensor_extclk",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "5de814ca13184f00b41321283dd966692ef0b0afcd949d3b2fbb2b76adfc69d3"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-sensor_extclk2",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "a65525711c4644c737b4b0f97b3cfb82eb79946e1639d9856d805b833478a7c8"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-sensor_shutdown",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "19678068caa73b39721f632dda98a6209518987e4d2c0b035fb5453f8d1a4942"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-sensor_shutdown2",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "4dee6906b651ba3338253665113fc4e4290e6ae9cf0ffd379d2e1aeae82c6754"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:function-torch_enable",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "923c3145d237489e36c8159f316407adb6e5e8bcf1a1626b91524debdd1ac740"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:interrupt-parent",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "9246be1e9ba9f5de5baf766a256eb725e9a7551fb93d7faa793c938e0f41de35"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:interrupts",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "9c8fa92f00782eb559374bde5561de9761ac11cf2c59b86d824397cc67eda26d"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:iommu-parent",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "c1b8c72a63af6503129ea0936ee4be96c7bea271b50b768ea87369e241be8719"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:name",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "700add293027bceacc5bfd39f2a649de0e13bb5b15badddaa7448c162411beb3"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:power-gates",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "5c26a7e1f3e6a511b754e7311b278fd23407508dfea309c5c716d281039bac33"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:reg",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "839d0ee8126f84aea8930d01d248bc8a95dca051f4adc4e896e36c418deb808d"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/isp:sensor-type",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "84fc05949dc1e486652a4ed316afb6434e9437eb30b714594a1d0b4205776602"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:AAPL,phandle",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "d596e806d34bd7d4304b9f00ec340f02fa90c4faa17fe39729cb15c76e0de77f"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:accel-interrupt-calibration",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:accel-orientation",
+      "left": null,
+      "right": {
+        "size": 32,
+        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:accel-sensitivity-calibration",
+      "left": null,
+      "right": {
+        "size": 40,
+        "sha256": "2c34ce1df23b838c5abf2a7f6437cca3d3067ed509ff25f11df6b11b582b51eb"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:device-usage",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "9d9f290527a6be626a8f5985b26e19b237b44872b03631811df4416fc1713178"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:device-usage-page",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "e890f350f4385cfe5b486628906ccb2370663d40763f50d39c272d49b3d583a6"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:device_type",
+      "left": null,
+      "right": {
+        "size": 14,
+        "sha256": "323b40372eb96ae14c544c57416e942651ef67a7593db114d459a1d9e5d28525"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:low-temp-accel-offset",
+      "left": null,
+      "right": {
+        "size": 20,
+        "sha256": "de47c9b27eb8d300dbb5f2c353e632c393262cf06340c4fa7f1b40c4cbd36f90"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/accelerometer:name",
+      "left": null,
+      "right": {
+        "size": 14,
+        "sha256": "323b40372eb96ae14c544c57416e942651ef67a7593db114d459a1d9e5d28525"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/cma:AAPL,phandle",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "5a05f87d329a8321f2006f4f3b11b810aeddcd21cb383b61df03824074eaffc9"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/cma:device-usage",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/cma:device-usage-page",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "e890f350f4385cfe5b486628906ccb2370663d40763f50d39c272d49b3d583a6"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/cma:device_type",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "510b7053cf054a6d88e3d23f12337329630fd4ea45276e1287c03cd8a2d7f784"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/cma:name",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "510b7053cf054a6d88e3d23f12337329630fd4ea45276e1287c03cd8a2d7f784"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:AAPL,phandle",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "ae3c8b8d99a39542f78af83dbbb42c81cd94199ec1b5f60a0801063e95842570"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:device-usage",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "9f076b7eb7fdc0311cd3208cdbbebbf8014dd3a05e35191c96947b358a362b40"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:device-usage-page",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "e890f350f4385cfe5b486628906ccb2370663d40763f50d39c272d49b3d583a6"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:device_type",
+      "left": null,
+      "right": {
+        "size": 5,
+        "sha256": "c17e913eea99e0395fa085b77be074f4ca4c1e359523ee4bb8bd919df9657448"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:gyro-interrupt-calibration",
+      "left": null,
+      "right": {
+        "size": 8,
+        "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:gyro-orientation",
+      "left": null,
+      "right": {
+        "size": 32,
+        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:gyro-sensitivity-calibration",
+      "left": null,
+      "right": {
+        "size": 40,
+        "sha256": "2c34ce1df23b838c5abf2a7f6437cca3d3067ed509ff25f11df6b11b582b51eb"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:gyro-temp-table",
+      "left": null,
+      "right": {
+        "size": 320,
+        "sha256": "7b6436b0c98f62380866d9432c2af0ee08ce16a171bda6951aecd95ee1307d61"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar/gyro:name",
+      "left": null,
+      "right": {
+        "size": 5,
+        "sha256": "c17e913eea99e0395fa085b77be074f4ca4c1e359523ee4bb8bd919df9657448"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:AAPL,phandle",
+      "left": null,
+      "right": {
+        "size": 4,
+        "sha256": "c8d26116ed30f9816a05fdf061b2535145472f388d9814e96f33f08369dbcbd0"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:compatible",
+      "left": null,
+      "right": {
+        "size": 18,
+        "sha256": "2ac40b005240c7923402991f57cf76f50e41f036c6f79aab592bc9d317276d8b"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:device_type",
+      "left": null,
+      "right": {
+        "size": 6,
+        "sha256": "222bd9d6addbc59f8329e3215ef5d499e5c68ba2592c6a1c08db0d2698220b7d"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:function-oscar_power1",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "6236f04f115c41b7121d90ead56f570aabd5cef39c7947ac6be0f9b96af06f21"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:function-oscar_power2",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "4e98b342fabea983ee95e431bfb88e0be74fec085be604799aea51c2e7a73ff5"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:function-reset",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "e7664002f8439bc52c93d8cf68faece89a71196e41f0d67a6054f11ee8bab62f"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:function-sensor_power",
+      "left": null,
+      "right": {
+        "size": 12,
+        "sha256": "75d77fa03a5044bbe5d1d8ea5d5bb6a43d06a4f6e4a4ed24928ec877cddb9e8c"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:function-time-sync",
+      "left": null,
+      "right": {
+        "size": 16,
+        "sha256": "e5c618cbcbbde805b26ada3033f556a401b9ff0b58c25cab564eca47d8146d93"
+      }
+    },
+    {
+      "field": "$./device-tree/arm-io/uart2/oscar:name",
+      "left": null,
+      "right": {
+        "size": 6,
+        "sha256": "222bd9d6addbc59f8329e3215ef5d499e5c68ba2592c6a1c08db0d2698220b7d"
+      }
+    },
+    {
+      "field": "$./device-tree/chosen/memory-map:DeviceTree.sha256",
+      "left": "3a632e2f49bce155d4433e6e56a29c1e46e794950c8e5ebd1d4fc60548944742",
+      "right": "4e1e4b1b81b6ff3ba57d6ffc036942857043786e81f6fcae1c3d372ac9f8b068"
+    },
+    {
+      "field": "$./device-tree/chosen:nvram-proxy-data.sha256",
+      "left": "5565c98c72140a1ea084778763935af65dde343aafade43096bad7ebdb9b195b",
+      "right": "79f2d05411b6edb9f7bda9925619ee7ad43ef70088f6a980e77c10d9248a48f3"
+    }
+  ],
+  "identical": false
+}

@@ -18,31 +18,74 @@ Interactive baseline launch uses `./vphone-legacy vm launch ios712`; `--paused` 
 
 The publication-preparation validation reproduced baseline preparation and launch locally: the guest reached launchd userspace, reported `FIPS USER Space POST: Integrity test failed!`, and began shutdown. QEMU exited zero. Treat this as a diagnosed bring-up result, not a successful UI boot.
 
-## UI research profile: additional inputs required
+## Experimental UI preparation from a local IPSW
 
-The baseline above is not the configuration used for the recorded Home/Settings runs. The later path is:
-
-1. Prepare baseline firmware/disks.
-2. Supply the separately prepared keybag/SMP/nooscar boot plan, its KernelMemory.bin, runtime DeviceTree, and every auxiliary image it references.
-3. Supply diagnostic System/Data images with the required seeded filesystem/keybag state.
-4. Build a virtual-activated derivative and launch it with the project backend.
+After `vm create`, the offline UI pipeline can extract n53 SEP firmware directly
+from your IPSW, prepare diagnostic disk copies, seed migration/Setup Assistant
+preferences, patch virtual activation, and regenerate an SMP boot plan. Firmware
+and prepared images remain local; none are distributed with the project.
 
 ```sh
-.venv/bin/python scripts/prepare_virtual_activation.py \
-  --plan /path/to/local/keybag/boot_plan.json \
-  --system /path/to/local/system-diagnostic-sep.raw \
-  --data /path/to/local/data-diagnostic-systembag.raw \
-  --output build/virtual-activated-rebuild
-.venv/bin/python backend/live_run.py \
-  --plan build/virtual-activated-rebuild/boot/boot_plan.json \
-  --system build/virtual-activated-rebuild/system.raw \
-  --data build/virtual-activated-rebuild/data.raw
+python3 scripts/ui_profile.py prepare-ui /path/to/VMs/ios712 \
+  --ipsw /path/to/iPhone6,2_7.1.2_11D257_Restore.ipsw --progress-json
+python3 scripts/ui_profile.py import-profile /path/to/VMs/ios712 \
+  --from /path/to/virtual-activated-profile-v5 --progress-json
 ```
 
-These commands require existing inputs; they are not an end-to-end IPSW recipe. [Profile snapshots](../profiles/virtual-activated/README.md) retain hashes and configuration, not the missing bytes. `${REPO_ROOT}` in those snapshots is a template token and must be replaced recursively before local use. Absolute artifact paths in a real boot plan must point at your own files.
+`--ipsw` is optional when `firmware.ipsw_path` or `firmware.ipsw_filename` resolves
+to an existing local file, or the bundle already contains the extracted SEP.
+The IPSW hash must match the baseline manifest when recorded. A differing local
+research SEP reference produces a warning, rather than replacing the user's input.
+`--force` creates a new generation from the untouched baseline disks. Existing UI
+generations are retained for recovery; they can consume disk space. A stopped VM
+is required (`runtime.lock` is held throughout preparation). Failed work directories
+are removed; completed profiles and the manifest switch are published atomically.
+An interrupted process can leave `.ui-preparing-*` directories, which may be removed
+only while holding the same lock and after confirming no preparation is running.
 
-**Reproducibility blocker:** the repository does not contain a complete automated IPSW-to-keybag/SMP/nooscar preparation path. `prepare_diagnostic_disks.py` is a research helper with additional SEP firmware/keybag prerequisites, not a substitute for that missing path. Do not manufacture or distribute these inputs as part of setup. Complete that pipeline in a separate feature change before promising one-command UI boot.
+The resulting manifest retains schema 2 and immutable firmware/System records.
+`artifacts.system_runtime_disk` and `artifacts.data_disk` point to persistent UI
+disks beneath `ui/<generation>/`; `plan` points to its self-contained boot plan.
+The existing `validate_bundle` provenance/size rules already accept this layout.
+Relaxed AMFI boot arguments and `chosen/debug-enabled` apply to this UI profile.
 
-`live_run.py` defaults to `build/virtual-activated-profile-v5`. It clones disposable disks and removes those clones on exit unless `--keep-images` is supplied. The validated storage/utility backing is also required; see the script's storage lookup and the original profile layout. Logs are printed with the temporary work directory. No baseline disk should be overwritten to make this layout work.
+For CLI integration, import `prepare_ui(bundle, progress=None, force=False,
+ipsw=None)` or `import_profile(bundle, source_profile_dir, progress=None,
+force=False)` from `scripts/ui_profile.py`. The callback accepts one schema-1 stage
+object per call, matching [the GUI contract](gui-contract.md). The API returns the
+new manifest or raises; the CLI wrapper owns the single final `result` event.
+The standalone commands above emit that result themselves. No contract or fixture
+schema was changed. Runtime integration must consume manifest `plan` (including
+its auxiliary images), or pass `debug_enabled=True` when rebuilding UI plans;
+rebuilding with the baseline defaults drops the required debug property.
 
-For debugger probes use `backend/display_probe.py --help`. Supply `--diagnostic-system`, `--diagnostic-data`, and `--plan` explicitly for research inputs. Hook JSON cache/index paths are resolved relative to the repository root unless absolute. Keep extracted shared caches and generated indexes in ignored local storage.
+### Evidence gates and Home limitations
+
+Offline preparation deliberately emits `boot-check: skipped` and records
+`home_screen_verified: false`. It does not boot a VM. `SpringBoard` or `lockdownd`
+serial text proves userspace only. `qemu.boot_check.classify_boot(serial,
+screendump)` accepts P6 QMP framebuffer bytes; a conservative icon-grid/dock
+reference match identifies Home, while a clock/slide/wallpaper heuristic identifies
+lockscreen. The latter is heuristic, with no captured lockscreen ground truth;
+visual changes, overlays, or different wallpaper can cause false negatives.
+The compact Home reference is derived from the archived public evidence, not a
+new boot. Synthetic lockscreen tests do not prove reliable real-device detection.
+
+The regenerated boot plan is **not identical to v5**. The offline oracle report
+and assessment are in [profiles/ui](../profiles/ui/README.md). In particular the
+new plan omits a persisted SEP ART NVRAM variable present in v5; functional
+equivalence and IPSW-to-Home remain unverified. Importing an existing prepared
+profile preserves its actual runtime DeviceTree/NVRAM and materializes all named
+auxiliary images, failing if required local bytes are missing.
+
+An orchestrator may run the opt-in acceptance gate (this command boots VMs):
+
+```sh
+python3 scripts/e2e_ui_boot.py --name ui-e2e --bundle /path/to/VMs/ui-e2e \
+  --ipsw /path/to/iPhone6,2_7.1.2_11D257_Restore.ipsw --seconds 180
+```
+
+It creates a fresh bundle, prepares UI, and requires `home` from three separate
+cold launches with serial/framebuffer evidence. Use a fresh name: it does not
+replace an existing bundle. Runtime/CLI integration must be in place first. Forced
+bounded stops are unclean; this gate does not establish clean guest shutdown.
