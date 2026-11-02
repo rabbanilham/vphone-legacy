@@ -15,6 +15,13 @@ public struct VPhoneLegacyApp: App {
                     LibraryView(appState: appState)
                 }
             }
+            .alert("vphone-legacy", isPresented: Binding(
+                get: { appState.errorMessage != nil },
+                set: { if !$0 { appState.errorMessage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(appState.errorMessage ?? "")
+            }
             .frame(minWidth: 900, minHeight: 620)
             .task {
                 await appState.checkSetup()

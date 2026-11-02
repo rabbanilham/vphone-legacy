@@ -2,6 +2,21 @@ import Foundation
 import SwiftUI
 import Observation
 
+/// Result of a detached `vm launch` call, shared between the launch task and the watcher.
+final class LaunchOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failure: String?
+    private var finished = false
+    private var checks = 0
+
+    func record(error: String) { lock.lock(); failure = error; lock.unlock() }
+    func markFinished() { lock.lock(); finished = true; lock.unlock() }
+    var error: String? { lock.lock(); defer { lock.unlock() }; return failure }
+    var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
+    /// A launcher stuck in `starting` for several polls is still considered up (the player is booting).
+    func elapsedLaunchCheck() -> Bool { lock.lock(); defer { lock.unlock() }; checks += 1; return checks >= 6 }
+}
+
 @Observable
 @MainActor
 public final class AppState {
@@ -135,20 +150,46 @@ public final class AppState {
         pollingTasks.removeValue(forKey: vmName)
     }
 
+    /// `vm launch` stays alive for the whole VM session (the launcher owns QEMU and the
+    /// player), so it must never be awaited: watch the launcher's status instead and only
+    /// surface the CLI's message if it exits before the VM is up.
     public func launchVM(name: String) async {
         guard let vm = vms.first(where: { $0.name == name }) else { return }
         let wifi = vmWifiSettings[name] ?? false
         let display = vm.isUiProfile ? "player" : "cocoa"
-        activeOperations[name] = "Launching..."
-
-        do {
-            _ = try await client.vmLaunch(name: name, display: display, wifi: wifi)
-            startMonitoring(for: name)
-        } catch {
-            self.errorMessage = "Launch failed: \(error.localizedDescription)"
+        errorMessage = nil
+        activeOperations[name] = "Starting..."
+        let outcome = LaunchOutcome()
+        let client = self.client
+        Task.detached {
+            do {
+                _ = try await client.vmLaunch(name: name, display: display, wifi: wifi)
+            } catch {
+                outcome.record(error: error.localizedDescription)
+            }
+            outcome.markFinished()
+        }
+        var running = false
+        for _ in 0..<80 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if outcome.isFinished { break }
+            await updateStatus(for: name)
+            let phase = vmStatuses[name]?.process?.phase
+            if phase == "running" || (phase == "starting" && outcome.elapsedLaunchCheck()) {
+                running = true
+                break
+            }
+        }
+        if let failure = outcome.error {
+            errorMessage = "Could not start \(name): \(failure)"
+        } else if !running && !outcome.isFinished {
+            errorMessage = "Could not start \(name): the launcher did not report a running VM within 40 seconds."
         }
         activeOperations.removeValue(forKey: name)
-        await updateStatus(for: name)
+        await refreshVMs()
+        if running {
+            startMonitoring(for: name)
+        }
     }
 
     public func stopVM(name: String, force: Bool = false) async {
