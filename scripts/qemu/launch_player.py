@@ -52,6 +52,7 @@ def build_qemu_command(
     paused: bool = False,
     probe_seconds: float | None = None,
     data_dir: str | Path | None = None,
+    control_qmp_path: str | Path | None = None,
 ) -> list[str]:
     """Pure function constructing QEMU command line arguments."""
     cmd = [
@@ -79,6 +80,12 @@ def build_qemu_command(
 
     cmd += [
         "-qmp", f"unix:{qmp_path},server=on,wait=off",
+    ]
+    if control_qmp_path:
+        # A QMP socket serves one client at a time: the player owns qmp_path for input,
+        # so the launcher needs a monitor of its own for stop/status/screendump.
+        cmd += ["-qmp", f"unix:{control_qmp_path},server=on,wait=off"]
+    cmd += [
         "-monitor", "none",
         "-chardev", f"stdio,id=console,signal=off,logfile={serial_log}",
         "-serial", "chardev:console",
@@ -90,6 +97,20 @@ def build_qemu_command(
     if probe_seconds is not None or paused:
         cmd.append("-S")
     return cmd
+
+
+def boot_image_options(manifest: dict) -> dict:
+    """Extra build_image() options a bundle's profile needs at launch time.
+
+    The UI profile must advertise chosen/debug-enabled: AppleMobileFileIntegrity only
+    honours the relaxed-signature boot arguments when the platform says a debugger
+    is allowed, and without them the guest never starts launchd.
+    """
+    options = {"debug_enabled": manifest.get("profile") == "ui"}
+    nvram = manifest.get("nvram_vars")
+    if nvram:
+        options["nvram_vars"] = {key: bytes.fromhex(value) for key, value in nvram.items()}
+    return options
 
 
 def resolve_player_binary(player_path: str | Path) -> Path:

@@ -14,6 +14,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from qemu.launch_player import (
+    boot_image_options,
     get_repo_root,
     resolve_display_mode,
     build_qemu_command,
@@ -95,6 +96,21 @@ class TestCommandBuilders(unittest.TestCase):
         # Must NOT have cocoa display
         self.assertNotIn("cocoa", cmd)
 
+    def test_player_mode_gives_the_launcher_its_own_qmp_socket(self):
+        cmd = build_qemu_command(
+            backend_binary=self.qemu_bin, machine=self.machine, accelerator="tcg,thread=multi",
+            cpu_count=2, kernel_image=self.kernel, display_mode="player", qmp_path=self.qmp,
+            vnc_path=self.vnc, serial_log=self.serial, trace_log=self.trace,
+            control_qmp_path="/tmp/vpl-x/ctl.sock")
+        sockets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-qmp"]
+        self.assertEqual(sockets, [f"unix:{self.qmp},server=on,wait=off",
+                                   "unix:/tmp/vpl-x/ctl.sock,server=on,wait=off"])
+        single = build_qemu_command(
+            backend_binary=self.qemu_bin, machine=self.machine, accelerator="tcg,thread=multi",
+            cpu_count=2, kernel_image=self.kernel, display_mode="cocoa", qmp_path=self.qmp,
+            serial_log=self.serial, trace_log=self.trace)
+        self.assertEqual(single.count("-qmp"), 1)
+
     def test_player_mode_passes_qemu_data_dir_for_vnc_keymaps(self):
         with tempfile.TemporaryDirectory() as bios:
             cmd = build_qemu_command(
@@ -107,6 +123,13 @@ class TestCommandBuilders(unittest.TestCase):
                 cpu_count=2, kernel_image=self.kernel, display_mode="cocoa", qmp_path=self.qmp,
                 serial_log=self.serial, trace_log=self.trace, data_dir=bios)
             self.assertNotIn("-L", cocoa)
+
+    def test_ui_profile_boots_with_debug_enabled(self):
+        self.assertEqual(boot_image_options({"profile": "ui"}), {"debug_enabled": True})
+        self.assertEqual(boot_image_options({"profile": "baseline"}), {"debug_enabled": False})
+        self.assertEqual(boot_image_options({}), {"debug_enabled": False})
+        art = boot_image_options({"profile": "ui", "nvram_vars": {"com.apple.System.sep.art": "3003020100"}})
+        self.assertEqual(art["nvram_vars"], {"com.apple.System.sep.art": bytes.fromhex("3003020100")})
 
     def test_qemu_command_player_mode_requires_vnc_path(self):
         with self.assertRaises(ValueError):

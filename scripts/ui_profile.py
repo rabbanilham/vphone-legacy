@@ -92,6 +92,24 @@ def _record(path, relative, mutable=False):
     return result
 
 
+def _der(tag, body):
+    n = len(body)
+    length = bytes([n]) if n < 0x80 else bytes([0x81, n]) if n < 0x100 else bytes([0x82, n >> 8, n & 0xff])
+    return bytes([tag]) + length + body
+
+
+def make_art_stub(rng=os.urandom):
+    """A fresh, random SEP anti-replay token blob (DER-shaped) for a new VM.
+
+    The guest's seputil panics at boot when NVRAM has no com.apple.System.sep.art.
+    A real device gets this value from its first restore; the emulated SEP does not
+    validate it, so each VM simply gets its own random token, stored in the manifest
+    so later launches see the same value.
+    """
+    token = _der(0x04, rng(32)) + _der(0x04, rng(32))
+    return _der(0x30, _der(0x02, b'\x00') + _der(0x31, _der(0x02, b'\x01') + token))
+
+
 def _publish(bundle, work, manifest):
     """Immutable generations + atomic manifest switch keep failures/retries safe."""
     if (bundle / 'ui').is_symlink():
@@ -105,6 +123,8 @@ def _publish(bundle, work, manifest):
     manifest['artifacts']['data_disk'] = _record(work / 'data.raw', final.relative_to(bundle) / 'data.raw', True)
     if plan.get('boot_args') != UI_ARGS:
         raise ValueError('Imported profile must use the validated v5 UI boot arguments')
+    if 'nvram_vars' not in manifest:
+        manifest['nvram_vars'] = {'com.apple.System.sep.art': make_art_stub().hex()}
     manifest.update(profile='ui', boot_args=plan['boot_args'],
                     plan=str(final.relative_to(bundle) / 'boot/boot_plan.json'),
                     ui=dict(generation=str(final.relative_to(bundle)), debug_enabled=True,

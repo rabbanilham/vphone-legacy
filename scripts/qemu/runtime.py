@@ -30,6 +30,7 @@ from qemu.boot_image import build_image
 from qemu.storage import prepare_system_runtime, snapshot_storage
 from qemu.utility import prepare_utility_image
 from qemu.launch_player import (
+    boot_image_options,
     get_repo_root,
     resolve_display_mode,
     build_qemu_command,
@@ -203,7 +204,8 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
                            resolve_artifact(bundle, manifest["artifacts"]["devicetree"]),
                            logs / "boot", manifest.get("boot_args", "-v serial=3 debug=0x14e"),
                            monitor_path=resolve_artifact(bundle, manifest["artifacts"]["monitor"]),
-                           ans_path=resolve_artifact(bundle, manifest["artifacts"]["ans_firmware"]))
+                           ans_path=resolve_artifact(bundle, manifest["artifacts"]["ans_firmware"]),
+                           **boot_image_options(manifest))
         write_json(logs / "boot-plan.json", plan)
         write_json(logs / "build-identity.json", {
             "backend": {key: backend[key] for key in ("source_commit", "sha256", "machine_source_sha256")},
@@ -223,7 +225,10 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
         with tempfile.TemporaryDirectory(prefix="vpl-", dir="/tmp") as control:
             qmp_path = str(Path(control) / "qmp.sock")
             vnc_path = str(Path(control) / "vnc.sock") if display_mode == "player" else None
+            control_qmp_path = str(Path(control) / "ctl.sock") if display_mode == "player" else None
             status["control"] = {"qmp": qmp_path}
+            if control_qmp_path:
+                status["control"]["launcher_qmp"] = control_qmp_path
             machine = f"s5l8960x,boot-el=3,boot-entry={plan['initial_entry_pa']:#x},boot-args={plan['initial_boot_args_pa']:#x},framebuffer={plan['framebuffer_pa']:#x}"
             if storage_paths:
                 # QemuOpts accepts doubled commas in string property values.
@@ -249,6 +254,7 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
                 trace_log=logs / "qemu-trace.log",
                 trace_mask=trace_mask,
                 vnc_path=vnc_path,
+                control_qmp_path=control_qmp_path,
                 auxiliary_images=plan.get("auxiliary_images", []),
                 paused=paused,
                 probe_seconds=probe_seconds,
@@ -292,8 +298,9 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
                 write_json(bundle / "runtime.json", status)
                 deadline = time.monotonic() + 10
                 while process.poll() is None and time.monotonic() < deadline:
-                    if Path(qmp_path).exists() and (vnc_path is None or Path(vnc_path).exists()):
-                        qmp = QMP(qmp_path)
+                    launcher_qmp = control_qmp_path or qmp_path
+                    if Path(launcher_qmp).exists() and (vnc_path is None or Path(vnc_path).exists()):
+                        qmp = QMP(launcher_qmp)
                         break
                     if interrupted:
                         break
