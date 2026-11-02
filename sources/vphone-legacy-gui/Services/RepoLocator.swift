@@ -31,6 +31,13 @@ public final class RepoLocator {
             }
         }
 
+        // dist/vphone-legacy.app lives two levels below the checkout it was built from.
+        let beside = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        if Self.validate(url: beside) {
+            self.repoRoot = beside
+            return
+        }
+
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         if Self.validate(url: cwd) {
             self.repoRoot = cwd
