@@ -55,10 +55,20 @@ index 65e5dbc..1042866 100644
          .state = MAIN_LOOP_POLL_FILL,
          .timeout = UINT32_MAX,
 diff --git a/util/qemu-timer.c b/util/qemu-timer.c
-index d93a020..0756780 100644
+index d93a020..37fa6e7 100644
 --- a/util/qemu-timer.c
 +++ b/util/qemu-timer.c
-@@ -343,6 +343,84 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+@@ -30,6 +30,9 @@
+ #include "exec/icount.h"
+ #include "system/replay.h"
+ #include "system/cpus.h"
++#ifdef __APPLE__
++#include <poll.h>
++#endif
+ #include "hw/core/cpu.h"
+ 
+ #ifdef CONFIG_POSIX
+@@ -343,6 +346,104 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
          return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
      }
  #else
@@ -73,6 +83,7 @@ index d93a020..0756780 100644
 +        fd_set rfds, wfds, efds;
 +        int maxfd = -1;
 +        bool usable = nfds <= FD_SETSIZE;
++        bool hup_only = false;
 +
 +        FD_ZERO(&rfds);
 +        FD_ZERO(&wfds);
@@ -85,6 +96,11 @@ index d93a020..0756780 100644
 +            if (fd >= FD_SETSIZE) {
 +                usable = false;
 +                break;
++            }
++            if (!(fds[i].events & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
++                /* Hang-up-only watch (QEMU chardevs use one to notice a
++                 * disconnected client): select() cannot wait for it. */
++                hup_only = true;
 +            }
 +            if (fds[i].events & G_IO_IN) {
 +                FD_SET(fd, &rfds);
@@ -101,6 +117,10 @@ index d93a020..0756780 100644
 +            struct timespec ts, *tsp = NULL;
 +            int n, ready = 0;
 +
++            if (hup_only && (timeout < 0 || timeout > 100000000LL)) {
++                /* select() cannot report hang-ups: re-check them often. */
++                timeout = 100000000LL;
++            }
 +            if (timeout >= 0) {
 +                int64_t tvsec = timeout / 1000000000LL;
 +                if (tvsec > (int64_t)INT32_MAX) {
@@ -126,6 +146,16 @@ index d93a020..0756780 100644
 +                    }
 +                    if ((fds[i].events & G_IO_PRI) && FD_ISSET(fd, &efds)) {
 +                        fds[i].revents |= G_IO_PRI;
++                    }
++                    if (!(fds[i].events & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
++                        /* Hang-up-only watch: ask poll() without sleeping. */
++                        struct pollfd p = { .fd = fd, .events = 0 };
++                        if (poll(&p, 1, 0) > 0 &&
++                            (p.revents & (POLLHUP | POLLERR | POLLNVAL))) {
++                            fds[i].revents |= (p.revents & POLLHUP ? G_IO_HUP : 0) |
++                                              (p.revents & POLLERR ? G_IO_ERR : 0) |
++                                              (p.revents & POLLNVAL ? G_IO_NVAL : 0);
++                        }
 +                    }
 +                    if (fds[i].revents) {
 +                        ready++;
