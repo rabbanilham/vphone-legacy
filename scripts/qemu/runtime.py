@@ -15,11 +15,30 @@ import tempfile
 import time
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Honor VPHONE_LEGACY_ROOT if set in the environment
+env_root = os.environ.get("VPHONE_LEGACY_ROOT")
+REPO_ROOT = Path(env_root).resolve() if env_root else Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+BACKEND_DIR = REPO_ROOT / "backend"
+
+for d in (str(SCRIPTS_DIR), str(BACKEND_DIR)):
+    if d not in sys.path:
+        sys.path.insert(0, d)
+
 from bundle import validate_bundle, resolve_artifact
 from qemu.boot_image import build_image
 from qemu.storage import prepare_system_runtime, snapshot_storage
 from qemu.utility import prepare_utility_image
+from qemu.launch_player import (
+    get_repo_root,
+    resolve_display_mode,
+    build_qemu_command,
+    build_player_command,
+    BootStageMonitor,
+    build_initial_runtime_status,
+    handle_stop_request,
+    cleanup_processes,
+)
 
 
 def write_json(path, value):
@@ -143,13 +162,14 @@ def host_launch_command(command):
     return command
 
 
-def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False):
+def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False, display=None):
     bundle = Path(bundle).resolve()
     report = validate_bundle(bundle)
     if report["errors"]:
         raise ValueError("\n".join(report["errors"]))
     manifest = json.loads((bundle / "vm_manifest.json").read_text())
     backend = report["backend"]
+    display_mode = resolve_display_mode(manifest, display_arg=display, headless=headless)
     with (bundle / "runtime.lock").open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -198,14 +218,11 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
             "storage_images": storage_paths,
             "storage_before": snapshots,
         })
-        stages = {name: dict(phase="unverified", evidence=None) for name in ("kernel", "userspace", "display", "agent")}
-        status = dict(schema_version=1, session_id=str(uuid.uuid4()),
-                      process=dict(phase="starting", pid=None, exit_code=None),
-                      shutdown=dict(clean=None, reason=None), capabilities=backend.get("capabilities", {}),
-                      log_directory=str(logs), **stages)
+        status = build_initial_runtime_status(str(uuid.uuid4()), logs, display_mode, backend.get("capabilities", {}))
         # macOS Unix socket paths are limited to 104 bytes; tempfile root is short.
         with tempfile.TemporaryDirectory(prefix="vpl-", dir="/tmp") as control:
             qmp_path = str(Path(control) / "qmp.sock")
+            vnc_path = str(Path(control) / "vnc.sock") if display_mode == "player" else None
             status["control"] = {"qmp": qmp_path}
             machine = f"s5l8960x,boot-el=3,boot-entry={plan['initial_entry_pa']:#x},boot-args={plan['initial_boot_args_pa']:#x},framebuffer={plan['framebuffer_pa']:#x}"
             if storage_paths:
@@ -220,26 +237,35 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
             # -d int logs every exception and timer FIQ (~100 MB per boot) and
             # unimp logs every modeled MMIO access; both slow the guest a lot.
             trace_mask = os.environ.get("VPHONE_QEMU_DEBUG", "guest_errors")
-            command = [backend["binary"], "-machine", machine, "-accel", accelerator,
-                       "-smp", str(plan["cpu_count"]), "-m", "1024M",
-                       "-kernel", plan["image"], "-display", "none" if headless else "cocoa",
-                       "-qmp", f"unix:{qmp_path},server=on,wait=off", "-monitor", "none",
-                       "-chardev", f"stdio,id=console,signal=off,logfile={logs / 'serial.log'}",
-                       "-serial", "chardev:console", "-d", trace_mask, "-D", str(logs / "qemu-trace.log")]
-            for image in plan["auxiliary_images"]:
-                command += ["-device", f"loader,file={image['path']},addr={image['address']:#x},force-raw=on"]
-            if probe_seconds is not None or paused:
-                command.append("-S")
+            command = build_qemu_command(
+                backend_binary=backend["binary"],
+                machine=machine,
+                accelerator=accelerator,
+                cpu_count=plan["cpu_count"],
+                kernel_image=plan["image"],
+                display_mode=display_mode,
+                qmp_path=qmp_path,
+                serial_log=logs / "serial.log",
+                trace_log=logs / "qemu-trace.log",
+                trace_mask=trace_mask,
+                vnc_path=vnc_path,
+                auxiliary_images=plan.get("auxiliary_images", []),
+                paused=paused,
+                probe_seconds=probe_seconds,
+            )
             # No virtio disks/network: legacy guest drivers do not support them.
             # ANS serves explicit raw partition files; no generic virtio disk.
-            backend_dir = Path(__file__).resolve().parents[2] / "backend"
-            if str(backend_dir) not in sys.path:
-                sys.path.insert(0, str(backend_dir))
             from host_wifi import configure_wifi
             child_env = configure_wifi(command, wifi)
             command = host_launch_command(command)
             write_json(logs / "command.json", command)
             write_json(bundle / "runtime.json", status)
+
+            player_binary = None
+            if display_mode == "player":
+                from live_run import build_player
+                player_binary = build_player(root=REPO_ROOT)
+
             print("Launching original secure monitor and XNU on experimental A7; no boot/UI readiness claimed.", flush=True)
             for limitation in report["limitations"]:
                 print("  " + limitation, flush=True)
@@ -253,18 +279,20 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
             for sig in (signal.SIGINT, signal.SIGTERM):
                 old_handlers[sig] = signal.signal(sig, interrupt)
             process = None
+            player_process = None
             qmp = None
             reason = None
             launch_failed = False
             verbose_trace = "int" in trace_mask.split(",")
             panic_monitor = PanicMonitor()
+            boot_monitor = BootStageMonitor()
             try:
                 process = subprocess.Popen(command, start_new_session=True, env=child_env)
                 status["process"].update(phase="running", pid=process.pid)
                 write_json(bundle / "runtime.json", status)
                 deadline = time.monotonic() + 10
                 while process.poll() is None and time.monotonic() < deadline:
-                    if Path(qmp_path).exists():
+                    if Path(qmp_path).exists() and (vnc_path is None or Path(vnc_path).exists()):
                         qmp = QMP(qmp_path)
                         break
                     if interrupted:
@@ -275,28 +303,42 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
                 if qmp is None:
                     raise ValueError("QMP startup timed out")
                 write_json(logs / "qmp-start.json", qmp.execute("query-status"))
+
+                if display_mode == "player" and not interrupted and process.poll() is None:
+                    player_cmd = build_player_command(player_binary, vnc_path, qmp_path)
+                    player_process = subprocess.Popen(player_cmd)
+
                 if probe_seconds is not None:
                     before = qmp.execute("human-monitor-command", {"command-line": "info registers"})
                     (logs / "registers-before.txt").write_text(before)
                     qmp.execute("cont")
                 started = time.monotonic()
                 while process.poll() is None:
-                    request_path = bundle / "stop-request.json"
-                    if request_path.exists():
-                        request = json.loads(request_path.read_text())
-                        if request.get("session_id") == status["session_id"]:
-                            request_path.unlink()
-                            if request.get("force"):
-                                reason = "explicit forced stop"
-                                break
-                            if backend.get("capabilities", {}).get("guest_shutdown") is True:
-                                qmp.execute("system_powerdown")
-                                status["process"]["phase"] = "stopping"
-                                write_json(bundle / "runtime.json", status)
-                    if panic_monitor.poll(logs / "serial.log"):
+                    if player_process is not None and player_process.poll() is not None:
+                        reason = "player window closed"
+                        break
+
+                    stop_req, stop_reason, is_stopping = handle_stop_request(
+                        bundle, status["session_id"], qmp=qmp,
+                        guest_shutdown_capable=backend.get("capabilities", {}).get("guest_shutdown", False)
+                    )
+                    if stop_req:
+                        reason = stop_reason
+                        break
+                    if is_stopping:
+                        status["process"]["phase"] = "stopping"
+                        write_json(bundle / "runtime.json", status)
+
+                    stage = boot_monitor.poll(logs / "serial.log")
+                    if stage != status.get("boot_stage"):
+                        status["boot_stage"] = stage
+                        write_json(bundle / "runtime.json", status)
+                    if stage == "panic" or panic_monitor.poll(logs / "serial.log"):
                         reason = "XNU panic observed on guest UART; boot failed"
                         launch_failed = True
                         status["kernel"] = dict(phase="failed", evidence=str(logs / "serial.log"), reason=reason)
+                        status["boot_stage"] = "panic"
+                        write_json(bundle / "runtime.json", status)
                         break
                     trace = logs / "qemu-trace.log"
                     if verbose_trace and trace.exists() and trace.stat().st_size > 16 * 1024 * 1024:
@@ -322,18 +364,28 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
                         reason = "bounded kernel probe; guest shutdown unverified"
                         break
                     time.sleep(0.1)
+
+                if process.poll() is not None and not reason:
+                    reason = f"QEMU exited unexpectedly (code {process.returncode})"
+                    if process.returncode != 0:
+                        launch_failed = True
+
                 if reason:
-                    if launch_failed:
-                        qmp.execute("stop")
-                        (logs / "registers-after.txt").write_text(qmp.execute("human-monitor-command", {"command-line": "info registers"}))
-                        write_json(logs / "qmp-end.json", qmp.execute("query-status"))
-                        qmp.execute("screendump", {"filename": str(logs / "framebuffer.ppm")})
+                    if launch_failed and qmp is not None:
+                        try:
+                            qmp.execute("stop")
+                            (logs / "registers-after.txt").write_text(qmp.execute("human-monitor-command", {"command-line": "info registers"}))
+                            write_json(logs / "qmp-end.json", qmp.execute("query-status"))
+                            qmp.execute("screendump", {"filename": str(logs / "framebuffer.ppm")})
+                        except Exception:
+                            pass
                     status["process"]["phase"] = "stopping"
                     write_json(bundle / "runtime.json", status)
-                    try:
-                        qmp.execute("quit")
-                    except (OSError, ValueError):
-                        pass
+                    if qmp is not None:
+                        try:
+                            qmp.execute("quit")
+                        except (OSError, ValueError):
+                            pass
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -343,32 +395,33 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
-                code = process.wait()
-                request_path = bundle / "stop-request.json"
-                request = json.loads(request_path.read_text()) if request_path.exists() else {}
-                if request.get("session_id") == status["session_id"]:
-                    reason = "explicit forced stop" if request["force"] else "guest shutdown requested; completion unverified"
-                    request_path.unlink()
-                status["process"].update(phase="failed" if launch_failed or code != 0 else "stopped", pid=None, exit_code=code)
+
+                if player_process is not None and player_process.poll() is None:
+                    player_process.terminate()
+                    try:
+                        player_process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        player_process.kill()
+                        player_process.wait()
+
+                code = process.wait() if process.poll() is None else process.returncode
+                is_clean_stop = (reason == "player window closed" or (isinstance(reason, str) and "forced stop" in reason))
+                status["process"].update(
+                    phase="failed" if (launch_failed or (code != 0 and not is_clean_stop)) else "stopped",
+                    pid=None,
+                    exit_code=0 if is_clean_stop and code in (0, -15) else code,
+                )
                 status["shutdown"] = dict(clean=False, reason=reason or "QEMU exited; guest filesystem shutdown not verified")
                 write_json(bundle / "runtime.json", status)
                 print(f"QEMU exited ({code}). " + (f"Launch failed: {reason}. " if launch_failed else "") + f"Evidence: {logs}", flush=True)
-                return code or (1 if launch_failed else 0)
+                return (0 if is_clean_stop else code) or (1 if launch_failed else 0)
             except Exception as exc:
                 status["process"].update(phase="failed", exit_code=process.poll() if process else None)
                 status["shutdown"] = dict(clean=False, reason=str(exc))
                 write_json(bundle / "runtime.json", status)
                 raise
             finally:
-                if qmp:
-                    qmp.close()
-                if process and process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
+                cleanup_processes(qemu_process=process, player_process=player_process, qmp=qmp)
                 if status["process"]["phase"] == "failed":
                     status["process"].update(pid=None, exit_code=process.returncode if process else None)
                     write_json(bundle / "runtime.json", status)
@@ -380,6 +433,8 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle")
+    parser.add_argument("--display", choices=["player", "cocoa", "none"], default=None,
+                        help="Display mode: player (native window), cocoa (QEMU window), or none (headless)")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--probe-seconds", type=float)
     parser.add_argument("--paused", action="store_true")
@@ -388,7 +443,7 @@ def main():
     if args.probe_seconds is not None and not 0 < args.probe_seconds <= 30:
         parser.error("probe-seconds must be greater than 0 and at most 30")
     try:
-        sys.exit(launch(args.bundle, args.headless, args.probe_seconds, args.paused, args.wifi))
+        sys.exit(launch(args.bundle, args.headless, args.probe_seconds, args.paused, args.wifi, display=args.display))
     except (OSError, ValueError, KeyError) as exc:
         parser.exit(1, f"Launch error: {exc}\n")
 

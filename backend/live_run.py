@@ -17,7 +17,14 @@ import time
 import platform
 import plistlib
 
-ROOT = Path(__file__).resolve().parents[1]
+def get_root():
+    env = os.environ.get('VPHONE_LEGACY_ROOT')
+    if env:
+        return Path(env).resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+ROOT = get_root()
 sys.path.insert(0, str(ROOT / 'backend'))
 from display_probe import FB  # noqa: E402
 
@@ -36,10 +43,11 @@ def clone_or_copy(src, dst):
     shutil.copyfile(src, dst)
 
 
-def build_player():
-    sources = sorted((ROOT / 'sources/vphone-player').glob('*.swift'))
-    resources = sorted(p for p in (ROOT / 'sources/vphone-player/Resources').glob('*') if p.is_file())
-    app = ROOT / 'build/player/vphone-player.app'
+def build_player(root=None):
+    root = Path(root).resolve() if root else get_root()
+    sources = sorted((root / 'sources/vphone-player').glob('*.swift'))
+    resources = sorted(p for p in (root / 'sources/vphone-player/Resources').glob('*') if p.is_file())
+    app = root / 'build/player/vphone-player.app'
     binary = app / 'Contents/MacOS/vphone-player'
     if not binary.exists() or any(p.stat().st_mtime > binary.stat().st_mtime for p in [*sources, *resources]):
         binary.parent.mkdir(parents=True, exist_ok=True)

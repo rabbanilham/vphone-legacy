@@ -1345,6 +1345,14 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var bezel: BezelView?
     var displayTimer: Timer?
     var displayQuery = false
+    var vncPath: String = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+    var qmpPath: String = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : ""
+
+    init(vncPath: String? = nil, qmpPath: String? = nil) {
+        if let vncPath { self.vncPath = vncPath }
+        if let qmpPath { self.qmpPath = qmpPath }
+        super.init()
+    }
     private let presentLock = NSLock()
     private var pendingSurface: IOSurface?
     private var pendingArrivalUptime: TimeInterval = 0
@@ -1383,13 +1391,13 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             bezel.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),bezel.leadingAnchor.constraint(equalTo:root.leadingAnchor),bezel.trailingAnchor.constraint(equalTo:root.trailingAnchor),bezel.bottomAnchor.constraint(equalTo:root.bottomAnchor,constant:-24),
             status.centerXAnchor.constraint(equalTo:bezel.centerXAnchor),status.centerYAnchor.constraint(equalTo:bezel.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:bezel.widthAnchor,constant:-24)])
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiatedAllowingIdleSystemSleep,.latencyCritical],reason:"Interactive emulator input")
-        let logURL = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("player-input.log")
+        let logURL = URL(fileURLWithPath:vncPath).deletingLastPathComponent().appendingPathComponent("player-input.log")
         _ = FileManager.default.createFile(atPath:logURL.path,contents:nil)
         inputLog = try? FileHandle(forWritingTo:logURL)
         screen.trace = {[weak self] text in self?.logInput(text)}
         rfb.trace = {[weak self] text in self?.logInput(text)}
         logInput("player started; VNC pointer and QMP gesture input configured")
-        let qmp = QMPInput(CommandLine.arguments[2]);touchInput = qmp
+        let qmp = QMPInput(qmpPath);touchInput = qmp
         screen.gestures.send = {[weak self,weak qmp] type,points in
             if type != "update" {self?.logInput("mtt \(type) points=\(points)")}
             qmp?.touch(type,points)
@@ -1417,6 +1425,9 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.screen.input = nil
                 self.screen.rfbKey = nil
                 self.screen.qmpKey = nil
+                if ProcessInfo.processInfo.environment["VPHONE_PLAYER_KEEP_ON_DISCONNECT"] == nil {
+                    NSApp.terminate(nil)
+                }
             }
         }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
@@ -1429,7 +1440,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Poll the guest's display power so a sleeping device shows as locked
         // instead of a frozen frame that ignores touches.
         displayTimer = Timer.scheduledTimer(withTimeInterval:0.5,repeats:true) {[weak self] _ in self?.pollDisplay()}
-        let path = CommandLine.arguments[1]
+        let path = vncPath
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
     }
 
@@ -1595,6 +1606,31 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool {true}
 }
 guard CommandLine.arguments.count == 3 else {
+    var vncArg: String?
+    var qmpArg: String?
+    var i = 1
+    while i < CommandLine.arguments.count {
+        let arg = CommandLine.arguments[i]
+        if arg == "--vnc" && i + 1 < CommandLine.arguments.count {
+            vncArg = CommandLine.arguments[i + 1]; i += 2
+        } else if arg == "--qmp" && i + 1 < CommandLine.arguments.count {
+            qmpArg = CommandLine.arguments[i + 1]; i += 2
+        } else if !arg.hasPrefix("-") {
+            if vncArg == nil { vncArg = arg }
+            else if qmpArg == nil { qmpArg = arg }
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+    if let vnc = vncArg, let qmp = qmpArg {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let player = Player(vncPath: vnc, qmpPath: qmp)
+        app.delegate = player
+        app.run()
+        exit(0)
+    }
     fputs("Usage: vphone-player VNC_UNIX_SOCKET QMP_UNIX_SOCKET\n", stderr); exit(2)
 }
 let app = NSApplication.shared

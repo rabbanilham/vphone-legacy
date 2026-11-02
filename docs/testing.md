@@ -12,6 +12,14 @@ bash -n research/tasks/merge-live.sh
 
 Default discovery runs Python tests and small compiled C harnesses. A host compiler is needed for those harnesses. It does not boot iOS or require a private VM. Missing optional firmware, dump corpora, or backend build tools produce explicit skips; inspect the skip summary before interpreting coverage. CI runs this path on macOS, with no firmware or private artifacts.
 
+`tests/test_player_launch.py` exercises bundle launch command construction, display resolution, process lifecycle, boot stage tracking, and contract compliance without running live VMs:
+- QEMU argv verification: verifies that player mode constructs `-display none -vnc unix:... -qmp unix:...` without `-display cocoa`, while cocoa mode retains `-display cocoa` and no VNC chardev.
+- Display mode resolution: tests manifest-driven defaults (`profile: ui` -> `player`, baseline -> `cocoa`) and explicit command-line overrides.
+- Lifecycle and stop request handling: verifies atomic request parsing, force termination, and guest shutdown signaling.
+- Process cleanup sequence: uses mock processes to verify that the player process is terminated first, followed by QEMU SIGTERM and timeout-based SIGKILL escalation, ensuring no orphan processes remain.
+- Runtime status schema: checks initial and dynamic fields (`display`, `boot_stage`, `process`, `shutdown`, `control`) against `tests/fixtures/gui/vm-status.json`.
+- Boot stage progression: validates non-regressing stages (`none` -> `kernel` -> `userspace` -> `lockscreen` -> `home`) and panic preemption from UART logs.
+
 To run the three probe-164 dump test modules against an external corpus, set `VPHONE_AGX_DUMPS=/absolute/path/to/dumps`. Keep the original `frame-N.bin` files and sidecars together. Other historical corpus tests use their documented local `build/` or `backend/evidence/` locations. Never commit memory dumps.
 
 ## Backend checks
