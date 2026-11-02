@@ -31,7 +31,12 @@ If the linker cannot read the selected SDK, choose a matching installed SDK expl
 
 ## Optional GUI
 
-`make gui` builds and opens the SwiftUI manager using the selected Xcode tools. The manager wraps VM management; it does not materialize the later research UI profile. The CLI and backend are the primary documented development workflow.
+`make gui` builds and opens `dist/vphone-legacy.app` (macOS 14+ SwiftUI Parallels-style manager):
+- **Setup Wizard**: Checks host prerequisites (`setup check --json`) with one-click fix buttons and manual instructions.
+- **Library**: Card-based VM overview with phase/boot stage, disk size, big Start/Stop controls (`vm launch`/`vm stop`), and `.ipa` drag-and-drop sideloading.
+- **New VM Wizard**: Guided creation from iOS 7.1.2 IPSW with streaming progress and error hints, or import from an existing profile (`vm import-profile`).
+- **Info & Logs**: Real-time status inspection and live serial log tailing without extraneous legacy panels.
+- **Repository Bound**: Configured once via `RepoLocator` (stored in `UserDefaults` as `repoRoot`) and passed to CLI subprocesses via `VPHONE_LEGACY_ROOT`.
 
 Continue with [firmware preparation](firmware.md) or [troubleshooting](troubleshooting.md).
 
