@@ -23,6 +23,11 @@ if [ -d "${PROJECT_ROOT}/sources/vphone-legacy-gui/Resources" ]; then
     cp -R "${PROJECT_ROOT}/sources/vphone-legacy-gui/Resources/." "${RESOURCES_DIR}/"
 fi
 
+echo "  Typechecking Swift GUI sources..."
+swiftc -sdk "${SDK_PATH}" -typecheck -parse-as-library \
+    -target "$(uname -m)-apple-macosx14.0" -module-cache-path "${BUILD_CACHE}" \
+    "${SWIFT_SOURCES[@]}"
+
 echo "  Compiling Swift GUI sources with swiftc (${#SWIFT_SOURCES[@]} files)..."
 swiftc -sdk "${SDK_PATH}" -O -parse-as-library \
     -target "$(uname -m)-apple-macosx14.0" -module-cache-path "${BUILD_CACHE}" \
@@ -51,6 +56,72 @@ cat << 'EOF' > "${APP_DIR}/Contents/Info.plist"
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>iOS Software Update Package</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.apple.itunes.ipsw</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>iOS Application Archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.apple.itunes.ipa</string>
+            </array>
+        </dict>
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.apple.itunes.ipsw</string>
+            <key>UTTypeDescription</key>
+            <string>iOS Software Update Package</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+                <string>public.archive</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>ipsw</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.apple.itunes.ipa</string>
+            <key>UTTypeDescription</key>
+            <string>iOS Application Archive</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+                <string>public.archive</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>ipa</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
 </dict>
 </plist>
 EOF
