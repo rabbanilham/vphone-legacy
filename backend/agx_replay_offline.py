@@ -269,6 +269,64 @@ def decode_tsw(f, tsw):
                 nc_sparse=nc_sparse, tsw=tsw, format=fmt)
 
 
+def union_triangles(fb, vs, vs_xy, count, copy, target_w, target_h, pw, ph,
+                    clip_x0, clip_y0, clip_x1, clip_y1):
+    """One-colour triangle meshes (the NC/lock grabber chevron) blend once from the union
+    of all triangles' 4x4 sample masks: per-triangle blending leaves a seam on every shared
+    edge (two partial coverages compose to less than one). False = not applicable (a
+    single triangle, mixed colours or a very large mesh); nothing was drawn."""
+    if count < 6:
+        return False
+    colours = {tuple(vs[t][2][:4]) for t in range(0, count - 2, 3)}
+    if len(colours) != 1:
+        return False
+    tr, tg, tb, ta = colours.pop()
+    tris = []
+    for t in range(0, count - 2, 3):
+        p0, p1, p2 = vs_xy[t], vs_xy[t + 1], vs_xy[t + 2]
+        det = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        if abs(det) >= 1e-5:
+            tris.append((p0, p1, p2, det))
+    if not tris:
+        return True
+    xs = [p[0] for tri in tris for p in tri[:3]]
+    ys = [p[1] for tri in tris for p in tri[:3]]
+    bx0 = max(clip_x0, int(math.floor(min(xs) - 0.5)))
+    bx1 = min(clip_x1, target_w, pw, int(math.ceil(max(xs) + 0.5)))
+    by0 = max(clip_y0, int(math.floor(min(ys) - 0.5)))
+    by1 = min(clip_y1, target_h, ph, int(math.ceil(max(ys) + 0.5)))
+    if bx0 >= bx1 or by0 >= by1 or (bx1 - bx0) * (by1 - by0) > 262144 or bx1 - bx0 > 640:
+        return False
+    bw = bx1 - bx0
+    mask = {}
+    for p0, p1, p2, det in tris:
+        x0 = max(bx0, int(math.floor(min(p0[0], p1[0], p2[0]) - 0.5)))
+        x1 = min(bx1, int(math.ceil(max(p0[0], p1[0], p2[0]) + 0.5)))
+        y0 = max(by0, int(math.floor(min(p0[1], p1[1], p2[1]) - 0.5)))
+        y1 = min(by1, int(math.ceil(max(p0[1], p1[1], p2[1]) + 0.5)))
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                bits = 0
+                for si in range(4):
+                    sx = x + (2 * si + 1) * 0.125
+                    for sj in range(4):
+                        sy = y + (2 * sj + 1) * 0.125
+                        e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0])
+                        e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0])
+                        e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0])
+                        if ((e0 >= 0 and e1 >= 0 and e2 >= 0) if det > 0 else (e0 <= 0 and e1 <= 0 and e2 <= 0)):
+                            bits |= 1 << (si * 4 + sj)
+                if bits:
+                    mask[(y, x)] = mask.get((y, x), 0) | bits
+    for (y, x), bits in mask.items():
+        cov = bin(bits).count('1') * 0.0625
+        ca, cr, cg, cb = (int(round(v * cov)) for v in (ta, tr, tg, tb))
+        d = (y * target_w + x) * 4
+        for c, src in enumerate((cr, cg, cb, ca)):
+            fb[d + c] = src if copy else min(255, src + fb[d + c] * (255 - ca) // 255)
+    return True
+
+
 def decode_sampler(words):
     """
     Decodes PowerVR Rogue sampler words (4 x 32-bit words).
@@ -1544,6 +1602,9 @@ def main():
                             d = (y * target_w + x) * 4
                             for c, src in enumerate((r, g, b, a)):
                                 fb[d + c] = src if prog == COPY else min(255, src + fb[d + c] * (255 - a) // 255)
+            elif union_triangles(fb, vs, vs_xy, count, prog == COPY, target_w, target_h, pw, ph,
+                                 clip_x0, clip_y0, clip_x1, clip_y1):
+                pass
             else:
                 for t in range(0, count - 2, 3):
                     p0, p1, p2 = vs_xy[t], vs_xy[t + 1], vs_xy[t + 2]

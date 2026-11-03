@@ -75,6 +75,21 @@ def rows_with_alpha(render, x0, x1):
             if any(rgba[(y * w + x) * 4 + 3] for x in range(x0, x1))]
 
 
+def seam_pixels(render):
+    """Partially covered pixels whose eight neighbours are all fully covered: a seam
+    along an edge shared by two triangles of one mesh, not a silhouette edge."""
+    w, h, rgba = render
+    alpha = [[rgba[(y * w + x) * 4 + 3] for x in range(w)] for y in range(h)]
+    full = max(max(row) for row in alpha)
+    count = 0
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if 0 < alpha[y][x] < full and all(
+                    alpha[y + dy][x + dx] == full for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dx or dy):
+                count += 1
+    return count
+
+
 class OffscreenMatrixTests(unittest.TestCase):
     def check_grabber(self, render):
         # Both triangle halves land in the target: the chevron spans x 0..76
@@ -105,6 +120,13 @@ class OffscreenMatrixTests(unittest.TestCase):
     def test_python_mirror_segments(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.check_segments(python_render(fixture(tmp, 'frame-27')))
+
+    def test_grabber_has_no_triangle_seams(self):
+        """The chevron's triangles share edges; blending each triangle alone left dark
+        seams there (two partial coverages compose to less than one)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(seam_pixels(python_render(fixture(tmp, 'frame-26'))), 0)
+            self.assertEqual(seam_pixels(c_render(tmp, fixture(tmp, 'frame-26'))), 0)
 
     def test_display_pass_gate_in_sources(self):
         """Full-screen display passes keep drawing in pixels (no matrix reuse)."""

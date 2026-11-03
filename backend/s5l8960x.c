@@ -7926,6 +7926,106 @@ static inline uint32_t agx_scale_premul(uint32_t colour, unsigned alpha)
     return b | (g << 8) | (r << 16) | (a << 24);
 }
 
+/* A triangle mesh drawn with one colour (the NC/lock grabber chevron) must not
+ * blend per triangle: each shared edge then has two partial coverages that
+ * compose to less than 1 and show as a seam. Accumulate the 4x4 sample masks of
+ * all triangles first and blend once. Returns false (nothing drawn) when the draw
+ * is a single triangle, mixes colours or is too large; the caller then falls
+ * back to per-triangle blending. */
+static bool agx_triangle_union_draw(A7State *s, uint64_t cat, AGXSurface *sf, uint32_t *row,
+                                    float (*xy)[2], uint64_t buf, unsigned stride,
+                                    unsigned v_count, uint32_t colour0, bool copy,
+                                    int clip_x0, int clip_y0, int clip_x1, int clip_y1)
+{
+    if (v_count < 6) {
+        return false;
+    }
+    float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+    uint32_t tri_colour = colour0, first = 0;
+    for (unsigned t = 0; t + 2 < v_count; t += 3) {
+        uint32_t c = colour0;
+        if (agx_ctx_read(s, cat, buf + (uint64_t)t * stride + 16, &c, 4)) {
+            c = (c & 0xff00ff00u) | ((c >> 16) & 0xff) | ((c & 0xff) << 16);
+        }
+        if (t == 0) {
+            first = c;
+        } else if (c != first) {
+            return false;
+        }
+        for (unsigned k = 0; k < 3; k++) {
+            minx = MIN(minx, xy[t + k][0]); maxx = MAX(maxx, xy[t + k][0]);
+            miny = MIN(miny, xy[t + k][1]); maxy = MAX(maxy, xy[t + k][1]);
+        }
+    }
+    tri_colour = first;
+    int bx0 = MAX(clip_x0, (int)floorf(minx - 0.5f)), bx1 = MIN(clip_x1, (int)ceilf(maxx + 0.5f));
+    int by0 = MAX(clip_y0, (int)floorf(miny - 0.5f)), by1 = MIN(clip_y1, (int)ceilf(maxy + 0.5f));
+    if (bx0 >= bx1 || by0 >= by1 || (int64_t)(bx1 - bx0) * (by1 - by0) > 262144 || bx1 - bx0 > 640) {
+        return false;
+    }
+    int bw = bx1 - bx0, bh = by1 - by0;
+    uint16_t *mask = g_new0(uint16_t, (size_t)bw * bh);
+    for (unsigned t = 0; t + 2 < v_count; t += 3) {
+        const float *p0 = xy[t], *p1 = xy[t + 1], *p2 = xy[t + 2];
+        float det = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+        if (fabsf(det) < 1e-5f) {
+            continue;
+        }
+        int x0 = MAX(bx0, (int)floorf(MIN(p0[0], MIN(p1[0], p2[0])) - 0.5f));
+        int x1 = MIN(bx1, (int)ceilf(MAX(p0[0], MAX(p1[0], p2[0])) + 0.5f));
+        int y0 = MAX(by0, (int)floorf(MIN(p0[1], MIN(p1[1], p2[1])) - 0.5f));
+        int y1 = MIN(by1, (int)ceilf(MAX(p0[1], MAX(p1[1], p2[1])) + 0.5f));
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                uint16_t bits = 0;
+                for (unsigned si = 0; si < 4; si++) {
+                    float sx = (float)x + (float)(2 * si + 1) * 0.125f;
+                    for (unsigned sj = 0; sj < 4; sj++) {
+                        float sy = (float)y + (float)(2 * sj + 1) * 0.125f;
+                        float e0 = (p1[0] - p0[0]) * (sy - p0[1]) - (p1[1] - p0[1]) * (sx - p0[0]);
+                        float e1 = (p2[0] - p1[0]) * (sy - p1[1]) - (p2[1] - p1[1]) * (sx - p1[0]);
+                        float e2 = (p0[0] - p2[0]) * (sy - p2[1]) - (p0[1] - p2[1]) * (sx - p2[0]);
+                        bool inside = (det > 0.0f) ? (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                                                   : (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+                        if (inside) {
+                            bits |= (uint16_t)1 << (si * 4 + sj);
+                        }
+                    }
+                }
+                mask[(size_t)(y - by0) * bw + (x - bx0)] |= bits;
+            }
+        }
+    }
+    uint32_t a = tri_colour >> 24, r = (tri_colour >> 16) & 0xff;
+    uint32_t g = (tri_colour >> 8) & 0xff, b = tri_colour & 0xff;
+    uint32_t src_table[17];
+    src_table[0] = 0;
+    for (unsigned c = 1; c <= 16; c++) {
+        float cov = (float)c * 0.0625f;
+        src_table[c] = ((uint32_t)lroundf((float)a * cov) << 24) | ((uint32_t)lroundf((float)r * cov) << 16) |
+                       ((uint32_t)lroundf((float)g * cov) << 8) | (uint32_t)lroundf((float)b * cov);
+    }
+    for (int y = by0; y < by1; y++) {
+        if (!agx_target_read(s, cat, sf, bx0, y, row, bw)) {
+            continue;
+        }
+        bool touched = false;
+        for (int x = 0; x < bw; x++) {
+            uint16_t bits = mask[(size_t)(y - by0) * bw + x];
+            if (bits) {
+                uint32_t src = src_table[__builtin_popcount(bits)];
+                row[x] = copy ? src : agx_blend_over(row[x], src);
+                touched = true;
+            }
+        }
+        if (touched) {
+            agx_target_write(s, cat, sf, bx0, y, row, bw);
+        }
+    }
+    g_free(mask);
+    return true;
+}
+
 static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                              uint64_t target, uint32_t width, uint32_t height,
                              bool is_clear, uint32_t pitch, uint64_t scissor_base)
@@ -8727,6 +8827,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             agx_target_write(s, cat, &sf, x0, y, row, x1 - x0);
                         }
                     }
+                } else if (agx_triangle_union_draw(s, cat, &sf, row, vs_xy, buf, stride, v_count,
+                                                   colour, prog == AGX_USC_COPY,
+                                                   clip_x0, clip_y0, clip_x1, clip_y1)) {
+                    any_drawn = true;
                 } else {
                     /* Triangle rasteriser: each consecutive vertex triple is one triangle */
                     for (unsigned t = 0; t + 2 < v_count; t += 3) {

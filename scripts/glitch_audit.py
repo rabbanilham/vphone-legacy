@@ -114,11 +114,11 @@ SCENARIOS = {
         key('home'), wait(2)]),
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
-        shot('settled'), swipe(320, 800, 320, 100, 400), wait(1.5), shot('closed')]),
+        shot('settled'), swipe(320, 1100, 320, 200, 500), wait(1.5), shot('closed')]),
     'nc-repeat': dict(start='home', steps=[
-        swipe(*c['nc_from'], *c['nc_to'], 500), wait(2), shot('settled-a'), swipe(320, 800, 320, 100, 400), wait(2),
-        swipe(*c['nc_from'], *c['nc_to'], 500), wait(3), shot('settled-b'), swipe(320, 800, 320, 100, 400), wait(2),
-        swipe(*c['nc_from'], *c['nc_to'], 500), wait(5), shot('settled-c'), swipe(320, 800, 320, 100, 400), wait(2)]),
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(2), shot('settled-a'), swipe(320, 1100, 320, 200, 500), wait(2),
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(3), shot('settled-b'), swipe(320, 1100, 320, 200, 500), wait(2),
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(5), shot('settled-c'), swipe(320, 1100, 320, 200, 500), wait(2)]),
     'nc-dump': dict(start='home', steps=[
         ('dumpon',), swipe(*c['nc_from'], *c['nc_to'], 500), wait(1.5), ('dumpoff',), shot('settled')]),
     'calendar-dump': dict(start='home', steps=[
