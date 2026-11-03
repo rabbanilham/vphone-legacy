@@ -8995,9 +8995,15 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
 
-                /* Texel-unit coordinates (rectangle textures) exceed 1. */
-                float su = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.w : 1;
-                float sv = nc_normalized || MAX(u1, v1) <= 1.0001f ? tex.h : 1;
+                /* Texel-unit coordinates (rectangle textures) exceed 1. A tiled
+                 * pattern (Calendar hour lines: a 4x2048 strip, u 0..134.5 over
+                 * 538 px, v 0.42..0.78) exceeds 1 on one axis only and covers
+                 * the quad exactly when read as normalized: keep it normalized. */
+                bool tiled = MAX(u1, v1) > 1.0001f &&
+                    ((v1 <= 1.0001f && fabsf((u1 - u0) * tex.w - (maxx - minx)) <= 1.0f) ||
+                     (u1 <= 1.0001f && fabsf((v1 - v0) * tex.h - (maxy - miny)) <= 1.0f));
+                float su = nc_normalized || tiled || MAX(u1, v1) <= 1.0001f ? tex.w : 1;
+                float sv = nc_normalized || tiled || MAX(u1, v1) <= 1.0001f ? tex.h : 1;
                 float sub_w = (u1 - u0) * su;
                 float sub_h = (v1 - v0) * sv;
                 bool is_scaled = (fabsf((maxx - minx) - sub_w) > 0.1f ||

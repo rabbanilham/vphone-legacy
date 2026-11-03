@@ -105,10 +105,16 @@ SCENARIOS = {
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 800, 320, 100, 400), wait(1.5), shot('closed')]),
+    'nc-repeat': dict(start='home', steps=[
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(2), shot('settled-a'), swipe(320, 800, 320, 100, 400), wait(2),
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(3), shot('settled-b'), swipe(320, 800, 320, 100, 400), wait(2),
+        swipe(*c['nc_from'], *c['nc_to'], 500), wait(5), shot('settled-c'), swipe(320, 800, 320, 100, 400), wait(2)]),
     'nc-dump': dict(start='home', steps=[
         ('dumpon',), swipe(*c['nc_from'], *c['nc_to'], 500), wait(1.5), ('dumpoff',), shot('settled')]),
-    'calendar-dump': dict(start='home', steps=[
-        tap(244, 120), wait(5), ('dump', 2.0), shot('calendar'), key('home'), wait(2)]),
+    'calendar-dump': dict(start='lock', steps=[
+        key('home'), wait(3), ('swipe', *c['unlock_from'], *c['unlock_to'], 700), wait(3), shot('unlock-1'),
+        ('swipe', *c['unlock_from'], *c['unlock_to'], 700), wait(3), shot('home'),
+        ('dumpon',), tap(244, 120), wait(6), ('dumpoff',), shot('calendar'), key('home'), wait(2)]),
     'control-center': dict(start='home', steps=[
         shot('before'), swipe(*c['cc_from'], *c['cc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 300, 320, 900, 400), wait(1.5), shot('closed')]),

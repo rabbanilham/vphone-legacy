@@ -1049,9 +1049,10 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
     uvs = ([struct.unpack_from('<2f', v[2], uv_off) for v in vs] if stride >= 24 or (stride == 16 and prog == WALLPAPER) else [(0, 0), (1, 1)])
     u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
     v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
-    su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
     xs = [(m[0] * v[0] + m[2]) * vp[0] + vp[1] for v in vs] if m else [v[0] for v in vs]
     ys = [(m[1] * v[1] + m[3]) * vp[2] + vp[3] for v in vs] if m else [v[1] for v in vs]
+    su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 and not is_tiled_pattern(
+        tex, u0, u1, v0, v1, max(xs) - min(xs), max(ys) - min(ys)) else (tex['w'], tex['h'])
     x0, x1 = max(0, int(round(min(xs)))), min(target_w, pw, int(round(max(xs))))
     y0, y1 = max(0, int(round(min(ys)))), min(target_h, ph, int(round(max(ys))))
     sub_w = (u1 - u0) * su
@@ -1095,6 +1096,15 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
         return 'replayed exactly: textured quad (bilinear scaled)', {'prog': hex(prog)}
     else:
         return 'replayed exactly: textured quad (1:1 nearest)', {'prog': hex(prog)}
+
+
+def is_tiled_pattern(tex, u0, u1, v0, v1, dest_w, dest_h):
+    """UV exceeds 1 on one axis only and, read as normalized, spans the quad
+    exactly (Calendar hour lines: a 4x2048 strip, u 0..134.5 over 538 px)."""
+    if max(u1, v1) <= 1.0001:
+        return False
+    return ((v1 <= 1.0001 and abs((u1 - u0) * tex['w'] - dest_w) <= 1.0) or
+            (u1 <= 1.0001 and abs((v1 - v0) * tex['h'] - dest_h) <= 1.0))
 
 
 def audit_frame(f):
@@ -1604,7 +1614,8 @@ def main():
                        else [(0, 0), (1, 1)])
                 u0, u1 = min(u for u, _ in uvs), max(u for u, _ in uvs)
                 v0, v1 = min(v for _, v in uvs), max(v for _, v in uvs)
-                su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 else (tex['w'], tex['h'])
+                su, sv = (1, 1) if not nc_normalized and max(u1, v1) > 1.0001 and not is_tiled_pattern(
+                    tex, u0, u1, v0, v1, max(xs) - min(xs), max(ys) - min(ys)) else (tex['w'], tex['h'])
                 uv_map = quad_affine(list(zip(xs, ys))[:3], uvs[:3]) if len(uvs) >= 3 else None
                 cross_row = uv_map is not None and abs(uv_map[3]) > 1e-8
                 tint = struct.unpack_from('<I', q_vs[0][2], 0)[0] if stride in (28, 36) else 0xffffffff
