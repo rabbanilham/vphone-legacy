@@ -293,7 +293,16 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
             panic_monitor = PanicMonitor()
             boot_monitor = BootStageMonitor()
             try:
-                process = subprocess.Popen(command, start_new_session=True, env=child_env)
+                # QEMU's device models print diagnostics to stderr from vCPU threads that
+                # hold the global lock. A pipe nobody drains would stall the whole VM
+                # (and its QMP sockets), so stdio always goes to a file.
+                qemu_output = open(logs / "qemu-output.log", "ab")
+                try:
+                    process = subprocess.Popen(command, start_new_session=True, env=child_env,
+                                               stdin=subprocess.DEVNULL, stdout=qemu_output,
+                                               stderr=subprocess.STDOUT)
+                finally:
+                    qemu_output.close()
                 status["process"].update(phase="running", pid=process.pid)
                 write_json(bundle / "runtime.json", status)
                 deadline = time.monotonic() + 10
@@ -313,7 +322,9 @@ def launch(bundle, headless=False, probe_seconds=None, paused=False, wifi=False,
 
                 if display_mode == "player" and not interrupted and process.poll() is None:
                     player_cmd = build_player_command(player_binary, vnc_path, qmp_path)
-                    player_process = subprocess.Popen(player_cmd)
+                    with open(logs / "player-output.log", "ab") as player_output:
+                        player_process = subprocess.Popen(player_cmd, stdin=subprocess.DEVNULL,
+                                                          stdout=player_output, stderr=subprocess.STDOUT)
 
                 if probe_seconds is not None:
                     before = qmp.execute("human-monitor-command", {"command-line": "info registers"})

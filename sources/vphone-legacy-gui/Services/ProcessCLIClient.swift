@@ -41,8 +41,17 @@ public struct ProcessCLIClient: CLIClient, @unchecked Sendable {
         let outHandle = outPipe.fileHandleForReading
         let errHandle = errPipe.fileHandleForReading
 
+        // Drain stderr concurrently: a child that fills either pipe while we block on the
+        // other would otherwise stall (and so would anything it spawned).
+        let errBox = DataBox()
+        let errDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            errBox.data = errHandle.readDataToEndOfFile()
+            errDone.signal()
+        }
         let outData = outHandle.readDataToEndOfFile()
-        let errData = errHandle.readDataToEndOfFile()
+        errDone.wait()
+        let errData = errBox.data
 
         task.waitUntilExit()
 
@@ -261,4 +270,8 @@ public struct ProcessCLIClient: CLIClient, @unchecked Sendable {
         }
         return streamCommand(arguments: args)
     }
+}
+
+private final class DataBox: @unchecked Sendable {
+    var data = Data()
 }

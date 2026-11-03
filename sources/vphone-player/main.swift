@@ -1338,6 +1338,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var activity: NSObjectProtocol?
     var inputFailed = false
     var gestureError: String?
+    let toast = NSVisualEffectView(), toastLabel = NSTextField(wrappingLabelWithString:"")
+    var toastTimer: Timer?
     var controlCenterPending = false
     var inputLog: FileHandle?
     var window: NSWindow!
@@ -1385,6 +1387,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bezel.onHome = {[weak self] in self?.home()}
         bezel.onPower = {[weak self] in self?.lock()}
         for view in [bezel,bar,status] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
+        configureToast(in:root)
         status.textColor = .secondaryLabelColor; status.alignment = .center; status.maximumNumberOfLines = 2
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo:root.topAnchor,constant:10),bar.centerXAnchor.constraint(equalTo:root.centerXAnchor),bar.heightAnchor.constraint(equalToConstant:32),
@@ -1533,14 +1536,33 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A gesture transport failure must not disable the independent pointer.
         logInput("QMP failure: \(message)")
         gestureError = message
-        status.stringValue = "Gesture gagal: \(message). Klik/drag tetap tersedia."
-        status.isHidden = false
+        showToast("Touch input failed: \(message)")
         updateButtons()
         let send = screen.gestures.send
         screen.gestures.send = nil
         screen.cancelTouch()
         screen.gestures.send = send
     }
+    func configureToast(in root:NSView) {
+        toast.material = .hudWindow; toast.blendingMode = .withinWindow; toast.state = .active
+        toast.wantsLayer = true; toast.layer?.cornerRadius = 10; toast.layer?.masksToBounds = true
+        toast.isHidden = true; toast.translatesAutoresizingMaskIntoConstraints = false
+        toastLabel.maximumNumberOfLines = 4; toastLabel.font = .systemFont(ofSize:12); toastLabel.translatesAutoresizingMaskIntoConstraints = false
+        let close = NSButton(image:NSImage(systemSymbolName:"xmark.circle.fill",accessibilityDescription:"Dismiss")!,target:self,action:#selector(dismissToast))
+        close.isBordered = false; close.toolTip = "Dismiss"; close.setAccessibilityLabel("Dismiss"); close.translatesAutoresizingMaskIntoConstraints = false
+        toast.addSubview(toastLabel); toast.addSubview(close); root.addSubview(toast)
+        NSLayoutConstraint.activate([
+            toast.leadingAnchor.constraint(equalTo:root.leadingAnchor,constant:12),toast.trailingAnchor.constraint(equalTo:root.trailingAnchor,constant:-12),toast.bottomAnchor.constraint(equalTo:root.bottomAnchor,constant:-8),
+            toastLabel.leadingAnchor.constraint(equalTo:toast.leadingAnchor,constant:12),toastLabel.topAnchor.constraint(equalTo:toast.topAnchor,constant:8),toastLabel.bottomAnchor.constraint(equalTo:toast.bottomAnchor,constant:-8),
+            close.leadingAnchor.constraint(equalTo:toastLabel.trailingAnchor,constant:8),close.trailingAnchor.constraint(equalTo:toast.trailingAnchor,constant:-8),close.centerYAnchor.constraint(equalTo:toast.centerYAnchor)])
+    }
+    func showToast(_ message:String) {
+        toastLabel.stringValue = message; toast.isHidden = false
+        toastTimer?.invalidate()
+        toastTimer = Timer.scheduledTimer(withTimeInterval:10,repeats:false) {[weak self] _ in self?.hideToast()}
+    }
+    func hideToast() { toastTimer?.invalidate(); toastTimer = nil; toast.isHidden = true }
+    @objc func dismissToast() { hideToast() }
     func logInput(_ text:String) {
         try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
@@ -1578,7 +1600,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.controlCenterPending = false; self.updateButtons()
             guard self.screen.touchEpoch == epoch else {return}
             if let error {self.handleGestureFailure(error);return}
-            self.gestureError = nil;self.status.isHidden = true
+            self.gestureError = nil;self.hideToast()
             self.screen.openControlCenter()
         }}
     }
