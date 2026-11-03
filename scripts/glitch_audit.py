@@ -42,19 +42,22 @@ DEVICE = 'a7-touch-display'
 # by 5 rows plus a dock; these are first estimates, adjust after looking at the
 # captured home frame.
 # ---------------------------------------------------------------------------
-COLS = (90, 240, 390, 540)             # icon centre x
-ROWS = (130, 306, 482, 658, 834)       # icon centre y (rows 1..5)
-DOCK_Y = 1040
+COLS = (92, 244, 396, 548)             # icon centre x (measured on the iOS 7.1.2 5s home frame)
+ROWS = (110, 286, 462, 638, 814)       # icon centre y (rows 1..5)
+DOCK_Y = 1030
 ICON = 120                             # icon tile size in px
 COORDS = {
-    'unlock_from': (40, 1036),         # lock slider knob
-    'unlock_to': (600, 1036),
-    'clock_icon': (COLS[1], ROWS[1]),  # Clock: row 2, col 2
-    'settings_icon': (COLS[0], ROWS[4]),   # Settings (verify on your layout)
+    'unlock_from': (60, 976),          # lock slider knob (the "slide to unlock" row)
+    'unlock_to': (600, 976),
+    'clock_icon': (COLS[0], ROWS[1]),  # Clock: row 2, col 1
+    'settings_icon': (COLS[0], ROWS[4]),   # Settings: row 5, col 1
     'safari_icon': (COLS[2], DOCK_Y),  # Safari: dock slot 3
-    'folder_icon': (COLS[0], ROWS[3]),  # a folder, if the layout has one
+    # A folder icon, if the layout has one. None = no folder: the scenario long-presses
+    # the first icon instead (jiggle mode), which exercises the same icon animations.
+    'folder_icon': None,
+    'long_press_icon': (COLS[0], ROWS[0]),
     'folder_close': (320, 1090),       # tap below the folder sheet to close
-    'safari_address_bar': (300, 70),
+    'safari_address_bar': (300, 84),
     'nc_from': (320, 4), 'nc_to': (320, 800),        # pull Notification Center down
     'cc_from': (320, 1131), 'cc_to': (320, 600),     # pull Control Center up
     'settings_row_top': (320, 330),
@@ -84,10 +87,13 @@ SCENARIOS = {
         ('swipe', *c['unlock_from'], *c['unlock_to'], 700), shot('mid-unlock-0'), wait(0.3),
         shot('mid-unlock-1'), wait(2), shot('unlocked')]),
     'home': dict(start='home', steps=[shot('home'), wait(2), shot('home-2s')]),
-    'folder-open-close': dict(start='home', steps=[
-        shot('before'), tap(*c['folder_icon']), shot('opening-0'), wait(0.25), shot('opening-1'),
-        wait(1.5), shot('open'), tap(*c['folder_close']), shot('closing-0'), wait(0.25),
-        shot('closing-1'), wait(1.5), shot('closed')]),
+    'folder-open-close': dict(start='home', steps=(
+        [shot('before'), tap(*c['folder_icon']), shot('opening-0'), wait(0.25), shot('opening-1'),
+         wait(1.5), shot('open'), tap(*c['folder_close']), shot('closing-0'), wait(0.25),
+         shot('closing-1'), wait(1.5), shot('closed')] if c['folder_icon'] else
+        [shot('before'), tap(*c['long_press_icon'], hold=1.4), shot('jiggle-0'), wait(0.25),
+         shot('jiggle-1'), wait(0.25), shot('jiggle-2'), key('home'), shot('exit-0'), wait(0.3),
+         shot('exit-1'), wait(1.5), shot('closed')])),
     'settings-switches': dict(start='home', steps=[
         tap(*c['settings_icon']), wait(4), shot('settings'),
         swipe(320, 800, 320, 400, 400), wait(1), shot('scrolled'),
