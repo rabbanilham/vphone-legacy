@@ -22,6 +22,18 @@ Default discovery runs Python tests and small compiled C harnesses. A host compi
 
 To run the three probe-164 dump test modules against an external corpus, set `VPHONE_AGX_DUMPS=/absolute/path/to/dumps`. Keep the original `frame-N.bin` files and sidecars together. Other historical corpus tests use their documented local `build/` or `backend/evidence/` locations. Never commit memory dumps.
 
+## UI glitch audit
+
+`scripts/glitch_audit.py` boots a UI bundle and plays scripted scenarios (lockscreen, unlock-slide, home, folder-open-close, settings-switches, safari-keyboard, notification-center, control-center, clock-icon, home-button-animation) while taking QMP `screendump`s.
+
+```sh
+.venv/bin/python scripts/glitch_audit.py list
+.venv/bin/python scripts/glitch_audit.py run --bundle NAME --out /tmp/audit [--scenarios home,clock-icon]
+.venv/bin/python scripts/glitch_audit.py analyze /tmp/audit   # writes report.json and report.html
+```
+
+`run` clones the bundle (APFS clone, excluding logs) under `OUT/_work`, launches that clone with a stub player so the input QMP socket is free, and removes the clone afterwards. It never launches the original bundle. `--use-running` instead attaches to `control.launcher_qmp` from `vm status NAME --json`; the launcher normally holds that socket, so prefer the default. Frames are `OUT/<scenario>/NN-label.png` and `OUT/manifest.json` has step timings. All tap and swipe coordinates are in the `COORDS` table at the top of the script (640x1136); icon positions are estimates, tune them against the captured home frame. `analyze` flags new flat dark/grey rectangles, square corners on icon tiles, and black or unchanged frames; the heuristics are coarse hints for human review, not pass/fail. Unit tests: `python -m unittest tests.test_glitch_audit`.
+
 ## Backend checks
 
 After building the project QEMU:
