@@ -84,6 +84,10 @@ SCENARIOS = {
     'lockscreen': dict(start='lock', steps=[shot('initial'), wait(2), shot('after-2s'),
                                             key('power'), wait(1.5), shot('slept'),
                                             key('power'), wait(2.5), shot('woke')]),
+    # Wake the lock screen with the AGX frame-dump window open (grabber/camera glyph passes).
+    'lock-dump': dict(start='lock', steps=[
+        key('power'), wait(2), ('dumpon',), key('power'), wait(1.5), shot('woke-1'), wait(3), ('dumpoff',),
+        shot('woke-2'), wait(3), shot('woke-3')]),
     'unlock-slide': dict(start='lock', steps=[
         key('home'), wait(2), shot('woke'),
         ('swipe', *c['unlock_from'], *c['unlock_to'], 1200), shot('mid-unlock-0'), wait(0.3),
