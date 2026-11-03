@@ -47,8 +47,8 @@ ROWS = (110, 286, 462, 638, 814)       # icon centre y (rows 1..5)
 DOCK_Y = 1030
 ICON = 120                             # icon tile size in px
 COORDS = {
-    'unlock_from': (60, 976),          # lock slider knob (the "slide to unlock" row)
-    'unlock_to': (600, 976),
+    'unlock_from': (30, 1000),         # lock slider row: starts below y~990 or the slide is ignored
+    'unlock_to': (630, 1000),
     'clock_icon': (COLS[0], ROWS[1]),  # Clock: row 2, col 1
     'settings_icon': (COLS[0], ROWS[4]),   # Settings: row 5, col 1
     'safari_icon': (COLS[2], DOCK_Y),  # Safari: dock slot 3
@@ -84,7 +84,7 @@ SCENARIOS = {
                                             key('power'), wait(2.5), shot('woke')]),
     'unlock-slide': dict(start='lock', steps=[
         key('home'), wait(2), shot('woke'),
-        ('swipe', *c['unlock_from'], *c['unlock_to'], 700), shot('mid-unlock-0'), wait(0.3),
+        ('swipe', *c['unlock_from'], *c['unlock_to'], 1200), shot('mid-unlock-0'), wait(0.3),
         shot('mid-unlock-1'), wait(2), shot('unlocked')]),
     'home': dict(start='home', steps=[shot('home'), wait(2), shot('home-2s')]),
     'folder-open-close': dict(start='home', steps=(
@@ -111,9 +111,7 @@ SCENARIOS = {
         swipe(*c['nc_from'], *c['nc_to'], 500), wait(5), shot('settled-c'), swipe(320, 800, 320, 100, 400), wait(2)]),
     'nc-dump': dict(start='home', steps=[
         ('dumpon',), swipe(*c['nc_from'], *c['nc_to'], 500), wait(1.5), ('dumpoff',), shot('settled')]),
-    'calendar-dump': dict(start='lock', steps=[
-        key('home'), wait(3), ('swipe', *c['unlock_from'], *c['unlock_to'], 700), wait(3), shot('unlock-1'),
-        ('swipe', *c['unlock_from'], *c['unlock_to'], 700), wait(3), shot('home'),
+    'calendar-dump': dict(start='home', steps=[
         ('dumpon',), tap(244, 120), wait(6), ('dumpoff',), shot('calendar'), key('home'), wait(2)]),
     'control-center': dict(start='home', steps=[
         shot('before'), swipe(*c['cc_from'], *c['cc_to'], 500), shot('pulled'), wait(1.5),
@@ -505,11 +503,58 @@ def run_steps(drv, name, steps, outdir, log):
         log.append(dict(op=op, args=list(st[1:]), t=t, took_s=round(time.monotonic() - t0 - t, 3)))
 
 
-def ensure_home(drv, outdir):
-    """Wake and unlock; harmless when already on the home screen (the slide lands on an icon-free area)."""
+UNLOCK_SWIPES = ((30, 1000, 630, 1000, 1200), (30, 1015, 630, 1015, 1500), (20, 1005, 630, 1005, 1000),
+                 (30, 995, 630, 995, 1800))
+LOCK_REGION = (0, 260, 640, 900)   # wallpaper only on the lock screen; icons on home; clock/status excluded
+
+
+def region_diff(a, b, box=LOCK_REGION, step=8):
+    tot = n = 0
+    for y in range(box[1], box[3], step):
+        for x in range(box[0], box[2], step):
+            p, q = a.px(x, y), b.px(x, y)
+            tot += abs(p[0] - q[0]) + abs(p[1] - q[1]) + abs(p[2] - q[2])
+            n += 3
+    return tot / n
+
+
+def probe_state(drv, outdir, lock_ref):
+    """'dark' (panel off), 'lock' (wallpaper matches the boot lock screen) or 'other' (home/app)."""
+    tmp = Path(outdir) / '_probe.png'
+    drv.screendump(tmp)
+    img = load_image(tmp)
+    tmp.unlink(missing_ok=True)
+    d = region_diff(img, lock_ref)
+    luma = region_diff(img, Img.blank(img.w, img.h))   # mean brightness: 0 while the panel is dark
+    state = 'dark' if luma < 60 else 'lock' if d < 6 else 'other'   # a fading panel counts as dark
+    print(f'  unlock check: {state} (lock-diff {d:.1f} luma {luma:.1f})', flush=True)
+    return state
+
+
+def ensure_home(drv, outdir, lock_ref=None):
+    """Wake and unlock, verified against the lock wallpaper; wakes a dark panel and retries
+    other slides. Harmless when already on the home screen (the slide lands in the dock)."""
     drv.key('home'); time.sleep(1.5)
-    drv.swipe(*COORDS['unlock_from'], *COORDS['unlock_to'], 700); time.sleep(2.5)
-    drv.key('home'); time.sleep(2)
+    if lock_ref is None:
+        drv.swipe(*UNLOCK_SWIPES[0]); time.sleep(2.5)
+        drv.key('home'); time.sleep(2)
+        return True
+    swipes = 0
+    for _ in range(12):
+        st = probe_state(drv, outdir, lock_ref)
+        if st == 'other':
+            drv.key('home'); time.sleep(2)
+            if probe_state(drv, outdir, lock_ref) == 'other':   # confirm it did not re-lock
+                return True
+            continue
+        if st == 'dark':
+            drv.key('home'); time.sleep(2.5)
+            continue
+        time.sleep(1.0 if swipes else 0)
+        drv.swipe(*UNLOCK_SWIPES[swipes % len(UNLOCK_SWIPES)]); swipes += 1
+        time.sleep(2.5)
+    print('WARNING: could not unlock the guest', flush=True)
+    return False
 
 
 def cmd_run(a):
@@ -538,11 +583,17 @@ def cmd_run(a):
             print('WARNING: digitizer never reported ready; continuing anyway', flush=True)
         time.sleep(a.settle)
         state = 'lock'
+        lock_ref = None
+        try:   # the guest boots to the lock screen: keep its wallpaper to verify unlocks against
+            drv.screendump(out / '_lock_ref.png'); lock_ref = load_image(out / '_lock_ref.png')
+            (out / '_lock_ref.png').unlink()
+        except Exception:
+            pass
         manifest['boot_stage'] = eph.stage() if eph else None
         for name in names:
             sc = SCENARIOS[name]
             if sc['start'] == 'home' and state != 'home':
-                ensure_home(drv, out); state = 'home'
+                ensure_home(drv, out, lock_ref); state = 'home'
             log = []
             print(f'scenario {name}', flush=True)
             run_steps(drv, name, sc['steps'], out, log)
