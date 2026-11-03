@@ -94,7 +94,7 @@ class Io(unittest.TestCase):
             self.assertIn(sc['start'], ('lock', 'home'))
             self.assertTrue(any(s[0] == 'shot' for s in sc['steps']), name)
             for s in sc['steps']:
-                self.assertIn(s[0], ('tap', 'swipe', 'key', 'wait', 'shot'))
+                self.assertIn(s[0], ('tap', 'swipe', 'key', 'wait', 'shot', 'down', 'up', 'dumpon', 'dumpoff'))
 
 
 class Report(unittest.TestCase):
