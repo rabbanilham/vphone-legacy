@@ -99,7 +99,7 @@ SCENARIOS = {
         swipe(320, 800, 320, 400, 400), wait(1), shot('scrolled'),
         tap(*c['settings_row_top']), wait(2), shot('row'), key('home'), wait(2)]),
     'safari-keyboard': dict(start='home', steps=[
-        tap(*c['safari_icon']), wait(5), shot('safari'),
+        tap(*c['safari_icon']), wait(9), shot('safari'), wait(3), shot('safari-3s'),
         tap(*c['safari_address_bar']), shot('keyboard-0'), wait(0.3), shot('keyboard-1'),
         wait(1.5), shot('keyboard'), key('home'), wait(2)]),
     'notification-center': dict(start='home', steps=[
@@ -117,6 +117,11 @@ SCENARIOS = {
         wait(0.1), shot('anim-03'), wait(0.1), shot('anim-04'), wait(0.1), shot('anim-05'),
         wait(0.2), shot('anim-06'), wait(0.4), shot('anim-07'), wait(1.5), shot('settled')]),
 }
+# Every home-based scenario begins from a settled home screen: a previous scenario may
+# have left an app, a pulled sheet or an animation running, and taps would then land wrong.
+for _sc in SCENARIOS.values():
+    if _sc['start'] == 'home':
+        _sc['steps'] = [key('home'), wait(2), key('home'), wait(1.5)] + list(_sc['steps'])
 DEFAULT_ORDER = list(SCENARIOS)
 
 
