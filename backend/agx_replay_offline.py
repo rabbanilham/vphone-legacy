@@ -249,7 +249,7 @@ def decode_tsw(f, tsw):
     # Display mappings use 16-row strips. Other layout-1 surfaces use
     # Y-first Morton order, including GPU-produced render targets.
     # Linear textures carry (pitch in pixels - 1) in TSW word 2 bits [15:0].
-    strip = is_strip_surface(f, addr, w)
+    strip = is_strip_surface(f, addr, w) if fmt == 6 else False
     if strip:
         stride = 2560
     elif (tsw[0] & 7) == 1:
@@ -260,7 +260,7 @@ def decode_tsw(f, tsw):
     nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
     return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, bpp=bpp,
                 twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or (bpp == 1 and (tsw[0] & 7) == 1) or ((tsw[0] >> 24) & 0xf) == 8 or nc_sparse),
-                nc_sparse=nc_sparse, tsw=tsw)
+                nc_sparse=nc_sparse, tsw=tsw, format=fmt)
 
 
 def decode_sampler(words):
@@ -299,8 +299,7 @@ def texture(f, ppp, prog=None):
     for _, ws in words:
         # TSW at 16-byte aligned 0 or 4; word 7 only behind the luma weights
         # (vibrancy block: luma, four sampler words, TSW), as in the C replay.
-        # Word 8 is used by ROUNDED_CAPS (two 4-word samplers followed by TSW).
-        offsets = (0, 4, 7, 8) if prog == ROUNDED_CAPS else (0, 4, 7)
+        offsets = (0, 4, 7)
         for k in offsets:
             if k == 7 and tuple(ws[:3]) != LUMA:
                 continue
@@ -628,23 +627,27 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 ox0 = struct.unpack('<f', struct.pack('<I', p_words[16]))[0]
                 oy0 = struct.unpack('<f', struct.pack('<I', p_words[17]))[0]
                 is_vert = None
-                if abs(ox0) > 0.01 and abs(oy0) < 0.001:
-                    is_vert = False
-                elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
-                    is_vert = True
+                if math.isfinite(ox0) and math.isfinite(oy0):
+                    if abs(ox0) > 0.01 and abs(oy0) < 0.001:
+                        is_vert = False
+                    elif abs(oy0) > 0.01 and abs(ox0) < 0.001:
+                        is_vert = True
 
                 if is_vert is not None:
-                    direction = 'vertical' if is_vert else 'horizontal'
                     read_offs = []
                     for j in range(16, 16 + 4 * max_taps, 4):
                         ox = struct.unpack('<f', struct.pack('<I', p_words[j]))[0]
                         oy = struct.unpack('<f', struct.pack('<I', p_words[j + 1]))[0]
+                        if not math.isfinite(ox) or not math.isfinite(oy):
+                            break
                         val = oy if is_vert else ox
-                        if 0.05 < val < 50.0:
+                        other = ox if is_vert else oy
+                        if abs(other) < 0.005 and 0.05 < val < 50.0:
                             read_offs.append(val)
                         else:
                             break
                     if len(read_offs) >= 3:
+                        direction = 'vertical' if is_vert else 'horizontal'
                         offsets = read_offs
                         n_taps = len(read_offs)
                         found_offsets = True
@@ -659,10 +662,12 @@ def extract_blur_params(f, vs_data, ppp, prog):
                 fl = [struct.unpack('<f', struct.pack('<I', w))[0] for w in ws]
                 # Look for weights
                 if not found_weights:
-                    for n in (7, 4):
+                    for n in (n_taps,) if found_offsets else (7, 6, 4):
+                        if (found_offsets or prog in (BLUR_4TAP, BLUR_7TAP)) and n != n_taps:
+                            continue
                         for i in range(len(fl) - n + 1):
                             sub = fl[i:i + n]
-                            if all(0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
+                            if all(math.isfinite(x) and 0.0005 <= x <= 0.6 for x in sub) and abs(sum(sub) - 0.5) < 0.01:
                                 weights = list(sub)
                                 n_taps = n
                                 found_weights = True
@@ -672,9 +677,9 @@ def extract_blur_params(f, vs_data, ppp, prog):
 
                 # Search for offsets in fragment uniforms if not found in vertex uniforms
                 if not found_offsets:
-                    for n in (n_taps, 7, 4):
+                    for n in (n_taps,) if found_weights else (n_taps, 7, 4):
                         for offset_sub in (0, 1):
-                            for start_idx in range(len(fl) - n * 4 + 1):
+                            for start_idx in range(max(0, len(fl) - ((n - 1) * 4 + offset_sub + 2) + 1)):
                                 xs = [fl[start_idx + k * 4 + offset_sub] for k in range(n)]
                                 ys = [fl[start_idx + k * 4 + offset_sub + 1] for k in range(n)]
                                 if all(0.05 < xs[k] < 50.0 for k in range(n)) and all(abs(ys[k]) < 0.001 for k in range(n)):
@@ -810,7 +815,7 @@ def texel(f, tex, x, y):
     try:
         if bpp == 1:
             a = f.read(gva, 1)[0]
-            return (0, 0, 0, a)
+            return bytes((255, 255, 255, a)) if tex.get('format') == 3 else (0, 0, 0, a)
         return f.read(gva, 4)
     except KeyError:
         return (0, 0, 0, 0) if bpp == 1 else b'\0\0\0\0'
@@ -847,6 +852,47 @@ def radial_coverage(u, v, mapping):
     return (inside*255+8)//16
 
 
+def apply_mask_tint(cov, tint):
+    """Format 3 coverage mask: vertex tint is already premultiplied.
+    Modulate alpha and apply coverage once to RGB."""
+    tb, tg, tr, ta = tint & 0xff, (tint >> 8) & 0xff, (tint >> 16) & 0xff, tint >> 24
+    out_a = ta * cov // 255
+    r = tr * cov // 255
+    g = tg * cov // 255
+    b = tb * cov // 255
+    return (out_a << 24) | (r << 16) | (g << 8) | b
+
+
+def is_axis_aligned_quad_mesh(vs_xy, count):
+    if count not in (4, 6, 54):
+        return False
+    step = 4 if count == 4 else 6
+    had_valid = False
+    for q in range(0, count, step):
+        q_coords = vs_xy[q:q + step]
+        if len(q_coords) < step:
+            return False
+        xs = [p[0] for p in q_coords]
+        ys = [p[1] for p in q_coords]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        if (maxx - minx) < 1e-3 or (maxy - miny) < 1e-3:
+            continue
+        has_tl = has_tr = has_bl = has_br = False
+        for x, y in q_coords:
+            if not ((abs(x - minx) < 1e-2 or abs(x - maxx) < 1e-2) and
+                    (abs(y - miny) < 1e-2 or abs(y - maxy) < 1e-2)):
+                return False
+            if abs(x - minx) < 1e-2 and abs(y - miny) < 1e-2: has_tl = True
+            if abs(x - maxx) < 1e-2 and abs(y - miny) < 1e-2: has_tr = True
+            if abs(x - minx) < 1e-2 and abs(y - maxy) < 1e-2: has_bl = True
+            if abs(x - maxx) < 1e-2 and abs(y - maxy) < 1e-2: has_br = True
+        if not (has_tl and has_tr and has_bl and has_br):
+            return False
+        had_valid = True
+    return had_valid
+
+
 def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, retained_ppp=None, copy_texmat_state=None):
     """Classify a draw outcome: replayed exactly, approximated, or skipped with reason."""
     count = draw[1]
@@ -881,6 +927,19 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
     nc_context = nc_context or bool(tex and tex.get('nc_sparse'))
     nc_normalized = (nc_context and stride == 24 and prog == 0x8eb52cf6fe248b1d and
                      nc_copy_texmat(f, vs_data, copy_texmat_state if copy_texmat_state is not None else {}))
+    m = ((1, 1, 0, 0) if stride == 16 and prog == WALLPAPER else
+         find_matrix(f, vs_data) if stride != 12 else None)
+    vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
+
+    if tex and tex.get('format') == 3:
+        vs_coords = []
+        for v in vs:
+            x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
+            y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
+            vs_coords.append((x, y))
+        if not is_axis_aligned_quad_mesh(vs_coords, count):
+            tex = None
+
     is_blur_prog = is_blur_program(f, ppp, prog) or (is_blur_program(f, retained_ppp, prog) if retained_ppp else False)
     if stride == 16 and prog in (SPANS, WEBKIT_SPANS):
         return 'replayed exactly: glyph spans (stride=16)', {'count': count, 'prog': hex(prog)}
@@ -904,10 +963,6 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
 
     if tex and tex['w'] * 4 > 0x10000:
         return 'skipped: texture wider than texrow', {'width': tex['w']}
-
-    m = ((1, 1, 0, 0) if stride == 16 and prog == WALLPAPER else
-         find_matrix(f, vs_data) if stride != 12 else None)
-    vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
 
     step = 4 if count == 4 else 6
     is_line = False
@@ -1209,6 +1264,14 @@ def main():
         webkit_upload = is_webkit_upload(f, prog, m, tex)
         if (tex and webkit_upload and (tex['tsw'][0] & 7) == 1 and not tex['strip']):
             tex['twiddled'] = True
+        if tex and tex.get('format') == 3:
+            vs_coords = []
+            for v in vs:
+                x = (m[0] * v[0] + m[2]) * vp[0] + vp[1] if m else v[0]
+                y = (m[1] * v[1] + m[3]) * vp[2] + vp[3] if m else v[1]
+                vs_coords.append((x, y))
+            if not is_axis_aligned_quad_mesh(vs_coords, count):
+                tex = None
         is_color_matrix = (tex is not None) and (prog == COLOR_MATRIX)
         if is_color_matrix:
             cm = extract_color_matrix(f, ppp)
@@ -1653,7 +1716,10 @@ def main():
                             g = max(0, min(255, int(round(gout * 255.0))))
                             b = max(0, min(255, int(round(bout * 255.0))))
                             a = 255
-                        if prog == ROUNDED_CAPS and (tex.get('addr') == 0x10524000 or (tex.get('w') == 114 and tex.get('h') == 87)):
+                        if tex.get('format') == 3:
+                            src_val = apply_mask_tint(a, tint)
+                            b, g, r, a = src_val & 255, (src_val >> 8) & 255, (src_val >> 16) & 255, src_val >> 24
+                        elif prog == ROUNDED_CAPS and (tex.get('addr') == 0x10524000 or (tex.get('w') == 114 and tex.get('h') == 87)):
                             cov = (r * a) // 255
                             ta = tint >> 24
                             tr = (tint >> 16) & 0xff

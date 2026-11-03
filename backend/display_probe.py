@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
-"""Bounded native display evidence on independent disks; never synthesizes pixels."""
+"""Bounded native display evidence on independent disks; never synthesizes pixels.
+
+CLI and execution bounds:
+  --output DIR             Target output directory (must not exist).
+  --seconds SECONDS        Active budget for probe execution (default: 45s).
+                           Capped at 180s for normal probes.
+  --long-run               Explicitly enables extended execution for continuous sessions
+                           (up to 1200s, e.g. 15-minute acceptance runs).
+                           Requires --stop-condition duration.
+  --stop-condition COND    first-pixel | ca-scanout | duration (default: first-pixel).
+
+Timing semantics:
+  RunClock active seconds (guest_running_seconds in observations.json) measure host
+  monotonic elapsed time while execution is active, excluding paused periods (such as
+  GDB hook handling or monitor inspection pauses). They do not constitute proof of the
+  emulated guest virtual clock rate or guest Mach absolute time scaling.
+"""
 import argparse
 from host_wifi import configure_wifi
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -336,11 +353,12 @@ def capture(fp, out, elapsed):
     return nz
 
 
-def main():
-    preparation_started = time.monotonic()
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--seconds', type=float, default=45)
+    p.add_argument('--long-run', action='store_true',
+                   help='Allow extended seconds budget up to 1200 with --stop-condition duration')
     p.add_argument('--breakpoint', action='append', default=[], help='name=0xVA')
     p.add_argument('--returns', action='store_true')
     p.add_argument('--hook-dump', action='append', default=[], help='name=xN|sp[+/-offset]:length, bounded read-only register-relative dump (repeatable; offset +/-4096, length 1..4096)')
@@ -368,10 +386,17 @@ def main():
     p.add_argument('--home-press-at', type=float, action='append', default=[],
                    help='Guest running seconds at which to press Home key via QMP')
     p.add_argument('--framebuffer-range', help='start,end,step for automated dense framebuffer captures')
-    args = p.parse_args()
+    return p
+
+
+def validate_args(p, args):
     if args.framebuffer_range:
-        parts = [float(x) for x in args.framebuffer_range.split(',')]
-        r_start, r_end, r_step = parts[0], parts[1], parts[2]
+        try:
+            r_start, r_end, r_step = map(float, args.framebuffer_range.split(','))
+        except ValueError:
+            p.error('--framebuffer-range must be start,end,step')
+        if not all(math.isfinite(x) for x in (r_start, r_end, r_step)) or r_step <= 0 or r_end < r_start:
+            p.error('--framebuffer-range requires finite bounds and a positive step')
         cur = r_start
         while cur <= r_end + 1e-6:
             args.framebuffer_at.append(round(cur, 3))
@@ -380,10 +405,28 @@ def main():
         hook_dumps = parse_hook_dumps(args.hook_dump)
     except ValueError as exc:
         p.error(str(exc))
-    assert 0 < args.seconds <= 300
-    if any(not 0 < at < args.seconds for at in args.framebuffer_at):
+    if not math.isfinite(args.seconds) or args.seconds <= 0:
+        p.error('--seconds must be a finite positive number')
+    if args.long_run:
+        if args.stop_condition != 'duration':
+            p.error('--long-run requires --stop-condition duration')
+        if args.seconds > 1200:
+            p.error('--seconds must be at most 1200 with --long-run')
+    else:
+        if args.seconds > 180:
+            p.error('--seconds must be at most 180 without --long-run (up to 1200 allowed with --long-run --stop-condition duration)')
+    if any(not (math.isfinite(at) and 0 < at < args.seconds) for at in args.framebuffer_at):
         p.error('--framebuffer-at must be positive and less than --seconds')
-    assert 1 <= args.step_count <= 64
+    if not (1 <= args.step_count <= 64):
+        p.error('--step-count must be between 1 and 64')
+    return hook_dumps
+
+
+def main(argv=None):
+    preparation_started = time.monotonic()
+    p = build_parser()
+    args = p.parse_args(argv)
+    hook_dumps = validate_args(p, args)
     plan_path = args.plan.resolve() if args.plan else PLAN
     storage = plan_path.parent.parent / 'storage-before'
     if not storage.exists():

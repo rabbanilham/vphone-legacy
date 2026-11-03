@@ -92,8 +92,8 @@ class AGXNavbarBlurTests(unittest.TestCase):
 
         # Strip detection on AGXSurface layout
         self.assertIn('agx_surface_layout(s, cat, tex->addr, tex->w, &sf);', src)
-        self.assertIn('tex->strip = sf.strip;', src)
-        self.assertIn('if (sf.strip) {', src)
+        self.assertIn('tex->strip = tex->bpp == 4 && sf.strip;', src)
+        self.assertIn('if (tex->strip) {', src)
         self.assertIn('tex->stride = sf.pitch;', src)
 
         # No screen-geometry guess: the backdrop blur must come from the
