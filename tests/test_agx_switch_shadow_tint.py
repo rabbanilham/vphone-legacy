@@ -444,6 +444,7 @@ typedef struct {{
     uint32_t bpp;
     bool strip;
     bool twiddled;
+    bool la88;
     bool linear_filter;
     bool clamp_to_edge;
     uint32_t sampler_words[4];
