@@ -6262,6 +6262,12 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 #define AGX_IS_DUAL_TEX(p) ((p) == AGX_USC_STRIDE36_DUAL_TEX || (p) == AGX_USC_STRIDE36_DUAL_MASK || \
                             (p) == AGX_USC_STRIDE36_DUAL_MASK2)
 #define AGX_USC_WEBKIT_GLYPHS UINT64_C(0x3064a456731fc3e3)
+/* Safari address-bar field: the rounded fill is drawn twice with the same 9-slice
+ * texture, first with this program (tint 0xb8b8b8b8, a compositing-filter blend, not
+ * src-over) and then with a src-over program (tint 0x0d0d0d0d). Replayed as src-over
+ * the first draw painted the field dark slate; the field is the light grey of the
+ * second draw alone. */
+#define AGX_USC_FIELD_FILTER_FILL UINT64_C(0x05efadb1cb07e25e)
 
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
  * pointers to blocks holding sampler state, texture state words (TSW) and
@@ -8212,6 +8218,10 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 AGX_REPLAY_SKIP(stride == 16 && !clip_space && !is_span ? "stride 16 outside the wallpaper program" :
                                 found == AGX_TEX_NONE ? (stride == 24 && prog == 0 ? "stride 24 untextured with program 0x0" : "untextured with unsupported stride") :
                                 "texture wider than texrow");
+                continue;
+            }
+            if (stride == 28 && prog == AGX_USC_FIELD_FILTER_FILL) {
+                AGX_REPLAY_SKIP("compositing-filter field fill (second draw carries the fill)");
                 continue;
             }
             if (is_span) {

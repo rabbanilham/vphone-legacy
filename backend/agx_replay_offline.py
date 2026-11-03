@@ -420,6 +420,7 @@ STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Backdrop through independent alpha-mas
 # Key-press balloon composite: backdrop plus balloon alpha mask as second sampler.
 STRIDE36_DUAL_MASK = 0x41266dfcceb2ee28
 STRIDE36_DUAL_MASK2 = 0x066c0e6f88bb95a9
+FIELD_FILTER_FILL = 0x05efadb1cb07e25e  # Safari address-bar field, first of two fills (filter blend)
 DUAL_TEX_PROGRAMS = (STRIDE36_DUAL_TEX, STRIDE36_DUAL_MASK, STRIDE36_DUAL_MASK2)
 WEBKIT_GLYPHS = 0x3064a456731fc3e3  # normalized U8 atlas coverage times RGBA vertex tint
 CORNER_RESTORE = 0x03a2edd2a4d84437  # CA dual-texture corner restore (backdrop + mask)
@@ -1341,6 +1342,8 @@ def main():
                 # draw only; later draws reuse it (display passes draw in pixels).
                 m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
+        if stride == 28 and prog == FIELD_FILTER_FILL:
+            continue
         tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)
         if not tex:
             tex = texture(f, ppp) or texture(f, retained_ppp)

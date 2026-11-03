@@ -121,6 +121,9 @@ SCENARIOS = {
         tap(*c['safari_icon']), wait(10), tap(*c['safari_address_bar']), wait(2.5),
         ('dumpon',), down(160, 765), wait(1.0), ('dumpoff',), shot('hold-e'), wait(0.5), shot('hold-e2'), up(160, 765), wait(0.8), shot('after-e'),
         key('home'), wait(2)]),
+    'safari-bar-dump': dict(start='home', steps=[
+        tap(*c['safari_icon']), wait(10), shot('safari'), ('dumpon',), tap(*c['safari_address_bar']), wait(1.5),
+        ('dumpoff',), shot('focused'), key('home'), wait(2)]),
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 1100, 320, 200, 500), wait(1.5), shot('closed')]),
