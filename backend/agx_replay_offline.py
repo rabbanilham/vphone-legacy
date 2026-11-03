@@ -212,7 +212,7 @@ def is_strip_surface(f, base, width):
 
 def nc_sparse_layout(f, base, w, h):
     """Recognize only the proved NC/folder scratch extents with sparse page maps."""
-    if base & 4095 or (w, h) not in ((128, 96), (640, 224), (640, 288), (640, 320), (640, 640)):
+    if base & 4095 or (w, h) not in ((128, 96), (224, 256), (608, 256), (640, 224), (640, 288), (640, 320), (640, 640)):
         return False
     pitch = ((w + 15) & ~15) * 4
     if all(((base + y * pitch) & ~4095) in f.pages for y in range(h)):
@@ -373,8 +373,8 @@ def texture(f, ppp, prog=None):
                     if k == 8 and prog == ROUNDED_CAPS and not (tex['addr'] == 0x10524000 or (tex['w'] == 114 and tex['h'] == 87)):
                         continue
                     # Trailing constants may be the next draw's allocation.
-                    tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog == STRIDE36_DUAL_TEX
-                    if prog in (STRIDE36_DUAL_TEX, CORNER_RESTORE) and len(ws) >= 8:
+                    tex['vibrancy'] = tuple(ws[:3]) == LUMA or prog in DUAL_TEX_PROGRAMS
+                    if (prog in DUAL_TEX_PROGRAMS or prog == CORNER_RESTORE) and len(ws) >= 8:
                         tex['mask_tex'] = decode_tsw(f, ws[4:8])
                     sampler = None
                     if k >= 4:
@@ -417,6 +417,10 @@ ROUNDED_CAPS = 0x6c01d033fd937c7c  # UISwitch knob rounded caps & drop shadow
 RADIAL_CLIP = 0xe344a0f081cc4997
 RADIAL_RESTORE = 0xab6fdb6c250c32c0
 STRIDE36_DUAL_TEX = 0xb61824c33264c501  # Backdrop through independent alpha-mask UVs
+# Key-press balloon composite: backdrop plus balloon alpha mask as second sampler.
+STRIDE36_DUAL_MASK = 0x41266dfcceb2ee28
+STRIDE36_DUAL_MASK2 = 0x066c0e6f88bb95a9
+DUAL_TEX_PROGRAMS = (STRIDE36_DUAL_TEX, STRIDE36_DUAL_MASK, STRIDE36_DUAL_MASK2)
 WEBKIT_GLYPHS = 0x3064a456731fc3e3  # normalized U8 atlas coverage times RGBA vertex tint
 CORNER_RESTORE = 0x03a2edd2a4d84437  # CA dual-texture corner restore (backdrop + mask)
 
@@ -1149,7 +1153,7 @@ def classify_draw(f, vs_data, ppp, draw, viewport, target_w, target_h, pw, ph, r
             return 'approximated: dest-in mask (bilinear scaled)', {'prog': hex(prog)}
         return 'replayed exactly: dest-in mask (1:1)', {'prog': hex(prog)}
     elif is_vibrancy:
-        if stride == 36 and prog == STRIDE36_DUAL_TEX:
+        if stride == 36 and prog in DUAL_TEX_PROGRAMS:
             return 'approximated: dual-texture alpha composite (stride=36)', {'prog': hex(prog)}
         return 'replayed exactly: vibrancy (Rec.709 luma-weighted tint)', {'prog': hex(prog)}
     elif stride == 36 and prog == CORNER_RESTORE:
@@ -1694,7 +1698,7 @@ def main():
 
                 uv2_map = None
                 u2_0, u2_1, v2_0, v2_1 = 0, 1, 0, 1
-                if stride == 36 and prog in (CORNER_RESTORE, STRIDE36_DUAL_TEX, RADIAL_RESTORE):
+                if stride == 36 and prog in (CORNER_RESTORE, RADIAL_RESTORE) + DUAL_TEX_PROGRAMS:
                     uv2s = [struct.unpack_from('<2f', v[2], 12) for v in q_vs]
                     u2_0, u2_1 = min(u for u, _ in uv2s), max(u for u, _ in uv2s)
                     v2_0, v2_1 = min(v for _, v in uv2s), max(v for _, v in uv2s)
@@ -1709,7 +1713,7 @@ def main():
                     is_scaled = abs(step_x - 1) > 0.1 or abs(step_y - 1) > 0.1
                 if tex.get('sampler') and tex['sampler']['linear_filter']:
                     is_scaled = True
-                if stride == 36 and prog == STRIDE36_DUAL_TEX:
+                if stride == 36 and prog in DUAL_TEX_PROGRAMS:
                     complete = True
                     for y in range(y0, y1):
                         fv = ((uv_map[4] * (y + 0.5) + uv_map[5]) if uv_map else
@@ -1850,7 +1854,7 @@ def main():
                             fb[d:d+4] = bytes(min(255, c*coverage//255+fb[d+i])
                                               for i,c in enumerate((r,g,b,a)))
                         elif tex.get('vibrancy'):
-                            if stride == 36 and prog == STRIDE36_DUAL_TEX and tex.get('mask_tex'):
+                            if stride == 36 and prog in DUAL_TEX_PROGRAMS and tex.get('mask_tex'):
                                 mask_tex = tex['mask_tex']
                                 mu = uv2_map[0]*(x+0.5)+uv2_map[1]*(y+0.5)+uv2_map[2]
                                 mv = uv2_map[3]*(x+0.5)+uv2_map[4]*(y+0.5)+uv2_map[5]

@@ -6255,6 +6255,12 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
 #define AGX_USC_RADIAL_CLIP UINT64_C(0xe344a0f081cc4997)
 #define AGX_USC_RADIAL_RESTORE UINT64_C(0xab6fdb6c250c32c0)
 #define AGX_USC_STRIDE36_DUAL_TEX UINT64_C(0xb61824c33264c501)
+/* The iOS 7 key-press balloon composite: backdrop texture plus the balloon alpha
+ * mask as the second sampler (luma constants precede the TSW pair). */
+#define AGX_USC_STRIDE36_DUAL_MASK UINT64_C(0x41266dfcceb2ee28)
+#define AGX_USC_STRIDE36_DUAL_MASK2 UINT64_C(0x066c0e6f88bb95a9)
+#define AGX_IS_DUAL_TEX(p) ((p) == AGX_USC_STRIDE36_DUAL_TEX || (p) == AGX_USC_STRIDE36_DUAL_MASK || \
+                            (p) == AGX_USC_STRIDE36_DUAL_MASK2)
 #define AGX_USC_WEBKIT_GLYPHS UINT64_C(0x3064a456731fc3e3)
 
 /* PPP words that point into the PDS heap reference fragment PDS data: u64
@@ -6331,7 +6337,7 @@ static int agx_replay_texture(A7State *s, uint64_t cat, const uint32_t *ppp,
                  * it can belong to the next draw; their luma weights must
                  * not turn an opaque wallpaper/icon draw into vibrancy. */
                 return (!memcmp(blocks[b], luma, sizeof(luma)) ||
-                        prog == AGX_USC_STRIDE36_DUAL_TEX) ?
+                        AGX_IS_DUAL_TEX(prog)) ?
                        AGX_TEX_VIBRANCY : AGX_TEX_FOUND;
             }
         }
@@ -6509,7 +6515,9 @@ static __thread bool agx_nc_layout_active;
 static bool agx_nc_sparse_layout(A7State *s, uint64_t cat, uint64_t base,
                                   uint32_t w, uint32_t h)
 {
-    if ((base & 4095) || !((w == 128 && h == 96) ||
+    /* 224x256 and 608x256 are the key-press balloon / accent-popup offscreen passes:
+     * Morton blocks past the padded width are never mapped (pages 42,43,46,47...). */
+    if ((base & 4095) || !((w == 128 && h == 96) || (w == 224 && h == 256) || (w == 608 && h == 256) ||
         (w == 640 && (h == 224 || h == 288 || h == 320 || h == 640)))) { return false; }
     if (agx_nc_layout_active) {
         for (unsigned i = 0; i < agx_nc_layout_count; i++) {
@@ -8244,7 +8252,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
             }
             AGXTexture mask_tex = { 0 };
             bool has_mask_tex = false;
-            if (stride == 36 && (prog == AGX_USC_STRIDE36_DUAL_TEX || prog == AGX_USC_CORNER_RESTORE)) {
+            if (stride == 36 && (AGX_IS_DUAL_TEX(prog) || prog == AGX_USC_CORNER_RESTORE)) {
                 has_mask_tex = agx_replay_decode_mask_tsw(s, cat, retained_ppp, 32, &mask_tex);
                 if (!has_mask_tex && ppp_count > 0) {
                     has_mask_tex = agx_replay_decode_mask_tsw(s, cat, ppp, ppp_count, &mask_tex);
@@ -8987,7 +8995,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                             }
                         }
                     }
-                    if (stride == 36 && (prog == AGX_USC_CORNER_RESTORE || radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX)) {
+                    if (stride == 36 && (prog == AGX_USC_CORNER_RESTORE || radial_restore || AGX_IS_DUAL_TEX(prog))) {
                         u2_0 = v2_0 = 1e9f; u2_1 = v2_1 = -1e9f;
                         for (unsigned i = q_start; i < q_start + step; i++) {
                             float t2[2];
@@ -9017,7 +9025,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     continue;
                 }
                 if ((radial_clip && !affine) ||
-                    ((radial_restore || prog == AGX_USC_STRIDE36_DUAL_TEX) && !affine2)) {
+                    ((radial_restore || AGX_IS_DUAL_TEX(prog)) && !affine2)) {
                     continue;
                 }
                 any_drawn = true;
@@ -9123,7 +9131,7 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     float step_y = hypotf(uv_map[1] * su, uv_map[4] * sv);
                     is_scaled = fabsf(step_x - 1.0f) > 0.1f || fabsf(step_y - 1.0f) > 0.1f;
                 }
-                if (stride == 36 && prog == AGX_USC_STRIDE36_DUAL_TEX) {
+                if (stride == 36 && AGX_IS_DUAL_TEX(prog)) {
                     bool complete = true;
                     for (int y = y0; y < y1; y++) {
                         float fv = affine ? uv_map[4] * (y + 0.5f) + uv_map[5] :

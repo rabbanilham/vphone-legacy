@@ -116,6 +116,11 @@ SCENARIOS = {
         down(160, 765), ('dumpon',), wait(0.4), ('dumpoff',), shot('press-e'), up(160, 765), wait(0.5), shot('after-e'),
         down(128, 983), wait(0.3), shot('press-z'), up(128, 983), wait(0.5), shot('after-z'),
         key('home'), wait(2)]),
+    # One long key hold with the dump window open for the whole popup appearance.
+    'kb-hold': dict(start='home', steps=[
+        tap(*c['safari_icon']), wait(10), tap(*c['safari_address_bar']), wait(2.5),
+        ('dumpon',), down(160, 765), wait(1.0), ('dumpoff',), shot('hold-e'), wait(0.5), shot('hold-e2'), up(160, 765), wait(0.8), shot('after-e'),
+        key('home'), wait(2)]),
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 1100, 320, 200, 500), wait(1.5), shot('closed')]),
