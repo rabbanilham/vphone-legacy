@@ -240,6 +240,10 @@ def decode_tsw(f, tsw):
     if fmt not in (6, 3) and not coverage:
         return None
     bpp = 1 if fmt == 3 or coverage else 4
+    # Format 3 with layout code 4 is a pitch-linear two-byte (L8A8) texture whose
+    # alpha is the second byte of each texel: the iOS 7 key-press balloon mask
+    # (204x228, pitch word 0xcf = 208 texels). Layout code 1 is the 1-byte Morton A8.
+    la88 = fmt == 3 and (tsw[0] & 7) == 4
     w = ((tsw[1] >> 2) & 0x3fff) + 1
     h = (tsw[1] >> 16) + 1
     q = tsw[2] | (tsw[3] << 32)
@@ -257,9 +261,11 @@ def decode_tsw(f, tsw):
     else:
         pitch = ((tsw[2] & 0xffff) + 1) * bpp
         stride = pitch if pitch >= w * bpp else ((w + 15) & ~15) * bpp
+        if la88:
+            stride = ((tsw[2] & 0xffff) + 1) * 2
     nc_sparse = not strip and (tsw[0] & 0x8007) == 1 and nc_sparse_layout(f, addr, w, h)
-    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, bpp=bpp,
-                twiddled=not strip and ((tsw[0] & 0x8007) == 0x8001 or (bpp == 1 and (tsw[0] & 7) == 1) or ((tsw[0] >> 24) & 0xf) == 8 or nc_sparse),
+    return dict(w=w, h=h, addr=addr, strip=strip, stride=stride, bpp=bpp, la88=la88,
+                twiddled=not strip and not la88 and ((tsw[0] & 0x8007) == 0x8001 or (bpp == 1 and (tsw[0] & 7) == 1) or ((tsw[0] >> 24) & 0xf) == 8 or nc_sparse),
                 nc_sparse=nc_sparse, tsw=tsw, format=fmt)
 
 
@@ -812,6 +818,8 @@ def texel(f, tex, x, y):
         gva = tex['addr'] + (y >> 4) * 0x10000 + (y & 15) * tex['stride'] + x * bpp
     else:
         gva = tex['addr'] + y * tex['stride'] + x * bpp
+        if tex.get('la88'):
+            gva += x + 1
     try:
         if bpp == 1:
             a = f.read(gva, 1)[0]

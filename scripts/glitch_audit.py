@@ -72,6 +72,8 @@ def S(**kw):
 def tap(x, y, hold=0.06): return ('tap', x, y, hold)
 def swipe(x1, y1, x2, y2, ms): return ('swipe', x1, y1, x2, y2, ms)
 def key(qcode): return ('key', qcode)
+def down(x, y): return ('down', x, y)
+def up(x, y): return ('up', x, y)
 def wait(s): return ('wait', s)
 def shot(label): return ('shot', label)
 
@@ -102,6 +104,14 @@ SCENARIOS = {
         tap(*c['safari_icon']), wait(9), shot('safari'), wait(3), shot('safari-3s'),
         tap(*c['safari_address_bar']), shot('keyboard-0'), wait(0.3), shot('keyboard-1'),
         wait(1.5), shot('keyboard'), key('home'), wait(2)]),
+    # Keyboard under Safari: slide-up frames, then held key presses (iOS 7 key popups).
+    'kb-type': dict(start='home', steps=[
+        tap(*c['safari_icon']), wait(10), shot('safari'),
+        tap(*c['safari_address_bar']), shot('kb-0'), wait(0.3), shot('kb-1'), wait(2.5), shot('kb'),
+        down(384, 875), ('dumpon',), wait(0.4), ('dumpoff',), shot('press-h'), up(384, 875), wait(0.5), shot('after-h'),
+        down(160, 765), ('dumpon',), wait(0.4), ('dumpoff',), shot('press-e'), up(160, 765), wait(0.5), shot('after-e'),
+        down(128, 983), wait(0.3), shot('press-z'), up(128, 983), wait(0.5), shot('after-z'),
+        key('home'), wait(2)]),
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 800, 320, 100, 400), wait(1.5), shot('closed')]),
@@ -484,6 +494,8 @@ def run_steps(drv, name, steps, outdir, log):
         if op == 'tap': drv.tap(st[1], st[2], st[3])
         elif op == 'swipe': drv.swipe(*st[1:6])
         elif op == 'key': drv.key(st[1])
+        elif op == 'down': drv.touch('begin', [(st[1], st[2])])
+        elif op == 'up': drv.touch('end', [(st[1], st[2])])
         elif op == 'wait': time.sleep(st[1])
         elif op in ('dumpon', 'dumpoff'):
             trig = os.environ.get('VPHONE_AGX_FRAME_DUMP_TRIGGER')

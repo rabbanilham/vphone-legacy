@@ -6184,6 +6184,7 @@ typedef struct AGXTexture {
     bool layout1;               /* descriptor layout, before software-target overrides */
     bool linear_filter;         /* sampler word 1 bits [5:4] or [7:6] == 1 */
     bool nc_sparse;             /* proved sparse NC allocation, not general layout 1 */
+    bool la88;                  /* format 3 layout 4: pitch-linear L8A8, alpha = byte 1 (key balloon) */
     bool clamp_to_edge;         /* sampler word 1 bits [11:9] or [14:12] == 2 */
     uint32_t sampler_words[4];
 } AGXTexture;
@@ -6209,6 +6210,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->format = fmt;
     tex->bpp = (fmt == 3 || coverage) ? 1 : 4;
     tex->layout1 = (tsw[0] & 7) == 1;
+    tex->la88 = fmt == 3 && (tsw[0] & 7) == 4;
     tex->w = ((tsw[1] >> 2) & 0x3fff) + 1;
     tex->h = (tsw[1] >> 16) + 1;
     tex->addr = ((q >> 16) & UINT64_C(0x3ffffffff)) << 2;
@@ -6222,7 +6224,7 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
     tex->strip = tex->bpp == 4 && sf.strip;
     tex->nc_sparse = !sf.strip && (tsw[0] & 0x8007) == 1 &&
                      agx_nc_sparse_layout(s, cat, tex->addr, tex->w, tex->h);
-    tex->twiddled = !tex->strip && ((tsw[0] & 0x8007) == 0x8001 || (tex->bpp == 1 && (tsw[0] & 7) == 1) ||
+    tex->twiddled = !tex->strip && !tex->la88 && ((tsw[0] & 0x8007) == 0x8001 || (tex->bpp == 1 && (tsw[0] & 7) == 1) ||
                                   ((tsw[0] >> 24) & 0xf) == 8 || tex->nc_sparse);
     if (tex->strip) {
         tex->stride = sf.pitch;
@@ -6234,6 +6236,9 @@ static bool agx_replay_decode_tsw(A7State *s, uint64_t cat, const uint32_t *tsw,
             tex->stride = (tsw[2] & 0xffff) + 1;
             if (tex->stride < tex->w) {
                 tex->stride = (tex->w + 15) & ~15u;
+            }
+            if (tex->la88) {
+                tex->stride = ((tsw[2] & 0xffff) + 1) * 2;
             }
         } else {
             tex->stride = ((tsw[2] & 0xffff) + 1) * 4;
@@ -6423,13 +6428,14 @@ static bool agx_texture_row(A7State *s, uint64_t cat, const AGXTexture *tex,
     unsigned bpp = tex->bpp ? tex->bpp : 4;
     if (!tex->twiddled) {
         if (bpp == 1) {
-            uint8_t row_bytes[4096];
-            if (tex->w > sizeof(row_bytes) ||
-                !agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), row_bytes, tex->w)) {
+            uint8_t row_bytes[8192];
+            unsigned step = tex->la88 ? 2 : 1;
+            if (tex->w * step > sizeof(row_bytes) ||
+                !agx_ctx_read(s, cat, agx_texel_gva(tex, 0, y), row_bytes, tex->w * step)) {
                 return false;
             }
             for (unsigned x = 0; x < tex->w; x++) {
-                out[x] = ((uint32_t)row_bytes[x] << 24) | (tex->format == 3 ? 0x00ffffffu : 0);
+                out[x] = ((uint32_t)row_bytes[x * step + (step - 1)] << 24) | (tex->format == 3 ? 0x00ffffffu : 0);
             }
             return true;
         }
