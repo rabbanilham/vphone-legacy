@@ -88,6 +88,9 @@ SCENARIOS = {
     'lock-dump': dict(start='lock', steps=[
         key('power'), wait(2), ('dumpon',), key('power'), wait(1.5), shot('woke-1'), wait(3), ('dumpoff',),
         shot('woke-2'), wait(3), shot('woke-3')]),
+    # Re-lock from home (SpringBoard builds a fresh lock view), then wake with the dump window open.
+    'relock-dump': dict(start='home', steps=[
+        key('power'), wait(4), ('dumpon',), key('power'), wait(3), shot('woke-1'), wait(4), shot('woke-2'), ('dumpoff',), wait(1), shot('woke-3')]),
     'unlock-slide': dict(start='lock', steps=[
         key('home'), wait(2), shot('woke'),
         ('swipe', *c['unlock_from'], *c['unlock_to'], 1200), shot('mid-unlock-0'), wait(0.3),
@@ -124,6 +127,12 @@ SCENARIOS = {
     'safari-bar-dump': dict(start='home', steps=[
         tap(*c['safari_icon']), wait(10), shot('safari'), ('dumpon',), tap(*c['safari_address_bar']), wait(1.5),
         ('dumpoff',), shot('focused'), key('home'), wait(2)]),
+    # Safari start page, Bookmarks sheet (book icon), its Reading List tab, then tabs overview.
+    'safari-bookmarks': dict(start='home', steps=[
+        tap(*c['safari_icon']), wait(10), shot('start'),
+        tap(447, 1092), wait(2.5), shot('bookmarks'),
+        tap(320, 84), wait(2), shot('second-tab'),
+        tap(320, 84), wait(1), key('home'), wait(1)]),
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 1100, 320, 200, 500), wait(1.5), shot('closed')]),
