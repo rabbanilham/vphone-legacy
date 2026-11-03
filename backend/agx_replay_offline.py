@@ -1255,7 +1255,10 @@ def main():
             if m:
                 last_m = m
             elif (stride == 16 and prog in (SPANS, WEBKIT_SPANS) or prog in (WEBKIT_GLYPHS, WEBKIT_STRIPS) or
-                  f.header.get('context_id', 1) != 1 and prog == 0x8eb52cf6fe248b1d) and last_m:
+                  f.header.get('context_id', 1) != 1 and prog == 0x8eb52cf6fe248b1d or
+                  (pw, ph) != (640, 1136)) and last_m:
+                # Small offscreen CA passes name the vertex matrix in the first
+                # draw only; later draws reuse it (display passes draw in pixels).
                 m = last_m
         vp = viewport or (pw / 2, pw / 2, ph / 2, ph / 2)
         tex = texture(f, ppp, prog) or texture(f, retained_ppp, prog)

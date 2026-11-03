@@ -105,6 +105,10 @@ SCENARIOS = {
     'notification-center': dict(start='home', steps=[
         shot('before'), swipe(*c['nc_from'], *c['nc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 800, 320, 100, 400), wait(1.5), shot('closed')]),
+    'nc-dump': dict(start='home', steps=[
+        ('dumpon',), swipe(*c['nc_from'], *c['nc_to'], 500), wait(1.5), ('dumpoff',), shot('settled')]),
+    'calendar-dump': dict(start='home', steps=[
+        tap(244, 120), wait(5), ('dump', 2.0), shot('calendar'), key('home'), wait(2)]),
     'control-center': dict(start='home', steps=[
         shot('before'), swipe(*c['cc_from'], *c['cc_to'], 500), shot('pulled'), wait(1.5),
         shot('settled'), swipe(320, 300, 320, 900, 400), wait(1.5), shot('closed')]),
@@ -477,6 +481,15 @@ def run_steps(drv, name, steps, outdir, log):
         elif op == 'swipe': drv.swipe(*st[1:6])
         elif op == 'key': drv.key(st[1])
         elif op == 'wait': time.sleep(st[1])
+        elif op in ('dumpon', 'dumpoff'):
+            trig = os.environ.get('VPHONE_AGX_FRAME_DUMP_TRIGGER')
+            if trig:
+                if op == 'dumpon': Path(trig).touch()
+                else: Path(trig).unlink(missing_ok=True)
+        elif op == 'dump':  # open the AGX frame-dump window (VPHONE_AGX_FRAME_DUMP_TRIGGER) for st[1] s
+            trig = os.environ.get('VPHONE_AGX_FRAME_DUMP_TRIGGER')
+            if trig:
+                Path(trig).touch(); time.sleep(st[1]); Path(trig).unlink(missing_ok=True)
         elif op == 'shot':
             n += 1
             rel = f'{name}/{n:02d}-{st[1]}.png'

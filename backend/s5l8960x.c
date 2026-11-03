@@ -5670,6 +5670,11 @@ static void agx_frame_dump(A7State *s, uint32_t context, uint64_t cat,
     if (!dir || !*dir) {
         return;
     }
+    /* TRIGGER: dump only while this file exists (live scripted captures). */
+    const char *trigger_env = getenv("VPHONE_AGX_FRAME_DUMP_TRIGGER");
+    if (trigger_env && access(trigger_env, F_OK) != 0) {
+        return;
+    }
     /* Bound captures to the transition under investigation, independent of
      * how many animation passes boot timing happened to submit beforehand. */
     const char *after_env = getenv("VPHONE_AGX_FRAME_DUMP_AFTER_NS");
@@ -5967,6 +5972,11 @@ static inline bool agx_replay_audit_enabled(void)
         qemu_log_mask(LOG_GUEST_ERROR, "AGX replay skip: %s\n", reason); \
     } \
 } while (0)
+#endif
+
+/* Debug hook for the host harness (draw bisection); a no-op in QEMU. */
+#ifndef AGX_REPLAY_DRAW_GATE
+#define AGX_REPLAY_DRAW_GATE() false
 #endif
 
 #define AGX_PDS_HEAP UINT64_C(0x600000000)
@@ -7969,6 +7979,11 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
     float vp[4] = { width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f };
     float last_m4[4];
     bool has_last_m4 = false;
+    /* A small offscreen CA pass (group masks, grabber glyphs) names its
+     * vertex matrix, a translation to the group origin, in the first draw
+     * only; later draws leave the vertex uniforms loaded, so they reuse it.
+     * Full-screen display passes draw in pixels and are unaffected. */
+    bool offscreen_pass = !(width == 640 && height == 1136);
     uint32_t last_copy_vs = 0;
     bool last_copy_normalized = false, have_copy_texmat = false;
     uint64_t decoded_nc_addr = 0;
@@ -8050,6 +8065,9 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 break;
             }
             pc += 12;
+            if (AGX_REPLAY_DRAW_GATE()) {
+                continue;
+            }
             count = MIN(w[1], 64u);
             if (!vs_data || !agx_ctx_read(s, cat, vs_data, &stride, 4) ||
                 !agx_ctx_read(s, cat, vs_data + 8, &buf, 8) || stride < 12 || stride > 64) {
@@ -8256,7 +8274,8 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                     has_last_m4 = true;
                     transformed = true;
                 } else if ((is_span || prog == AGX_USC_WEBKIT_GLYPHS || prog == AGX_USC_WEBKIT_STRIPS ||
-                            (ldl_le_p(ta + 4) != 1 && prog == UINT64_C(0x8eb52cf6fe248b1d))) && has_last_m4) {
+                            (ldl_le_p(ta + 4) != 1 && prog == UINT64_C(0x8eb52cf6fe248b1d)) ||
+                            (offscreen_pass && !clip_space)) && has_last_m4) {
                     memcpy(m4, last_m4, sizeof(m4));
                     transformed = true;
                 }
@@ -8474,6 +8493,13 @@ static void agx_replay_frame(A7State *s, uint64_t cat, const uint8_t *ta,
                 float vs_xy[64][2];
                 float m4[4];
                 bool transformed = (stride != 12) && agx_replay_matrix(s, cat, vs_data, m4);
+                if (transformed) {
+                    memcpy(last_m4, m4, sizeof(m4));
+                    has_last_m4 = true;
+                } else if (stride != 12 && offscreen_pass && !clip_space && has_last_m4) {
+                    memcpy(m4, last_m4, sizeof(m4));
+                    transformed = true;
+                }
                 unsigned v_count = MIN(count, 64u);
                 for (unsigned i = 0; i < v_count; i++) {
                     float xy[2];
@@ -9828,6 +9854,23 @@ static void agx_trace_rt(A7State *s, uint32_t block, uint32_t address,
     bool capture_context = dump_context ?
         (!strcmp(dump_context, "all") || context_id == strtoul(dump_context, NULL, 0)) :
         (context_id == 1 && s->disp_mmu_table);
+    if (capture_context && pbe_target) {
+        /* EXCLUDE_TARGETS="0xaddr,..." leaves out passes that render to
+         * these targets (a looping animation can flood a capture). */
+        const char *excl = getenv("VPHONE_AGX_FRAME_DUMP_EXCLUDE_TARGETS");
+        for (const char *p = excl; p && *p;) {
+            char *end;
+            uint64_t t = strtoull(p, &end, 0);
+            if (end == p) {
+                break;
+            }
+            if (t == pbe_target) {
+                capture_context = false;
+                break;
+            }
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
     if (capture_context && context_cat && pbe_target) {
         /* Optional: only dump frames with at least MIN_DRAWS draws (CA
          * redraws only dirty regions, so most frames are small). */
