@@ -108,6 +108,15 @@ static MemTxResult host_access(hwaddr pa, void *buf, size_t n, bool write)
 #define address_space_read(as, pa, attrs, buf, n) host_access((pa), (buf), (n), false)
 #define address_space_write(as, pa, attrs, buf, n) host_access((pa), (void *)(buf), (n), true)
 
+/* AGX_HOST_DRAW_RANGE=first:last replays only draws first..last (bisection). */
+static int host_draw_first = 0, host_draw_last = -1, host_draw_seen;
+static bool host_draw_gate(void)
+{
+    int di = host_draw_seen++;
+    return host_draw_last >= 0 && (di < host_draw_first || di > host_draw_last);
+}
+#define AGX_REPLAY_DRAW_GATE() host_draw_gate()
+
 #include "agx_replay_core.inc"
 
 static void add_skip_json(gpointer key, gpointer value, gpointer data)
@@ -250,6 +259,9 @@ static int replay_one(const char *dump, const char *rgba_path, GHashTable *carri
 int main(int argc, char **argv)
 {
     host_verbose = getenv("AGX_HOST_VERBOSE") != NULL;
+    if (getenv("AGX_HOST_DRAW_RANGE")) {
+        sscanf(getenv("AGX_HOST_DRAW_RANGE"), "%d:%d", &host_draw_first, &host_draw_last);
+    }
     host_skips = g_hash_table_new(g_str_hash, g_str_equal);
     if (argc >= 4 && !strcmp(argv[1], "--chain")) {
         GHashTable *carried = new_page_table();

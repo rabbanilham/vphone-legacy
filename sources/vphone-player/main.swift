@@ -1338,6 +1338,8 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var activity: NSObjectProtocol?
     var inputFailed = false
     var gestureError: String?
+    let toast = NSVisualEffectView(), toastLabel = NSTextField(wrappingLabelWithString:"")
+    var toastTimer: Timer?
     var controlCenterPending = false
     var inputLog: FileHandle?
     var window: NSWindow!
@@ -1345,6 +1347,14 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var bezel: BezelView?
     var displayTimer: Timer?
     var displayQuery = false
+    var vncPath: String = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+    var qmpPath: String = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : ""
+
+    init(vncPath: String? = nil, qmpPath: String? = nil) {
+        if let vncPath { self.vncPath = vncPath }
+        if let qmpPath { self.qmpPath = qmpPath }
+        super.init()
+    }
     private let presentLock = NSLock()
     private var pendingSurface: IOSurface?
     private var pendingArrivalUptime: TimeInterval = 0
@@ -1377,19 +1387,20 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bezel.onHome = {[weak self] in self?.home()}
         bezel.onPower = {[weak self] in self?.lock()}
         for view in [bezel,bar,status] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
+        configureToast(in:root)
         status.textColor = .secondaryLabelColor; status.alignment = .center; status.maximumNumberOfLines = 2
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo:root.topAnchor,constant:10),bar.centerXAnchor.constraint(equalTo:root.centerXAnchor),bar.heightAnchor.constraint(equalToConstant:32),
             bezel.topAnchor.constraint(equalTo:bar.bottomAnchor,constant:10),bezel.leadingAnchor.constraint(equalTo:root.leadingAnchor),bezel.trailingAnchor.constraint(equalTo:root.trailingAnchor),bezel.bottomAnchor.constraint(equalTo:root.bottomAnchor,constant:-24),
             status.centerXAnchor.constraint(equalTo:bezel.centerXAnchor),status.centerYAnchor.constraint(equalTo:bezel.centerYAnchor),status.widthAnchor.constraint(lessThanOrEqualTo:bezel.widthAnchor,constant:-24)])
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiatedAllowingIdleSystemSleep,.latencyCritical],reason:"Interactive emulator input")
-        let logURL = URL(fileURLWithPath:CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("player-input.log")
+        let logURL = URL(fileURLWithPath:vncPath).deletingLastPathComponent().appendingPathComponent("player-input.log")
         _ = FileManager.default.createFile(atPath:logURL.path,contents:nil)
         inputLog = try? FileHandle(forWritingTo:logURL)
         screen.trace = {[weak self] text in self?.logInput(text)}
         rfb.trace = {[weak self] text in self?.logInput(text)}
         logInput("player started; VNC pointer and QMP gesture input configured")
-        let qmp = QMPInput(CommandLine.arguments[2]);touchInput = qmp
+        let qmp = QMPInput(qmpPath);touchInput = qmp
         screen.gestures.send = {[weak self,weak qmp] type,points in
             if type != "update" {self?.logInput("mtt \(type) points=\(points)")}
             qmp?.touch(type,points)
@@ -1417,6 +1428,9 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.screen.input = nil
                 self.screen.rfbKey = nil
                 self.screen.qmpKey = nil
+                if ProcessInfo.processInfo.environment["VPHONE_PLAYER_KEEP_ON_DISCONNECT"] == nil {
+                    NSApp.terminate(nil)
+                }
             }
         }
         window.center(); window.makeKeyAndOrderFront(nil);window.makeFirstResponder(screen); NSApp.activate(ignoringOtherApps:true)
@@ -1429,7 +1443,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Poll the guest's display power so a sleeping device shows as locked
         // instead of a frozen frame that ignores touches.
         displayTimer = Timer.scheduledTimer(withTimeInterval:0.5,repeats:true) {[weak self] _ in self?.pollDisplay()}
-        let path = CommandLine.arguments[1]
+        let path = vncPath
         DispatchQueue.global(qos:.userInteractive).async { self.rfb.run(path) }
     }
 
@@ -1522,14 +1536,33 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A gesture transport failure must not disable the independent pointer.
         logInput("QMP failure: \(message)")
         gestureError = message
-        status.stringValue = "Gesture gagal: \(message). Klik/drag tetap tersedia."
-        status.isHidden = false
+        showToast("Touch input failed: \(message)")
         updateButtons()
         let send = screen.gestures.send
         screen.gestures.send = nil
         screen.cancelTouch()
         screen.gestures.send = send
     }
+    func configureToast(in root:NSView) {
+        toast.material = .hudWindow; toast.blendingMode = .withinWindow; toast.state = .active
+        toast.wantsLayer = true; toast.layer?.cornerRadius = 10; toast.layer?.masksToBounds = true
+        toast.isHidden = true; toast.translatesAutoresizingMaskIntoConstraints = false
+        toastLabel.maximumNumberOfLines = 4; toastLabel.font = .systemFont(ofSize:12); toastLabel.translatesAutoresizingMaskIntoConstraints = false
+        let close = NSButton(image:NSImage(systemSymbolName:"xmark.circle.fill",accessibilityDescription:"Dismiss")!,target:self,action:#selector(dismissToast))
+        close.isBordered = false; close.toolTip = "Dismiss"; close.setAccessibilityLabel("Dismiss"); close.translatesAutoresizingMaskIntoConstraints = false
+        toast.addSubview(toastLabel); toast.addSubview(close); root.addSubview(toast)
+        NSLayoutConstraint.activate([
+            toast.leadingAnchor.constraint(equalTo:root.leadingAnchor,constant:12),toast.trailingAnchor.constraint(equalTo:root.trailingAnchor,constant:-12),toast.bottomAnchor.constraint(equalTo:root.bottomAnchor,constant:-8),
+            toastLabel.leadingAnchor.constraint(equalTo:toast.leadingAnchor,constant:12),toastLabel.topAnchor.constraint(equalTo:toast.topAnchor,constant:8),toastLabel.bottomAnchor.constraint(equalTo:toast.bottomAnchor,constant:-8),
+            close.leadingAnchor.constraint(equalTo:toastLabel.trailingAnchor,constant:8),close.trailingAnchor.constraint(equalTo:toast.trailingAnchor,constant:-8),close.centerYAnchor.constraint(equalTo:toast.centerYAnchor)])
+    }
+    func showToast(_ message:String) {
+        toastLabel.stringValue = message; toast.isHidden = false
+        toastTimer?.invalidate()
+        toastTimer = Timer.scheduledTimer(withTimeInterval:10,repeats:false) {[weak self] _ in self?.hideToast()}
+    }
+    func hideToast() { toastTimer?.invalidate(); toastTimer = nil; toast.isHidden = true }
+    @objc func dismissToast() { hideToast() }
     func logInput(_ text:String) {
         try? inputLog?.write(contentsOf:Data("\(Date().timeIntervalSince1970) \(text)\n".utf8))
     }
@@ -1567,7 +1600,7 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.controlCenterPending = false; self.updateButtons()
             guard self.screen.touchEpoch == epoch else {return}
             if let error {self.handleGestureFailure(error);return}
-            self.gestureError = nil;self.status.isHidden = true
+            self.gestureError = nil;self.hideToast()
             self.screen.openControlCenter()
         }}
     }
@@ -1595,6 +1628,31 @@ final class Player: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool {true}
 }
 guard CommandLine.arguments.count == 3 else {
+    var vncArg: String?
+    var qmpArg: String?
+    var i = 1
+    while i < CommandLine.arguments.count {
+        let arg = CommandLine.arguments[i]
+        if arg == "--vnc" && i + 1 < CommandLine.arguments.count {
+            vncArg = CommandLine.arguments[i + 1]; i += 2
+        } else if arg == "--qmp" && i + 1 < CommandLine.arguments.count {
+            qmpArg = CommandLine.arguments[i + 1]; i += 2
+        } else if !arg.hasPrefix("-") {
+            if vncArg == nil { vncArg = arg }
+            else if qmpArg == nil { qmpArg = arg }
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+    if let vnc = vncArg, let qmp = qmpArg {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let player = Player(vncPath: vnc, qmpPath: qmp)
+        app.delegate = player
+        app.run()
+        exit(0)
+    }
     fputs("Usage: vphone-player VNC_UNIX_SOCKET QMP_UNIX_SOCKET\n", stderr); exit(2)
 }
 let app = NSApplication.shared

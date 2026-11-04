@@ -1,205 +1,196 @@
 import SwiftUI
 
 public struct VMDetailView: View {
-    @ObservedObject var vmManager: VMManager
-    let vm: VirtualMachineInfo
-    @Binding var selectedTab: Int
-    
-    public init(vmManager: VMManager, vm: VirtualMachineInfo, selectedTab: Binding<Int>) {
-        self.vmManager = vmManager
+    @Bindable public var appState: AppState
+    public let vm: VMInfo
+
+    @State private var selectedTab: Int = 0
+
+    public init(appState: AppState, vm: VMInfo) {
+        self.appState = appState
         self.vm = vm
-        self._selectedTab = selectedTab
     }
-    
+
+    private var status: VMStatus? {
+        appState.vmStatuses[vm.name]
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
-            // Top Toolbar Bar
-            HStack(spacing: 12) {
+            // Header
+            HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Text(vm.name)
-                            .font(.title2)
-                            .fontWeight(.bold)
-                        Text("iOS \(vm.version)")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.blue.opacity(0.15))
-                            .foregroundColor(.blue)
-                            .cornerRadius(6)
-                    }
-                    Text("Guest firmware: \(vm.device) • Required \(vm.chip) / \(vm.cpu)")
+                    Text(vm.name)
+                        .font(.title2)
+                        .bold()
+                    Text("iPhone 5s (iPhone6,2) • iOS \(vm.ios) (11D257)")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                 }
-                
                 Spacer()
-                
-                // Hardware controls are disabled until events can reach the guest.
-                HStack(spacing: 6) {
-                    Button("Home", systemImage: "circle.circle") {}.disabled(true)
-                    Button("Power", systemImage: "power") {}.disabled(true)
-                }
-                .help("Unavailable: backend guest input is not implemented")
 
-                // Start / Stop Button
-                if vmManager.isRunning && vmManager.activeVMName == vm.name {
-                    Button(action: {
-                        vmManager.stopVM()
-                    }) {
-                        Label(vmManager.isStopping ? "Requesting Stop…" : "Shut Down", systemImage: "stop.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    .disabled(vmManager.isStopping)
-                    Button("Force Stop") { vmManager.stopVM(force: true) }
-                        .disabled(vmManager.isStopping)
-                        .help("Terminate the backend without a clean guest shutdown")
-                } else {
-                    Button(action: {
-                        vmManager.launchVM(vm: vm)
-                    }) {
-                        Label("Start VM", systemImage: "play.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .disabled(vmManager.isRunning)
+                Picker("View", selection: $selectedTab) {
+                    Text("Info").tag(0)
+                    Text("Logs").tag(1)
                 }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            .background(Color(NSColor.windowBackgroundColor))
-            
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+
             Divider()
-            
-            // Tab Picker
-            Picker("", selection: $selectedTab) {
-                Text("Runtime Status & Specs").tag(0)
-                Text("Serial Console").tag(1)
-                Text("Guest Agent (vphoned)").tag(2)
-                Text("Firmware Info").tag(3)
+
+            // Content
+            if selectedTab == 0 {
+                infoTabContent
+            } else {
+                logsTabContent
             }
-            .pickerStyle(SegmentedPickerStyle())
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            
-            Divider()
-            
-            // Tab Content
-            ScrollView {
-                if selectedTab == 0 {
-                    overviewTab
-                } else if selectedTab == 1 {
-                    ConsoleView(vmManager: vmManager)
-                } else if selectedTab == 2 {
-                    AgentView(vmManager: vmManager)
-                } else {
-                    FirmwareCatalogView(vm: vm)
-                }
-            }
+        }
+        .task {
+            await appState.tailLog(for: vm.name)
         }
     }
-    
-    private var overviewTab: some View {
-        HStack(alignment: .top, spacing: 30) {
-            VMStatusView(vmManager: vmManager, vm: vm)
-                .padding(.leading, 20)
-            
-            // Specification & Configuration Cards
+
+    // MARK: - Info Tab
+
+    private var infoTabContent: some View {
+        ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                // Specs Card
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Machine Configuration")
+                // Status Box
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Runtime Status")
                         .font(.headline)
-                    
-                    Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
-                        GridRow {
-                            Text("Device Identity:").foregroundColor(.secondary)
-                            Text("\(vm.device) (\(vm.board))")
-                                .fontWeight(.medium)
-                        }
-                        GridRow {
-                            Text("Processor / SoC:").foregroundColor(.secondary)
-                            Text("Apple A7 (\(vm.chip)) ARM64")
-                                .fontWeight(.medium)
-                        }
-                        GridRow {
-                            Text("Guest CPU Requirement:").foregroundColor(.secondary)
-                            Text(vm.cpu)
-                                .font(.system(.body, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Backend CPU (experimental):").foregroundColor(.secondary)
-                            Text(vmManager.backendCPUDescription)
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                        GridRow {
-                            Text("Configured Memory:").foregroundColor(.secondary)
-                            Text("\(vm.memoryMB) MB DRAM")
-                        }
-                        GridRow {
-                            Text("Filesystem Type:").foregroundColor(.secondary)
-                            Text("See validated bundle manifest")
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                        infoField(label: "Phase", value: vm.phase.capitalized)
+                        infoField(label: "Boot Stage", value: status?.boot_stage ?? vm.boot_stage)
+                        infoField(label: "PID", value: status?.process?.pid.map(String.init) ?? (vm.pid.map(String.init) ?? "None"))
+                        infoField(label: "Lock", value: status?.lock ?? "free")
+                    }
+                }
+                .padding()
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
+
+                // VM Properties
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Hardware & System")
+                        .font(.headline)
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                        infoField(label: "Device", value: vm.device)
+                        infoField(label: "Profile", value: vm.profile)
+                        infoField(label: "Memory", value: "\(vm.memoryMB) MB")
+                        infoField(label: "Disk Size", value: vm.formattedDiskSize)
+                        infoField(label: "Bundle Path", value: vm.path)
+                        infoField(label: "Session ID", value: status?.session_id ?? "—")
+                    }
+                }
+                .padding()
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
+
+                // Installed Applications
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Installed Applications (\(vm.apps.count))")
+                        .font(.headline)
+
+                    if vm.apps.isEmpty {
+                        Text("No third-party apps installed. Drag and drop an .ipa file onto the VM card in Library to sideload.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(spacing: 6) {
+                            ForEach(vm.apps, id: \.bundle_id) { app in
+                                HStack {
+                                    Image(systemName: "app.fill")
+                                        .font(.title3)
+                                        .foregroundStyle(.blue)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(app.bundle_id)
+                                            .font(.subheadline)
+                                            .bold()
+                                        Text(app.path)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(8)
+                                .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.textBackgroundColor)))
+                            }
                         }
                     }
                 }
-                .padding(16)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(10)
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Firmware Validation").font(.headline)
-                    Text("Run vm doctor \(vm.name) in the CLI to inspect firmware checksums, storage, and backend capabilities. Launch succeeds only when its required checks pass.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                .padding(16)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(10)
-
-                // Boot Arguments
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Boot Arguments")
-                        .font(.headline)
-                    Text(vm.bootArgs)
-                        .font(.system(.caption, design: .monospaced))
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.black.opacity(0.1))
-                        .cornerRadius(6)
-                }
-                .padding(16)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(10)
+                .padding()
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
             }
-            .padding(.trailing, 20)
+            .padding()
         }
-        .padding(.vertical, 20)
+    }
+
+    private func infoField(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.subheadline)
+                .bold()
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Logs Tab
+
+    private var logsTabContent: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Serial / Console Log")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task {
+                        await appState.tailLog(for: vm.name)
+                    }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            let logText = appState.vmLogs[vm.name] ?? "No serial output observed yet."
+
+            ScrollView {
+                Text(logText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .textSelection(.enabled)
+            }
+            .background(Color(NSColor.textBackgroundColor))
+        }
     }
 }
 
-extension Color {
-    init(hex: String) {
-        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
-        let a, r, g, b: UInt64
-        switch hex.count {
-        case 3: // RGB (12-bit)
-            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
-        case 6: // RGB (24-bit)
-            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
-        case 8: // ARGB (32-bit)
-            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
-        default:
-            (a, r, g, b) = (1, 1, 1, 0)
-        }
-        self.init(
-            .sRGB,
-            red: Double(r) / 255,
-            green: Double(g) / 255,
-            blue:  Double(b) / 255,
-            opacity: Double(a) / 255
-        )
-    }
+#Preview {
+    let vm = VMInfo(
+        name: "ios712",
+        path: "/Users/me/.vphone-legacy/VMs/ios712",
+        ios: "7.1.2",
+        build: "11D257",
+        device: "iPhone6,2",
+        profile: "ui",
+        memory_mb: 1024,
+        disk_bytes: 7300000000,
+        phase: "stopped",
+        boot_stage: "none",
+        apps: [VMAppInfo(bundle_id: "com.vphone.hello", path: "/Applications/Hello.app")]
+    )
+    VMDetailView(appState: AppState(client: FixtureCLIClient()), vm: vm)
 }

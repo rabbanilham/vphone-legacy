@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
-"""Prepare persistent diagnostic disks for display and AGX probes.
-
-1. build/diagnostic/system-diagnostic-sep.raw:
-   Clone of build/ios712-validated/system.raw with H6SURamDisk.dmg removed to free space,
-   and sep-firmware.n53.RELEASE.im4p installed as /usr/standalone/firmware/sep-firmware.img4.
-
-2. build/diagnostic/data-diagnostic-systembag.raw:
-   Clone of build/ios712-validated/data.raw seeded with the /private/var
-   template from system.raw, plus /keybags/systembag.kb for unencrypted keybag loading
-   and com.apple.migration.plist so DataMigration does not rerun on every boot.
-"""
+"""Prepare diagnostic disk copies from an explicit bundle; never mutate baseline disks."""
 import hashlib
 import os
 from pathlib import Path
 import plistlib
 import shutil
-import subprocess
 import sys
 
 from qemu.hfs_mount import attach, detach, mounted
 
-ROOT = Path(__file__).resolve().parents[1]
-VALIDATED = ROOT / "build/ios712-validated"
-DIAG_DIR = ROOT / "build/diagnostic"
-SEP_FW = ROOT / "research/firmware-artifacts/sep-firmware.n53.RELEASE.im4p"
+def clone(source, target):
+    """Use APFS clonefile on Darwin, with a portable copy fallback."""
+    if Path(target).exists():
+        raise ValueError(f"Refusing to replace {target}")
+    if sys.platform == "darwin":
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.clonefile(os.fsencode(source), os.fsencode(target), 0) == 0:
+            return
+        if ctypes.get_errno() not in (18, 45, 95):
+            raise OSError(ctypes.get_errno(), "clonefile failed")
+    shutil.copyfile(source, target)
 
 
 def digest(path):
@@ -75,12 +72,13 @@ def seed_migration_preferences(data_mount, build_version="11D257"):
         (prefs / "com.apple.accountsd.plist").write_bytes(accountsd_payload)
 
 
-def prepare_system():
-    target = DIAG_DIR / "system-diagnostic-sep.raw"
+def prepare_system(bundle, out, sep_fw):
+    bundle, out = Path(bundle), Path(out)
+    target = out / "system-diagnostic-sep.raw"
     if target.exists():
         target.unlink()
-    print(f"[*] Creating {target} from {VALIDATED / 'system.raw'}...")
-    shutil.copyfile(VALIDATED / "system.raw", target)
+    print(f"[*] Creating {target} from {bundle / 'system.raw'}...")
+    clone(bundle / "system.raw", target)
     with mounted(target) as (dev, mount):
         # Free space by removing unused update ramdisk
         ramdisk = mount / "usr/standalone/update/ramdisk/H6SURamDisk.dmg"
@@ -90,22 +88,23 @@ def prepare_system():
         fw_dest = mount / "usr/standalone/firmware/sep-firmware.img4"
         fw_dest.parent.mkdir(parents=True, exist_ok=True)
         print(f"[*] Copying SEP firmware to {fw_dest}...")
-        shutil.copyfile(SEP_FW, fw_dest)
+        shutil.copyfile(sep_fw, fw_dest)
         fw_dest.chmod(0o644)
     sha = digest(target)
     print(f"[+] Successfully prepared {target} (SHA256: {sha})")
     return target, sha
 
 
-def prepare_data():
-    target = DIAG_DIR / "data-diagnostic-systembag.raw"
+def prepare_data(bundle, out):
+    bundle, out = Path(bundle), Path(out)
+    target = out / "data-diagnostic-systembag.raw"
     if target.exists():
         target.unlink()
-    print(f"[*] Creating {target} from {VALIDATED / 'data.raw'}...")
-    shutil.copyfile(VALIDATED / "data.raw", target)
+    print(f"[*] Creating {target} from {bundle / 'data.raw'}...")
+    clone(bundle / "data.raw", target)
     
     # Mount system.raw read-only to copy the /private/var template
-    with mounted(VALIDATED / "system.raw", readonly=True) as (sys_dev, sys_mount):
+    with mounted(bundle / "system.raw", readonly=True) as (sys_dev, sys_mount):
         with mounted(target) as (data_dev, data_mount):
             var_src = sys_mount / "private/var"
             print(f"[*] Seeding /private/var template to {data_mount}...")
@@ -171,13 +170,14 @@ def seed_setup_done(data_mount, build_version="11D257"):
     (root / "com.apple.purplebuddy.plist").write_bytes(purplebuddy)
 
 
-def prepare_setup_done_variant():
+def prepare_setup_done_variant(out):
+    out = Path(out)
     """Copy the prepared data disk and add the setup-done state to the copy."""
-    source = DIAG_DIR / "data-diagnostic-systembag.raw"
-    target = DIAG_DIR / "data-diagnostic-setupdone.raw"
+    source = out / "data-diagnostic-systembag.raw"
+    target = out / "data-diagnostic-setupdone.raw"
     if target.exists():
         target.unlink()
-    shutil.copyfile(source, target)
+    clone(source, target)
     with mounted(target) as (dev, mount):
         seed_setup_done(mount)
         print("[*] Seeded purplebuddy setup-done preferences")
@@ -187,16 +187,21 @@ def prepare_setup_done_variant():
 
 
 def main():
-    DIAG_DIR.mkdir(parents=True, exist_ok=True)
-    sys_img, sys_sha = prepare_system()
-    data_img, data_sha = prepare_data()
-    print("[*] Diagnostic images ready:")
-    print("    System:", sys_img, sys_sha)
-    print("    Data:  ", data_img, data_sha)
+    import argparse
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("bundle", type=Path)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--sep", type=Path)
+    p.add_argument("--ipsw", type=Path)
+    a = p.parse_args()
+    out = a.out or a.bundle / "ui/diagnostic"
+    out.mkdir(parents=True, exist_ok=True)
+    if a.sep is None:
+        from ui_profile import extract_sep
+        a.sep = extract_sep(a.bundle, out, a.ipsw)
+    prepare_system(a.bundle, out, a.sep)
+    prepare_data(a.bundle, out)
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--setup-done-variant"]:
-        prepare_setup_done_variant()
-    else:
-        main()
+    main()

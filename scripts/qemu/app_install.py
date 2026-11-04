@@ -116,6 +116,32 @@ def install_app(system_image, data_image, ipa, *, sign=True, uid=0, gid=ADMIN_GI
     return report
 
 
+def remove_app(system_image, data_image, app_dir_name):
+    """Delete /Applications/<app_dir_name>.app and force installd to rescan."""
+    system_image, data_image = Path(system_image), Path(data_image)
+    if not app_dir_name.endswith('.app') or '/' in app_dir_name or app_dir_name.startswith('.'):
+        raise InstallError('Invalid app directory name')
+    if images_in_use(system_image, data_image):
+        raise InstallError('A QEMU process is using these images; stop the VM first')
+    removed_cache = []
+    with mounted(system_image) as volume:
+        target = Path(volume.mount_point) / 'Applications' / app_dir_name
+        if not target.is_dir():
+            raise InstallError(f'{app_dir_name} is not installed')
+        shutil.rmtree(target)
+    with mounted(data_image) as volume:
+        mount = Path(volume.mount_point)
+        for rel in CACHE_PATHS:
+            if (mount / rel).exists():
+                (mount / rel).unlink()
+                removed_cache.append(rel)
+        for pattern in CACHE_GLOBS:
+            for item in mount.glob(pattern):
+                item.unlink()
+                removed_cache.append(str(item.relative_to(mount)))
+    return {'removed': app_dir_name, 'removed_cache': removed_cache}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('ipa', type=Path)

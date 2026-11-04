@@ -1,0 +1,6 @@
+{"schema": 1, "event": "stage", "id": "preflight", "status": "start", "fraction": null, "message": "Checking inputs", "hint": null}
+{"schema": 1, "event": "stage", "id": "preflight", "status": "done", "fraction": 1.0, "message": "IPSW is iPhone6,2 7.1.2 11D257", "hint": null}
+{"schema": 1, "event": "stage", "id": "decrypt-rootfs", "status": "progress", "fraction": 0.4, "message": "Decrypting RootFS", "hint": null}
+{"schema": 1, "event": "log", "message": "vfdecrypt: 1.46 GB processed"}
+{"schema": 1, "event": "stage", "id": "convert-rootfs", "status": "error", "fraction": null, "message": "qemu-img failed", "hint": "Install qemu with: brew install qemu"}
+{"schema": 1, "event": "result", "ok": false, "data": {"exit_code": 1}}

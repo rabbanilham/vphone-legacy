@@ -200,7 +200,7 @@ def omit_unpopulated_devices(root):
                                if c.get_prop("name") != path[-1].encode() + b"\0"]
 
 
-def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 cpus=1", *, monitor_path=None, ans_path=None, nvram_vars=None):
+def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 cpus=1", *, monitor_path=None, ans_path=None, nvram_vars=None, debug_enabled=False):
     if monitor_path is None:
         raise ValueError("Native secure monitor is required; rebuild firmware bundle")
     cmdline = single_cpu_boot_args(cmdline)
@@ -240,6 +240,8 @@ def build_image(kernel_path, tree_path, out_dir, cmdline="-v serial=3 debug=0x8 
     args_offset = align(highest)
     dt_offset = align(args_offset + BOOT_ARGS_SIZE)
     chosen = add_node(root, "chosen")
+    if debug_enabled:
+        chosen.set_prop("debug-enabled", struct.pack("<I", 1))
     chosen.set_prop("boot-args", cmdline.encode("ascii") + b"\0")
     chosen.set_prop("nvram-proxy-data", build_nvram_proxy_data(cmdline, nvram_vars=nvram_vars))
     root_matching = (

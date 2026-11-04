@@ -12,7 +12,27 @@ bash -n research/tasks/merge-live.sh
 
 Default discovery runs Python tests and small compiled C harnesses. A host compiler is needed for those harnesses. It does not boot iOS or require a private VM. Missing optional firmware, dump corpora, or backend build tools produce explicit skips; inspect the skip summary before interpreting coverage. CI runs this path on macOS, with no firmware or private artifacts.
 
+`tests/test_player_launch.py` exercises bundle launch command construction, display resolution, process lifecycle, boot stage tracking, and contract compliance without running live VMs:
+- QEMU argv verification: verifies that player mode constructs `-display none -vnc unix:... -qmp unix:...` without `-display cocoa`, while cocoa mode retains `-display cocoa` and no VNC chardev.
+- Display mode resolution: tests manifest-driven defaults (`profile: ui` -> `player`, baseline -> `cocoa`) and explicit command-line overrides.
+- Lifecycle and stop request handling: verifies atomic request parsing, force termination, and guest shutdown signaling.
+- Process cleanup sequence: uses mock processes to verify that the player process is terminated first, followed by QEMU SIGTERM and timeout-based SIGKILL escalation, ensuring no orphan processes remain.
+- Runtime status schema: checks initial and dynamic fields (`display`, `boot_stage`, `process`, `shutdown`, `control`) against `tests/fixtures/gui/vm-status.json`.
+- Boot stage progression: validates non-regressing stages (`none` -> `kernel` -> `userspace` -> `lockscreen` -> `home`) and panic preemption from UART logs.
+
 To run the three probe-164 dump test modules against an external corpus, set `VPHONE_AGX_DUMPS=/absolute/path/to/dumps`. Keep the original `frame-N.bin` files and sidecars together. Other historical corpus tests use their documented local `build/` or `backend/evidence/` locations. Never commit memory dumps.
+
+## UI glitch audit
+
+`scripts/glitch_audit.py` boots a UI bundle and plays scripted scenarios (lockscreen, unlock-slide, home, folder-open-close, settings-switches, safari-keyboard, notification-center, control-center, clock-icon, home-button-animation) while taking QMP `screendump`s.
+
+```sh
+.venv/bin/python scripts/glitch_audit.py list
+.venv/bin/python scripts/glitch_audit.py run --bundle NAME --out /tmp/audit [--scenarios home,clock-icon]
+.venv/bin/python scripts/glitch_audit.py analyze /tmp/audit   # writes report.json and report.html
+```
+
+`run` clones the bundle (APFS clone, excluding logs) under `OUT/_work`, launches that clone with a stub player so the input QMP socket is free, and removes the clone afterwards. It never launches the original bundle. `--use-running` instead attaches to `control.launcher_qmp` from `vm status NAME --json`; the launcher normally holds that socket, so prefer the default. Frames are `OUT/<scenario>/NN-label.png` and `OUT/manifest.json` has step timings. All tap and swipe coordinates are in the `COORDS` table at the top of the script (640x1136); icon positions are estimates, tune them against the captured home frame. `analyze` flags new flat dark/grey rectangles, square corners on icon tiles, and black or unchanged frames; the heuristics are coarse hints for human review, not pass/fail. Unit tests: `python -m unittest tests.test_glitch_audit`.
 
 ## Backend checks
 
@@ -28,7 +48,55 @@ After building the project QEMU:
 
 These execute synthetic guest contracts. UART/framebuffer success is not native iOS acceptance. QMP requires local Unix sockets. Native boot acceptance must independently record source/backend/input hashes, serial output, screenshots, timing, and panic/exit status.
 
+## Offline AGX corpus replay and fast iteration
+
+`scripts/agx_corpus.py` compiles the renderer core of `backend/s5l8960x.c` into a standalone host harness (`backend/agx_replay_host.c`) to replay recorded GPU passes offline without booting QEMU.
+
+### Common CLI workflows
+
+```sh
+# 1. Fast C-only replay on a single frame
+.venv/bin/python scripts/agx_corpus.py replay \
+  --corpus build/agx-corpus --scene clock --frames 5 --c-only --output /tmp/clock-f5
+
+# 2. Iterate on a range with dependency chaining
+.venv/bin/python scripts/agx_corpus.py replay \
+  --corpus build/agx-corpus --scene settings-all --frames 5..10 --c-only --output /tmp/settings-f5-10
+
+# 3. Full multi-scene audit without deleting existing reports
+.venv/bin/python scripts/agx_corpus.py replay \
+  --corpus build/agx-corpus --scene clock,settings --unique-output
+
+# 4. Standard default chained audit across all corpus scenes
+.venv/bin/python scripts/agx_corpus.py replay --corpus build/agx-corpus
+```
+
+### Dependency prefix semantics
+
+In chained replay mode (the default), GPU memory is stateful: later passes frequently composite, blend, or sample from offscreen passes or earlier framebuffers. When specific frames are selected via `--frames` (e.g. `--frames 5` or `--frames 5..10`):
+- All earlier passes in scene order (passes 1..4) execute as a **dependency prefix** through `agx_replay_host --chain`.
+- Carried dirty memory pages are propagated forward into selected frames so rendered pixels match full-chain replays bit-for-bit.
+- Unselected prerequisite passes release intermediate RGBA buffers immediately without encoding PNGs.
+- If any prerequisite pass encounters an error or skips a draw, dependent selected frames are marked invalid and execution exits with code 1.
+
+### Stage timing boundaries
+
+Phase timings are separated and reported in stdout and `summary.json`:
+- `build_s`: harness core extraction, SHA-256 hash check, and compiler invocation (cached check takes ~0.0s).
+- `c_replay_s`: elapsed replay stage, including harness subprocesses and their result processing, before PNG conversion.
+- `py_audit_s`: Python offline audit (`agx_replay_offline.py` / `audit_frame`); exactly 0.0s when `--c-only` is passed.
+- `export_s`: image conversions (selected RGBA to PNG, live PPM to PNG) and summary metrics calculation.
+- `total_s`: elapsed time from replay entry through image export. Final JSON/HTML serialization and console output are excluded from these timings.
+
+### Report preservation and output directories
+
+- Existing report directories are never deleted or truncated.
+- If `--output <DIR>` is specified, `<DIR>` must be empty or new; existing non-empty directories are rejected with an error to prevent accidental data loss.
+- If `--unique-output` is given or the default `report/` directory already exists, a timestamped directory (e.g. `report-YYYYMMDD-HHMMSS[-N]`) is created atomically under `--corpus`.
+
 ## Optional integration
+
+`VPHONE_AGX_CORPUS=/absolute/path/to/agx-corpus` enables the recorded unlock-frame blur fallback regression. Without an override, it uses `build/agx-corpus`; the test skips when that optional dump is absent.
 
 `VPHONE_TEST_BUNDLE=/absolute/path/to/bundle` enables lifecycle integration in `test_backend_lifecycle.py`. It launches QEMU and force-stops the guest, modifying runtime/session state: use a disposable prepared bundle. `VPHONE_REAL_FIRMWARE_TEST=1` enables real-firmware tests. `VPHONE_TEST_IPSW` and `VPHONE_TEST_ANS_SOURCE` override the local IPSW and extracted ANS file paths respectively; absent overrides use the historical checkout layout. Inspect `test_firmware_gate.py` and `test_ans_image.py` before enabling it. These tests are not part of firmware-free CI.
 
